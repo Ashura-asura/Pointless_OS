@@ -243,3 +243,25 @@ The demo (`cargo run --release -p aegis-shell`) re-enacts the same claims in the
 boot scene — the agent cannot talk to the services even knowing the exact slot
 numbers, and its refusals appear in the reachable-authority audit alongside the
 endpoint state.
+
+### Machine-checked verification (executable): supervision (§5)
+
+`capability-core/tests/supervision.rs` (3 tests) checks the kernel side of the
+supervision-tree contract — the part that must hold before any "self-healing"
+claim is worth making:
+
+- Containment is a full-subtree revoke (I4), not a flag flip: killing smtp only
+  marks it dead; the supervisor's `revoke` removes the agent's restart role from
+  the agent's own table in one operation, and the refused retry fails with
+  `NoCap`. The kill is recorded, not erased — forensics survive containment.
+- The supervision cycle is reconstructable from the audit log alone: the
+  supervisor's TaskKill and the agent's TaskSpawn(s) are distinct records with
+  distinct callers and targets; the agent's log shows spawns only (no creation,
+  no grants, no revokes — the role bought restart only).
+- Escalation stops the retry loop and logs it: after revocation the agent cannot
+  keep restarting, and the refusal is a logged failed TaskSpawn — never a silent
+  swallow (the anti-"self-healing hides bugs" property of §5).
+
+Scheduling and retry policy remain userspace (the kernel's close contract): the
+kernel decides *whether* an op may run and records it; the supervision tree
+decides *how often* to retry.
