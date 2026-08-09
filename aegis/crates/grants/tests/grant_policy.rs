@@ -147,6 +147,57 @@ fn completion_revoke_removes_the_grant_and_only_the_grant() {
     assert_eq!(k.audit().query(Some(root.id()), AuditFilter::Ops(&[OpKind::Revoke])).count(), 1);
 }
 
+/// The §9.2 visibility claim: the always-visible grant list is a queryable
+/// registry, not a UI abstraction — it shows every confirmed grant with its role,
+/// grantee and deadline (None = persistent), and a grant leaves the list when
+/// revoked.
+#[test]
+fn the_active_grant_list_is_queryable_and_honest() {
+    let (mut k, root, creator) = boot();
+    let (_smtp, smtp_cap) = task(&mut k, root, creator, "smtp");
+    let inbox_ep = k.create_endpoint(root, creator).unwrap();
+    let (_agent, agent_cap) = task(&mut k, root, creator, "agent");
+    let mut svc = GrantService::new(&mut k, root, creator).unwrap();
+    let lib = RoleLibrary::default_roles();
+
+    let ephemeral = svc
+        .propose(
+            &k,
+            &lib,
+            "restart-service",
+            "agent",
+            agent_cap,
+            GrantTarget { label: "smtp".into(), source: smtp_cap },
+            GrantPolicy::TaskScoped { ticks: 100 },
+        )
+        .unwrap();
+    svc.confirm(&mut k, ephemeral).unwrap();
+    let persistent = svc
+        .propose(
+            &k,
+            &lib,
+            "triage-inbox",
+            "agent",
+            agent_cap,
+            GrantTarget { label: "inbox".into(), source: inbox_ep },
+            GrantPolicy::Persistent,
+        )
+        .unwrap();
+    svc.confirm(&mut k, persistent).unwrap();
+
+    let list = svc.list_active();
+    assert_eq!(list.len(), 2, "both grants are visible, persistent one included");
+    let persistent_grant = list.iter().find(|g| g.role_id == "triage-inbox").unwrap();
+    assert_eq!(persistent_grant.caps[0].deadline, None, "persistent is honestly marked");
+    let task_scoped = list.iter().find(|g| g.role_id == "restart-service").unwrap();
+    assert!(
+        task_scoped.caps[0].deadline.is_some(),
+        "task-scoped grants carry their deadline"
+    );
+
+    svc.revoke(&mut k).unwrap();
+    assert!(svc.list_active().is_empty(), "revoked grants leave the visible list");
+}
 /// A review is never a TOCTOU hole: if the grantor's authority disappears between
 /// propose and confirm, confirm fails — the mint re-checks every assumption.
 #[test]

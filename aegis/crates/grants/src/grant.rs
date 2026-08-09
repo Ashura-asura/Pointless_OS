@@ -57,7 +57,7 @@ pub struct GrantedCap {
     pub deadline: Option<u64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ActiveGrant {
     pub role_id: &'static str,
     pub grantee_label: String,
@@ -67,10 +67,13 @@ pub struct ActiveGrant {
 
 /// Runs under the grantor's identity. Owns exactly one grant root; revoke() removes
 /// the whole grant — every cap minted under it, from every CSpace — whoever currently
-/// holds them (I4, cross-grantee revocation).
+/// holds them (I4, cross-grantee revocation). Retains a grant registry so the
+/// "always-visible, easy-to-audit grant list" (§9.2) is a real, queryable thing
+/// rather than a UI abstraction.
 pub struct GrantService {
     grantor: TaskHandle,
     grant_root: CapHandle,
+    registry: Vec<ActiveGrant>,
 }
 
 impl GrantService {
@@ -80,7 +83,17 @@ impl GrantService {
         creator: CapHandle,
     ) -> KernelResult<GrantService> {
         let grant_root = kernel.create_grant_root(grantor, creator)?;
-        Ok(GrantService { grantor, grant_root })
+        Ok(GrantService {
+            grantor,
+            grant_root,
+            registry: Vec::new(),
+        })
+    }
+
+    /// The current grant list: every grant this service has confirmed and not yet
+    /// revoked, with role, grantee, deadline (None = persistent) and issue time.
+    pub fn list_active(&self) -> &[ActiveGrant] {
+        &self.registry
     }
 
     /// Validate a role grant request and produce its diff for human review. Rejected
@@ -172,19 +185,23 @@ impl GrantService {
             rights: pending.request.rights,
             deadline: expiry,
         };
-        Ok(ActiveGrant {
+        let active = ActiveGrant {
             role_id: pending.role_id,
             grantee_label: pending.grantee_label,
             caps: vec![cap],
             issued_at: kernel.now(),
-        })
+        };
+        self.registry.push(active.clone());
+        Ok(active)
     }
 
     /// The task-scoped half of "expires on completion": the supervisor calls this when
     /// the bound task ends. Every cap of the grant vanishes — from the agent's CSpace
     /// and anywhere the agent managed to push them (it cannot, but the kernel's
-    /// derivation graph would catch it if it had).
+    /// derivation graph would catch it if it had). A revoked grant leaves the list.
     pub fn revoke(&mut self, kernel: &mut Kernel) -> KernelResult<()> {
-        kernel.revoke(self.grantor, self.grant_root)
+        kernel.revoke(self.grantor, self.grant_root)?;
+        self.registry.clear();
+        Ok(())
     }
 }

@@ -69,6 +69,20 @@ pub fn run() -> Outcome {
     let granted = svc.confirm(&mut k, pending).unwrap();
     let grant_slot = CapHandle(granted.caps[0].slot);
 
+    // ---- the always-visible grant list (§9.2): one line per confirmed grant —
+    // role, grantee, deadline — not buried in a settings pane.
+    println!("--- visible grant list (always on screen, section 9.2) ---");
+    for g in svc.list_active() {
+        let deadline = match g.caps[0].deadline {
+            Some(t) => format!("t+{}", t.saturating_sub(k.now())),
+            None => "persistent".to_string(),
+        };
+        println!(
+            "  grant '{}' -> {}: role={}, rights={}, expires {deadline}",
+            g.role_id, g.grantee_label, g.caps[0].kind, g.caps[0].rights
+        );
+    }
+
     // ---- the task itself: smtp crashes; the agent restarts it, nothing else
     k.task_kill(root, smtp_cap).unwrap(); // the crash (would be a supervisor detection)
     assert!(!k.task_running(root, smtp_cap).unwrap());
@@ -230,6 +244,10 @@ pub fn run() -> Outcome {
 
     // ---- completion: task-scoped grant dies with the task (supervisor revokes)
     svc.revoke(&mut k).unwrap();
+    assert!(
+        svc.list_active().is_empty(),
+        "a revoked grant leaves the visible list"
+    );
     let after = k.authorized(agent);
     assert_eq!(after.len(), 1, "revoke left trace: {after:?}");
     assert_eq!(after[0].kind, ObjectKind::Task); // only the self cap
