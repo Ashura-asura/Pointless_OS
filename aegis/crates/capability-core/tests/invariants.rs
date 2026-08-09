@@ -42,9 +42,18 @@ fn delegation_can_never_expand_rights() {
     let (wally, wally_cap) = k.create_task(root, creator, "wally").unwrap();
 
     // root -> bob: CONTROL|GRANT on smtp (slot 1) + naming cap to zed (slot 2).
+    // The naming cap must carry RECEIVE — it consents to zed being targeted as a
+    // grant destination (I6); a bare naming reference is not a mailbox.
     k.grant(root, smtp_cap, bob_cap, Rights::GRANT.union(Rights::CONTROL), None)
         .unwrap();
-    k.grant(root, zed_cap, bob_cap, Rights::CONTROL, None).unwrap();
+    k.grant(
+        root,
+        zed_cap,
+        bob_cap,
+        Rights::CONTROL.union(Rights::RECEIVE),
+        None,
+    )
+    .unwrap();
 
     // bob -> zed: bob asks for EVERYTHING. The kernel clamps to bob's CONTROL|GRANT.
     // Zed now holds: self (0), smtp C|G (1).
@@ -62,8 +71,16 @@ fn delegation_can_never_expand_rights() {
 
     // zed -> wally: zed narrows to CONTROL (subset of its own C|G — the kernel mints
     // rights ∩ source, so a grantor can only pass rights it holds).
-    // root also gave zed a naming cap to wally (slot 2). Wally: self (0), smtp C (1).
-    k.grant(root, wally_cap, zed_cap, Rights::CONTROL, None).unwrap();
+    // root also gave zed a naming cap to wally carrying RECEIVE (slot 2), consenting
+    // to wally as a destination. Wally: self (0), smtp C (1).
+    k.grant(
+        root,
+        wally_cap,
+        zed_cap,
+        Rights::CONTROL.union(Rights::RECEIVE),
+        None,
+    )
+    .unwrap();
     k.grant(zed, CapHandle(1), CapHandle(2), Rights::CONTROL, None).unwrap();
     assert!(k.task_spawn(wally, CapHandle(1)).is_ok());
 
@@ -91,12 +108,19 @@ fn revocation_removes_derived_caps_from_all_cspaces() {
     let (_smtp, smtp_cap) = smtp_server(&mut k, root, creator);
 
     // root -> bob: GRANT+CONTROL on smtp (so bob may narrow and re-delegate), plus a
-    // task cap to carol so bob can name carol.
+    // task cap to carol carrying RECEIVE so bob may target carol (I6).
     let (bob, bob_cap) = k.create_task(root, creator, "bob").unwrap();
     let (carol, carol_cap) = k.create_task(root, creator, "carol").unwrap();
     k.grant(root, smtp_cap, bob_cap, Rights::GRANT.union(Rights::CONTROL), None)
         .unwrap();
-    k.grant(root, carol_cap, bob_cap, Rights::CONTROL, None).unwrap();
+    k.grant(
+        root,
+        carol_cap,
+        bob_cap,
+        Rights::CONTROL.union(Rights::RECEIVE),
+        None,
+    )
+    .unwrap();
 
     // bob -> carol: bob hands carol CONTROL (subset of bob's own C|G — the kernel
     // mints rights ∩ source, so carol can never exceed bob). Carol: self (0), smtp C (1).
@@ -106,15 +130,15 @@ fn revocation_removes_derived_caps_from_all_cspaces() {
         vec![(ObjectKind::Task, Rights::ALL), (ObjectKind::Task, Rights::CONTROL)]
     );
 
-    // Root revokes its smtp cap. The whole subtree dies: bob's C|G and carol's READ.
+    // Root revokes its smtp cap. The whole subtree dies: bob's C|G and carol's C.
     k.revoke(root, smtp_cap).unwrap();
     // bob keeps: the self cap + the carol task cap (chain rooted in root's *carol*
-    // cap, which was not revoked).
+    // cap, which was not revoked) — still carrying its RECEIVE consent right.
     assert_eq!(
         caps_of(&k, bob),
         vec![
             (ObjectKind::Task, Rights::ALL),
-            (ObjectKind::Task, Rights::CONTROL),
+            (ObjectKind::Task, Rights::CONTROL.union(Rights::RECEIVE)),
         ]
     );
     // carol keeps only its self cap.
@@ -156,8 +180,15 @@ fn expiry_kills_caps_and_cannot_be_extended() {
     let (bob, bob_cap) = k.create_task(root, creator, "bob").unwrap();
     let (carol, carol_cap) = k.create_task(root, creator, "carol").unwrap();
     k.grant(root, smtp_cap, bob_cap, Rights::ALL, Some(100)).unwrap();
-    // bob also gets a task cap to carol so it can name carol when re-granting.
-    k.grant(root, carol_cap, bob_cap, Rights::CONTROL, None).unwrap();
+    // bob also gets a task cap to carol carrying RECEIVE so bob may target carol (I6).
+    k.grant(
+        root,
+        carol_cap,
+        bob_cap,
+        Rights::CONTROL.union(Rights::RECEIVE),
+        None,
+    )
+    .unwrap();
 
     // Bob: self (0), smtp ALL exp100 (1), carol cap (2). Bob copies — the copy is an
     // exact derivation of the parent grant (slot 3), so it inherits the deadline.
@@ -202,4 +233,52 @@ fn failed_operations_are_audited() {
         failures.iter().any(|r| r.op == OpKind::TaskKill),
         "bob's rejected TaskKill was not audited"
     );
+}
+
+/// I6 — grant consent: a task's CSpace may only be written into by a caller holding
+/// a RECEIVE-rights cap to that task. A bare naming reference (Rights::NONE) must
+/// not license minting caps into the victim's table — the CSpace-exhaustion attack
+/// fails at the first injection, not the 255th, and legitimate grants still land.
+#[test]
+fn grant_requires_receiver_consent() {
+    let (mut k, root, creator) = boot();
+    let (victim, victim_cap) = k.create_task(root, creator, "victim").unwrap();
+    let (attacker, attacker_cap) = k.create_task(root, creator, "attacker").unwrap();
+
+    // attacker gets ONLY a zero-rights naming reference to victim — "the attacker
+    // merely knows the victim exists," no authority over it.
+    k.grant(root, victim_cap, attacker_cap, Rights::NONE, None).unwrap();
+    // and one GRANT-capable resource (a valid source cap for grant()).
+    let (_r, r_cap) = k.create_task(root, creator, "junk").unwrap();
+    k.grant(root, r_cap, attacker_cap, Rights::GRANT, None).unwrap();
+
+    // First injection attempt already fails: the kernel demands RECEIVE (I6).
+    assert_eq!(
+        k.grant(attacker, CapHandle(2), CapHandle(1), Rights::CONTROL, None)
+            .unwrap_err(),
+        KernelError::InsufficientRights(Rights::RECEIVE)
+    );
+    // grant_mint refuses the same way before anything else can be checked.
+    assert!(k
+        .grant_mint(
+            attacker,
+            CapHandle(0), // not even a GrantRoot cap — consent checked only on path
+            CapHandle(2),
+            CapHandle(1),
+            Rights::CONTROL,
+            None,
+        )
+        .is_err());
+
+    // The victim's CSpace is undisturbed and a legitimate grant still lands after.
+    let before = k.authorized(victim).len();
+    k.grant(
+        root,
+        victim_cap,
+        victim_cap,
+        Rights::CONTROL.union(Rights::RECEIVE),
+        None,
+    )
+    .unwrap();
+    assert_eq!(k.authorized(victim).len(), before + 1);
 }

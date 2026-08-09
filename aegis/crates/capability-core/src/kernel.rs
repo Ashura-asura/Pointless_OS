@@ -437,7 +437,9 @@ impl Kernel {
     /// Grant: mint a narrowed, possibly short-lived copy of one of the caller's caps
     /// into another task's CSpace. The target task is named by a Task capability the
     /// caller holds in its own CSpace (no one can name a task's table without holding a
-    /// cap to that task). Requires GRANT on the source (I2).
+    /// cap to that task). Requires GRANT on the source (I2), and requires the naming
+    /// cap to carry RECEIVE (I6): pushing caps into a task's CSpace needs that task's
+    /// consent as encoded in the cap — a bare naming reference is not a mailbox.
     pub fn grant(
         &mut self,
         caller: TaskHandle,
@@ -452,6 +454,7 @@ impl Kernel {
             k.require_right(src, Rights::GRANT)?;
             let (_, task_cap) = k.lookup(caller.0, into_task)?;
             k.require_kind(task_cap, ObjectKind::Task)?;
+            k.require_right(task_cap, Rights::RECEIVE)?;
             let narrowed = rights.intersect(src.rights);
             let src_exp = src.expires_at;
             let src_cid = k.capid_of(caller.0, src_slot).unwrap();
@@ -479,6 +482,7 @@ impl Kernel {
     /// grant from every CSpace, while the grantor's own caps survive (spec §4, I4).
     /// Rights are still clamped by the source cap (I2); expiry is clamped by the
     /// source's remaining life (I5). This is the grant-service op, not a general tool.
+    /// Also requires RECEIVE on the naming cap (I6), like `grant`.
     pub fn grant_mint(
         &mut self,
         caller: TaskHandle,
@@ -497,6 +501,7 @@ impl Kernel {
             k.require_right(src, Rights::GRANT)?;
             let (_, task_cap) = k.lookup(caller.0, into_task)?;
             k.require_kind(task_cap, ObjectKind::Task)?;
+            k.require_right(task_cap, Rights::RECEIVE)?;
             let narrowed = rights.intersect(src.rights);
             let root_cid = k.capid_of(caller.0, root_slot).unwrap();
             // Expiry: clamp by the *source*'s life; derivation parent is the grant root.

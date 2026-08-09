@@ -13,9 +13,13 @@ impl Rights {
     pub const SEND: Rights = Rights(1 << 3);
     pub const RECV: Rights = Rights(1 << 4);
     pub const GRANT: Rights = Rights(1 << 5);
+    /// Grant-consent (I6): the holder of a RECEIVE cap to a task may target that
+    /// task as a grant destination. Without it, a cap is only a *naming reference* —
+    /// it proves the task exists, it does not license pushing caps into its CSpace.
+    pub const RECEIVE: Rights = Rights(1 << 6);
 
     pub const NONE: Rights = Rights(0);
-    pub const ALL: Rights = Rights((1 << 6) - 1);
+    pub const ALL: Rights = Rights((1 << 7) - 1);
 
     pub const fn new(bits: u32) -> Rights {
         Rights(bits & Self::ALL.0)
@@ -59,6 +63,7 @@ impl fmt::Display for Rights {
             (Self::SEND, "S"),
             (Self::RECV, "RCV"),
             (Self::GRANT, "G"),
+            (Self::RECEIVE, "RCVE"),
         ] {
             if self.contains(bit) {
                 out.push_str(name);

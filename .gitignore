@@ -1,1 +1,3 @@
 aegis/target/
+aegis/spec/states/
+aegis/spec/AegisCapabilities_TTrace_*
