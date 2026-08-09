@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Opaque identity of an execution context. Only the kernel can fabricate one; a task
 /// cannot name another task's identity any more than it can name another task's caps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TaskHandle(ObjectId);
 
 impl TaskHandle {
@@ -53,6 +53,17 @@ pub struct CapInfo {
     pub slot: u32,
     pub kind: ObjectKind,
     pub rights: Rights,
+}
+
+/// A raw, read-only projection of one cap in a task's CSpace, keeping *object identity*
+/// — the reachable-authority auditor needs to know which task a naming cap refers to
+/// for the delegation closure (design doc §10 [CLOSED] TCB-creep fix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CapView {
+    pub obj: ObjectId,
+    pub kind: ObjectKind,
+    pub rights: Rights,
+    pub expires_at: Option<u64>,
 }
 
 pub struct Kernel {
@@ -803,6 +814,32 @@ impl Kernel {
             kind,
             rights: inst.rights,
         })
+    }
+
+    /// Raw read-only projection of every live cap a task holds, including object
+    /// identity (unlike [`Kernel::authorized`], which drops it). Same liveness rules
+    /// as a lookup: expired caps are not shown. Feeds the reachable-authority auditor.
+    pub fn caps_of(&self, caller: TaskHandle) -> Vec<CapView> {
+        let mut out = Vec::new();
+        if let Some(cspace) = self.cspaces.get(&caller.0) {
+            for (_, cap) in cspace.iter() {
+                if cap.expires_at.map(|e| self.now > e).unwrap_or(false) {
+                    continue;
+                }
+                out.push(CapView {
+                    obj: cap.obj,
+                    kind: self
+                        .objects
+                        .get(&cap.obj)
+                        .map(Object::kind)
+                        .unwrap_or(ObjectKind::Task),
+                    rights: cap.rights,
+                    expires_at: cap.expires_at,
+                });
+            }
+        }
+        out.sort_by_key(|c| (c.kind, c.rights));
+        out
     }
 }
 

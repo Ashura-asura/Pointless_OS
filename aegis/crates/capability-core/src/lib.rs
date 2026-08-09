@@ -14,6 +14,6 @@ pub mod rights;
 pub use audit::{AuditFilter, AuditLog, AuditRecord, OpKind};
 pub use cspace::CapHandle;
 pub use error::{KernelError, KernelResult};
-pub use kernel::{AuthorizedCap, CapInfo, Kernel, TaskHandle};
+pub use kernel::{AuthorizedCap, CapInfo, CapView, Kernel, TaskHandle};
 pub use objects::{Message, ObjectId, ObjectKind};
 pub use rights::Rights;

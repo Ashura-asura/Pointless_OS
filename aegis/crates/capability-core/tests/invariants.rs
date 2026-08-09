@@ -150,7 +150,7 @@ fn revocation_removes_derived_caps_from_all_cspaces() {
 #[test]
 fn grant_root_revocation_cleans_every_grantee() {
     let (mut k, root, creator) = boot();
-    let (smtp, smtp_cap) = smtp_server(&mut k, root, creator);
+    let (_smtp, smtp_cap) = smtp_server(&mut k, root, creator);
     let (bob, bob_cap) = k.create_task(root, creator, "bob").unwrap();
     let (carol, carol_cap) = k.create_task(root, creator, "carol").unwrap();
 
@@ -215,7 +215,7 @@ fn expiry_kills_caps_and_cannot_be_extended() {
 #[test]
 fn failed_operations_are_audited() {
     let (mut k, root, creator) = boot();
-    let (smtp, smtp_cap) = smtp_server(&mut k, root, creator);
+    let (_smtp, smtp_cap) = smtp_server(&mut k, root, creator);
     let (bob, _bob_cap) = k.create_task(root, creator, "bob").unwrap();
 
     assert_eq!(

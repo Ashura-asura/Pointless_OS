@@ -17,7 +17,7 @@ impl CapId {
 }
 
 /// Kernel-only object id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectId(u64);
 
 impl ObjectId {
@@ -28,7 +28,7 @@ impl ObjectId {
 
 /// What kind of object a capability refers to — used for introspection and error
 /// reporting, never as an authority check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ObjectKind {
     Task,
     Endpoint,

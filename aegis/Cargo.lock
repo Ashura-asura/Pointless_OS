@@ -6,6 +6,15 @@ version = 4
 name = "aegis-shell"
 version = "0.1.0"
 dependencies = [
+ "capability-audit",
+ "capability-core",
+ "grants",
+]
+
+[[package]]
+name = "capability-audit"
+version = "0.1.0"
+dependencies = [
  "capability-core",
  "grants",
 ]

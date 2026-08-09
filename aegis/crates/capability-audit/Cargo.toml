@@ -1,9 +1,8 @@
 [package]
-name = "aegis-shell"
+name = "capability-audit"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 capability-core = { path = "../capability-core" }
-capability-audit = { path = "../capability-audit" }
 grants = { path = "../grants" }

@@ -7,7 +7,7 @@
 //! the latter decides what may happen.
 
 use capability_core::{
-    AuditFilter, CapHandle, Kernel, KernelError, ObjectKind, OpKind, Rights, TaskHandle,
+    AuditFilter, CapHandle, Kernel, KernelError, ObjectKind, OpKind, TaskHandle,
 };
 use grants::{GrantPolicy, GrantService, GrantTarget, RoleLibrary};
 
@@ -69,17 +69,32 @@ pub fn run() -> Outcome {
     let granted = svc.confirm(&mut k, pending).unwrap();
     let grant_slot = CapHandle(granted.caps[0].slot);
 
-    // ---- reachable-authority auditor: agent holds exactly [self, grant]
-    let expected: Vec<(ObjectKind, Rights, Option<u64>)> = vec![
-        (ObjectKind::Task, Rights::ALL, None),
-        (ObjectKind::Task, Rights::READ.union(Rights::CONTROL), Some(1000)),
-    ];
-    let actual: Vec<(ObjectKind, Rights, Option<u64>)> = k
-        .authorized(agent)
-        .iter()
-        .map(|c| (c.kind, c.rights, c.expires_at))
-        .collect();
-    assert_eq!(expected, actual, "authority grew beyond the manifest");
+    // ---- reachable-authority auditor (design doc §10 [CLOSED]): the build breaks
+    // if the agent's reachable authority ever grows beyond its manifest. Audited
+    // *after* the adversarial suite, so the ceiling claim covers the attack run too.
+    let session_manifest = capability_audit::manifests::session();
+    let assistant_manifest = capability_audit::manifests::assistant();
+    let report = capability_audit::audit::audit(
+        &k,
+        &[
+            (root, &session_manifest),
+            (agent, &assistant_manifest),
+        ],
+    );
+    for (service, ws) in &report.warnings {
+        for w in ws {
+            println!("  audit warning  {service}: {w}");
+        }
+    }
+    assert!(
+        report.is_clean(),
+        "reachable authority exceeds the manifest: {report:?}"
+    );
+    println!(
+        "[PASS] reachable-authority audit: {} services within declared manifests ({} warnings)",
+        report.entries.len(),
+        report.warning_count()
+    );
 
     // ---- the task itself: smtp crashes; the agent restarts it, nothing else
     k.task_kill(root, smtp_cap).unwrap(); // the crash (would be a supervisor detection)
