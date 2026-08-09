@@ -1,0 +1,10 @@
+[package]
+name = "resources"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+capability-audit = { path = "../capability-audit" }
+capability-core = { path = "../capability-core" }
+object-store = { path = "../object-store" }
+packages = { path = "../packages" }

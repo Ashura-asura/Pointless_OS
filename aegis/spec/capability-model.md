@@ -361,6 +361,30 @@ Honest limits: generations are single-application (one package per generation),
 boot-target persistence is in-memory store content (no block device), and
 health signals are supplied by the operator rather than probed from hardware.
 
+### Machine-checked verification (executable): the resource model (§8)
+
+`resources` (4 contract tests) realizes hierarchical budgets over the
+supervision tree, metered from kernel truth and enforced by revocation:
+
+- Budgets are a hierarchy mirroring the tree. The ledger refuses overcommit —
+  a parent cannot subdivide more than it holds, a service has exactly one
+  parent — and conserves the total: root kept plus subtree tops equals the
+  root's budget, exactly (no accounting can stretch a fixed total).
+- Metering trusts no userspace bookkeeping: CPU is every successful audit
+  record attributed to the task (the log is the scheduler's clock; a partition
+  of the log by task is provably exact), and memory is the WRITE-reachable
+  bytes of the task's live regions, read straight from the cap tables. A
+  READ-only service provably meters zero resident bytes.
+- Enforcement is ordinary revocation: an over-budget service is recycled
+  through its own install anchor — the governor holds no special authority —
+  and siblings are provably untouched, by cap census and by meter.
+- A recycled service reinstalls into a clean envelope (fresh task, zero spent).
+
+Honest limits: CPU is metered in executed-op units rather than hardware ticks,
+memory is a footprint of what caps *could* write rather than what was touched,
+and v1 does no dynamic re-scheduling — the recycle-then-reinstall cycle is the
+whole enforcement loop.
+
 ### Machine-checked verification (executable): grant policy (§9)
 
 `grants/tests/grant_policy.rs` (4 tests) checks the §9.1-9.3 policy claims
