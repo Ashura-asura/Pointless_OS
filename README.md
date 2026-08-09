@@ -4,7 +4,7 @@ An executable reference implementation of a capability-based operating system de
 
 ## Status
 
-72 tests passing, 0 failures across 41 crate targets. The reachable-authority auditor runs clean (0 violations, 3 warnings). The interactive demo (`cargo run -p aegis-shell`) runs without errors.
+77 tests passing, 0 failures across 41 crate targets. The reachable-authority auditor runs clean (0 violations, 3 warnings). The interactive demo (`cargo run -p aegis-shell`) runs without errors.
 
 ## What Is Implemented
 
@@ -22,14 +22,15 @@ The kernel model (`capability-core`) proves six authority invariants (I1-I6) via
 - **Two-party confirmation**: high-risk roles refuse single-click, require two distinct people (3 tests)
 - **Anomaly circuit breaker**: monitor trains on actual op-shape, suspends on deviation, never revokes, has zero authority (3 tests)
 - **Batched I/O**: one kernel crossing for N operations (io_uring pattern), per-entry capability checks (3 tests)
+- **Package-driven exec**: install a package, start its app, app reads granted payload, refuses writes and Creator access (1 test)
+- **Macaroon capability tokens**: HMAC-SHA256 chained portable tokens for cross-machine authority transfer (4 tests)
 - **Reachable-authority auditor**: CI entry point that computes actual capability reachability vs manifests (CLI tool)
 
 ## What Is Not Done
 
-- Capability-graph CLI visualization tool (data exists, no visual output)
-- Package-driven exec demo (install works, launch from install not wired)
-- Distributed macaroon/capability tokens (not started)
 - POSIX filesystem view projection (not started)
+- Network transport (loopback only, no real NIC driver)
+- Constant-time HMAC comparison (prototype uses `!=`, production would need `subtle::ConstantTimeEq`)
 
 ## Honest Limits
 
@@ -42,7 +43,8 @@ The kernel model (`capability-core`) proves six authority invariants (I1-I6) via
 ## Running
 
 ```
-cargo test                    # Run all 72 tests
+cargo test                    # Run all 77 tests
 cargo run -p capability-audit # Reachable-authority audit
+cargo run -p capability-audit -- --graph  # Capability graph visualization
 cargo run -p aegis-shell      # Interactive demo
 ```
