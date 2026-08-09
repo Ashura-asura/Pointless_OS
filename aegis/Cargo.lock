@@ -29,3 +29,10 @@ version = "0.1.0"
 dependencies = [
  "capability-core",
 ]
+
+[[package]]
+name = "object-store"
+version = "0.1.0"
+dependencies = [
+ "capability-core",
+]

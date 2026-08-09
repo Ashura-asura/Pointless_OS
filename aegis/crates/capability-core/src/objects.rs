@@ -21,7 +21,13 @@ impl CapId {
 pub struct ObjectId(u64);
 
 impl ObjectId {
-    pub(crate) fn from_raw(raw: u64) -> ObjectId {
+    /// The numeric form of the id, for persistence/serialization into object
+    /// bytes (the id alone grants nothing — see module docs).
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    pub fn from_raw(raw: u64) -> ObjectId {
         ObjectId(raw)
     }
 }

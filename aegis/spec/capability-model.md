@@ -266,6 +266,37 @@ Scheduling and retry policy remain userspace (the kernel's close contract): the
 kernel decides *whether* an op may run and records it; the supervision tree
 decides *how often* to retry.
 
+### Machine-checked verification (executable): object store (§8 + §10 [CLOSED])
+
+`object-store` (8 tests: 4 SHA-256 vectors + 6 contract) realizes the storage
+claims against the same kernel:
+
+- Ground truth is content-addressed immutable blocks: identical bytes are the
+  same block, stored once (dedup); the SHA-256 content hash is integrity itself
+  (implemented dependency-free, pinned against the standard vectors; the
+  non-empty ones were cross-checked with the host OS's SHA-256 at authoring
+  time).
+- Blocks are capability-addressed: the content hash *and* the kernel object id
+  grant nothing. A reader with no region cap in its own CSpace reads nothing;
+  the store grants READ into the reader's table, and the granted cap is a
+  narrowed copy that cannot be widened into WRITE (I2, executable).
+- Mutable data is a COW layer: writes create new blocks and new node regions,
+  never mutating existing ones — snapshot stability is mechanical, one region
+  per version.
+- The §10 [CLOSED] contract is stated as *types* and *behavior*: `commit`'s and
+  `write_version`'s function-pointer types carry no index and no index result
+  (the assignments compile only if that is true); a full file workload runs
+  with no index registered at all; the relationship index ingests *only* the
+  write-ahead log, orders behind, catches up later, and rebuilds identically
+  from the log — a cache, never a participant, exactly the property that
+  structurally closes the WinFS failure mode.
+- The POSIX file view is a projection: file bytes are store blocks, the
+  namespace is a COW store object, every mutation is WAL material. No second
+  source of truth exists to drift.
+
+Honest limits: single-region blocks (no multi-block files), in-memory WAL, flat
+namespace, and durability ends at process exit — a block device is Phase 3/4.
+
 ### Machine-checked verification (executable): grant policy (§9)
 
 `grants/tests/grant_policy.rs` (4 tests) checks the §9.1-9.3 policy claims
