@@ -8,7 +8,7 @@
 
 use capability_audit::audit::audit;
 use capability_audit::manifests::{assistant, session};
-use capability_audit::{AuditReport, Manifest};
+use capability_audit::{reach, AuditReport, Manifest};
 use capability_core::{CapHandle, Kernel, TaskHandle};
 use grants::{GrantPolicy, GrantService, GrantTarget, RoleLibrary};
 use std::process::ExitCode;
@@ -70,7 +70,91 @@ fn render(report: &AuditReport) -> String {
     out
 }
 
+fn format_rights(rights: capability_core::Rights) -> String {
+    if rights == capability_core::Rights::ALL {
+        "ALL".to_string()
+    } else {
+        format!("{rights}")
+    }
+}
+
+fn render_graph(
+    k: &Kernel,
+    bindings: &[(TaskHandle, &Manifest)],
+) -> String {
+    let mut out = String::new();
+    out.push_str("capability graph\n");
+    out.push_str("----------------\n");
+    let tasks: Vec<TaskHandle> = bindings.iter().map(|(t, _)| *t).collect();
+    let snap = reach::snapshot(k, &tasks);
+    let edges = reach::delivery_edges(&snap);
+
+    for (task, manifest) in bindings {
+        let label = manifest.service;
+        let repo = if manifest.repo.is_kernel() {
+            "kernel"
+        } else {
+            "service"
+        };
+        out.push_str(&format!("  {} ({} repo):\n", label, repo));
+        if let Some(caps) = snap.get(task) {
+            for cap in caps {
+                let kind_name = format!("{:?}", cap.kind);
+                let rights_str = format_rights(cap.rights);
+                out.push_str(&format!("    [{}] {}\n", kind_name, rights_str));
+            }
+        }
+        let delegation_targets: Vec<&str> = edges
+            .iter()
+            .filter(|(from, _)| *from == *task)
+            .filter_map(|(_, to)| {
+                bindings
+                    .iter()
+                    .find(|(t, _)| *t == *to)
+                    .map(|(_, m)| m.service)
+            })
+            .collect();
+        if delegation_targets.is_empty() {
+            out.push_str("    (no delegation edges)\n");
+        } else {
+            out.push_str(&format!(
+                "    → could delegate to: {}\n",
+                delegation_targets.join(", ")
+            ));
+        }
+    }
+    out
+}
+
+fn print_help() {
+    eprintln!("Usage: capability-audit [OPTIONS]");
+    eprintln!();
+    eprintln!("Audits reachable authority of every bound service against its manifest.");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --graph   Print a human-readable capability graph after the audit report");
+    eprintln!("  --help    Show this help message");
+}
+
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    let mut graph_mode = false;
+
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--graph" => graph_mode = true,
+            "--help" => {
+                print_help();
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("Unknown option: {other}");
+                print_help();
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     let (k, root, agent, _agent_cap, _smtp_cap) = build_reference_world();
     let session = session();
     let assistant = assistant();
@@ -78,6 +162,11 @@ fn main() -> ExitCode {
         vec![(root, &session), (agent, &assistant)];
     let report = audit(&k, &bindings);
     print!("{}", render(&report));
+
+    if graph_mode {
+        print!("{}", render_graph(&k, &bindings));
+    }
+
     if report.is_clean() {
         ExitCode::SUCCESS
     } else {
