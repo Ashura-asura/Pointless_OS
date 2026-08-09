@@ -8,6 +8,7 @@ members = [
     "crates/packages",
     "crates/system-update",
     "crates/resources",
+    "crates/net",
     "crates/aegis-shell",
 ]
 

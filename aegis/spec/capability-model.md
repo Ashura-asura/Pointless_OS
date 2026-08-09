@@ -385,6 +385,33 @@ memory is a footprint of what caps *could* write rather than what was touched,
 and v1 does no dynamic re-scheduling — the recycle-then-reinstall cycle is the
 whole enforcement loop.
 
+### Machine-checked verification (executable): the network stack (§8)
+
+`net` (4 contract tests) realizes the doc's userspace-netstack sentence
+verbatim: *"holding a network capability means holding a specific, revocable
+right to talk to a specific endpoint or class of endpoint, not ambient 'this
+process can open any socket' authority."*
+
+- Sockets are kernel endpoint objects under a userspace port namespace. Ports
+  are not ambient authority: a task that knows a port number but holds no
+  channel cap is refused by the stack, and the kernel refuses the raw `ep_send`
+  underneath it. A socket's channel cap is minted into the subscriber's own
+  CSpace, narrowed by derivation.
+- The stack is a real router, not a wrapper: a packet traverses two logged,
+  attributed hops (the sender's injection, then the stack's forward from its
+  own router caps), and the audit log alone reconstructs the whole path —
+  sender task, router, destination — with no path that bypasses the log.
+- The loopback is FIFO (message order is endpoint-queue order), and tearing a
+  socket down removes it from the interface without touching any peer.
+- The stack is a router, not a root: after a conversation, the census of its
+  CSpace shows exactly its channel endpoints and the boot role's own creator —
+  zero grant roots, zero new authority.
+
+Honest limits: loopback interface only (no NIC, no IP packet framing), one
+stack instance, ports are per-socket addresses, and routing authority (a
+Creator cap) is held by the stack's host identity — this is the "one driver,
+one capability envelope" arrangement, not an ambient networking stack.
+
 ### Machine-checked verification (executable): grant policy (§9)
 
 `grants/tests/grant_policy.rs` (4 tests) checks the §9.1-9.3 policy claims
