@@ -7,7 +7,7 @@
 //! the latter decides what may happen.
 
 use capability_core::{
-    AuditFilter, CapHandle, Kernel, KernelError, ObjectKind, OpKind, TaskHandle,
+    AuditFilter, CapHandle, Kernel, KernelError, ObjectKind, OpKind, Rights, TaskHandle,
 };
 use grants::{GrantPolicy, GrantService, GrantTarget, RoleLibrary};
 
@@ -68,33 +68,6 @@ pub fn run() -> Outcome {
 
     let granted = svc.confirm(&mut k, pending).unwrap();
     let grant_slot = CapHandle(granted.caps[0].slot);
-
-    // ---- reachable-authority auditor (design doc §10 [CLOSED]): the build breaks
-    // if the agent's reachable authority ever grows beyond its manifest. Audited
-    // *after* the adversarial suite, so the ceiling claim covers the attack run too.
-    let session_manifest = capability_audit::manifests::session();
-    let assistant_manifest = capability_audit::manifests::assistant();
-    let report = capability_audit::audit::audit(
-        &k,
-        &[
-            (root, &session_manifest),
-            (agent, &assistant_manifest),
-        ],
-    );
-    for (service, ws) in &report.warnings {
-        for w in ws {
-            println!("  audit warning  {service}: {w}");
-        }
-    }
-    assert!(
-        report.is_clean(),
-        "reachable authority exceeds the manifest: {report:?}"
-    );
-    println!(
-        "[PASS] reachable-authority audit: {} services within declared manifests ({} warnings)",
-        report.entries.len(),
-        report.warning_count()
-    );
 
     // ---- the task itself: smtp crashes; the agent restarts it, nothing else
     k.task_kill(root, smtp_cap).unwrap(); // the crash (would be a supervisor detection)
@@ -160,6 +133,99 @@ pub fn run() -> Outcome {
         .count();
     println!(
         "--- audit: agent performed {ok_ops} successful ops and {failed_ops} rejected ops, all logged ---"
+    );
+
+    // ---- capability-scoped IPC (design doc §8): an endpoint between the two
+    // services; the agent holds no endpoint cap and cannot talk, even knowing the
+    // exact slot numbers in the other tables.
+    let ep = k.create_endpoint(root, root_creator).unwrap();
+    k.grant(
+        root,
+        ep,
+        smtp_cap,
+        Rights::SEND.union(Rights::RECV),
+        None,
+    )
+    .unwrap();
+    k.grant(
+        root,
+        ep,
+        ntp_cap,
+        Rights::SEND.union(Rights::RECV),
+        None,
+    )
+    .unwrap();
+    // The harness (userland scheduling) drives the services addressing their own
+    // tables; the session's endpoint identity comes from kernel introspection.
+    let smtp_ep = k
+        .authorized(smtp)
+        .iter()
+        .find(|c| c.kind == ObjectKind::Endpoint)
+        .unwrap()
+        .slot;
+    let ntp_ep = k
+        .authorized(ntp)
+        .iter()
+        .find(|c| c.kind == ObjectKind::Endpoint)
+        .unwrap()
+        .slot;
+    k.ep_send(smtp, CapHandle(smtp_ep), b"health?".to_vec()).unwrap();
+    assert_eq!(
+        k.ep_recv(ntp, CapHandle(ntp_ep)).unwrap(),
+        Some(b"health?".to_vec()),
+        "IPC delivery broke the FIFO order"
+    );
+    k.ep_send(ntp, CapHandle(ntp_ep), b"ok".to_vec()).unwrap();
+    assert_eq!(
+        k.ep_recv(smtp, CapHandle(smtp_ep)).unwrap(),
+        Some(b"ok".to_vec())
+    );
+    println!("[PASS] capability-scoped IPC: smtp <-> ntp exchange over a session-granted endpoint");
+    // The agent: it knows both slot numbers, it holds no endpoint cap. Whether a
+    // slot index lands in its table (WrongObjectType) or past it (NoCap) depends on
+    // the world's layout — what is guaranteed is that every send is refused.
+    assert!(k.ep_send(agent, CapHandle(smtp_ep), b"pwn".to_vec()).is_err());
+    assert!(k.ep_send(agent, CapHandle(ntp_ep), b"pwn".to_vec()).is_err());
+    assert!(k.ep_send(agent, CapHandle(0), b"pwn".to_vec()).is_err());
+    println!("[PASS] agent without an endpoint cap cannot send, even knowing the slot numbers");
+    // Endpoint identity is a stable audit key: the exchange and the refusals are all
+    // on record against the endpoint's object.
+    let ep_obj = k.cap_info(root, ep).unwrap().obj;
+    assert!(k.audit().ever_succeeded(smtp.id(), OpKind::Send, ep_obj));
+    assert!(k.audit().ever_succeeded(ntp.id(), OpKind::Recv, ep_obj));
+    assert!(!k.audit().ever_succeeded(agent.id(), OpKind::Send, ep_obj));
+    println!("[PASS] endpoint identity is the audit key: every send, recv and refusal is logged");
+
+    // ---- reachable-authority auditor (design doc §10 [CLOSED]): the build breaks
+    // if any service's reachable authority ever grows beyond its manifest. Audited
+    // *after* the adversarial suite AND the IPC exchange, so the ceiling claim
+    // covers the attack run and the endpoint state.
+    let session_manifest = capability_audit::manifests::session();
+    let assistant_manifest = capability_audit::manifests::assistant();
+    let smtp_manifest = capability_audit::manifests::smtp();
+    let ntp_manifest = capability_audit::manifests::ntp();
+    let report = capability_audit::audit::audit(
+        &k,
+        &[
+            (root, &session_manifest),
+            (agent, &assistant_manifest),
+            (smtp, &smtp_manifest),
+            (ntp, &ntp_manifest),
+        ],
+    );
+    for (service, ws) in &report.warnings {
+        for w in ws {
+            println!("  audit warning  {service}: {w}");
+        }
+    }
+    assert!(
+        report.is_clean(),
+        "reachable authority exceeds the manifest: {report:?}"
+    );
+    println!(
+        "[PASS] reachable-authority audit: {} services within declared manifests ({} warnings)",
+        report.entries.len(),
+        report.warning_count()
     );
 
     // ---- completion: task-scoped grant dies with the task (supervisor revokes)

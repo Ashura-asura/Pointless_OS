@@ -53,6 +53,10 @@ pub struct CapInfo {
     pub slot: u32,
     pub kind: ObjectKind,
     pub rights: Rights,
+    /// Object identity of what the cap names — the stable, queryable audit key
+    /// (design doc §9.4); the grants layer logs it so a grant is traceable to the
+    /// exact object it authorized.
+    pub obj: ObjectId,
 }
 
 /// A raw, read-only projection of one cap in a task's CSpace, keeping *object identity*
@@ -813,6 +817,7 @@ impl Kernel {
             slot,
             kind,
             rights: inst.rights,
+            obj: inst.obj,
         })
     }
 

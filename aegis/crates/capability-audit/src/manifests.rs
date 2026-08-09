@@ -17,6 +17,10 @@ pub fn session() -> Manifest {
         .allow(ObjectKind::Creator, Rights::ALL)
         .allow(ObjectKind::Task, Rights::ALL)
         .allow(ObjectKind::GrantRoot, Rights::GRANT)
+        .allow(
+            ObjectKind::Endpoint,
+            Rights::SEND.union(Rights::RECV).union(Rights::GRANT),
+        )
 }
 
 /// The assistant: granted exactly the "restart-service" role — READ+CONTROL over the
@@ -25,4 +29,16 @@ pub fn session() -> Manifest {
 pub fn assistant() -> Manifest {
     Manifest::new("assistant", Repo::Service)
         .allow(ObjectKind::Task, Rights::READ.union(Rights::CONTROL))
+}
+
+/// The mail service: talks over the endpoint the session granted it (SEND+RECV).
+pub fn smtp() -> Manifest {
+    Manifest::new("smtp", Repo::Service)
+        .allow(ObjectKind::Endpoint, Rights::SEND.union(Rights::RECV))
+}
+
+/// The time service: same scope — the endpoint, and nothing else.
+pub fn ntp() -> Manifest {
+    Manifest::new("ntp", Repo::Service)
+        .allow(ObjectKind::Endpoint, Rights::SEND.union(Rights::RECV))
 }
