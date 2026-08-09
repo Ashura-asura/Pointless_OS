@@ -11,6 +11,7 @@ members = [
     "crates/net",
     "crates/devices",
     "crates/supervision-tree",
+    "crates/io-batch",
     "crates/aegis-shell",
 ]
 

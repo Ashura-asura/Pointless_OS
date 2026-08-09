@@ -13,6 +13,7 @@
 //! handle resolves to a live task on every operation.
 
 use crate::audit::{AuditLog, AuditRecord, OpKind};
+use crate::batch::{BatchEntry, BatchResult};
 use crate::cspace::{CapHandle, CapInstance, CSpace};
 use crate::error::{KernelError, KernelResult};
 use crate::objects::{
@@ -722,6 +723,125 @@ impl Kernel {
                 _ => Err(KernelError::WrongObjectType),
             }
         })
+    }
+
+    // -------------------------------------------------- batched submission (io_uring pattern)
+
+    /// Execute `entries` with a single kernel crossing. The design doc's
+    /// "batched submission queues (the io_uring pattern — submit many
+    /// operations, one kernel crossing, collect results asynchronously): the
+    /// crossing is the cost, and it is paid once: the audit log receives
+    /// exactly one `Batch` record no matter how many entries the submission
+    /// carries, so high-frequency I/O (file reads and writes) stops being
+    /// O(ops) crossings.
+    ///
+    /// What is batched is the crossing, never the authorization: every entry
+    /// resolves through the caller's own CSpace and must pass the same
+    /// capability checks as the individual op (lookup, rights, object kind,
+    /// bounds). An entry that fails is reported in its slot of the completion
+    /// vector and leaves a Failed audit record of its own kind; the rest of
+    /// the batch completes regardless — per-entry completion, like a
+    /// submission queue's completion ring.
+    pub fn batch_submit(
+        &mut self,
+        caller: TaskHandle,
+        entries: Vec<BatchEntry>,
+    ) -> KernelResult<Vec<BatchResult>> {
+        self.guarded(caller.0, OpKind::Batch, |k| {
+            k.ensure_task(&caller)?;
+            let n = entries.len();
+            let mut out = Vec::with_capacity(n);
+            let mut completed = 0usize;
+            for entry in entries {
+                match k.batch_one(caller, entry) {
+                    Ok(result) => {
+                        completed += 1;
+                        out.push(result);
+                    }
+                    Err(err) => out.push(BatchResult::Failed(err)),
+                }
+            }
+            k.audit_op(
+                caller.0,
+                OpKind::Batch,
+                None,
+                true,
+                format!("{n} entries, {completed} completed"),
+            );
+            Ok(out)
+        })
+    }
+
+    /// One batch entry: the same checks as the individual op, minus its own
+    /// success audit — the submission already carries it.
+    fn batch_one(&mut self, caller: TaskHandle, entry: BatchEntry) -> KernelResult<BatchResult> {
+        match entry {
+            BatchEntry::MemRead {
+                region,
+                offset,
+                len,
+            } => {
+                let res = (|| {
+                    let (_, cap) = self.lookup(caller.0, region)?;
+                    self.require_right(cap, Rights::READ)?;
+                    match self.objects.get(&cap.obj) {
+                        Some(Object::MemRegion(r)) => {
+                            let end = offset.checked_add(len).ok_or(KernelError::InvalidOperation)?;
+                            Ok(BatchResult::Read(
+                                r.data
+                                    .get(offset..end)
+                                    .ok_or(KernelError::InvalidOperation)?
+                                    .to_vec(),
+                            ))
+                        }
+                        _ => Err(KernelError::WrongObjectType),
+                    }
+                })();
+                if let Err(err) = &res {
+                    self.audit_op(
+                        caller.0,
+                        OpKind::MemRead,
+                        None,
+                        false,
+                        format!("batch entry refused: {err}"),
+                    );
+                }
+                res
+            }
+            BatchEntry::MemWrite {
+                region,
+                offset,
+                bytes,
+            } => {
+                let res = (|| {
+                    let (_, cap) = self.lookup(caller.0, region)?;
+                    self.require_right(cap, Rights::WRITE)?;
+                    match self.objects.get_mut(&cap.obj) {
+                        Some(Object::MemRegion(r)) => {
+                            let end = offset
+                                .checked_add(bytes.len())
+                                .ok_or(KernelError::InvalidOperation)?;
+                            if end > r.data.len() {
+                                return Err(KernelError::InvalidOperation);
+                            }
+                            r.data[offset..end].copy_from_slice(&bytes);
+                            Ok(BatchResult::Write)
+                        }
+                        _ => Err(KernelError::WrongObjectType),
+                    }
+                })();
+                if let Err(err) = &res {
+                    self.audit_op(
+                        caller.0,
+                        OpKind::MemWrite,
+                        None,
+                        false,
+                        format!("batch entry refused: {err}"),
+                    );
+                }
+                res
+            }
+        }
     }
 
     // ------------------------------------------------------------- task lifecycle

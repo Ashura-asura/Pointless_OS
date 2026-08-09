@@ -23,6 +23,7 @@ pub enum OpKind {
     TaskSpawn,
     TaskState,
     ExpireCheck,
+    Batch,
 }
 
 impl fmt::Display for OpKind {

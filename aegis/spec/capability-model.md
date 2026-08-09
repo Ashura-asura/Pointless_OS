@@ -559,3 +559,40 @@ touches only grant confirmations — the already-minted caps live until their
 own expiry, the same trade-off the design doc declares (suspension is
 reversible, revocation is not, so the breaker errs on the side of not
 revoking).
+
+### Machine-checked verification (executable): batched submission queues (the io_uring pattern)
+
+The design doc's [REDUCED] answer to "IPC overhead vs. a monolithic kernel's
+syscall path" — "batched submission queues (the io_uring pattern: submit many
+operations, one kernel crossing, collect results asynchronously) for
+high-frequency operations like file I/O" — is checked by
+`io-batch/tests/batch_contract.rs` and `capability-core`'s `batch_submit`:
+
+- One kernel crossing for many operations: a 64-entry submission (32 writes,
+  32 reads, sector offsets at 9-byte strides) produces exactly one audited
+  `Batch` record and zero individual `MemRead`/`MemWrite` records — the
+  audited crossing count is O(1), never O(ops) — while every entry's effect
+  lands in the region, verified op by op afterwards.
+- Queued operations cost nothing: entries accumulated in the submission
+  queue leave the kernel untouched (no records, no data) until `submit` — the
+  accumulation is caller-side, the crossing is one call.
+- Batching the crossing never batches the authority: a submission mixing a
+  legal write with out-of-range writes and a read of a capability slot the
+  caller does not hold completes per entry — the legal write lands, each
+  unlawful entry returns `Failed` in its own completion slot, the refused
+  writes have zero effect, and the kernel logs one Failed record per refused
+  entry — refusals are as visible as successes.
+- Completions are drained apart from submissions: a second crossing happens
+  while the first batch's completion queue is still unconsumed, each
+  submission is one crossing (two submissions = two Batch records), and
+  completion order is submission order.
+
+Honest limits: the "kernel crossing" is one audited Batch record, not a real
+syscall boundary — there is no hardware submission queue, no interrupt or
+notification path, and the kernel model itself is synchronous (completions
+are materialized at submit and drained later; the async half of the pattern
+is the isolation between the caller-side accumulation and the separate
+completion queue, which nothing forces the caller to drain eagerly). The
+design doc's own caveat applies: this claims the same performance
+*neighborhood* as seL4 IPC benchmarks, never parity with a bare syscall, and
+the model measures crossings, not wall time.
