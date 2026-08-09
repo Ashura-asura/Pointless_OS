@@ -10,6 +10,7 @@ members = [
     "crates/resources",
     "crates/net",
     "crates/devices",
+    "crates/supervision-tree",
     "crates/aegis-shell",
 ]
 

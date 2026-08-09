@@ -463,6 +463,42 @@ with no subregion clipping; one display server per service instance; and the
 device registry's licensing decisions run in the platform identity — the
 registry itself is trusted userspace, not a kernel mechanism.
 
+### Machine-checked verification (executable): the supervision-tree runtime (§5)
+
+The kernel's side of the supervision contract is already checked by
+`capability-core/tests/supervision.rs`. This crate is the *runtime* on top of
+it — the policy layer the doc calls for: self-healing is circuit breaker +
+supervision tree, not silent retry; "contain the fault so it doesn't cascade,
+preserve full forensic state, escalate with an auditable trail, never silently
+retry the same failure indefinitely."
+
+- Restarts are within budget: `Supervisor::pump` reads liveness from kernel
+  truth (`task_running` — the runtime has no opinion, only policy), restarts a
+  crashed subsystem through its own granted CONTROL cap, and records every
+  crash and restart with the kernel's clock and the subsystem's task id.
+- The circuit breaker is real: when a subsystem burns its `max_restarts` budget
+  the breaker trips open — no further automatic restarts, the trip is logged,
+  and every later crash leaves both the breaker state and the log unchanged
+  (no silent retry, no flapping). Exactly the budget is burned in kernel
+  TaskSpawn records.
+- Containment: a crashing (or tripped) subsystem never touches its siblings —
+  their kernel census and their operations are bit-identical throughout, and
+  the runtime logs nothing about them.
+- Escalation: a tripped subsystem is surrendered to a parent supervisor; the
+  parent restarts the whole subsystem under its own authority (a fresh spawn,
+  a fresh budget) and the surrender-and-adoption is an audited step in both
+  decision logs.
+- Forensic cross-check: the runtime's decision log and the kernel audit are
+  independently append-only; the sequence of crashes (with kernel task ids),
+  restarts, and trips in the runtime log exactly equals the kernel's
+  TaskKill/TaskSpawn counts — neither side can be selectively rewritten.
+
+Honest limits: liveness is `task_running` only (no heartbeat or health checks);
+the policy tables run in one execution context in the model (real OTP gives
+every supervisor its own process); the restart budget is per-subsystem-lifetime
+rather than a sliding window; and the runtime holds CONTROL on its charges'
+naming caps — the "restart-service" role from §9, mechanically.
+
 ### Machine-checked verification (executable): grant policy (§9)
 
 `grants/tests/grant_policy.rs` (4 tests) checks the §9.1-9.3 policy claims

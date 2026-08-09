@@ -71,6 +71,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "supervision-tree"
+version = "0.1.0"
+dependencies = [
+ "capability-core",
+]
+
+[[package]]
 name = "system-update"
 version = "0.1.0"
 dependencies = [
