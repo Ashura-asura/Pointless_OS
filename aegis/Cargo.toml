@@ -5,6 +5,7 @@ members = [
     "crates/capability-audit",
     "crates/grants",
     "crates/object-store",
+    "crates/packages",
     "crates/aegis-shell",
 ]
 

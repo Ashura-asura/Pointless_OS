@@ -297,6 +297,41 @@ claims against the same kernel:
 Honest limits: single-region blocks (no multi-block files), in-memory WAL, flat
 namespace, and durability ends at process exit — a block device is Phase 3/4.
 
+### Machine-checked verification (executable): packages (§8)
+
+`packages` (6 contract tests in `install_contract.rs`) realizes the package
+model against the same kernel, the store, and the auditor:
+
+- A package is a declared authority ceiling (manifest, repository boundary as
+  trust boundary) plus a content-addressed payload of store blocks. Payload
+  bytes are immutable by construction: identical payloads across installs add
+  zero new blocks (dedup is *observable*, asserted as `block_count` staying
+  flat), and every install reads back the same bytes.
+- Installation grants exactly — and only — what the manifest declares: the app
+  task's live cap table after install is precisely its self-cap plus the
+  declared minted caps plus READ-only payload delivery, all clamped by
+  derivation (I2: no WRITE anywhere, asserted per cap). Nothing ambient: the
+  manager's own table grows only by its two install artifacts.
+- Installation runs no code: over the whole window the kernel audit shows
+  exactly one CreateTask record (the app itself, attributable to the manager)
+  and zero operations performed by the app during install. There is no script
+  step anywhere in the install path.
+- Installations are transactional and rollback-capable by construction: every
+  minted cap — declared and payload alike — hangs off one per-install grant
+  root (I4). A refused install (unholdable source: nothing to derive from;
+  kernel-equivalent request: audited out, per the §10 [CLOSED] repository
+  boundary) revokes that root plus the task and the world is measurably as it
+  was. Revoking a live install's anchor leaves the app alive but holding
+  precisely zero authority.
+- Enforcement is *the kernel's*, not policy fiction: mint time re-checks what
+  the manager holds, the kernel clamps rights, and the manifest audit certifies
+  reachability before the install returns success.
+
+Honest limits: v1 has one service host (the packager, the store and the boot
+task are one identity, so "what the manager may grant" is exactly its own cap
+table), no code signing or online update channel, and no separate package
+repository service.
+
 ### Machine-checked verification (executable): grant policy (§9)
 
 `grants/tests/grant_policy.rs` (4 tests) checks the §9.1-9.3 policy claims

@@ -218,6 +218,14 @@ impl Store {
         self.blocks.get(id).map(|l| l.len)
     }
 
+    /// The store's own cap for a block's region, in the store's CSpace. A caller
+    /// holding it (the store's host) may derive narrower copies; delivery under
+    /// an external grant anchor is the packager's job (§8: payload caps die with
+    /// the install, not with a bare `grant`).
+    pub fn block_cap(&self, id: &BlockId) -> Option<CapHandle> {
+        self.blocks.get(id).map(|l| l.service_cap)
+    }
+
     /// The capability address itself: grant the recipient READ of the block's
     /// region, placed in the recipient's own CSpace. `recipient_name` is a cap in
     /// the *service's* CSpace naming the recipient task (where the service can see

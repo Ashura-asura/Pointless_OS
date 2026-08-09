@@ -36,3 +36,12 @@ version = "0.1.0"
 dependencies = [
  "capability-core",
 ]
+
+[[package]]
+name = "packages"
+version = "0.1.0"
+dependencies = [
+ "capability-audit",
+ "capability-core",
+ "object-store",
+]
