@@ -210,3 +210,36 @@ What this does **not** claim:
 - The TLA+ spec must always stay in sync with `capability-core`: the Rust tests are
   the executable check of the same invariants, run on every `cargo test`; the TLA+
   run pins the intent. Divergence is a bug in one of the two.
+
+### Machine-checked verification (executable): IPC and shared memory
+
+`capability-core/tests/ipc.rs` (7 tests, on every `cargo test`) checks the §8 IPC
+claims against the real kernel, not a model:
+
+- SEND and RECV are independent rights on the endpoint capability; a task granted
+  only SEND cannot receive and vice versa (`InsufficientRights`), and delivery is
+  FIFO.
+- A narrowed copy keeps the narrowing: a RECV-only copy cannot send on the copy
+  (I2 clamping, executable).
+- No endpoint cap, no endpoint: slot numbers "leaked" from another task's CSpace
+  resolve against the caller's own table and fail (`NoCap`), and a slot that holds
+  a non-endpoint cap fails with `WrongObjectType`.
+- Every send, recv and refusal is in the audit log, keyed by endpoint identity
+  (`CapInfo.obj`), so "what did this agent actually do with what it was given"
+  stays answerable without tracking conversations.
+- The async notification path: a sender whose receiver is busy never blocks — the
+  kernel buffers the burst and the receiver drains one message at a time, in FIFO
+  order, with no duplication.
+- Endpoints are anonymous queue identities: two endpoints between the same tasks
+  keep separate queues.
+- Bulk data moves by capability grant, not byte-copy (the seL4/Zircon pattern):
+  the producer writes a 64 KiB region through its WRITE cap, the consumer is
+  notified over the endpoint by a 5-byte message, and reads the payload through
+  its own READ-granted region cap. The payload never enters the kernel's queue
+  (the audit shows exactly one Send of the notification), and the READ-only grant
+  cannot be turned into WRITE.
+
+The demo (`cargo run --release -p aegis-shell`) re-enacts the same claims in the
+boot scene — the agent cannot talk to the services even knowing the exact slot
+numbers, and its refusals appear in the reachable-authority audit alongside the
+endpoint state.

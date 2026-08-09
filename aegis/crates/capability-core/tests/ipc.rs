@@ -147,3 +147,127 @@ fn ipc_is_fully_audited() {
         .count();
     assert_eq!(refused, 1, "the refusal is on record");
 }
+
+/// The asynchronous notification path (design doc §8, second primitive): a sender
+/// with nobody listening never blocks — the kernel buffers the message and the
+/// receiver drains the queue later, one message at a time, in FIFO order.
+#[test]
+fn async_senders_never_block_and_fifo_survives_the_buffer() {
+    let (mut k, root, creator) = boot();
+    let (sensor, sensor_cap) = task(&mut k, root, creator, "sensor");
+    let (daemon, daemon_cap) = task(&mut k, root, creator, "daemon");
+    let ep = k.create_endpoint(root, creator).unwrap();
+    k.grant(root, ep, sensor_cap, Rights::SEND, None).unwrap();
+    k.grant(root, ep, daemon_cap, Rights::RECV, None).unwrap();
+    let sensor_ep = endpoint_slot(&k, sensor);
+    let daemon_ep = endpoint_slot(&k, daemon);
+
+    // Burst of three events while the daemon is busy elsewhere. Non-blocking by
+    // construction; the queue absorbs the burst.
+    for i in 0..3u8 {
+        k.ep_send(sensor, CapHandle(sensor_ep), vec![i]).unwrap();
+    }
+    // Nothing lost or reordered, drained one at a time.
+    assert_eq!(k.ep_recv(daemon, CapHandle(daemon_ep)).unwrap(), Some(vec![0]));
+    assert_eq!(k.ep_recv(daemon, CapHandle(daemon_ep)).unwrap(), Some(vec![1]));
+    assert_eq!(k.ep_recv(daemon, CapHandle(daemon_ep)).unwrap(), Some(vec![2]));
+    assert_eq!(
+        k.ep_recv(daemon, CapHandle(daemon_ep)).unwrap(),
+        None,
+        "queue must be drained, not duplicated"
+    );
+    // The burst is on record even though no one was listening at the time.
+    let ep_obj = endpoint_id(&k, root, ep);
+    assert!(k.audit().ever_succeeded(sensor.id(), OpKind::Send, ep_obj));
+}
+
+/// Endpoints are anonymous queue identities, never ambient channels: two endpoints
+/// keep separate queues even between the same tasks.
+#[test]
+fn two_endpoints_keep_separate_queues() {
+    let (mut k, root, creator) = boot();
+    let (peer, peer_cap) = task(&mut k, root, creator, "peer");
+    let ep_a = k.create_endpoint(root, creator).unwrap();
+    let ep_b = k.create_endpoint(root, creator).unwrap();
+    k.grant(root, ep_a, peer_cap, Rights::SEND, None).unwrap();
+    k.grant(root, ep_b, peer_cap, Rights::SEND, None).unwrap();
+    let ep_a_slot = endpoint_slot(&k, peer);
+    // Two endpoints in peer's table; find the slot that is NOT ep_a.
+    let ep_b_slot = k
+        .authorized(peer)
+        .iter()
+        .filter(|c| c.kind == ObjectKind::Endpoint)
+        .map(|c| c.slot)
+        .find(|s| *s != ep_a_slot)
+        .unwrap();
+
+    k.ep_send(peer, CapHandle(ep_a_slot), b"a".to_vec()).unwrap();
+    k.ep_send(peer, CapHandle(ep_b_slot), b"b".to_vec()).unwrap();
+    assert_eq!(
+        k.ep_recv(root, ep_a).unwrap(),
+        Some(b"a".to_vec()),
+        "ep_a must yield only its own message"
+    );
+    assert_eq!(k.ep_recv(root, ep_a).unwrap(), None);
+    assert_eq!(k.ep_recv(root, ep_b).unwrap(), Some(b"b".to_vec()));
+}
+
+/// Bulk data moves by capability grant, not byte-copy through the kernel (design
+/// doc §8): the producer creates a region, grants READ of it to the consumer, and
+/// only the *notification* travels over the endpoint. The payload never enters the
+/// kernel's queue — it is addressed by the region cap the consumer already holds.
+#[test]
+fn bulk_data_moves_by_capability_grant_not_byte_copy() {
+    let (mut k, root, creator) = boot();
+    let (producer, producer_cap) = task(&mut k, root, creator, "producer");
+    let (consumer, consumer_cap) = task(&mut k, root, creator, "consumer");
+    let region = k.create_mem(root, creator, vec![7u8; 64 * 1024]).unwrap();
+    let ep = k.create_endpoint(root, creator).unwrap();
+
+    k.grant(root, region, producer_cap, Rights::WRITE, None).unwrap();
+    k.grant(root, region, consumer_cap, Rights::READ, None).unwrap();
+    k.grant(root, ep, producer_cap, Rights::SEND, None).unwrap();
+    k.grant(root, ep, consumer_cap, Rights::RECV, None).unwrap();
+    let producer_slot = |k: &Kernel| endpoint_slot(k, producer);
+    let producer_region = {
+        let caps = k.authorized(producer);
+        caps.iter().find(|c| c.kind == ObjectKind::MemRegion).unwrap().slot
+    };
+    let consumer_region = {
+        let caps = k.authorized(consumer);
+        caps.iter().find(|c| c.kind == ObjectKind::MemRegion).unwrap().slot
+    };
+
+    // Producer writes the payload into the shared region, then notifies.
+    k.mem_write(producer, CapHandle(producer_region), 0, b"log line #1".to_vec())
+        .unwrap();
+    k.ep_send(producer, CapHandle(producer_slot(&k)), b"ready".to_vec())
+        .unwrap();
+
+    // Consumer is woken by the notification — a 5-byte message — and reads the
+    // 64 KiB payload straight out of the region through its own cap.
+    assert_eq!(
+        k.ep_recv(consumer, CapHandle(endpoint_slot(&k, consumer))).unwrap(),
+        Some(b"ready".to_vec())
+    );
+    assert_eq!(
+        k.mem_read(consumer, CapHandle(consumer_region), 0, 11).unwrap(),
+        b"log line #1".to_vec()
+    );
+    // The rest of the region is intact behind the read window.
+    assert_eq!(k.mem_read(consumer, CapHandle(consumer_region), 11, 3).unwrap(), vec![7, 7, 7]);
+    // READ-only cannot be turned into WRITE: the grant narrowed the cap (I2).
+    assert_eq!(
+        k.mem_write(consumer, CapHandle(consumer_region), 0, b"x".to_vec())
+            .unwrap_err(),
+        KernelError::InsufficientRights(Rights::WRITE)
+    );
+    // The payload never entered the endpoint queue: only the notification did.
+    let ep_obj = endpoint_id(&k, root, ep);
+    let sent = k
+        .audit()
+        .query(Some(producer.id()), AuditFilter::Ops(&[OpKind::Send]))
+        .filter(|r| r.ok && r.target == Some(ep_obj))
+        .count();
+    assert_eq!(sent, 1, "exactly one byte-copy class of traffic: the notification");
+}
