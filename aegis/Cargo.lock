@@ -45,3 +45,13 @@ dependencies = [
  "capability-core",
  "object-store",
 ]
+
+[[package]]
+name = "system-update"
+version = "0.1.0"
+dependencies = [
+ "capability-audit",
+ "capability-core",
+ "object-store",
+ "packages",
+]

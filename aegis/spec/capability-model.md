@@ -332,6 +332,35 @@ task are one identity, so "what the manager may grant" is exactly its own cap
 table), no code signing or online update channel, and no separate package
 repository service.
 
+### Machine-checked verification (executable): updates (§8)
+
+`system-update` (5 contract tests) realizes the update architecture against the
+same kernel, store, packages and auditor:
+
+- Generations are *staged*: a candidate is fully installed (manifest-gated) and
+  the boot target — a `current` pointer inside the boot-config store view — is
+  provably untouched while staging; the staged app is inert (zero audit
+  records) until activated.
+- Activation is health-gated (the check is operator-supplied; the manager
+  enforces the gating) and refused candidates never become default.
+- The flip itself is store content, not capability authority: the kernel audit
+  for the activation window contains zero grant/copy/revoke/spawn/root-creating
+  records — evidencing the "updates are data, not principals" claim.
+- Rollback returns to the last-known-good generation (healthy at activation,
+  and not the current target). The rollback window likewise executes zero
+  authority operations, and the survivor's caps were never touched (clean
+  manifest re-audit). The dethroned generation leaves the applied history, so
+  a second rollback is provably a no-op *and* its ordinary install anchor still
+  revokes it like any other software.
+- The updater is not a second root: after a full stage/activate/rollback cycle
+  the world contains exactly the two install anchors as grant roots, the boot
+  role's one creator, and the boot task plus the two installed apps — nothing
+  the machinery could have minted for itself.
+
+Honest limits: generations are single-application (one package per generation),
+boot-target persistence is in-memory store content (no block device), and
+health signals are supplied by the operator rather than probed from hardware.
+
 ### Machine-checked verification (executable): grant policy (§9)
 
 `grants/tests/grant_policy.rs` (4 tests) checks the §9.1-9.3 policy claims

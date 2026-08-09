@@ -6,6 +6,7 @@ members = [
     "crates/grants",
     "crates/object-store",
     "crates/packages",
+    "crates/system-update",
     "crates/aegis-shell",
 ]
 

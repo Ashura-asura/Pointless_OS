@@ -41,7 +41,7 @@ impl Package {
 
 /// Everything an install left behind. `cap_slots` is precisely the set of caps
 /// the app received: manifest-minted sources plus READ-only payload delivery.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InstalledApp {
     pub task: TaskHandle,
     /// The app's naming cap in the manager's CSpace (the install anchor lives
