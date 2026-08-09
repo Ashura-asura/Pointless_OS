@@ -733,7 +733,17 @@ impl Kernel {
             let (_, cap) = k.lookup(caller.0, task)?;
             k.require_right(cap, Rights::READ)?;
             match k.objects.get(&cap.obj) {
-                Some(Object::Task(t)) => Ok(t.running),
+                Some(Object::Task(t)) => {
+                    let running = t.running;
+                    k.audit_op(
+                        caller.0,
+                        OpKind::TaskState,
+                        Some(cap),
+                        true,
+                        format!("task state = {running}"),
+                    );
+                    Ok(running)
+                }
                 _ => Err(KernelError::WrongObjectType),
             }
         })

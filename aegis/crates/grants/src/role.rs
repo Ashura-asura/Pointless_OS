@@ -25,6 +25,12 @@ const TRIAGE_INBOX_REQS: [CapRequest; 1] = [CapRequest {
     note: "submit already-classified triage results (no reads)",
 }];
 
+const MODIFY_POLICY_REQS: [CapRequest; 1] = [CapRequest {
+    kind: ObjectKind::Task,
+    rights: Rights::CONTROL,
+    note: "modify the security-policy service's configuration (irreversible)",
+}];
+
 /// A task-shaped role.
 #[derive(Debug, Clone, Copy)]
 pub struct Role {
@@ -33,6 +39,10 @@ pub struct Role {
     /// Whether this role may ever be granted persistently. False by default
     /// (§9.2: grants default to ephemeral and task-scoped).
     pub allow_persistent: bool,
+    /// Whether this role touches irreversible actions (§9: anything touching
+    /// "deleting data, sending money, modifying security policy itself").
+    /// High-risk roles require two-party confirmation, never a single click.
+    pub high_risk: bool,
     pub requests: &'static [CapRequest],
 }
 
@@ -49,13 +59,22 @@ impl RoleLibrary {
                     id: "restart-service",
                     name: "Restart a named service",
                     allow_persistent: false,
+                    high_risk: false,
                     requests: &RESTART_SERVICE_REQS,
                 },
                 Role {
                     id: "triage-inbox",
                     name: "Triage my inbox",
                     allow_persistent: true,
+                    high_risk: false,
                     requests: &TRIAGE_INBOX_REQS,
+                },
+                Role {
+                    id: "modify-security-policy",
+                    name: "Modify security policy",
+                    allow_persistent: true,
+                    high_risk: true,
+                    requests: &MODIFY_POLICY_REQS,
                 },
             ],
         }

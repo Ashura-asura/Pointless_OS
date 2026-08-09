@@ -3,7 +3,7 @@
 //! Every minted right is recorded; every use is in the kernel audit log.
 
 use capability_core::{
-    CapHandle, Kernel, KernelError, KernelResult, ObjectKind, Rights, TaskHandle,
+    CapHandle, Kernel, KernelError, KernelResult, ObjectId, ObjectKind, Rights, TaskHandle,
 };
 
 /// Expiry policy (§9.2: grants default to ephemeral and task-scoped, not persistent).
@@ -45,6 +45,25 @@ pub struct PendingGrant {
     pub target: GrantTarget,
     pub policy: GrantPolicy,
     pub request: crate::role::CapRequest,
+    /// Filled by `propose` from the role definition: high-risk roles can never
+    /// be confirmed by a single party (§9: two-party confirmation for
+    /// irreversible actions).
+    pub high_risk: bool,
+}
+
+/// A high-risk grant mid-confirmation: one party has approved; the mint
+/// happens only after a *different* party confirms (§9, two-party
+/// confirmation — "the same control banks use for wire transfers over a
+/// threshold").
+#[derive(Debug)]
+pub struct PendingTwoParty {
+    pub role_id: &'static str,
+    pub grantee_label: String,
+    pub grantee: CapHandle,
+    pub target: GrantTarget,
+    pub policy: GrantPolicy,
+    pub request: crate::role::CapRequest,
+    pub first: ObjectId,
 }
 
 /// What the grantee ended up holding, as decided by the *kernel* (not by what anyone
@@ -63,6 +82,32 @@ pub struct ActiveGrant {
     pub grantee_label: String,
     pub caps: Vec<GrantedCap>,
     pub issued_at: u64,
+    /// Who confirmed this grant. One entry = single-party; two distinct
+    /// entries = two-party confirmation (§9).
+    pub approvals: Vec<ObjectId>,
+}
+
+/// One entry of the service's policy log: every suspension, resumption, and
+/// refused confirmation — the "distinct, more visible confirmation flow"
+/// (§9.2) made auditable, and the "suspension is reversible and logged,
+/// silent permanent revocation is not" (§9) record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyEvent {
+    Suspended {
+        at: u64,
+        agent: ObjectId,
+        reason: String,
+    },
+    Resumed {
+        at: u64,
+        agent: ObjectId,
+    },
+    ConfirmationRefused {
+        at: u64,
+        agent: ObjectId,
+        role: &'static str,
+        reason: &'static str,
+    },
 }
 
 /// Runs under the grantor's identity. Owns exactly one grant root; revoke() removes
@@ -74,6 +119,11 @@ pub struct GrantService {
     grantor: TaskHandle,
     grant_root: CapHandle,
     registry: Vec<ActiveGrant>,
+    /// Agents whose grants are suspended by the anomaly monitor, pending
+    /// human review (§9). Suspension is ledger state: reversible, logged, and
+    /// *not* revocation — already-minted caps stay live.
+    suspended: Vec<ObjectId>,
+    policy_log: Vec<PolicyEvent>,
 }
 
 impl GrantService {
@@ -87,6 +137,8 @@ impl GrantService {
             grantor,
             grant_root,
             registry: Vec::new(),
+            suspended: Vec::new(),
+            policy_log: Vec::new(),
         })
     }
 
@@ -94,6 +146,15 @@ impl GrantService {
     /// revoked, with role, grantee, deadline (None = persistent) and issue time.
     pub fn list_active(&self) -> &[ActiveGrant] {
         &self.registry
+    }
+
+    /// The policy log: suspensions, resumptions, refused confirmations.
+    pub fn policy_log(&self) -> &[PolicyEvent] {
+        &self.policy_log
+    }
+
+    pub fn is_suspended(&self, agent: ObjectId) -> bool {
+        self.suspended.contains(&agent)
     }
 
     /// Validate a role grant request and produce its diff for human review. Rejected
@@ -138,6 +199,7 @@ impl GrantService {
             target,
             policy,
             request: *request,
+            high_risk: role.high_risk,
         })
     }
 
@@ -167,6 +229,116 @@ impl GrantService {
         kernel: &mut Kernel,
         pending: PendingGrant,
     ) -> KernelResult<ActiveGrant> {
+        if pending.high_risk {
+            // §9: a role that touches irreversible actions cannot be confirmed
+            // by a single click — two-party confirmation is the only path.
+            let agent = kernel
+                .cap_info(self.grantor, pending.grantee)
+                .map_err(|_| KernelError::NoCap)?
+                .obj;
+            self.policy_log.push(PolicyEvent::ConfirmationRefused {
+                at: kernel.now(),
+                agent,
+                role: pending.role_id,
+                reason: "high-risk role requires two-party confirmation",
+            });
+            return Err(KernelError::InvalidOperation);
+        }
+        // The anomaly circuit breaker (§9): a suspended agent's *whole grant
+        // flow* is frozen pending human review — suspension blocks new
+        // confirmations, while the already-minted caps stay live.
+        let agent = kernel
+            .cap_info(self.grantor, pending.grantee)
+            .map_err(|_| KernelError::NoCap)?
+            .obj;
+        if self.is_suspended(agent) {
+            self.policy_log.push(PolicyEvent::ConfirmationRefused {
+                at: kernel.now(),
+                agent,
+                role: pending.role_id,
+                reason: "agent's grants are suspended pending human review",
+            });
+            return Err(KernelError::InvalidOperation);
+        }
+        let active = self.mint(kernel, pending, vec![])?;
+        Ok(active)
+    }
+
+    /// Open a two-party confirmation for a high-risk grant (§9: "a two-party
+    /// confirmation rather than a single click"). `first` is the first human
+    /// reviewer; the grant still does not exist.
+    pub fn open_two_party(
+        &mut self,
+        _kernel: &Kernel,
+        pending: PendingGrant,
+        first: TaskHandle,
+    ) -> KernelResult<PendingTwoParty> {
+        if !pending.high_risk {
+            return Err(KernelError::InvalidOperation);
+        }
+        Ok(PendingTwoParty {
+            role_id: pending.role_id,
+            grantee_label: pending.grantee_label,
+            grantee: pending.grantee,
+            target: pending.target,
+            policy: pending.policy,
+            request: pending.request,
+            first: first.id(),
+        })
+    }
+
+    /// The second, *different* party confirms; only now does the mint happen.
+    /// One person approving twice is refused — two-party means two.
+    pub fn confirm_second(
+        &mut self,
+        kernel: &mut Kernel,
+        pending: PendingTwoParty,
+        second: TaskHandle,
+    ) -> KernelResult<ActiveGrant> {
+        let agent = kernel
+            .cap_info(self.grantor, pending.grantee)
+            .map_err(|_| KernelError::NoCap)?
+            .obj;
+        if second.id() == pending.first {
+            self.policy_log.push(PolicyEvent::ConfirmationRefused {
+                at: kernel.now(),
+                agent,
+                role: pending.role_id,
+                reason: "second confirmer must be a different person",
+            });
+            return Err(KernelError::InvalidOperation);
+        }
+        if self.is_suspended(agent) {
+            self.policy_log.push(PolicyEvent::ConfirmationRefused {
+                at: kernel.now(),
+                agent,
+                role: pending.role_id,
+                reason: "agent's grants are suspended pending human review",
+            });
+            return Err(KernelError::InvalidOperation);
+        }
+        let active = self.mint(
+            kernel,
+            PendingGrant {
+                role_id: pending.role_id,
+                grantee_label: pending.grantee_label,
+                grantee: pending.grantee,
+                target: pending.target,
+                policy: pending.policy,
+                request: pending.request,
+                high_risk: true,
+            },
+            vec![pending.first, second.id()],
+        )?;
+        Ok(active)
+    }
+
+    fn mint(
+        &mut self,
+        kernel: &mut Kernel,
+        pending: PendingGrant,
+        approvals: Vec<ObjectId>,
+    ) -> KernelResult<ActiveGrant> {
         let expiry = match pending.policy {
             GrantPolicy::TaskScoped { ticks } => Some(kernel.now() + ticks),
             GrantPolicy::Persistent => None,
@@ -190,9 +362,36 @@ impl GrantService {
             grantee_label: pending.grantee_label,
             caps: vec![cap],
             issued_at: kernel.now(),
+            approvals,
         };
         self.registry.push(active.clone());
         Ok(active)
+    }
+
+    /// The anomaly monitor's circuit breaker (§9): auto-suspend, never
+    /// auto-revoke. Suspension is ledger state — the already-minted caps stay
+    /// live (revocation is permanent; suspension is neither), and every new
+    /// confirmation for the agent is refused until a human resumes it.
+    pub fn suspend(&mut self, kernel: &Kernel, agent: TaskHandle, reason: &str) {
+        let id = agent.id();
+        if !self.suspended.contains(&id) {
+            self.suspended.push(id);
+        }
+        self.policy_log.push(PolicyEvent::Suspended {
+            at: kernel.now(),
+            agent: id,
+            reason: reason.to_string(),
+        });
+    }
+
+    /// Human review clears the suspension: reversible, logged, never silent.
+    pub fn resume(&mut self, kernel: &Kernel, agent: TaskHandle) {
+        let id = agent.id();
+        self.suspended.retain(|a| *a != id);
+        self.policy_log.push(PolicyEvent::Resumed {
+            at: kernel.now(),
+            agent: id,
+        });
     }
 
     /// The task-scoped half of "expires on completion": the supervisor calls this when

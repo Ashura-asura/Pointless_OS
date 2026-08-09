@@ -516,3 +516,46 @@ against the grant service and kernel together:
 - A review is never a TOCTOU hole: if the grantor's source cap dies between
   `propose` and `confirm`, the mint fails and the refusal is logged — the
   confirmation re-checks every authority assumption at mint time.
+
+### Machine-checked verification (executable): two-party confirmation and the anomaly circuit breaker (§9)
+
+`grants/tests/two_party_contract.rs` and `grants/tests/anomaly_contract.rs` (6
+tests) check the §9 controls for irreversible actions and for behavioral
+deviation:
+
+- The highest-risk role ("modify-security-policy": CONTROL over the policy
+  service itself, persistent) cannot be confirmed by a single click: `confirm`
+  refuses it with `InvalidOperation`, the refusal is a visible `ConfirmationRefused`
+  policy event, and nothing is minted. The two-party door is the only path —
+  and it is closed to ordinary roles (`open_two_party` refuses non-high-risk
+  requests), so the special door cannot be abused as a back door.
+- Two-party means two distinct people: Alice approving twice is refused; Alice
+  then Bob mints. The grantee ends up actually holding CONTROL over the policy
+  service (verified via `caps_of`), the active grant records both approvals,
+  and the grantor's own caps are untouched.
+- The anomaly monitor is the §9 circuit breaker in action: it is trained on
+  the agent's *actual* op-shape read from the kernel's own audit log
+  (successful `task_running` state checks as the role's normal shape), and
+  observes deviation — off-profile op kinds (endpoint sends a restart-role
+  agent never does) or a >2x baseline rate. On deviation it *suspends* the
+  agent's grants: the already-minted cap still works (nothing was revoked —
+  the kernel log shows zero `Revoke` records), and the agent's whole grant
+  flow is frozen: new confirmations are refused and logged until a human
+  `resume`s the agent. Every step — train, deviation, suspend, resume — is a
+  logged event; nothing happens silently.
+- The monitor itself has no authority: its `caps_of` is exactly its own
+  self-cap, and fabricated kill/revoke/create attempts are all refused by the
+  kernel. It is a read-only service (the audit log is the only thing it
+  reads) plus an invocation of a grant service's ledger — exactly "not the AI
+  itself, not in the TCB, just another capability-scoped service".
+
+Honest limits: the shape baseline is a fixed per-op count from the agent's
+full audit history — there is no sliding window, no rate smoothing, and no
+time-decay, so "what the role normally does" is a snapshot, not a model; the
+"significant" threshold is a flat 2x rule, not a statistical measure; the
+baseline is what the agent *does*, never what it *should* do — an agent whose
+history already contains the anomaly is immune; and the monitor's suspension
+touches only grant confirmations — the already-minted caps live until their
+own expiry, the same trade-off the design doc declares (suspension is
+reversible, revocation is not, so the breaker errs on the side of not
+revoking).
