@@ -1,0 +1,6 @@
+[package]
+name = "capability-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,0 +1,8 @@
+[package]
+name = "aegis-shell"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+capability-core = { path = "../capability-core" }
+grants = { path = "../grants" }
