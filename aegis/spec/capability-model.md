@@ -265,3 +265,21 @@ claim is worth making:
 Scheduling and retry policy remain userspace (the kernel's close contract): the
 kernel decides *whether* an op may run and records it; the supervision tree
 decides *how often* to retry.
+
+### Machine-checked verification (executable): grant policy (§9)
+
+`grants/tests/grant_policy.rs` (4 tests) checks the §9.1-9.3 policy claims
+against the grant service and kernel together:
+
+- Persistent grants are gated per role: `propose` refuses `Persistent` for a role
+  that declares `allow_persistent = false` (restart-service), and accepts it for
+  one that does (triage-inbox) — the gate is the role definition, not the caller.
+- Task-scoped grants are real expiry: the grantee is held to the exact deadline
+  (`now + ticks`), the cap is live before the clock passes it, gone after —
+  enforced by capability lookup, not by advisory policy.
+- Completion revoke removes the grant from the grantee's CSpace (I4 subtree under
+  the grant root) while the grantor's own caps survive — and both the mint and
+  the revoke are audited events.
+- A review is never a TOCTOU hole: if the grantor's source cap dies between
+  `propose` and `confirm`, the mint fails and the refusal is logged — the
+  confirmation re-checks every authority assumption at mint time.
