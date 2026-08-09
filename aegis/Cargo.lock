@@ -24,6 +24,13 @@ name = "capability-core"
 version = "0.1.0"
 
 [[package]]
+name = "devices"
+version = "0.1.0"
+dependencies = [
+ "capability-core",
+]
+
+[[package]]
 name = "grants"
 version = "0.1.0"
 dependencies = [

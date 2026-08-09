@@ -412,6 +412,57 @@ stack instance, ports are per-socket addresses, and routing authority (a
 Creator cap) is held by the stack's host identity — this is the "one driver,
 one capability envelope" arrangement, not an ambient networking stack.
 
+### Machine-checked verification (executable): the device model and graphics (§8)
+
+`devices` (4 contract tests) realizes the doc's §8 sentences for devices and
+graphics. The device registry (`Devices`) is a *userspace* service: there is
+no kernel API to enumerate or touch a device — a device is a registry entry
+plus the kernel objects its licence derives from, and every operation resolves
+through a cap the *caller itself* holds. Its typed interface gates match the
+doc's device list (block device, network device, GPU command queue).
+
+- Devices are capability-scoped objects with typed interfaces: a client
+  licenced with READ on the block device reads sectors and is refused `write`
+  by the kernel (`InsufficientRights`); the *registry* refuses whole
+  interfaces — a block device has no command queue, a net device no sector
+  interface — before any kernel op. Every kind speaks exactly its own record
+  formats.
+- No ambient access: a task that knows a device id but was never licenced gets
+  `NotHeld` on every op — device memory is reachable only through a granted
+  device capability (the model's IOMMU analogue; a real IOMMU is hardware and
+  out of scope, see §5).
+- Ownership: a device's operative caps live in the *driver's own CSpace*
+  (`claim`), so the driver is the licenced operator of record, and nothing is
+  kernel-resident — the only owners are contexts.
+- Crash containment and supervision recovery (§5's concrete payoff): killing
+  the driver only stops its execution context — `is_up` goes false, no new
+  licences are issued (`DeviceDown`), while already-granted client caps ride
+  through (revocation is explicit in this model) and an unrelated service's
+  census and operations are bit-identical. Restarting the driver restores
+  licensing and service. Execution contexts start stopped; starting them is a
+  supervision-tree action, and a driver's "up" state is exactly the kernel's
+  running record, not the registry's opinion.
+- Graphics: GPU access is capability-scoped command-queue submission — a
+  context's queue is granted SEND only (user-mode submission, no read-back),
+  and submissions are ordinary attributed `ep_send` in the audit log. GPU
+  memory and queue isolation between contexts is kernel-enforced by objects:
+  each context holds only its own queue and its own framebuffer, and cap
+  handles resolve against the caller's table alone — a neighbouring context's
+  reported slot numbers either fail or land on the caller's *own* objects,
+  never on the neighbour's.
+- Compositing is an ordinary, replaceable userspace service (the display
+  server): it holds READ grants on every framebuffer and the screen comes out
+  of its own caps. A dead display server stops the screen (`DeviceDown`) while
+  the contexts' capsules are untouched; a replacement compositor rebuilds the
+  identical screen with no kernel state having moved.
+
+Honest limits: no real IOMMU, MMIO, DMA, or interrupt model (the isolation
+claim is modelled at the object/cap level, which is where the kernel's
+authority actually sits); the framebuffer model is per-context byte regions
+with no subregion clipping; one display server per service instance; and the
+device registry's licensing decisions run in the platform identity — the
+registry itself is trusted userspace, not a kernel mechanism.
+
 ### Machine-checked verification (executable): grant policy (§9)
 
 `grants/tests/grant_policy.rs` (4 tests) checks the §9.1-9.3 policy claims
