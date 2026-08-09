@@ -45,6 +45,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "macaroon"
+version = "0.1.0"
+dependencies = [
+ "capability-core",
+ "object-store",
+]
+
+[[package]]
 name = "net"
 version = "0.1.0"
 dependencies = [

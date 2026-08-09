@@ -13,6 +13,7 @@ members = [
     "crates/supervision-tree",
     "crates/io-batch",
     "crates/aegis-shell",
+    "crates/macaroon",
 ]
 
 [workspace.package]
