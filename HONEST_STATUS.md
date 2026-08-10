@@ -2,9 +2,9 @@
 
 *Generated: 2026-08-10. Every claim below is verified by `cargo test` on the current commit.*
 
-## What exists (260 tests, 0 failures)
+## What exists (274 tests, 0 failures)
 
-Breakdown: 88 model-crate tests (aegis workspace), 162 aegis-kernel tests (Phases 1-9), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `3bfca8a`.
+Breakdown: 88 model-crate tests (aegis workspace), 176 aegis-kernel tests (Phases 1-10), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `2ed2b56`.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -99,6 +99,15 @@ Honest limits for Phase 8: translation is model logic, not a real ring-3 syscall
 
 Honest limits for Phase 9: the design doc is explicit that full Windows compatibility without licensing Windows or running a real Windows kernel is not a solved problem anywhere. This is the narrow well-behaved-subset translator (model logic); the VM-based full-fidelity path (needs a hypervisor + Windows) is not built.
 
+### Real adaptive-ceiling verification (aegis-kernel)
+| Component | Tests | What it proves |
+|-----------|-------|----------------|
+| Ceiling verification | 14 | Every AdaptivePolicy/PolicyEngine decision is monotonically non-expanding: tighten never raises budgets, never adds a syscall, never adds network; worst-case adversarial inputs stay within the granted (even restrictive) scope |
+
+This phase caught and fixed a real bug: `tighten_scope` previously did `(budget / 2).max(1)`, which raised a restrictive scope's 0 file-handle budget to 1 — an actual ceiling expansion. Now floored at `min(current, 1)`.
+
+Honest limits: property-style contract tests over finite deterministic model logic — not an inductive formal proof, and no coverage of real hardware (supervision/chaos tests remain the model-crate layer, 10 tests).
+
 ### Tooling
 - `capability-audit`: reachable-authority CLI, `--graph` flag for capability visualization
 - `aegis-shell`: interactive demo exercising IPC, grants, anomaly monitoring
@@ -146,7 +155,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | 7 | Native app model + shell | ✅ Done (real): Shell runtime (6 tests), window manager (7), object-relationship graph (6), input dispatcher (5). Honest limits: no GPU rendering, no real display output, no real keyboard/mouse hardware |
 | 8 | Linux compat | ✅ Done (real, model-level): syscall ABI translation (12 tests), ELF loader + initial stack (12 tests), compat personality with capability gating (8 tests). Honest limits: no hypervisor lightweight-VM vehicle (needs hypervisor); translation proven against buffers, not a live Linux userspace |
 | 9 | Windows compat | ✅ Done (real, model-level): NT syscall ABI translation (12 tests), PE32+ loader (12 tests), Windows compat personality with capability gating (7 tests). Honest limits: narrow well-behaved-subset translator only; full-fidelity VM path (needs hypervisor + Windows) not built; design doc says full Windows compat is unsolved by translation alone |
-| 10 | Self-healing hardening + chaos testing | ✅ Done (6 chaos tests + 4 supervision tests) |
+| 10 | Self-healing hardening + chaos testing | ✅ Done: supervision-tree (4) + chaos (6) model tests; adaptive-ceiling verification (14) in aegis-kernel — caught+fixed real scope-expansion bug in tighten_scope |
 | 11 | Distributed extension (macaroons) | 🟡 Token crate complete (HMAC-SHA256 chain, constant-time verify, serialization); no cross-machine transport |
 | 12 | Production hardening | ⬜ Not started |
 
@@ -188,3 +197,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `91c8455` | CI: kernel + bootloader job — fmt, clippy, tests, release target builds |
 | `cf19232` | Phase 8: Linux compat — syscall ABI translation (12 tests), ELF loader + initial stack (12 tests), compat personality with capability gating (8 tests) |
 | `3bfca8a` | Phase 9: Windows compat — NT syscall ABI translation (12 tests), PE32+ loader (12 tests), Windows compat personality with capability gating (7 tests) |
+| `2ed2b56` | Phase 10: adaptive-ceiling verification (14 tests); FIXED tighten_scope budget-expansion bug |

@@ -695,3 +695,15 @@ validation (MZ/PE signatures, machine, entry point, image base, section flags an
 bounds); personality gating on the capability scope. Honest limits: this is the narrow
 well-behaved-subset translator only, model logic — the design doc is explicit that full
 Windows fidelity requires a licensed Windows kernel or VM (neither built).
+
+### Machine-checked verification (executable): adaptive-layer ceiling (§3/§5 Phase 10)
+
+`ceiling.rs` (14, test-only module): every decision from `AdaptivePolicy` and
+`PolicyEngine` is verified monotonically non-expanding against its source scope —
+tighten never raises memory/file budgets (including never raising a zero budget to a
+nonzero one), never adds an allowed syscall, never adds network; worst-case adversarial
+profiles never escape even a restrictive ceiling. This verification *caught and fixed a
+real bug*: `tighten_scope` previously floored `(budget / 2)` at 1, expanding a
+restrictive 0-file-handle budget to 1. Honest limits: finite deterministic property
+tests, not an inductive proof; the ceiling (not the policy) is what is verified, per the
+design doc.
