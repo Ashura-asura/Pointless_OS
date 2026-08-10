@@ -6,6 +6,7 @@ mod memory_map;
 mod page_tables;
 mod serial;
 
+use uefi::mem::memory_map::MemoryMap;
 use uefi::prelude::*;
 
 /// Embedded kernel binary — linked at build time by build_image.py.
@@ -89,11 +90,6 @@ fn main() -> Status {
                 }
             }
 
-            uefi::println!(
-                "Aegis: Kernel loaded. Jumping to 0x{:016X}...",
-                kernel.entry
-            );
-
             // Apply base-0 relocations (R_X86_64_RELATIVE). The kernel links
             // with a link-time base of 0, so each slot just receives the
             // addend. Without this, indirect calls through .got/.data tables
@@ -111,6 +107,20 @@ fn main() -> Status {
                     core::ptr::write_volatile(rel.offset as *mut u64, rel.addend);
                 }
             }
+
+            // Exit boot services: the kernel now owns the machine. The
+            // firmware stops servicing events, its boot watchdog is
+            // disarmed, and the memory map is finalized. From this point on
+            // only raw hardware (serial, LAPIC, paging) remains usable, so
+            // all remaining prints go to the polled COM1 port only.
+            uefi::println!("Aegis: Calling ExitBootServices...");
+            let final_map = unsafe {
+                uefi::boot::exit_boot_services(Some(uefi::boot::MemoryType::LOADER_DATA))
+            };
+            sprintln!(
+                "Aegis: ExitBootServices OK — machine handed over to kernel ({} descriptors in final map)",
+                final_map.entries().count()
+            );
 
             uefi::println!(
                 "Aegis: Kernel loaded. Jumping to 0x{:016X}...",

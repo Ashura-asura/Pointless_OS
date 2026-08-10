@@ -33,12 +33,21 @@ impl Default for PageTable {
 static mut KERNEL_PML4: PageTable = PageTable::new();
 static mut KERNEL_PDPT: PageTable = PageTable::new();
 
+// Scratch area for the 0xC0000000-0xFFFFFFFF window (splits the huge page so
+// the local APIC page can be mapped with ordinary 4 KB pages: QEMU TCG cannot
+// perform MMIO writes through a 1 GB huge page and triple-faults).
+static mut SCRATCH_PD: PageTable = PageTable::new();
+static mut SCRATCH_PT: PageTable = PageTable::new();
+
 // Per-process scratch area for creating new user page tables
 static mut SCRATCH_PDPT: PageTable = PageTable::new();
-static mut SCRATCH_PD: PageTable = PageTable::new();
+
+const LAPIC_PHYS: u64 = 0xFEE0_0000;
 
 /// Set up identity-mapped kernel page tables (first 1GB, same as Phase 1).
-/// Maps first 4 GB using 1GB huge pages via PDPT entries.
+/// Maps first 4 GB using 1GB huge pages via PDPT entries, except the local
+/// APIC page (0xFEE00000) which is mapped through a 4 KB page table so MMIO
+/// writes reach the device.
 ///
 /// # Safety
 ///
@@ -47,13 +56,30 @@ static mut SCRATCH_PD: PageTable = PageTable::new();
 pub unsafe fn init_kernel_tables() {
     let pml4 = (&raw mut KERNEL_PML4).as_mut().unwrap();
     let pdpt = (&raw mut KERNEL_PDPT).as_mut().unwrap();
+    let pd = (&raw mut SCRATCH_PD).as_mut().unwrap();
+    let pt = (&raw mut SCRATCH_PT).as_mut().unwrap();
 
     pml4.clear();
     pdpt.clear();
+    pd.clear();
+    pt.clear();
 
-    // Map first 4 entries as 1GB each = 4GB identity
-    for i in 0..4 {
+    // Map first 3 entries as 1GB each = 3GB identity
+    for i in 0..3 {
         pdpt.entries[i] = (i as u64 * 0x4000_0000) | PRESENT | WRITABLE | HUGE_PAGE;
+    }
+
+    // 4th entry (0xC0000000-0xFFFFFFFF): PD of 2MB pages, with the LAPIC
+    // page broken out into a 4KB page table.
+    pdpt.entries[3] = core::ptr::addr_of!(SCRATCH_PD) as u64 | PRESENT | WRITABLE;
+    for i in 0..512u64 {
+        pd.entries[i as usize] = (0xC000_0000 + i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE;
+    }
+    let lapic_pd_index = ((LAPIC_PHYS >> 21) & 0x1FF) as usize;
+    pd.entries[lapic_pd_index] = core::ptr::addr_of!(SCRATCH_PT) as u64 | PRESENT | WRITABLE;
+    let lapic_window = LAPIC_PHYS & !0x1F_FFFF;
+    for i in 0..512u64 {
+        pt.entries[i as usize] = (lapic_window + i * 0x1000) | PRESENT | WRITABLE;
     }
 
     // Link PDPT into PML4

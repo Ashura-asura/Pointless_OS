@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 
+pub mod cpu;
 pub mod gdt;
 pub mod idt;
 pub mod page_tables;

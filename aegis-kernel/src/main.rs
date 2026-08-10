@@ -4,17 +4,6 @@
 use aegis_kernel::sprintln;
 use core::panic::PanicInfo;
 
-/// VGA text mode buffer at physical address 0xB8000.
-const VGA_BUFFER: *mut u8 = 0xB8000 as *mut u8;
-
-unsafe fn vga_print(msg: &str, row: usize, col: usize, attr: u8) {
-    let offset = (row * 80 + col) * 2;
-    for (i, byte) in msg.bytes().enumerate() {
-        core::ptr::write_volatile(VGA_BUFFER.add(offset + i * 2), byte);
-        core::ptr::write_volatile(VGA_BUFFER.add(offset + i * 2 + 1), attr);
-    }
-}
-
 #[no_mangle]
 pub extern "sysv64" fn _start() -> ! {
     aegis_kernel::serial::SerialWriter::init();
@@ -23,30 +12,58 @@ pub extern "sysv64" fn _start() -> ! {
     sprintln!("Aegis: kernel started (loader handed off at entry)");
 
     unsafe {
-        for i in 0..(80 * 25 * 2) {
-            core::ptr::write_volatile(VGA_BUFFER.add(i), if i % 2 == 0 { b' ' } else { 0x07 });
-        }
-        vga_print("Aegis kernel running", 0, 0, 0x0A);
-        vga_print("Phase 2: process isolation", 1, 0, 0x07);
+        aegis_kernel::cpu::switch_to_kernel_stack();
     }
+    sprintln!(
+        "Aegis: kernel stack 0x{:016X} (16 KiB, tail of BSS)",
+        aegis_kernel::cpu::stack_top()
+    );
+
+    unsafe {
+        aegis_kernel::cpu::init_gdt();
+    }
+    sprintln!("Aegis: GDT + TSS loaded (lgdt/ltr)");
+
+    unsafe {
+        aegis_kernel::cpu::init_idt();
+    }
+    sprintln!("Aegis: IDT loaded (exception vectors 0-31 + timer at 0x30)");
+
+    unsafe {
+        aegis_kernel::cpu::mask_pic();
+    }
+    sprintln!("Aegis: legacy PIC masked");
 
     unsafe {
         aegis_kernel::page_tables::init_kernel_tables();
+        aegis_kernel::page_tables::switch_to(aegis_kernel::page_tables::kernel_pml4_phys());
     }
-    sprintln!("Aegis: kernel page tables up (4GB identity via 1GB pages)");
-    sprintln!(
-        "Aegis: CR3 = 0x{:016X}",
-        aegis_kernel::page_tables::kernel_pml4_phys()
-    );
-    sprintln!("Aegis: entering idle loop");
+    sprintln!("Aegis: CR3 switched to kernel page tables (identity with 4 KB LAPIC mapping)");
 
+    unsafe {
+        aegis_kernel::cpu::init_lapic_timer();
+    }
+    sprintln!("Aegis: LAPIC timer armed (periodic, vector 0x30)");
+
+    unsafe {
+        core::arch::asm!("sti");
+    }
+    sprintln!("Aegis: interrupts enabled - entering idle loop");
+
+    let mut next_print: u64 = 512;
     loop {
-        unsafe { core::arch::asm!("hlt") }
+        unsafe { core::arch::asm!("hlt") };
+        let t = aegis_kernel::cpu::timer_ticks();
+        if t >= next_print {
+            next_print = t + 512;
+            sprintln!("Aegis: tick = {} (timer alive)", t);
+        }
     }
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    aegis_kernel::sprintln!("KERNEL PANIC: {}", info);
     loop {
         unsafe { core::arch::asm!("hlt") }
     }

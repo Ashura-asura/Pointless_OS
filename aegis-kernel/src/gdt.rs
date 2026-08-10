@@ -1,4 +1,5 @@
-/// x86_64 Task State Segment (104 bytes)
+/// x86_64 Task State Segment (104 bytes; the architectural minimum for a
+/// 64-bit TSS, and the size `ltr` enforces via the descriptor limit).
 #[repr(C, packed)]
 pub struct TssStruct {
     pub reserved: u32,
@@ -15,6 +16,7 @@ pub struct TssStruct {
     pub ist7: u64,
     pub reserved3: u64,
     pub iopb_offset: u16,
+    pub reserved4: u16,
 }
 
 impl TssStruct {
@@ -34,6 +36,7 @@ impl TssStruct {
             ist7: 0,
             reserved3: 0,
             iopb_offset: core::mem::size_of::<TssStruct>() as u16,
+            reserved4: 0,
         }
     }
 }
@@ -73,9 +76,13 @@ const fn gdt_entry(base: u32, limit: u32, access: u8, granularity: u8) -> GdtEnt
     }
 }
 
-/// GDT with 6 entries + TSS
+/// GDT with 8 entries + TSS. Entry 6 is the mandatory upper half of the
+/// 16-byte 64-bit TSS descriptor (base[63:32] + reserved, all zero for a
+/// sub-4 GB TSS); QEMU's LTR helper rejects a nonzero upper "type" nibble.
+/// Entry 7 mirrors the loader's flat DPL0 64-bit code descriptor so the
+/// CS=0x38 in force at handoff remains valid after `lgdt`.
 pub struct Gdt {
-    entries: [GdtEntry; 6],
+    entries: [GdtEntry; 8],
     tss: TssStruct,
 }
 
@@ -123,6 +130,15 @@ impl Gdt {
             base_high: 0,
         };
 
+        // TSS upper half (index 6 = selector 0x30): base[63:32] + reserved,
+        // all zero. Not a usable data segment; never loaded. The CPU reads
+        // this as part of the 16-byte 64-bit TSS descriptor at index 5.
+        let tss_upper = gdt_entry(0, 0, 0, 0);
+
+        // Flat DPL0 64-bit code (index 7 = selector 0x38): mirrors the
+        // loader's CS, which stays in force until the first ring transition.
+        let code38 = gdt_entry(0, 0xFFFFF, 0x9A, 0xA0);
+
         Gdt {
             entries: [
                 null,
@@ -131,6 +147,8 @@ impl Gdt {
                 user_code,
                 user_data,
                 tss_entry,
+                tss_upper,
+                code38,
             ],
             tss: TssStruct::new(),
         }
@@ -154,38 +172,46 @@ impl Gdt {
             granularity: 0x00,
             base_high: ((tss_addr >> 24) & 0xFF) as u8,
         };
+        // Upper half of the 16-byte 64-bit TSS descriptor: TSS base[63:32]
+        // (zero for sub-4 GB) and reserved-zero type bits. Without this,
+        // QEMU's LTR reads the following GDT entry as the upper half and
+        // raises #GP on the nonzero type nibble.
+        self.entries[6] = GdtEntry {
+            limit_low: ((tss_addr >> 32) & 0xFFFF) as u16,
+            base_low: ((tss_addr >> 48) & 0xFFFF) as u16,
+            base_mid: 0,
+            access: 0,
+            granularity: 0,
+            base_high: 0,
+        };
 
         let gdt_ptr = GdtPtr {
-            limit: (core::mem::size_of::<[GdtEntry; 6]>() - 1) as u16,
+            limit: (core::mem::size_of::<[GdtEntry; 8]>() - 1) as u16,
             base: self.entries.as_ptr() as u64,
         };
 
         // Load GDT
         core::arch::asm!("lgdt [{}]", in(reg) &gdt_ptr);
 
-        // Reload CS via far return
-        let code_sel = KERNEL_CODE_SELECTOR as u64;
-        core::arch::asm!(
-            "push {code_sel}",
-            "lea {tmp}, [2f]",
-            "push {tmp}",
-            "retfq",
-            "2:",
-            code_sel = in(reg) code_sel,
-            tmp = out(reg) _,
-        );
-
         // Load TSS
         let tss_sel = TSS_SELECTOR;
         core::arch::asm!("ltr {tss_sel:x}", tss_sel = in(reg) tss_sel);
 
-        // Set data segment registers
+        // Set data segment registers.
+        // CS is intentionally NOT reloaded here: the firmware's code
+        // descriptor is already a DPL0 64-bit descriptor (verified in the
+        // QEMU trace under OVMF), and a far transfer would need a
+        // position-independent CS reload that stable inline asm cannot
+        // express (a `lea reg64, [label]` materializes the label address
+        // absolutely, which is invalid for the kernel's PIE image).
+        // CS gets replaced at the first ring transition, when the TSS
+        // entry / user code path is implemented.
         let data_sel = KERNEL_DATA_SELECTOR;
         core::arch::asm!(
-            "mov ds, {data_sel:x}",
-            "mov es, {data_sel:x}",
-            "mov ss, {data_sel:x}",
-            data_sel = in(reg) data_sel,
+            "mov ds, {sel:x}",
+            "mov es, {sel:x}",
+            "mov ss, {sel:x}",
+            sel = in(reg) data_sel,
         );
     }
 
@@ -198,5 +224,36 @@ impl Gdt {
 impl Default for Gdt {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selector_constants_are_as_documented() {
+        assert_eq!(KERNEL_CODE_SELECTOR, 0x08);
+        assert_eq!(KERNEL_DATA_SELECTOR, 0x10);
+        assert_eq!(USER_CODE_SELECTOR, 0x1B);
+        assert_eq!(USER_DATA_SELECTOR, 0x23);
+        assert_eq!(TSS_SELECTOR, 0x28);
+    }
+
+    #[test]
+    fn kernel_segment_descriptors_are_flat_64bit() {
+        // gdt_entry(base, limit, access, granularity)
+        let code: GdtEntry = gdt_entry(0, 0xFFFFF, 0x9A, 0xA0);
+        assert_eq!(code.access, 0x9A); // present, DPL0, code, readable
+        assert_eq!(code.granularity, 0xA0); // long mode, granularity
+        let data: GdtEntry = gdt_entry(0, 0xFFFFF, 0x92, 0xC0);
+        assert_eq!(data.access, 0x92); // present, DPL0, data, writable
+        assert_eq!(data.granularity, 0xC0);
+    }
+
+    #[test]
+    fn tss_iopb_offset_points_at_the_end_of_the_struct() {
+        let tss = TssStruct::new();
+        assert_eq!(tss.iopb_offset as usize, core::mem::size_of::<TssStruct>());
     }
 }
