@@ -2,9 +2,9 @@
 
 *Generated: 2026-08-10. Every claim below is verified by `cargo test` on the current commit.*
 
-## What exists (197 tests, 0 failures)
+## What exists (229 tests, 0 failures)
 
-Breakdown: 88 model-crate tests (aegis workspace), 99 aegis-kernel tests (Phases 1-7), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `df5a6d7`.
+Breakdown: 88 model-crate tests (aegis workspace), 131 aegis-kernel tests (Phases 1-8), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `cf19232`.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -81,6 +81,15 @@ A single-threaded, in-process capability kernel with:
 | Object graph | 6 | Node/relationship CRUD, neighbor traversal, type filtering |
 | Input handler | 5 | Ring buffer push/pop, full/empty detection, focus-based dispatch |
 
+### Real Linux compat layer (aegis-kernel)
+| Component | Tests | What it proves |
+|-----------|-------|----------------|
+| Syscall ABI translation | 12 | Linux x86-64 syscall numbers + register args map to Aegis operations (read/write/open/close/mmap/munmap/exit/socket/connect/send/recv/exec/sleep); unknown numbers rejected |
+| ELF loader | 12 | ET_EXEC/ET_DYN header validation (magic/class/endian/type/machine), PT_LOAD parsing with bounds checks, interpreter detection, load-range computation, System V initial stack layout (argc/argv/envp/auxv) |
+| Compat personality | 8 | Linux contexts translate and gate operations on the capability scope; native personalities reject Linux syscalls; denials are counted |
+
+Honest limits for Phase 8: translation is model logic, not a real ring-3 syscall trap; the lightweight-VM execution vehicle (design doc §5, WSL2-lineage) is not built — it needs a hypervisor. The compat layer is an unprivileged capability-scoped service, matching the design doc's AI ceiling.
+
 ### Tooling
 - `capability-audit`: reachable-authority CLI, `--graph` flag for capability visualization
 - `aegis-shell`: interactive demo exercising IPC, grants, anomaly monitoring
@@ -95,7 +104,7 @@ A single-threaded, in-process capability kernel with:
 | Real process isolation on hardware (page faults, cr3 switching) | Code + 10 contract tests | Scheduler/page-table code tested in-process; lgdt/lidt/mov-cr3 ops UNTESTED on real hardware |
 | seL4-class formal proof | Not built | TLA+ model-checking (finite instance), not inductive proof |
 | Real network I/O on a NIC | Driver code + 22 tests | VirtIO-net driver exists; no real NIC traffic, no TCP/UDP yet |
-| Linux/Windows compat layers | Not started | Phase 8-9 in design doc; Phase 8 starts next |
+| Linux/Windows compat layers | Partially built (Phase 8 model-level) | Linux syscall/ABI translation + ELF loader + personality (32 tests); no hypervisor VM vehicle; Windows compat (Phase 9) not started |
 | AI orchestration on real hardware | Model-level code only | Agent/profiler/adaptive/policy tested in-process (23 tests); no real-time integration |
 | Graphical shell on a real display | Model-level code only | Shell/window/graph/input tested in-process (24 tests); no GPU, no framebuffer, no real input |
 | Cross-machine transport for macaroon tokens | Not started | Token format exists; network transport between kernels is Phase 11 |
@@ -126,7 +135,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | 5 | Networking stack | ✅ Done (real + model): VirtIO-net driver (9 tests), Ethernet frames (5), ARP (6), IPv4 (6). Model: loopback stack (4 tests). Honest limits: no real NIC hardware, no TCP/UDP yet |
 | 6 | AI orchestration layer | ✅ Done (real + model): Agent runtime (8 tests), usage profiler (5), adaptive grants (5), policy engine (5). Model: anomaly monitor (3 tests). Honest limits: no real AI model, profiler is histogram-based not ML, no real-time learning |
 | 7 | Native app model + shell | ✅ Done (real): Shell runtime (6 tests), window manager (7), object-relationship graph (6), input dispatcher (5). Honest limits: no GPU rendering, no real display output, no real keyboard/mouse hardware |
-| 8 | Linux compat | ⬜ Not started |
+| 8 | Linux compat | ✅ Done (real, model-level): syscall ABI translation (12 tests), ELF loader + initial stack (12 tests), compat personality with capability gating (8 tests). Honest limits: no hypervisor lightweight-VM vehicle (needs hypervisor); translation proven against buffers, not a live Linux userspace |
 | 9 | Windows compat | ⬜ Not started |
 | 10 | Self-healing hardening + chaos testing | ✅ Done (6 chaos tests + 4 supervision tests) |
 | 11 | Distributed extension (macaroons) | 🟡 Token crate complete (HMAC-SHA256 chain, constant-time verify, serialization); no cross-machine transport |
@@ -163,3 +172,9 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `6e82f3f` | Phase 6: AI orchestration — agent runtime, usage profiler, adaptive grants, policy engine (23 tests) |
 | `86f8686` | Phase 7: shell — app runtime, window manager, object-relationship graph, input dispatcher (23 tests) |
 | `df5a6d7` | Update HONEST_STATUS: Phase 7 now has real shell (runtime/window/graph/input, 23 tests) |
+| `8bf8c0c` | Fix HONEST_STATUS: accurate counts (197 total from clean lockfile), remove stale rows, honest VM-compat note |
+| `1d49bc4` | Rule 6: machine-checked verification sections for kernel Phases 1-7 in capability-model.md |
+| `6b5a68f` | cargo fmt across aegis-kernel and uefi-boot (fmt-check clean, tests still 99 + 10) |
+| `c2d83c1` | Fix clippy -Dwarnings in aegis-kernel (Default impls, is_some_and, flatten, safety docs) |
+| `91c8455` | CI: kernel + bootloader job — fmt, clippy, tests, release target builds |
+| `cf19232` | Phase 8: Linux compat — syscall ABI translation (12 tests), ELF loader + initial stack (12 tests), compat personality with capability gating (8 tests) |

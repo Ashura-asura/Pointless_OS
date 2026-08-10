@@ -675,3 +675,13 @@ histogram-based, not ML; no real AI model; no real-time integration.
 launch/stop/restart and focus, window z-order/hit-test/compositor order/dirty regions,
 graph node/relationship CRUD and traversal, input ring buffer and focus dispatch. Honest
 limits: no GPU, no framebuffer output, no real keyboard/mouse hardware.
+
+### Machine-checked verification (executable): Linux compatibility (§5/§7 Phase 8)
+
+`linux_abi.rs` (12), `elf_loader.rs` (12), `linux_compat.rs` (8): Linux x86-64 syscall
+number/register translation to capability-scoped Aegis operations; ET_EXEC/ET_DYN header
+and PT_LOAD validation with bounds checks plus System V initial stack layout
+(argc/argv/envp/auxv); personality gating where every translated operation is checked
+against the context's capability scope (the AI ceiling applies to compat code). Honest
+limits: translation is model logic, not a real ring-3 syscall trap; the lightweight-VM
+execution vehicle from §5 (WSL2-lineage) is not built — it needs a hypervisor.
