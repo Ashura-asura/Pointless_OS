@@ -1,0 +1,1 @@
+C:\Users\bisha\Desktop\Pointless_OS\uefi-boot\target\x86_64-unknown-uefi\release\uefi-boot.efi: C:\Users\bisha\Desktop\Pointless_OS\uefi-boot\src\main.rs C:\Users\bisha\Desktop\Pointless_OS\uefi-boot\src\memory_map.rs C:\Users\bisha\Desktop\Pointless_OS\uefi-boot\src\page_tables.rs
