@@ -44,10 +44,12 @@ impl Scheduler {
         let pid = self.next_pid;
         self.next_pid += 1;
 
-        let mut cpu_state = CpuState::default();
-        cpu_state.rip = entry_point;
-        cpu_state.rsp = user_stack;
-        cpu_state.rflags = 0x200; // IF flag set
+        let cpu_state = CpuState {
+            rip: entry_point,
+            rsp: user_stack,
+            rflags: 0x200, // IF flag set
+            ..CpuState::default()
+        };
 
         self.processes[slot] = Some(Process {
             pid,
@@ -66,7 +68,7 @@ impl Scheduler {
         let current_idx = self.current.and_then(|cur| {
             self.processes
                 .iter()
-                .position(|p| p.as_ref().map_or(false, |proc| proc.pid == cur))
+                .position(|p| p.as_ref().is_some_and(|proc| proc.pid == cur))
         });
 
         let start = current_idx.map_or(0, |i| i + 1);
@@ -95,24 +97,20 @@ impl Scheduler {
 
     pub fn block_current(&mut self) {
         if let Some(cur) = self.current {
-            for slot in self.processes.iter_mut() {
-                if let Some(ref mut proc) = slot {
-                    if proc.pid == cur {
-                        proc.state = ProcessState::Blocked;
-                        break;
-                    }
+            for proc in self.processes.iter_mut().flatten() {
+                if proc.pid == cur {
+                    proc.state = ProcessState::Blocked;
+                    break;
                 }
             }
         }
     }
 
     pub fn wake(&mut self, pid: Pid) {
-        for slot in self.processes.iter_mut() {
-            if let Some(ref mut proc) = slot {
-                if proc.pid == pid && proc.state == ProcessState::Blocked {
-                    proc.state = ProcessState::Ready;
-                    break;
-                }
+        for proc in self.processes.iter_mut().flatten() {
+            if proc.pid == pid && proc.state == ProcessState::Blocked {
+                proc.state = ProcessState::Ready;
+                break;
             }
         }
     }
@@ -129,7 +127,7 @@ impl Scheduler {
         self.current.and_then(|cur| {
             self.processes
                 .iter()
-                .find(|p| p.as_ref().map_or(false, |proc| proc.pid == cur))
+                .find(|p| p.as_ref().is_some_and(|proc| proc.pid == cur))
                 .and_then(|p| p.as_ref())
         })
     }
@@ -138,7 +136,7 @@ impl Scheduler {
         self.current.and_then(|cur| {
             self.processes
                 .iter_mut()
-                .find(|p| p.as_ref().map_or(false, |proc| proc.pid == cur))
+                .find(|p| p.as_ref().is_some_and(|proc| proc.pid == cur))
                 .and_then(|p| p.as_mut())
         })
     }
@@ -149,21 +147,27 @@ impl Scheduler {
 
     pub fn is_ready(&self, pid: Pid) -> bool {
         self.processes.iter().any(|p| {
-            p.as_ref().map_or(false, |proc| {
-                proc.pid == pid && proc.state == ProcessState::Ready
-            })
+            p.as_ref()
+                .is_some_and(|proc| proc.pid == pid && proc.state == ProcessState::Ready)
         })
     }
 
     /// Remove zombie processes from the table
     pub fn reap_zombies(&mut self) {
         for slot in self.processes.iter_mut() {
-            if let Some(ref proc) = slot {
-                if proc.state == ProcessState::Zombie {
-                    *slot = None;
-                }
+            if slot
+                .as_ref()
+                .is_some_and(|p| p.state == ProcessState::Zombie)
+            {
+                *slot = None;
             }
         }
+    }
+}
+
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -148,7 +148,9 @@ impl InputBuffer {
 
 pub struct InputDispatcher {
     focused_window: Option<WindowId>,
+    #[allow(dead_code)] // Reserved for per-window key registration (real input loop)
     key_handlers: [Option<WindowId>; 16],
+    #[allow(dead_code)] // Reserved for per-window mouse registration (real input loop)
     mouse_handlers: [Option<WindowId>; 16],
 }
 
@@ -176,6 +178,18 @@ impl InputDispatcher {
             InputEvent::Key(_) => self.focused_window,
             InputEvent::Mouse(_) => self.focused_window,
         }
+    }
+}
+
+impl Default for InputBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for InputDispatcher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

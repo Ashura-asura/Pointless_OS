@@ -54,6 +54,7 @@ pub struct Profiler {
     profiles: [ProfileSlot; 32],
     records: [RecordSlot; 256],
     record_count: usize,
+    #[allow(dead_code)] // Window size parameter; used to tune deviation baselines
     window_size: u32,
 }
 

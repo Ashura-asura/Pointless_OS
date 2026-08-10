@@ -38,6 +38,12 @@ impl TssStruct {
     }
 }
 
+impl Default for TssStruct {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A single GDT entry (8 bytes)
 #[repr(C, packed)]
 pub struct GdtEntry {
@@ -131,6 +137,12 @@ impl Gdt {
     }
 
     /// Load GDT and TSS via lgdt/ltr. UNTESTED on real hardware.
+    ///
+    /// # Safety
+    ///
+    /// Must be called with a valid `self` whose TSS base will be patched into
+    /// the TSS descriptor. After this call the CPU uses this GDT, so the
+    /// struct must outlive its use and never move.
     pub unsafe fn install(&mut self) {
         // Patch the TSS GDT entry to point to our TSS
         let tss_addr = &self.tss as *const TssStruct as u64;
@@ -180,5 +192,11 @@ impl Gdt {
     /// Get the TSS pointer for setting RSP0 on context switch
     pub fn tss_mut(&mut self) -> &mut TssStruct {
         &mut self.tss
+    }
+}
+
+impl Default for Gdt {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -1,5 +1,4 @@
 /// VirtIO-net NIC driver interface.
-
 // VirtIO register offsets (MMIO)
 pub const REG_DEVICE_FEATURES: u64 = 0x00;
 pub const REG_QUEUE_ADDRESS: u64 = 0x08;
@@ -43,6 +42,12 @@ impl VirtioNetHeader {
             csum_start: 0,
             csum_offset: 0,
         }
+    }
+}
+
+impl Default for VirtioNetHeader {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

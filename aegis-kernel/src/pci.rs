@@ -28,7 +28,6 @@ pub const CLASS_BRIDGE: u8 = 0x06;
 pub const SUBCLASS_NVME: u8 = 0x08;
 
 /// BAR helper functions — pure logic, testable
-
 pub fn bar_is_io(bar: u32) -> bool {
     (bar & 1) == 1
 }
@@ -122,7 +121,6 @@ impl PciDevice {
 }
 
 /// Fixed-capacity PCI device list
-
 pub struct PciDeviceList {
     devices: [Option<PciDevice>; 32],
     count: usize,
@@ -164,6 +162,12 @@ impl PciDeviceList {
 
     pub fn find_network(&self) -> Option<&PciDevice> {
         self.iter().find(|d| d.is_network())
+    }
+}
+
+impl Default for PciDeviceList {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

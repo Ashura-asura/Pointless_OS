@@ -120,11 +120,11 @@ impl ObjectGraph {
         let from_exists = self
             .nodes
             .iter()
-            .any(|s| s.as_ref().map_or(false, |n| n.id == from));
+            .any(|s| s.as_ref().is_some_and(|n| n.id == from));
         let to_exists = self
             .nodes
             .iter()
-            .any(|s| s.as_ref().map_or(false, |n| n.id == to));
+            .any(|s| s.as_ref().is_some_and(|n| n.id == to));
         if !from_exists || !to_exists {
             return Err("node not found");
         }
@@ -170,18 +170,16 @@ impl ObjectGraph {
     pub fn neighbors(&self, id: ObjectId) -> [ObjectId; 16] {
         let mut result = [0u64; 16];
         let mut count = 0;
-        for slot in self.relationships.iter() {
-            if let Some(r) = slot {
-                if count >= 16 {
-                    break;
-                }
-                if r.from_id == id {
-                    result[count] = r.to_id;
-                    count += 1;
-                } else if r.bidirectional && r.to_id == id {
-                    result[count] = r.from_id;
-                    count += 1;
-                }
+        for r in self.relationships.iter().flatten() {
+            if count >= 16 {
+                break;
+            }
+            if r.from_id == id {
+                result[count] = r.to_id;
+                count += 1;
+            } else if r.bidirectional && r.to_id == id {
+                result[count] = r.from_id;
+                count += 1;
             }
         }
         result
@@ -190,29 +188,20 @@ impl ObjectGraph {
     pub fn find_by_type(&self, obj_type: ObjectType) -> [ObjectId; 16] {
         let mut result = [0u64; 16];
         let mut count = 0;
-        for slot in self.nodes.iter() {
-            if let Some(n) = slot {
-                if count >= 16 {
-                    break;
-                }
-                if n.obj_type == obj_type {
-                    result[count] = n.id;
-                    count += 1;
-                }
+        for n in self.nodes.iter().flatten() {
+            if count >= 16 {
+                break;
+            }
+            if n.obj_type == obj_type {
+                result[count] = n.id;
+                count += 1;
             }
         }
         result
     }
 
     pub fn get_node(&self, id: ObjectId) -> Option<&ObjectNode> {
-        for slot in self.nodes.iter() {
-            if let Some(n) = slot {
-                if n.id == id {
-                    return Some(n);
-                }
-            }
-        }
-        None
+        self.nodes.iter().flatten().find(|n| n.id == id)
     }
 
     pub fn node_count(&self) -> usize {
@@ -221,6 +210,12 @@ impl ObjectGraph {
 
     pub fn rel_count(&self) -> usize {
         self.rel_count
+    }
+}
+
+impl Default for ObjectGraph {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

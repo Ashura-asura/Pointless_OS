@@ -97,66 +97,61 @@ impl AgentRegistry {
     }
 
     pub fn suspend(&mut self, id: AgentId) -> Result<(), &'static str> {
-        for slot in self.agents.iter_mut() {
-            if let Some(a) = slot {
-                if a.id == id && a.state != AgentState::Terminated {
-                    a.state = AgentState::Suspended;
-                    return Ok(());
-                }
-            }
+        if let Some(a) = self
+            .agents
+            .iter_mut()
+            .flatten()
+            .find(|a| a.id == id && a.state != AgentState::Terminated)
+        {
+            a.state = AgentState::Suspended;
+            return Ok(());
         }
         Err("agent not found")
     }
 
     pub fn resume(&mut self, id: AgentId) -> Result<(), &'static str> {
-        for slot in self.agents.iter_mut() {
-            if let Some(a) = slot {
-                if a.id == id && a.state == AgentState::Suspended {
-                    a.state = AgentState::Running;
-                    return Ok(());
-                }
-            }
+        if let Some(a) = self
+            .agents
+            .iter_mut()
+            .flatten()
+            .find(|a| a.id == id && a.state == AgentState::Suspended)
+        {
+            a.state = AgentState::Running;
+            return Ok(());
         }
         Err("agent not found or not suspended")
     }
 
     pub fn terminate(&mut self, id: AgentId) -> Result<(), &'static str> {
-        for slot in self.agents.iter_mut() {
-            if let Some(a) = slot {
-                if a.id == id && a.state != AgentState::Terminated {
-                    a.state = AgentState::Terminated;
-                    self.count -= 1;
-                    return Ok(());
-                }
-            }
+        if let Some(a) = self
+            .agents
+            .iter_mut()
+            .flatten()
+            .find(|a| a.id == id && a.state != AgentState::Terminated)
+        {
+            a.state = AgentState::Terminated;
+            self.count -= 1;
+            return Ok(());
         }
         Err("agent not found")
     }
 
     pub fn get(&self, id: AgentId) -> Option<&Agent> {
-        for slot in self.agents.iter() {
-            if let Some(a) = slot {
-                if a.id == id {
-                    return Some(a);
-                }
-            }
-        }
-        None
+        self.agents.iter().flatten().find(|a| a.id == id)
     }
 
     pub fn get_mut(&mut self, id: AgentId) -> Option<&mut Agent> {
-        for slot in self.agents.iter_mut() {
-            if let Some(a) = slot {
-                if a.id == id {
-                    return Some(a);
-                }
-            }
-        }
-        None
+        self.agents.iter_mut().flatten().find(|a| a.id == id)
     }
 
     pub fn active_count(&self) -> usize {
         self.count
+    }
+}
+
+impl Default for AgentRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

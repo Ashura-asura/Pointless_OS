@@ -25,6 +25,12 @@ impl IdtEntry {
     }
 }
 
+impl Default for IdtEntry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[repr(C, packed)]
 struct IdtPtr {
     limit: u16,
@@ -64,12 +70,23 @@ impl Idt {
     }
 
     /// Load IDT via lidt. UNTESTED on real hardware.
+    ///
+    /// # Safety
+    ///
+    /// All handlers referenced by the entries must be valid, present code.
+    /// This struct must remain alive and unmoved while the IDT is loaded.
     pub unsafe fn install(&self) {
         let idt_ptr = IdtPtr {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: self.entries.as_ptr() as u64,
         };
         core::arch::asm!("lidt [{}]", in(reg) &idt_ptr);
+    }
+}
+
+impl Default for Idt {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

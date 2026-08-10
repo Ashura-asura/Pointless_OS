@@ -120,7 +120,7 @@ mod tests {
         let mut policy = AdaptivePolicy::new(CapabilityScope::permissive());
         let dev = prof.compute_deviation(1);
         assert!(
-            dev >= 0.3 && dev < 0.7,
+            (0.3..0.7).contains(&dev),
             "deviation {} not in medium range",
             dev
         );

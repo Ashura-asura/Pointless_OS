@@ -1,5 +1,4 @@
 /// IPv4 packet handling.
-
 pub const IPV4_HEADER_MIN_SIZE: usize = 20;
 pub const IPV4_VERSION: u8 = 4;
 pub const DEFAULT_TTL: u8 = 64;
@@ -51,7 +50,7 @@ impl IPv4Address {
         IPv4Address { octets: *bytes }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_address(s: &str) -> Option<Self> {
         let mut parts = [0u8; 4];
         let mut idx = 0;
         let mut num = 0u32;
@@ -66,7 +65,7 @@ impl IPv4Address {
                 num = 0;
                 has_digit = false;
                 idx += 1;
-            } else if b >= b'0' && b <= b'9' {
+            } else if b.is_ascii_digit() {
                 num = num.checked_mul(10)?.checked_add((b - b'0') as u32)?;
                 if num > 255 {
                     return None;
@@ -170,10 +169,10 @@ impl<'a> IPv4Packet<'a> {
         })
     }
 
-    pub fn serialize(&self, buffer: &mut [u8]) -> Result<usize, ()> {
+    pub fn serialize(&self, buffer: &mut [u8]) -> Result<usize, &'static str> {
         let header_len = (self.ihl as usize) * 4;
         if buffer.len() < header_len + self.payload.len() {
-            return Err(());
+            return Err("buffer too small for IPv4 packet");
         }
 
         buffer[0] = (self.version << 4) | (self.ihl & 0x0F);

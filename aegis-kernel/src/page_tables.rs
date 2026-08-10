@@ -20,6 +20,12 @@ impl PageTable {
     }
 }
 
+impl Default for PageTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // Static kernel page tables — identity-mapped, shared by all processes
 static mut KERNEL_PML4: PageTable = PageTable::new();
 static mut KERNEL_PDPT: PageTable = PageTable::new();
@@ -30,9 +36,14 @@ static mut SCRATCH_PD: PageTable = PageTable::new();
 
 /// Set up identity-mapped kernel page tables (first 1GB, same as Phase 1).
 /// Maps first 4 GB using 1GB huge pages via PDPT entries.
+///
+/// # Safety
+///
+/// Must be called exactly once at boot, before any address-space switch. The
+/// static page tables are mutated in place; concurrent access is undefined.
 pub unsafe fn init_kernel_tables() {
-    let pml4 = &mut *(&raw mut KERNEL_PML4);
-    let pdpt = &mut *(&raw mut KERNEL_PDPT);
+    let pml4 = (&raw mut KERNEL_PML4).as_mut().unwrap();
+    let pdpt = (&raw mut KERNEL_PDPT).as_mut().unwrap();
 
     pml4.clear();
     pdpt.clear();
@@ -50,10 +61,15 @@ pub unsafe fn init_kernel_tables() {
 /// Upper half (entries 256-511) points to kernel's PDPT (kernel space shared).
 /// Lower half (entries 0-255) are zeroed (user space unique).
 /// Returns the physical address of the new PML4.
+///
+/// # Safety
+///
+/// The returned address references a single static scratch PML4; callers must
+/// copy it into per-process memory before creating another table.
 pub unsafe fn create_user_tables() -> u64 {
     static mut USER_PML4: PageTable = PageTable::new();
-    let user_pml4 = &mut *(&raw mut USER_PML4);
-    let kernel_pml4 = &*(&raw const KERNEL_PML4);
+    let user_pml4 = (&raw mut USER_PML4).as_mut().unwrap();
+    let kernel_pml4 = (&raw const KERNEL_PML4).as_ref().unwrap();
 
     user_pml4.clear();
 
@@ -67,6 +83,11 @@ pub unsafe fn create_user_tables() -> u64 {
 }
 
 /// Map one 2MB page in the given PML4.
+///
+/// # Safety
+///
+/// `pml4_phys` must be a valid physical address of a present PML4 page table.
+/// Scratch page-table pages are reused; only one mapping walk may be in flight.
 pub unsafe fn map_page(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
     let pml4 = &mut *(pml4_phys as *mut PageTable);
 
@@ -76,7 +97,7 @@ pub unsafe fn map_page(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
 
     // Get or create PDPT
     if pml4.entries[pml4_index] & PRESENT == 0 {
-        let scratch = &mut *(&raw mut SCRATCH_PDPT);
+        let scratch = (&raw mut SCRATCH_PDPT).as_mut().unwrap();
         scratch.clear();
         pml4.entries[pml4_index] =
             core::ptr::addr_of!(SCRATCH_PDPT) as u64 | PRESENT | WRITABLE | USER;
@@ -85,7 +106,7 @@ pub unsafe fn map_page(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
 
     // Get or create PD
     if pdpt.entries[pdpt_index] & PRESENT == 0 {
-        let scratch = &mut *(&raw mut SCRATCH_PD);
+        let scratch = (&raw mut SCRATCH_PD).as_mut().unwrap();
         scratch.clear();
         pdpt.entries[pdpt_index] =
             core::ptr::addr_of!(SCRATCH_PD) as u64 | PRESENT | WRITABLE | USER;
@@ -97,6 +118,11 @@ pub unsafe fn map_page(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
 }
 
 /// Switch to a different address space by writing CR3.
+///
+/// # Safety
+///
+/// `pml4_phys` must be the physical address of a valid, fully populated PML4.
+/// Switching to a partially-built table will fault on the next access.
 pub unsafe fn switch_to(pml4_phys: u64) {
     asm!("mov cr3, {}", in(reg) pml4_phys);
 }

@@ -51,7 +51,6 @@ pub enum NvmeIoOp {
 }
 
 /// NVMe queue pair
-
 pub struct NvmeQueue {
     submissions: [NvmeSubmissionEntry; 64],
     completions: [NvmeCompletionEntry; 64],

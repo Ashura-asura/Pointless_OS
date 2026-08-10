@@ -96,6 +96,12 @@ impl ArpTable {
     }
 }
 
+impl Default for ArpTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug)]
 pub struct ArpPacket {
@@ -177,6 +183,12 @@ impl ArpPacket {
             target_mac,
             target_ip,
         })
+    }
+}
+
+impl Default for ArpPacket {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

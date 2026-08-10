@@ -36,7 +36,6 @@ impl IommuPageTable {
             }; 512],
         }
     }
-
     pub fn map(&mut self, index: usize, phys_addr: u64, flags: u32) -> bool {
         if index >= 512 {
             return false;
@@ -64,8 +63,13 @@ impl IommuPageTable {
     }
 }
 
-/// IOMMU domain — one page table per domain
+impl Default for IommuPageTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
+/// IOMMU domain — one page table per domain
 pub struct IommuDomain {
     pub id: u32,
     pub root: u64,
@@ -89,10 +93,15 @@ impl IommuDomain {
 }
 
 /// IOMMU manager
-
 pub struct Iommu {
     domains: [Option<IommuDomain>; 32],
     domain_count: u32,
+}
+
+impl Default for Iommu {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Iommu {
@@ -213,7 +222,7 @@ mod tests {
     fn assign_device_associates_device_with_domain() {
         let mut iommu = Iommu::new();
         let dom = iommu.create_domain().unwrap();
-        let bdf: u32 = (1 << 16) | (2 << 3) | 0; // bus 1, device 2, function 0
+        let bdf: u32 = (1 << 16) | (2 << 3); // bus 1, device 2, function 0
         assert!(iommu.assign_device(dom, bdf));
         let domain = iommu.domains[dom as usize].as_ref().unwrap();
         assert_eq!(domain.device_count, 1);

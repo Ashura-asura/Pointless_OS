@@ -89,7 +89,6 @@ impl PolicyEngine {
             self.rule_count += 1;
         }
     }
-
     pub fn evaluate(&mut self, agent: &Agent, profiler: &Profiler) -> PolicyDecision {
         let empty_profile = crate::profiler::UsageProfile::new(agent.id);
         let profile_ref = profiler.get_profile(agent.id).unwrap_or(&empty_profile);
@@ -182,6 +181,12 @@ impl PolicyEngine {
     }
 }
 
+impl Default for PolicyEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,7 +262,7 @@ mod tests {
 
     #[test]
     fn audit_log_records_every_evaluation() {
-        let mut prof = Profiler::new(1000);
+        let prof = Profiler::new(1000);
         let agent = make_agent(1);
         let mut engine = PolicyEngine::new();
         engine.add_rule(PolicyRule::MaxSyscalls(320));
@@ -269,7 +274,7 @@ mod tests {
 
     #[test]
     fn clear_audit_log_empties_log() {
-        let mut prof = Profiler::new(1000);
+        let prof = Profiler::new(1000);
         let agent = make_agent(1);
         let mut engine = PolicyEngine::new();
         engine.add_rule(PolicyRule::MaxSyscalls(320));

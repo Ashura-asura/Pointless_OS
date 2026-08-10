@@ -24,7 +24,9 @@ pub struct WindowManager {
     windows: [Option<Window>; 32],
     count: usize,
     next_id: WindowId,
+    #[allow(dead_code)] // Screen bounds for clipping in the real compositor
     screen_width: u16,
+    #[allow(dead_code)] // Screen bounds for clipping in the real compositor
     screen_height: u16,
     dirty_regions: [Region; 32],
     dirty_count: usize,
@@ -86,27 +88,23 @@ impl WindowManager {
     }
 
     pub fn destroy_window(&mut self, id: WindowId) -> Result<(), &'static str> {
-        for slot in self.windows.iter_mut() {
-            if let Some(w) = slot {
-                if w.id == id {
-                    *slot = None;
-                    self.count -= 1;
-                    return Ok(());
-                }
-            }
+        if let Some(slot) = self
+            .windows
+            .iter_mut()
+            .find(|s| s.as_ref().is_some_and(|w| w.id == id))
+        {
+            *slot = None;
+            self.count -= 1;
+            return Ok(());
         }
         Err("window not found")
     }
 
     pub fn move_window(&mut self, id: WindowId, x: i16, y: i16) -> Result<(), &'static str> {
-        for slot in self.windows.iter_mut() {
-            if let Some(w) = slot {
-                if w.id == id {
-                    w.region.x = x;
-                    w.region.y = y;
-                    return Ok(());
-                }
-            }
+        if let Some(w) = self.windows.iter_mut().flatten().find(|w| w.id == id) {
+            w.region.x = x;
+            w.region.y = y;
+            return Ok(());
         }
         Err("window not found")
     }
@@ -117,38 +115,26 @@ impl WindowManager {
         width: u16,
         height: u16,
     ) -> Result<(), &'static str> {
-        for slot in self.windows.iter_mut() {
-            if let Some(w) = slot {
-                if w.id == id {
-                    w.region.width = width;
-                    w.region.height = height;
-                    return Ok(());
-                }
-            }
+        if let Some(w) = self.windows.iter_mut().flatten().find(|w| w.id == id) {
+            w.region.width = width;
+            w.region.height = height;
+            return Ok(());
         }
         Err("window not found")
     }
 
     pub fn set_visible(&mut self, id: WindowId, visible: bool) -> Result<(), &'static str> {
-        for slot in self.windows.iter_mut() {
-            if let Some(w) = slot {
-                if w.id == id {
-                    w.visible = visible;
-                    return Ok(());
-                }
-            }
+        if let Some(w) = self.windows.iter_mut().flatten().find(|w| w.id == id) {
+            w.visible = visible;
+            return Ok(());
         }
         Err("window not found")
     }
 
     pub fn set_z_order(&mut self, id: WindowId, z: u8) -> Result<(), &'static str> {
-        for slot in self.windows.iter_mut() {
-            if let Some(w) = slot {
-                if w.id == id {
-                    w.z_order = z;
-                    return Ok(());
-                }
-            }
+        if let Some(w) = self.windows.iter_mut().flatten().find(|w| w.id == id) {
+            w.z_order = z;
+            return Ok(());
         }
         Err("window not found")
     }
@@ -160,13 +146,9 @@ impl WindowManager {
             .filter_map(|s| s.as_ref().map(|w| w.z_order))
             .max()
             .unwrap_or(0);
-        for slot in self.windows.iter_mut() {
-            if let Some(w) = slot {
-                if w.id == id {
-                    w.z_order = max_z + 1;
-                    return Ok(());
-                }
-            }
+        if let Some(w) = self.windows.iter_mut().flatten().find(|w| w.id == id) {
+            w.z_order = max_z + 1;
+            return Ok(());
         }
         Err("window not found")
     }
@@ -174,20 +156,18 @@ impl WindowManager {
     pub fn hit_test(&self, x: i16, y: i16) -> Option<WindowId> {
         let mut best_z: i16 = -1;
         let mut best_id: Option<WindowId> = None;
-        for slot in self.windows.iter() {
-            if let Some(w) = slot {
-                if !w.visible {
-                    continue;
-                }
-                if x >= w.region.x
-                    && x < w.region.x + w.region.width as i16
-                    && y >= w.region.y
-                    && y < w.region.y + w.region.height as i16
-                    && w.z_order as i16 > best_z
-                {
-                    best_z = w.z_order as i16;
-                    best_id = Some(w.id);
-                }
+        for w in self.windows.iter().flatten() {
+            if !w.visible {
+                continue;
+            }
+            if x >= w.region.x
+                && x < w.region.x + w.region.width as i16
+                && y >= w.region.y
+                && y < w.region.y + w.region.height as i16
+                && w.z_order as i16 > best_z
+            {
+                best_z = w.z_order as i16;
+                best_id = Some(w.id);
             }
         }
         best_id
@@ -196,11 +176,9 @@ impl WindowManager {
     pub fn compositor_order(&self) -> [WindowId; 32] {
         let mut entries: [(WindowId, u8); 32] = [(0, 0); 32];
         let mut entry_count = 0;
-        for slot in self.windows.iter() {
-            if let Some(w) = slot {
-                entries[entry_count] = (w.id, w.z_order);
-                entry_count += 1;
-            }
+        for w in self.windows.iter().flatten() {
+            entries[entry_count] = (w.id, w.z_order);
+            entry_count += 1;
         }
         for i in 1..entry_count {
             let mut j = i;
@@ -220,14 +198,10 @@ impl WindowManager {
         if self.dirty_count >= self.dirty_regions.len() {
             return Err("dirty list full");
         }
-        for slot in self.windows.iter() {
-            if let Some(w) = slot {
-                if w.id == id {
-                    self.dirty_regions[self.dirty_count] = w.region;
-                    self.dirty_count += 1;
-                    return Ok(());
-                }
-            }
+        if let Some(w) = self.windows.iter().flatten().find(|w| w.id == id) {
+            self.dirty_regions[self.dirty_count] = w.region;
+            self.dirty_count += 1;
+            return Ok(());
         }
         Err("window not found")
     }
@@ -271,7 +245,7 @@ mod tests {
     #[test]
     fn hit_test_finds_topmost_window() {
         let mut wm = WindowManager::new(800, 600);
-        let id1 = wm
+        let _id1 = wm
             .create_window(
                 1,
                 b"bottom",

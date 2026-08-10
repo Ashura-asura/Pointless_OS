@@ -55,10 +55,10 @@ impl<'a> EthernetFrame<'a> {
         })
     }
 
-    pub fn serialize(&self, buffer: &mut [u8]) -> Result<usize, ()> {
+    pub fn serialize(&self, buffer: &mut [u8]) -> Result<usize, &'static str> {
         let total = ETH_HEADER_SIZE + self.payload.len();
         if buffer.len() < total {
-            return Err(());
+            return Err("buffer too small for Ethernet frame");
         }
 
         buffer[0..6].copy_from_slice(&self.dst_mac.octets);
@@ -70,7 +70,7 @@ impl<'a> EthernetFrame<'a> {
 
         let frame_end = total.max(MIN_FRAME_SIZE);
         if buffer.len() < frame_end {
-            return Err(());
+            return Err("buffer too small for padded frame");
         }
         for b in &mut buffer[total..frame_end] {
             *b = 0;

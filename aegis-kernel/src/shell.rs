@@ -63,7 +63,7 @@ fn empty_entry() -> AppEntry {
 
 impl ShellRuntime {
     pub fn new() -> Self {
-        let mut apps: [Option<AppEntry>; 16] = [
+        let apps: [Option<AppEntry>; 16] = [
             None, None, None, None, None, None, None, None, None, None, None, None, None, None,
             None, None,
         ];
@@ -100,17 +100,13 @@ impl ShellRuntime {
     }
 
     pub fn stop(&mut self, app_id: AppId) -> Result<(), &'static str> {
-        for slot in self.apps.iter_mut() {
-            if let Some(entry) = slot {
-                if entry.id == app_id {
-                    entry.state = AppState::Stopped;
-                    entry.pid = None;
-                    if self.focused_app == Some(app_id) {
-                        self.focused_app = None;
-                    }
-                    return Ok(());
-                }
+        if let Some(entry) = self.apps.iter_mut().flatten().find(|e| e.id == app_id) {
+            entry.state = AppState::Stopped;
+            entry.pid = None;
+            if self.focused_app == Some(app_id) {
+                self.focused_app = None;
             }
+            return Ok(());
         }
         Err("app not found")
     }
@@ -125,14 +121,13 @@ impl ShellRuntime {
                     .map(|e| e.manifest.clone())
             })
             .ok_or("app not found")?;
-        for slot in self.apps.iter_mut() {
-            if let Some(e) = slot {
-                if e.id == app_id {
-                    *slot = None;
-                    self.count -= 1;
-                    break;
-                }
-            }
+        if let Some(slot) = self
+            .apps
+            .iter_mut()
+            .find(|s| s.as_ref().is_some_and(|e| e.id == app_id))
+        {
+            *slot = None;
+            self.count -= 1;
         }
         self.launch(manifest)
     }
@@ -187,6 +182,12 @@ impl ShellRuntime {
 
     pub fn app_count(&self) -> usize {
         self.count
+    }
+}
+
+impl Default for ShellRuntime {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
