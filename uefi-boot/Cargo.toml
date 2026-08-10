@@ -3,9 +3,24 @@ name = "uefi-boot"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+uefi = []
+
 [dependencies]
 uefi = { version = "0.39", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
 log = "0.4"
+
+[[bin]]
+name = "uefi-boot"
+path = "src/main.rs"
+required-features = ["uefi"]
+
+[dev-dependencies]
+
+[[test]]
+name = "elf_contract"
+path = "tests/elf_contract.rs"
 
 [profile.dev]
 panic = "abort"
