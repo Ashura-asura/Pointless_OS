@@ -719,3 +719,16 @@ verified across nodes. Honest limits: two-node in-process model — no sockets, 
 consensus, no partition/split-brain modeling (the design doc's CAP warning explicitly
 applies); `bind_caveat` requires the issuer key, whereas real macaroons allow keyless
 attenuation (documented model difference).
+
+### Machine-checked verification (executable): production hardening (§8/§7 Phase 12)
+
+`crates/security-audit` (10) + `aegis-kernel/src/hardening.rs` (13) + `SECURITY_AUDIT.md`:
+the reachable-authority audit is promoted to an aggregate build gate with contract
+tests covering the clean reference world, kernel-equivalent-demand rejection,
+undeclared-holding rejection, overhang-warns-not-fails, and structural-self-cap
+exclusion; kernel boundary tests drive every parser and both syscall ABIs with
+garbage/truncated/overflowing inputs under `catch_unwind` and assert total (error,
+never-panic) behavior; the certification matrix records exactly what is and is not
+certified. Honest limits: deterministic boundary testing, not fuzzing; model-level
+audit, not hardware certification — every hardware-touching operation remains UNTESTED;
+no inductive proof; no secure boot/attestation.

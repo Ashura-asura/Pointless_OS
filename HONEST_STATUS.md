@@ -2,9 +2,9 @@
 
 *Generated: 2026-08-10. Every claim below is verified by `cargo test` on the current commit.*
 
-## What exists (287 tests, 0 failures)
+## What exists (310 tests, 0 failures)
 
-Breakdown: 101 model-crate tests (aegis workspace, incl. fleet), 176 aegis-kernel tests (Phases 1-10), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `91165ff`.
+Breakdown: 111 model-crate tests (aegis workspace, incl. fleet + security-audit), 189 aegis-kernel tests (Phases 1-12), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `305ce8c`.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -115,6 +115,13 @@ Honest limits: property-style contract tests over finite deterministic model log
 
 Honest limits: two-node in-process model (no sockets, no real network); no consensus, replication, or split-brain handling — the design doc's CAP/partition warning applies and partition behavior is deliberately NOT modeled. `macaroon::bind_caveat` requires the signing key, so attenuation is done by a node holding the issuer key; real macaroons allow keyless caveats (documented difference).
 
+### Real production hardening (security-audit + aegis-kernel)
+| Component | Tests | What it proves |
+|-----------|-------|----------------|
+| Aggregate security audit | 10 | Reference world is clean (0 violations); kernel-equivalent demand from userspace repo is a violation; undeclared holdings are violations; delivery overhang warns but never breaks the build; self caps excluded from reachable authority; unbound tasks skipped |
+| Kernel boundary/panic-safety | 13 | All parsers (ELF/PE/IPv4/Ethernet/ARP) and both syscall ABIs return errors on garbage/truncated/overflowing inputs and never panic; compat layers reject garbage; shell/window/graph/input reject bad IDs without panicking |
+| Certification matrix | — | `SECURITY_AUDIT.md`: what is certified (model-level only), what is NOT (all real-hardware ops UNTESTED, no inductive proof, no fuzzing, no distributed guarantees) |
+
 ### Tooling
 - `capability-audit`: reachable-authority CLI, `--graph` flag for capability visualization
 - `aegis-shell`: interactive demo exercising IPC, grants, anomaly monitoring
@@ -164,7 +171,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | 9 | Windows compat | ✅ Done (real, model-level): NT syscall ABI translation (12 tests), PE32+ loader (12 tests), Windows compat personality with capability gating (7 tests). Honest limits: narrow well-behaved-subset translator only; full-fidelity VM path (needs hypervisor + Windows) not built; design doc says full Windows compat is unsolved by translation alone |
 | 10 | Self-healing hardening + chaos testing | ✅ Done: supervision-tree (4) + chaos (6) model tests; adaptive-ceiling verification (14) in aegis-kernel — caught+fixed real scope-expansion bug in tighten_scope |
 | 11 | Distributed extension (macaroons) | ✅ Done (model-level): fleet crate — cross-machine capability transport with explicit locality, wire envelope, peer trust, chain/expiry verification, remote attenuation (13 tests). Honest limits: two-node in-process model; no real network/consensus; partition behavior deliberately not modeled (design doc CAP warning) |
-| 12 | Production hardening | ⬜ Not started |
+| 12 | Production hardening | ✅ Done (model-level): security-audit aggregate gate (10 tests), kernel boundary/panic-safety tests (13), SECURITY_AUDIT.md certification matrix. Honest limits: NO real-hardware certification of any kind — all hardware ops UNTESTED; no inductive proof; no fuzzing; secure boot/attestation not built |
 
 ## Commits (this session)
 
@@ -206,3 +213,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `3bfca8a` | Phase 9: Windows compat — NT syscall ABI translation (12 tests), PE32+ loader (12 tests), Windows compat personality with capability gating (7 tests) |
 | `2ed2b56` | Phase 10: adaptive-ceiling verification (14 tests); FIXED tighten_scope budget-expansion bug |
 | `91165ff` | Phase 11: fleet crate — cross-machine capability transport, explicit locality, wire envelope, peer trust, verification (13 tests) |
+| `305ce8c` | Phase 12: production hardening — security-audit aggregate gate (10 tests), kernel boundary tests (13), SECURITY_AUDIT.md |
