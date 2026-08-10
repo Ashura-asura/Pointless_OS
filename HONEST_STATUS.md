@@ -2,9 +2,9 @@
 
 *Generated: 2026-08-10. Every claim below is verified by `cargo test` on the current commit.*
 
-## What exists (310 tests, 0 failures)
+## What exists (316 tests, 0 failures)
 
-Breakdown: 111 model-crate tests (aegis workspace, incl. fleet + security-audit), 189 aegis-kernel tests (Phases 1-12), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `76471bb`.
+Breakdown: 113 model-crate tests (aegis workspace, incl. fleet + security-audit), 193 aegis-kernel tests (Phases 1-12), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `d59ebd9`.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -111,7 +111,7 @@ Honest limits: property-style contract tests over finite deterministic model log
 ### Real distributed extension (fleet crate)
 | Component | Tests | What it proves |
 |-----------|-------|----------------|
-| Fleet transport | 13 | Node identity, explicit locality (Local vs Remote — never hidden), wire-format envelope round-trips, peer trust registry, HMAC chain verification across nodes, expiry enforcement, remote attenuation (rights narrow + expiry clamp), tamper/unknown-issuer/untrusted-peer rejection |
+| Fleet transport | 15 | Node identity, explicit locality (Local vs Remote — never hidden), wire-format envelope round-trips, peer trust registry, HMAC chain verification across nodes, expiry enforcement, remote attenuation (rights narrow + expiry clamp), tamper/unknown-issuer/untrusted-peer rejection, **recipient binding**: intended recipient is HMAC-bound at send time, so relayed tokens and forged recipient fields are rejected (2 regression tests for the audit finding) |
 
 Honest limits: two-node in-process model (no sockets, no real network); no consensus, replication, or split-brain handling — the design doc's CAP/partition warning applies and partition behavior is deliberately NOT modeled. `macaroon::bind_caveat` requires the signing key, so attenuation is done by a node holding the issuer key; real macaroons allow keyless caveats (documented difference).
 
@@ -119,7 +119,7 @@ Honest limits: two-node in-process model (no sockets, no real network); no conse
 | Component | Tests | What it proves |
 |-----------|-------|----------------|
 | Aggregate security audit | 10 | Reference world is clean (0 violations); kernel-equivalent demand from userspace repo is a violation; undeclared holdings are violations; delivery overhang warns but never breaks the build; self caps excluded from reachable authority; unbound tasks skipped |
-| Kernel boundary/panic-safety | 13 | All parsers (ELF/PE/IPv4/Ethernet/ARP) and both syscall ABIs return errors on garbage/truncated/overflowing inputs and never panic; compat layers reject garbage; shell/window/graph/input reject bad IDs without panicking |
+| Kernel boundary/panic-safety | 17 | All parsers (ELF/PE/IPv4/Ethernet/ARP) and both syscall ABIs return errors on garbage/truncated/overflowing inputs and never panic; ELF/PE loaders reject attacker-controlled offsets that would overflow (checked_add/checked_mul — 4 regression tests); compat layers reject garbage; shell/window/graph/input reject bad IDs without panicking |
 | Certification matrix | — | `SECURITY_AUDIT.md`: what is certified (model-level only), what is NOT (all real-hardware ops UNTESTED, no inductive proof, no fuzzing, no distributed guarantees) |
 
 ### Tooling
@@ -214,3 +214,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `2ed2b56` | Phase 10: adaptive-ceiling verification (14 tests); FIXED tighten_scope budget-expansion bug |
 | `91165ff` | Phase 11: fleet crate — cross-machine capability transport, explicit locality, wire envelope, peer trust, verification (13 tests) |
 | `305ce8c` | Phase 12: production hardening — security-audit aggregate gate (10 tests), kernel boundary tests (13), SECURITY_AUDIT.md |
+| `d59ebd9` | Security fixes from audit: fleet recipient binding (HMAC-bound, relay rejected) + ELF/PE checked offset arithmetic (6 regression tests total) |

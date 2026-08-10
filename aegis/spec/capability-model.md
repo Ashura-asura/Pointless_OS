@@ -710,25 +710,29 @@ design doc.
 
 ### Machine-checked verification (executable): distributed extension (§3/§5/§7 Phase 11)
 
-`crates/fleet` (13): cross-machine capability transport over the macaroon token format.
+`crates/fleet` (15): cross-machine capability transport over the macaroon token format.
 Node identity, explicit locality (`Local`/`Remote` — never hidden, per the design doc),
 a wire-format `RemoteCapability` envelope (serialize/deserialize round-trip), a peer
 trust registry, and verification that checks HMAC chain integrity under the issuer's
-key, issuer trust, and expiry. Remote attenuation (rights narrow + expiry clamp) is
-verified across nodes. Honest limits: two-node in-process model — no sockets, no
-consensus, no partition/split-brain modeling (the design doc's CAP warning explicitly
-applies); `bind_caveat` requires the issuer key, whereas real macaroons allow keyless
-attenuation (documented model difference).
+key, issuer trust, **recipient binding** (the intended recipient is cryptographically
+bound into the HMAC chain at send time, so relayed tokens and forged recipient fields
+are rejected — regression-tested for the relay finding), and expiry. Remote attenuation
+(rights narrow + expiry clamp) is verified across nodes. Honest limits: two-node
+in-process model — no sockets, no consensus, no partition/split-brain modeling (the
+design doc's CAP warning explicitly applies); `bind_caveat` requires the issuer key,
+whereas real macaroons allow keyless attenuation (documented model difference).
 
 ### Machine-checked verification (executable): production hardening (§8/§7 Phase 12)
 
-`crates/security-audit` (10) + `aegis-kernel/src/hardening.rs` (13) + `SECURITY_AUDIT.md`:
+`crates/security-audit` (10) + `aegis-kernel/src/hardening.rs` (17) + `SECURITY_AUDIT.md`:
 the reachable-authority audit is promoted to an aggregate build gate with contract
 tests covering the clean reference world, kernel-equivalent-demand rejection,
 undeclared-holding rejection, overhang-warns-not-fails, and structural-self-cap
 exclusion; kernel boundary tests drive every parser and both syscall ABIs with
 garbage/truncated/overflowing inputs under `catch_unwind` and assert total (error,
-never-panic) behavior; the certification matrix records exactly what is and is not
+never-panic) behavior — including regressions proving the ELF/PE loaders reject
+attacker-controlled offset arithmetic with `checked_add`/`checked_mul` instead of
+wrapping or panicking; the certification matrix records exactly what is and is not
 certified. Honest limits: deterministic boundary testing, not fuzzing; model-level
 audit, not hardware certification — every hardware-touching operation remains UNTESTED;
 no inductive proof; no secure boot/attestation.
