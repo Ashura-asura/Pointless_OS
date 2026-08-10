@@ -19,6 +19,7 @@ const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3; // Shared object / PIE (freestanding kernels link as PIE)
 const EM_X86_64: u16 = 0x3E;
 const PT_LOAD: u32 = 1;
+const R_X86_64_RELATIVE: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ElfError;
@@ -32,11 +33,18 @@ struct ProgramHeader {
     flags: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Relocation {
+    offset: u64,
+    addend: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ElfBinary {
     entry: u64,
     segments: [ProgramHeader; 16],
     segment_count: usize,
+    relocations: Vec<Relocation>,
 }
 
 fn parse_elf(data: &[u8]) -> Result<ElfBinary, ElfError> {
@@ -103,11 +111,92 @@ fn parse_elf(data: &[u8]) -> Result<ElfBinary, ElfError> {
     if segment_count == 0 {
         return Err(ElfError);
     }
+    let relocations = parse_relocations(data)?;
     Ok(ElfBinary {
         entry,
         segments,
         segment_count,
+        relocations,
     })
+}
+
+fn parse_relocations(data: &[u8]) -> Result<Vec<Relocation>, ElfError> {
+    let shoff = u64::from_le_bytes(data[0x28..0x30].try_into().unwrap()) as usize;
+    let shentsize = u16::from_le_bytes([data[0x3A], data[0x3B]]) as usize;
+    let shnum = u16::from_le_bytes([data[0x3C], data[0x3D]]) as usize;
+    let shstrndx = u16::from_le_bytes([data[0x3E], data[0x3F]]) as usize;
+
+    if shoff == 0 || shnum == 0 || shentsize < 64 {
+        return Ok(Vec::new());
+    }
+    if shstrndx as usize >= shnum as usize {
+        return Err(ElfError);
+    }
+
+    let shstr_off = shoff + shstrndx as usize * shentsize;
+    let shstr_offset = u64::from_le_bytes(
+        data[shstr_off + 24..shstr_off + 32]
+            .try_into()
+            .map_err(|_| ElfError)?,
+    ) as usize;
+    let shstr_size = u64::from_le_bytes(
+        data[shstr_off + 32..shstr_off + 40]
+            .try_into()
+            .map_err(|_| ElfError)?,
+    ) as usize;
+    if shstr_offset + shstr_size > data.len() {
+        return Err(ElfError);
+    }
+    let shstrtab = &data[shstr_offset..shstr_offset + shstr_size];
+
+    let mut relocations = Vec::new();
+    for i in 0..shnum {
+        let sec_off = shoff + i as usize * shentsize;
+        let name_idx = u32::from_le_bytes(
+            data[sec_off..sec_off + 4]
+                .try_into()
+                .map_err(|_| ElfError)?,
+        ) as usize;
+        let sec_offset = u64::from_le_bytes(
+            data[sec_off + 24..sec_off + 32]
+                .try_into()
+                .map_err(|_| ElfError)?,
+        ) as usize;
+        let sec_size = u64::from_le_bytes(
+            data[sec_off + 32..sec_off + 40]
+                .try_into()
+                .map_err(|_| ElfError)?,
+        ) as usize;
+
+        let name_end = shstrtab[name_idx..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| name_idx + p)
+            .unwrap_or(shstrtab.len());
+        let name = &shstrtab[name_idx..name_end];
+        if name != b".rela.dyn" && name != b".rela.plt" {
+            continue;
+        }
+        if sec_offset + sec_size > data.len() || sec_size % 24 != 0 {
+            return Err(ElfError);
+        }
+
+        for j in (0..sec_size).step_by(24) {
+            let entry = sec_offset + j;
+            let r_offset = u64::from_le_bytes(data[entry..entry + 8].try_into().unwrap());
+            let r_info = u64::from_le_bytes(data[entry + 8..entry + 16].try_into().unwrap());
+            let r_type = r_info & 0xFFFF_FFFF;
+            let r_addend = i64::from_le_bytes(data[entry + 16..entry + 24].try_into().unwrap());
+            if r_type != R_X86_64_RELATIVE {
+                return Err(ElfError);
+            }
+            relocations.push(Relocation {
+                offset: r_offset,
+                addend: r_addend as u64,
+            });
+        }
+    }
+    Ok(relocations)
 }
 
 /// Build a minimal valid ELF64 binary in memory.
@@ -180,7 +269,75 @@ fn accepts_pie_type() {
             segs
         },
         segment_count: 1,
+        relocations: vec![],
     }));
+}
+
+/// Append section headers + shstrtab + a .rela.dyn section to a built ELF.
+/// `relas` = (r_offset, r_type, r_addend) entries.
+fn append_rela_section(mut data: Vec<u8>, relas: &[(u64, u64, i64)]) -> Vec<u8> {
+    let relas_bytes = relas.len() * 24;
+    let shstr = b"\0.rela.dyn\0";
+    let shstr_offset = data.len() + relas_bytes;
+
+    let rela_start = data.len();
+    data.extend_from_slice(&vec![0u8; relas_bytes]);
+    for (i, &(off, typ, add)) in relas.iter().enumerate() {
+        let e = rela_start + i * 24;
+        data[e..e + 8].copy_from_slice(&off.to_le_bytes());
+        data[e + 8..e + 16].copy_from_slice(&typ.to_le_bytes());
+        data[e + 16..e + 24].copy_from_slice(&add.to_le_bytes());
+    }
+
+    let shstr_start = data.len();
+    data.extend_from_slice(shstr);
+
+    let shoff = data.len();
+    let shnum = 3usize; // null(0) + shstrtab(1) + .rela.dyn(2)
+    data.extend_from_slice(&vec![0u8; shnum * 64]);
+
+    // shstrtab section header (index 1)
+    let shstr_sec = shoff + 1 * 64;
+    data[shstr_sec + 0..shstr_sec + 4].copy_from_slice(&0u32.to_le_bytes());
+    data[shstr_sec + 24..shstr_sec + 32].copy_from_slice(&(shstr_start as u64).to_le_bytes());
+    data[shstr_sec + 32..shstr_sec + 40].copy_from_slice(&(shstr.len() as u64).to_le_bytes());
+
+    // .rela.dyn section header (index 2)
+    let rela_sec = shoff + 2 * 64;
+    data[rela_sec + 0..rela_sec + 4].copy_from_slice(&1u32.to_le_bytes()); // name idx = 1
+    data[rela_sec + 24..rela_sec + 32].copy_from_slice(&(rela_start as u64).to_le_bytes());
+    data[rela_sec + 32..rela_sec + 40].copy_from_slice(&(relas_bytes as u64).to_le_bytes());
+
+    // e_shoff / e_shentsize / e_shnum / e_shstrndx
+    data[0x28..0x30].copy_from_slice(&(shoff as u64).to_le_bytes());
+    data[0x3A..0x3C].copy_from_slice(&64u16.to_le_bytes());
+    data[0x3C..0x3E].copy_from_slice(&(shnum as u16).to_le_bytes());
+    data[0x3E..0x40].copy_from_slice(&1u16.to_le_bytes()); // shstrndx = 1
+
+    data
+}
+
+#[test]
+fn parses_relative_relocations() {
+    let base = build_test_elf(0x1000, &[(0, 0, 0x1000, 5)]);
+    let data = append_rela_section(base, &[(0x2BF0, 8, 0x16E0), (0x2BF8, 8, 0x13B0)]);
+    let elf = parse_elf(&data).unwrap();
+    assert_eq!(elf.relocations.len(), 2);
+    assert_eq!(
+        elf.relocations[0],
+        Relocation { offset: 0x2BF0, addend: 0x16E0 }
+    );
+    assert_eq!(
+        elf.relocations[1],
+        Relocation { offset: 0x2BF8, addend: 0x13B0 }
+    );
+}
+
+#[test]
+fn rejects_symbolic_relocations() {
+    let base = build_test_elf(0x1000, &[(0, 0, 0x1000, 5)]);
+    let data = append_rela_section(base, &[(0x2BF0, 1, 0x16E0)]); // R_X86_64_64
+    assert_eq!(parse_elf(&data), Err(ElfError));
 }
 
 #[test]

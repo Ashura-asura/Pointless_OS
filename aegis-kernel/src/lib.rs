@@ -36,3 +36,5 @@ pub mod win_compat;
 pub mod ceiling;
 
 pub mod hardening;
+
+pub mod serial;

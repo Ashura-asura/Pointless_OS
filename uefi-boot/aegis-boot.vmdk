@@ -5,7 +5,7 @@ parentCID=ffffffff
 createType="monolithicFlat"
 
 # Extent description
-RW 32768 FLAT "aegis-boot.img" 0
+RW 131072 FLAT "reference32.img" 0
 
 # The Disk Data Base
 #DDB
@@ -17,4 +17,4 @@ ddb.geometry.sectors = "63"
 ddb.geometry.biosCylinders = "52"
 ddb.geometry.biosHeads = "16"
 ddb.geometry.biosSectors = "63"
-ddb.adapterType = "lsilogic"
+ddb.adapterType = "sata"

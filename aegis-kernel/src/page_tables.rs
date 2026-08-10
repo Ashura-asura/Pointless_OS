@@ -16,7 +16,10 @@ impl PageTable {
     }
 
     pub fn clear(&mut self) {
-        self.entries = [0; 512];
+        let p = self.entries.as_mut_ptr();
+        for i in 0..512 {
+            unsafe { core::ptr::write_volatile(p.add(i), 0u64) };
+        }
     }
 }
 

@@ -93,6 +93,23 @@ fn main() -> Status {
                 "Aegis: Kernel loaded. Jumping to 0x{:016X}...",
                 kernel.entry
             );
+
+            // Apply base-0 relocations (R_X86_64_RELATIVE). The kernel links
+            // with a link-time base of 0, so each slot just receives the
+            // addend. Without this, indirect calls through .got/.data tables
+            // would read link-time placeholder zeros.
+            uefi::println!("Aegis: Applying {} relocations...", kernel.relocations.len());
+            sprintln!("Aegis: Applying {} relocations...", kernel.relocations.len());
+            for rel in &kernel.relocations {
+                unsafe {
+                    core::ptr::write_volatile(rel.offset as *mut u64, rel.addend);
+                }
+            }
+
+            uefi::println!(
+                "Aegis: Kernel loaded. Jumping to 0x{:016X}...",
+                kernel.entry
+            );
             sprintln!(
                 "Aegis: Kernel loaded. Jumping to 0x{:016X}...",
                 kernel.entry

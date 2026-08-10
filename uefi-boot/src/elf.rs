@@ -1,6 +1,9 @@
 //! Minimal ELF64 parser for loading kernel binaries.
 //! Pure logic — no hardware dependencies — fully testable.
 
+use alloc::vec::Vec;
+extern crate alloc;
+
 /// ELF64 header magic and class
 const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
@@ -11,6 +14,11 @@ const EM_X86_64: u16 = 0x3E; // x86_64
 
 /// Program header types
 const PT_LOAD: u32 = 1;
+
+/// Relocation types (x86_64 ABI, ELF64)
+/// R_X86_64_RELATIVE = 8: B + A. With a link-time base of 0 (the convention
+/// for freestanding PIE kernels), the runtime value equals the addend alone.
+const R_X86_64_RELATIVE: u64 = 8;
 
 /// Program header flags
 /// Documented ELF p_flags values. Not referenced by the current boot path
@@ -36,12 +44,20 @@ pub struct ProgramHeader {
     pub flags: u32,
 }
 
+/// One base-0 relative relocation to apply after segments are loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Relocation {
+    pub offset: u64,
+    pub addend: u64,
+}
+
 /// Parsed ELF64 binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElfBinary {
     pub entry: u64,
     pub segments: [ProgramHeader; 16], // Max 16 loadable segments
     pub segment_count: usize,
+    pub relocations: Vec<Relocation>,
 }
 
 /// Parse an ELF64 executable binary from a byte slice.
@@ -144,9 +160,99 @@ pub fn parse_elf(data: &[u8]) -> Result<ElfBinary, ElfError> {
         return Err(ElfError); // No loadable segments
     }
 
+    let relocations = parse_relocations(data)?;
+
     Ok(ElfBinary {
         entry,
         segments,
         segment_count,
+        relocations,
     })
+}
+
+/// Parse base-0 relocations (.rela.dyn/.rela.plt section headers).
+///
+/// Freestanding PIE kernels link with a link-time base of 0; every
+/// R_X86_64_RELATIVE entry must be materialized by the loader writing
+/// (base + addend) into the slot, which is simply the addend here. Any
+/// other relocation type is rejected: symbolic relocations cannot be
+/// resolved without a dynamic loader, so the binary is not loadable.
+fn parse_relocations(data: &[u8]) -> Result<Vec<Relocation>, ElfError> {
+    // e_shoff at 0x28, e_shentsize at 0x3A, e_shnum at 0x3C, e_shstrndx at 0x3E
+    let shoff = u64::from_le_bytes(data[0x28..0x30].try_into().unwrap()) as usize;
+    let shentsize = u16::from_le_bytes([data[0x3A], data[0x3B]]) as usize;
+    let shnum = u16::from_le_bytes([data[0x3C], data[0x3D]]) as usize;
+    let shstrndx = u16::from_le_bytes([data[0x3E], data[0x3F]]) as usize;
+
+    if shoff == 0 || shnum == 0 || shentsize < 64 {
+        return Ok(Vec::new()); // No section headers: no relocations to apply
+    }
+    if shstrndx as usize >= shnum as usize {
+        return Err(ElfError);
+    }
+
+    let shstr_off = shoff + shstrndx as usize * shentsize;
+    let shstr_offset = u64::from_le_bytes(
+        data[shstr_off + 24..shstr_off + 32]
+            .try_into()
+            .map_err(|_| ElfError)?,
+    ) as usize;
+    let shstr_size = u64::from_le_bytes(
+        data[shstr_off + 32..shstr_off + 40]
+            .try_into()
+            .map_err(|_| ElfError)?,
+    ) as usize;
+    if shstr_offset + shstr_size > data.len() {
+        return Err(ElfError);
+    }
+    let shstrtab = &data[shstr_offset..shstr_offset + shstr_size];
+
+    let mut relocations = Vec::new();
+    for i in 0..shnum {
+        let sec_off = shoff + i as usize * shentsize;
+        let name_idx = u32::from_le_bytes(
+            data[sec_off..sec_off + 4]
+                .try_into()
+                .map_err(|_| ElfError)?,
+        ) as usize;
+        let sec_offset = u64::from_le_bytes(
+            data[sec_off + 24..sec_off + 32]
+                .try_into()
+                .map_err(|_| ElfError)?,
+        ) as usize;
+        let sec_size = u64::from_le_bytes(
+            data[sec_off + 32..sec_off + 40]
+                .try_into()
+                .map_err(|_| ElfError)?,
+        ) as usize;
+
+        let name_end = shstrtab[name_idx..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| name_idx + p)
+            .unwrap_or(shstrtab.len());
+        let name = &shstrtab[name_idx..name_end];
+        if name != b".rela.dyn" && name != b".rela.plt" {
+            continue;
+        }
+        if sec_offset + sec_size > data.len() || sec_size % 24 != 0 {
+            return Err(ElfError);
+        }
+
+        for j in (0..sec_size).step_by(24) {
+            let entry = sec_offset + j;
+            let r_offset = u64::from_le_bytes(data[entry..entry + 8].try_into().unwrap());
+            let r_info = u64::from_le_bytes(data[entry + 8..entry + 16].try_into().unwrap());
+            let r_type = r_info & 0xFFFF_FFFF;
+            let r_addend = i64::from_le_bytes(data[entry + 16..entry + 24].try_into().unwrap());
+            if r_type != R_X86_64_RELATIVE {
+                return Err(ElfError); // Symbolic relocs unsupported
+            }
+            relocations.push(Relocation {
+                offset: r_offset,
+                addend: r_addend as u64,
+            });
+        }
+    }
+    Ok(relocations)
 }

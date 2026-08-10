@@ -11,3 +11,16 @@ serial.log
 *.scoreboard
 *.vmsd
 nvram
+
+# QEMU/OVMF debug artifacts
+*.log
+*.fd
+qemu32-*.txt
+qemu-stderr.txt
+qemu-stdout.txt
+__pycache__/
+vgamem.bin
+*.bak2
+*.bak3
+BOOT_RESULT.txt
+PROGRESS*.txt
