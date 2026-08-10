@@ -685,3 +685,13 @@ and PT_LOAD validation with bounds checks plus System V initial stack layout
 against the context's capability scope (the AI ceiling applies to compat code). Honest
 limits: translation is model logic, not a real ring-3 syscall trap; the lightweight-VM
 execution vehicle from §5 (WSL2-lineage) is not built — it needs a hypervisor.
+
+### Machine-checked verification (executable): Windows compatibility (§5/§7 Phase 9)
+
+`nt_abi.rs` (12), `pe_loader.rs` (12), `win_compat.rs` (7): narrow NT syscall subset
+translation (NtCreateFile/Read/Write/Close/CreateSection/MapView/TerminateProcess/
+DeviceIoControl/QuerySystemTime) to capability-scoped Aegis operations; PE32+ (x64)
+validation (MZ/PE signatures, machine, entry point, image base, section flags and
+bounds); personality gating on the capability scope. Honest limits: this is the narrow
+well-behaved-subset translator only, model logic — the design doc is explicit that full
+Windows fidelity requires a licensed Windows kernel or VM (neither built).

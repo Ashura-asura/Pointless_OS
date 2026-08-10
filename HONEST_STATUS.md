@@ -2,9 +2,9 @@
 
 *Generated: 2026-08-10. Every claim below is verified by `cargo test` on the current commit.*
 
-## What exists (229 tests, 0 failures)
+## What exists (260 tests, 0 failures)
 
-Breakdown: 88 model-crate tests (aegis workspace), 131 aegis-kernel tests (Phases 1-8), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `cf19232`.
+Breakdown: 88 model-crate tests (aegis workspace), 162 aegis-kernel tests (Phases 1-9), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `3bfca8a`.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -90,6 +90,15 @@ A single-threaded, in-process capability kernel with:
 
 Honest limits for Phase 8: translation is model logic, not a real ring-3 syscall trap; the lightweight-VM execution vehicle (design doc §5, WSL2-lineage) is not built — it needs a hypervisor. The compat layer is an unprivileged capability-scoped service, matching the design doc's AI ceiling.
 
+### Real Windows compat layer (aegis-kernel)
+| Component | Tests | What it proves |
+|-----------|-------|----------------|
+| NT syscall ABI translation | 12 | Narrow NT syscall subset (NtCreateFile/Read/Write/Close/CreateSection/MapView/TerminateProcess/DeviceIoControl/QuerySystemTime...) maps to Aegis operations; unknown numbers rejected |
+| PE loader | 12 | PE32+ (x64) validation: MZ/PE signatures, machine type, entry point, image base, section table with read/write/execute flags and bounds checks |
+| Windows compat personality | 7 | Windows contexts translate and gate NT operations on the capability scope; native personalities reject NT syscalls; denials counted |
+
+Honest limits for Phase 9: the design doc is explicit that full Windows compatibility without licensing Windows or running a real Windows kernel is not a solved problem anywhere. This is the narrow well-behaved-subset translator (model logic); the VM-based full-fidelity path (needs a hypervisor + Windows) is not built.
+
 ### Tooling
 - `capability-audit`: reachable-authority CLI, `--graph` flag for capability visualization
 - `aegis-shell`: interactive demo exercising IPC, grants, anomaly monitoring
@@ -104,7 +113,7 @@ Honest limits for Phase 8: translation is model logic, not a real ring-3 syscall
 | Real process isolation on hardware (page faults, cr3 switching) | Code + 10 contract tests | Scheduler/page-table code tested in-process; lgdt/lidt/mov-cr3 ops UNTESTED on real hardware |
 | seL4-class formal proof | Not built | TLA+ model-checking (finite instance), not inductive proof |
 | Real network I/O on a NIC | Driver code + 22 tests | VirtIO-net driver exists; no real NIC traffic, no TCP/UDP yet |
-| Linux/Windows compat layers | Partially built (Phase 8 model-level) | Linux syscall/ABI translation + ELF loader + personality (32 tests); no hypervisor VM vehicle; Windows compat (Phase 9) not started |
+| Linux/Windows compat layers | Partially built (Phase 8+9 model-level) | Linux (32 tests) + Windows (31 tests) translation/loader/personality; no hypervisor VM vehicles; full Windows fidelity explicitly not solved by translation alone |
 | AI orchestration on real hardware | Model-level code only | Agent/profiler/adaptive/policy tested in-process (23 tests); no real-time integration |
 | Graphical shell on a real display | Model-level code only | Shell/window/graph/input tested in-process (24 tests); no GPU, no framebuffer, no real input |
 | Cross-machine transport for macaroon tokens | Not started | Token format exists; network transport between kernels is Phase 11 |
@@ -136,7 +145,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | 6 | AI orchestration layer | ✅ Done (real + model): Agent runtime (8 tests), usage profiler (5), adaptive grants (5), policy engine (5). Model: anomaly monitor (3 tests). Honest limits: no real AI model, profiler is histogram-based not ML, no real-time learning |
 | 7 | Native app model + shell | ✅ Done (real): Shell runtime (6 tests), window manager (7), object-relationship graph (6), input dispatcher (5). Honest limits: no GPU rendering, no real display output, no real keyboard/mouse hardware |
 | 8 | Linux compat | ✅ Done (real, model-level): syscall ABI translation (12 tests), ELF loader + initial stack (12 tests), compat personality with capability gating (8 tests). Honest limits: no hypervisor lightweight-VM vehicle (needs hypervisor); translation proven against buffers, not a live Linux userspace |
-| 9 | Windows compat | ⬜ Not started |
+| 9 | Windows compat | ✅ Done (real, model-level): NT syscall ABI translation (12 tests), PE32+ loader (12 tests), Windows compat personality with capability gating (7 tests). Honest limits: narrow well-behaved-subset translator only; full-fidelity VM path (needs hypervisor + Windows) not built; design doc says full Windows compat is unsolved by translation alone |
 | 10 | Self-healing hardening + chaos testing | ✅ Done (6 chaos tests + 4 supervision tests) |
 | 11 | Distributed extension (macaroons) | 🟡 Token crate complete (HMAC-SHA256 chain, constant-time verify, serialization); no cross-machine transport |
 | 12 | Production hardening | ⬜ Not started |
@@ -178,3 +187,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `c2d83c1` | Fix clippy -Dwarnings in aegis-kernel (Default impls, is_some_and, flatten, safety docs) |
 | `91c8455` | CI: kernel + bootloader job — fmt, clippy, tests, release target builds |
 | `cf19232` | Phase 8: Linux compat — syscall ABI translation (12 tests), ELF loader + initial stack (12 tests), compat personality with capability gating (8 tests) |
+| `3bfca8a` | Phase 9: Windows compat — NT syscall ABI translation (12 tests), PE32+ loader (12 tests), Windows compat personality with capability gating (7 tests) |
