@@ -101,8 +101,15 @@ pub fn parse_elf(data: &[u8]) -> Result<LoadedProgram, &'static str> {
     let mut needs_interpreter = false;
 
     for i in 0..e_phnum as u64 {
-        let ph = (e_phoff + i * e_phentsize as u64) as usize;
-        if ph + PHDR_SIZE > data.len() {
+        let stride = e_phentsize as u64;
+        let ph = e_phoff
+            .checked_add(
+                i.checked_mul(stride)
+                    .ok_or("program header offset overflow")?,
+            )
+            .ok_or("program header offset overflow")?;
+        let ph = usize::try_from(ph).map_err(|_| "program header offset overflow")?;
+        if ph.checked_add(PHDR_SIZE).is_none_or(|end| end > data.len()) {
             return Err("program header out of bounds");
         }
         let p_type = u32_at(data, ph);

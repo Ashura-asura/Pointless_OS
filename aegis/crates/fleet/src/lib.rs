@@ -11,7 +11,9 @@
 //! This crate is the transport/envelope layer over the `macaroon` token
 //! format: node identity, an explicit locality flag, a wire-format envelope
 //! for `RemoteCapability`, peer trust registration, and verification that
-//! checks chain integrity, issuer trust, and expiry.
+//! checks chain integrity, issuer trust, **recipient binding** (the intended
+//! recipient is cryptographically bound into the HMAC chain at send time, so
+//! a holder cannot relay a token to a third party), and expiry.
 //!
 //! Honest limits: this is a two-node in-process model of a fleet (no sockets,
 //! no real network, no consensus/split-brain handling — the design doc's
@@ -47,11 +49,14 @@ pub enum Locality {
 }
 
 /// A capability with its transport envelope: the token chain, the issuing
-/// node, and the locality from the *holding* node's point of view.
+/// node, the *intended recipient* (bound into the HMAC chain at send time so
+/// a holder cannot relay the token to a third party), and the locality from
+/// the *holding* node's point of view.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteCapability {
     pub chain: TokenChain,
     pub issuer: NodeId,
+    pub recipient: NodeId,
     pub locality: Locality,
 }
 
@@ -65,6 +70,7 @@ pub enum FleetError {
     Expired,
     Serialization,
     BadEnvelope,
+    NotRecipient,
 }
 
 impl From<TokenError> for FleetError {
@@ -80,6 +86,35 @@ impl From<TokenError> for FleetError {
 }
 
 const MAX_PEERS: usize = 16;
+
+/// Caveat prefix used to cryptographically bind the intended recipient into
+/// the token chain. Payload: `RECIPIENT_CAVEAT_PREFIX || node_id(32)`.
+const RECIPIENT_CAVEAT_PREFIX: &[u8] = b"recipient:";
+
+/// Build the recipient caveat for `node` (prefix + 32-byte id).
+fn recipient_caveat(node: NodeId) -> Caveat {
+    let mut payload = Vec::with_capacity(RECIPIENT_CAVEAT_PREFIX.len() + 32);
+    payload.extend_from_slice(RECIPIENT_CAVEAT_PREFIX);
+    payload.extend_from_slice(&node.0);
+    Caveat::Custom(payload)
+}
+
+/// Extract the HMAC-bound recipient from a chain, if a recipient caveat is
+/// present. A token with no recipient caveat is a locally-issued token.
+fn chain_recipient(token: &macaroon::CapabilityToken) -> Option<NodeId> {
+    for c in &token.caveats {
+        if let Caveat::Custom(data) = c {
+            if data.len() == RECIPIENT_CAVEAT_PREFIX.len() + 32
+                && data.starts_with(RECIPIENT_CAVEAT_PREFIX)
+            {
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&data[RECIPIENT_CAVEAT_PREFIX.len()..]);
+                return Some(NodeId(id));
+            }
+        }
+    }
+    None
+}
 
 /// One node's view of the fleet: its identity, its signing key, the set of
 /// peers it trusts (peer id -> shared secret for HMAC verification), and a
@@ -163,32 +198,55 @@ impl Fleet {
 
     /// Wrap a chain for presentation to a trusted peer. The envelope's
     /// locality is Remote(issuer): from the *holding* node's point of view the
-    /// capability is remote and originated at this (issuing) node.
+    /// capability is remote and originated at this (issuing) node. The
+    /// recipient is bound into the HMAC chain at this point: the peer named
+    /// here is the only node that can verify it.
     pub fn send_to(&self, chain: TokenChain, peer: NodeId) -> Result<RemoteCapability, FleetError> {
         if !self.has_peer(peer) {
             return Err(FleetError::UntrustedPeer);
         }
+        let chain = macaroon::bind_caveat(&self.signing_key, &chain, recipient_caveat(peer));
         Ok(RemoteCapability {
             chain,
             issuer: self.node_id,
+            recipient: peer,
             locality: Locality::Remote(self.node_id),
         })
     }
 
-    /// A chain minted by this node and held locally.
+    /// A chain minted by this node and held locally. The recipient is self.
     pub fn hold_local(&self, chain: TokenChain) -> RemoteCapability {
         RemoteCapability {
             chain,
             issuer: self.node_id,
+            recipient: self.node_id,
             locality: Locality::Local,
         }
     }
 
     /// Verify a capability the holder received: chain integrity under the
-    /// issuer's key, issuer trust, and expiry.
+    /// issuer's key, issuer trust, **recipient binding** (the HMAC-bound
+    /// recipient caveat must name this node), and expiry.
     pub fn verify(&self, cap: &RemoteCapability) -> Result<(), FleetError> {
         let key = self.issuer_key(cap.issuer, cap.locality)?;
         macaroon::verify(&key, &cap.chain)?;
+        // Envelope-level check: the intended recipient must be this node.
+        if cap.recipient != self.node_id {
+            return Err(FleetError::NotRecipient);
+        }
+        // Cryptographic check: the chain's HMAC-bound recipient must also be
+        // this node. A holder cannot re-sign (it lacks the issuer key), so a
+        // token bound for B can never be made to name C.
+        match chain_recipient(&cap.chain.token) {
+            Some(rcpt) if rcpt == self.node_id => {}
+            Some(_) => return Err(FleetError::NotRecipient),
+            None => {
+                // Locally-issued tokens carry no recipient caveat.
+                if cap.issuer != self.node_id {
+                    return Err(FleetError::NotRecipient);
+                }
+            }
+        }
         if let Some(exp) = cap.chain.token.expiry {
             if self.now > exp {
                 return Err(FleetError::Expired);
@@ -199,6 +257,7 @@ impl Fleet {
 
     /// Narrow (attenuate) a held capability. Uses the issuer key to re-sign
     /// (documented model limitation; real macaroons allow keyless caveats).
+    /// The recipient binding is preserved.
     pub fn narrow(
         &self,
         cap: &RemoteCapability,
@@ -209,6 +268,7 @@ impl Fleet {
         Ok(RemoteCapability {
             chain,
             issuer: cap.issuer,
+            recipient: cap.recipient,
             locality: cap.locality,
         })
     }
@@ -237,10 +297,12 @@ impl Fleet {
     }
 
     /// Wire format for a RemoteCapability:
-    /// issuer(32) | locality_flag(1) | remote_id(32, only if Remote) | chain bytes.
+    /// issuer(32) | recipient(32) | locality_flag(1) | remote_id(32, only if
+    /// Remote) | chain bytes.
     pub fn serialize(cap: &RemoteCapability) -> Result<Vec<u8>, FleetError> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&cap.issuer.0);
+        buf.extend_from_slice(&cap.recipient.0);
         match cap.locality {
             Locality::Local => buf.push(0),
             Locality::Remote(id) => {
@@ -253,32 +315,35 @@ impl Fleet {
     }
 
     pub fn deserialize(data: &[u8]) -> Result<RemoteCapability, FleetError> {
-        if data.len() < 33 {
+        if data.len() < 65 {
             return Err(FleetError::BadEnvelope);
         }
         let mut issuer = [0u8; 32];
         issuer.copy_from_slice(&data[0..32]);
-        let locality = match data[32] {
+        let mut recipient = [0u8; 32];
+        recipient.copy_from_slice(&data[32..64]);
+        let locality = match data[64] {
             0 => Locality::Local,
             1 => {
-                if data.len() < 65 {
+                if data.len() < 97 {
                     return Err(FleetError::BadEnvelope);
                 }
                 let mut id = [0u8; 32];
-                id.copy_from_slice(&data[33..65]);
+                id.copy_from_slice(&data[65..97]);
                 Locality::Remote(NodeId(id))
             }
             _ => return Err(FleetError::BadEnvelope),
         };
         let chain_off = if matches!(locality, Locality::Local) {
-            33
-        } else {
             65
+        } else {
+            97
         };
         let chain = macaroon::deserialize_chain(&data[chain_off..])?;
         Ok(RemoteCapability {
             chain,
             issuer: NodeId(issuer),
+            recipient: NodeId(recipient),
             locality,
         })
     }
@@ -360,15 +425,13 @@ mod tests {
     #[test]
     fn expired_token_rejected() {
         let (id_a, key_a) = node_a();
-        let fleet_a = Fleet::new(id_a, key_a);
-        let chain = fleet_a.issue(1, ObjectKind::MemRegion, read_write(), Some(100));
-        let mut fleet_holder = Fleet::new(node_b().0, node_b().1);
+        let (id_b, key_b) = node_b();
+        let mut fleet_a = Fleet::new(id_a, key_a);
+        let mut fleet_holder = Fleet::new(id_b, key_b);
+        fleet_a.register_peer(id_b, key_b).unwrap();
         fleet_holder.register_peer(id_a, key_a).unwrap();
-        let cap = RemoteCapability {
-            chain,
-            issuer: id_a,
-            locality: Locality::Remote(id_a),
-        };
+        let chain = fleet_a.issue(1, ObjectKind::MemRegion, read_write(), Some(100));
+        let cap = fleet_a.send_to(chain, id_b).unwrap();
         fleet_holder.advance_time(50);
         assert_eq!(fleet_holder.verify(&cap), Ok(()));
         fleet_holder.advance_time(101);
@@ -378,16 +441,14 @@ mod tests {
     #[test]
     fn expiry_clamp_caveat_binds_before_expiry_check() {
         let (id_a, key_a) = node_a();
-        let fleet_a = Fleet::new(id_a, key_a);
-        let chain = fleet_a.issue(1, ObjectKind::MemRegion, read_write(), Some(1000));
-        let mut holder = Fleet::new(node_b().0, node_b().1);
+        let (id_b, key_b) = node_b();
+        let mut fleet_a = Fleet::new(id_a, key_a);
+        let mut holder = Fleet::new(id_b, key_b);
+        fleet_a.register_peer(id_b, key_b).unwrap();
         holder.register_peer(id_a, key_a).unwrap();
 
-        let cap = RemoteCapability {
-            chain,
-            issuer: id_a,
-            locality: Locality::Remote(id_a),
-        };
+        let chain = fleet_a.issue(1, ObjectKind::MemRegion, read_write(), Some(1000));
+        let cap = fleet_a.send_to(chain, id_b).unwrap();
         // Narrow expiry to 10, then check at t=11
         let narrowed = holder.narrow(&cap, Caveat::ExpiryClamp(10)).unwrap();
         holder.advance_time(11);
@@ -397,19 +458,17 @@ mod tests {
     #[test]
     fn rights_narrowing_reduces_authority() {
         let (id_a, key_a) = node_a();
-        let fleet_a = Fleet::new(id_a, key_a);
+        let (id_b, key_b) = node_b();
+        let mut fleet_a = Fleet::new(id_a, key_a);
+        fleet_a.register_peer(id_b, key_b).unwrap();
         let chain = fleet_a.issue(1, ObjectKind::MemRegion, read_write(), None);
-        let cap = RemoteCapability {
-            chain,
-            issuer: id_a,
-            locality: Locality::Remote(id_a),
-        };
-        // Note: narrowing requires the issuer key (documented model limit),
-        // so use fleet_a itself as the attenuating holder.
+        let cap = fleet_a.send_to(chain, id_b).unwrap();
+        // Narrowing uses the issuer key; A holds it.
         let mask = Rights::READ.bits();
         let narrowed = fleet_a.narrow(&cap, Caveat::RightsNarrow(mask)).unwrap();
         assert_eq!(narrowed.chain.token.rights, Rights::READ.bits());
         assert_eq!(narrowed.chain.token.rights & Rights::WRITE.bits(), 0);
+        assert_eq!(narrowed.recipient, id_b);
     }
 
     #[test]
@@ -421,6 +480,7 @@ mod tests {
         let bytes = Fleet::serialize(&cap).unwrap();
         let decoded = Fleet::deserialize(&bytes).unwrap();
         assert_eq!(decoded.issuer, id_a);
+        assert_eq!(decoded.recipient, id_a);
         assert_eq!(decoded.locality, Locality::Local);
         assert_eq!(decoded.chain.token.object_id, 9);
     }
@@ -439,6 +499,7 @@ mod tests {
         let bytes = Fleet::serialize(&cap).unwrap();
         let decoded = Fleet::deserialize(&bytes).unwrap();
         assert_eq!(decoded.locality, Locality::Remote(id_a));
+        assert_eq!(decoded.recipient, id_b);
         assert_eq!(fleet_b.verify(&decoded), Ok(()));
     }
 
@@ -446,8 +507,57 @@ mod tests {
     fn envelope_rejects_bad_headers() {
         assert_eq!(Fleet::deserialize(&[0u8; 10]), Err(FleetError::BadEnvelope));
         let mut bad = vec![0u8; 65];
-        bad[32] = 2; // invalid locality flag
+        bad[64] = 2; // invalid locality flag
         assert_eq!(Fleet::deserialize(&bad), Err(FleetError::BadEnvelope));
+    }
+
+    #[test]
+    fn relayed_token_rejected_by_unintended_recipient() {
+        // Regression for the audit finding: A sends a capability specifically
+        // to B; B relays the identical token bytes to C, who independently
+        // trusts A as an issuer. Before the fix, C could verify the relayed
+        // token because nothing bound it to B. Now the recipient is bound into
+        // the HMAC chain at send time and enforced at verify time.
+        let (id_a, key_a) = node_a();
+        let (id_b, key_b) = node_b();
+        let (id_c, key_c) = node_c();
+        let mut fleet_a = Fleet::new(id_a, key_a);
+        let mut fleet_b = Fleet::new(id_b, key_b);
+        let mut fleet_c = Fleet::new(id_c, key_c);
+        fleet_a.register_peer(id_b, key_b).unwrap();
+        fleet_b.register_peer(id_a, key_a).unwrap();
+        fleet_c.register_peer(id_a, key_a).unwrap();
+
+        let chain = fleet_a.issue(7, ObjectKind::Task, Rights::READ, None);
+        let cap = fleet_a.send_to(chain, id_b).unwrap();
+
+        // First hop: B is the intended recipient and verifies.
+        assert_eq!(fleet_b.verify(&cap), Ok(()));
+
+        // Relay: B presents the identical bytes to C.
+        let bytes = Fleet::serialize(&cap).unwrap();
+        let relayed = Fleet::deserialize(&bytes).unwrap();
+        assert_eq!(fleet_c.verify(&relayed), Err(FleetError::NotRecipient));
+    }
+
+    #[test]
+    fn forged_recipient_field_still_rejected() {
+        // B tampers with the envelope's recipient field to name C; the chain
+        // itself is still HMAC-bound for B, so verification must fail.
+        let (id_a, key_a) = node_a();
+        let (id_b, key_b) = node_b();
+        let (id_c, key_c) = node_c();
+        let mut fleet_a = Fleet::new(id_a, key_a);
+        let mut fleet_b = Fleet::new(id_b, key_b);
+        let mut fleet_c = Fleet::new(id_c, key_c);
+        fleet_a.register_peer(id_b, key_b).unwrap();
+        fleet_b.register_peer(id_a, key_a).unwrap();
+        fleet_c.register_peer(id_a, key_a).unwrap();
+
+        let chain = fleet_a.issue(7, ObjectKind::Task, Rights::READ, None);
+        let mut forged = fleet_a.send_to(chain, id_b).unwrap();
+        forged.recipient = id_c;
+        assert_eq!(fleet_c.verify(&forged), Err(FleetError::NotRecipient));
     }
 
     #[test]
@@ -495,6 +605,7 @@ mod tests {
         let cap = RemoteCapability {
             chain,
             issuer: id_a,
+            recipient: id_b,
             locality: Locality::Remote(id_a),
         };
         assert_eq!(fleet_b.verify(&cap), Err(FleetError::UntrustedPeer));

@@ -51,6 +51,44 @@ fn elf_loader_rejects_absurd_segment_counts() {
 }
 
 #[test]
+fn elf_loader_rejects_overflowing_phoff_without_panicking() {
+    // e_phoff = u64::MAX with many program headers: the offset arithmetic
+    // must fail with checked overflow instead of wrapping or panicking.
+    let mut data = vec![0u8; 64 + 56];
+    data[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    data[4] = 2;
+    data[5] = 1;
+    data[16..18].copy_from_slice(&2u16.to_le_bytes());
+    data[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+    data[24..32].copy_from_slice(&0x1000u64.to_le_bytes());
+    data[32..40].copy_from_slice(&u64::MAX.to_le_bytes()); // e_phoff
+    data[54..56].copy_from_slice(&(56u16).to_le_bytes()); // phentsize
+    data[56..58].copy_from_slice(&4u16.to_le_bytes()); // phnum
+    let res = no_panic(|| crate::elf_loader::parse_elf(&data)).unwrap();
+    assert!(
+        res.is_err(),
+        "overflowing e_phoff must be rejected, not wrapped"
+    );
+}
+
+#[test]
+fn elf_loader_rejects_large_phoff_past_buffer() {
+    // e_phoff far beyond the buffer but not overflowing: bounds check catches it.
+    let mut data = vec![0u8; 64 + 56];
+    data[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    data[4] = 2;
+    data[5] = 1;
+    data[16..18].copy_from_slice(&2u16.to_le_bytes());
+    data[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+    data[24..32].copy_from_slice(&0x1000u64.to_le_bytes());
+    data[32..40].copy_from_slice(&0x0000_FFFF_0000_0000u64.to_le_bytes()); // e_phoff
+    data[54..56].copy_from_slice(&56u16.to_le_bytes());
+    data[56..58].copy_from_slice(&1u16.to_le_bytes());
+    let res = no_panic(|| crate::elf_loader::parse_elf(&data)).unwrap();
+    assert!(res.is_err(), "out-of-buffer e_phoff must be rejected");
+}
+
+#[test]
 fn pe_loader_survives_truncated_and_garbage_inputs() {
     for len in [0usize, 1, 63, 64, 128, 200] {
         let data = vec![0xAAu8; len];
@@ -79,6 +117,35 @@ fn pe_loader_rejects_overflowing_section_count() {
     data[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
     data[0x86..0x88].copy_from_slice(&0xFFFFu16.to_le_bytes());
     data[0x98..0x9A].copy_from_slice(&0x20Bu16.to_le_bytes());
+    let res = no_panic(|| crate::pe_loader::parse_pe(&data)).unwrap();
+    assert!(res.is_err());
+}
+
+#[test]
+fn pe_loader_rejects_wrapped_section_table_offset() {
+    // Valid PE32+ but with a huge optional-header size so the section-table
+    // offset arithmetic must be rejected cleanly, never wrap or panic.
+    let mut data = vec![0u8; 512];
+    data[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes());
+    data[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    data[0x80..0x84].copy_from_slice(&0x4550u32.to_le_bytes());
+    data[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+    data[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // one section
+    data[0x94..0x96].copy_from_slice(&0xFFFFu16.to_le_bytes()); // huge opt size
+    data[0x98..0x9A].copy_from_slice(&0x20Bu16.to_le_bytes());
+    let res = no_panic(|| crate::pe_loader::parse_pe(&data)).unwrap();
+    assert!(
+        res.is_err(),
+        "wrapping section-table offset must be rejected"
+    );
+}
+
+#[test]
+fn pe_loader_rejects_pe_offset_past_buffer() {
+    // MZ valid, but e_lfanew points just past the buffer end.
+    let mut data = vec![0u8; 100];
+    data[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes());
+    data[0x3C..0x40].copy_from_slice(&(101u32).to_le_bytes());
     let res = no_panic(|| crate::pe_loader::parse_pe(&data)).unwrap();
     assert!(res.is_err());
 }

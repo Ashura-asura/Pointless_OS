@@ -69,7 +69,7 @@ pub fn parse_pe(data: &[u8]) -> Result<PeImage, &'static str> {
         return Err("missing MZ signature");
     }
     let pe_off = u32_at(data, 0x3C) as usize;
-    if pe_off + 24 > data.len() {
+    if pe_off.checked_add(24).is_none_or(|end| end > data.len()) {
         return Err("PE header out of bounds");
     }
     if u32_at(data, pe_off) != PE_MAGIC {
@@ -84,8 +84,10 @@ pub fn parse_pe(data: &[u8]) -> Result<PeImage, &'static str> {
         return Err("invalid section count");
     }
     let opt_size = u16_at(data, pe_off + 20) as usize;
-    let opt_off = pe_off + 24;
-    if opt_off + 64 > data.len() {
+    let opt_off = pe_off
+        .checked_add(24)
+        .ok_or("optional header offset overflow")?;
+    if opt_off.checked_add(64).is_none_or(|end| end > data.len()) {
         return Err("optional header out of bounds");
     }
     let opt_magic = u16_at(data, opt_off);
@@ -95,8 +97,16 @@ pub fn parse_pe(data: &[u8]) -> Result<PeImage, &'static str> {
     let entry = u32_at(data, opt_off + 16) as u64;
     let image_base = u64_at(data, opt_off + 24);
 
-    let section_table = opt_off + opt_size;
-    if section_table + num_sections * 40 > data.len() {
+    let section_table = opt_off
+        .checked_add(opt_size)
+        .ok_or("section table offset overflow")?;
+    let section_bytes = num_sections
+        .checked_mul(40)
+        .ok_or("section table offset overflow")?;
+    if section_table
+        .checked_add(section_bytes)
+        .is_none_or(|end| end > data.len())
+    {
         return Err("section table out of bounds");
     }
     let mut sections = [PeSection {
@@ -107,7 +117,9 @@ pub fn parse_pe(data: &[u8]) -> Result<PeImage, &'static str> {
         characteristics: 0,
     }; MAX_SECTIONS];
     for (i, section) in sections.iter_mut().enumerate().take(num_sections) {
-        let s = section_table + i * 40;
+        let s = section_table
+            .checked_add(i * 40)
+            .ok_or("section entry offset overflow")?;
         let mut name = [0u8; 8];
         name.copy_from_slice(&data[s..s + 8]);
         *section = PeSection {
