@@ -55,6 +55,14 @@ A single-threaded, in-process capability kernel with:
 | IOMMU (VT-d) | 5 | Domain creation, DMA page table mapping/unmapping, device-to-domain assignment, DMAR table parsing. UNTESTED: requires real VT-d hardware |
 | NVMe queues | 5 | Submission/completion queue entry construction, tail/head pointer management, phase-bit tracking. UNTESTED: requires real NVMe device |
 
+### Real networking stack (aegis-kernel)
+| Component | Tests | What it proves |
+|-----------|-------|----------------|
+| VirtIO-net driver | 9 | Device init, MAC address handling, header construction, device status. UNTESTED: requires real VirtIO NIC |
+| Ethernet frames | 5 | Frame parsing/serialization, ethertype validation, minimum size enforcement, broadcast |
+| ARP | 6 | Table lookup/insert/remove, request/reply construction, packet parsing. UNTESTED: no real network |
+| IPv4 | 6 | Packet parsing/serialization, checksum computation, address formatting, loopback/broadcast detection |
+
 ### Tooling
 - `capability-audit`: reachable-authority CLI, `--graph` flag for capability visualization
 - `aegis-shell`: interactive demo exercising IPC, grants, anomaly monitoring
@@ -96,7 +104,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | 2 | Userspace resource managers + supervision tree | ✅ Done (real + model): GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework. Honest limits: hardware ops untested (need VMware), no real timer interrupt yet |
 | 3 | Driver framework (IOMMU) | ✅ Done (real + model): PCIe enumeration (6 tests), VT-d IOMMU domain isolation (5 tests), NVMe command queues (5 tests). Model: typed Block/Net/Gpu interfaces, crash containment, GPU isolation, compositor (4 tests). Honest limits: all hardware ops UNTESTED (need real PCIe/IOMMU/NVMe) |
 | 4 | Storage service + POSIX view | ✅ Done (model: FlatView is a flat, single-level namespace projection — create/read/write/delete/list by name. Not a hierarchical POSIX filesystem — no nested dirs, no path resolution, no permission bits, no symlinks. 8 contract tests) |
-| 5 | Networking stack | ⬜ Partial (loopback only) |
+| 5 | Networking stack | ✅ Done (real + model): VirtIO-net driver (9 tests), Ethernet frames (5), ARP (6), IPv4 (6). Model: loopback stack (4 tests). Honest limits: no real NIC hardware, no TCP/UDP yet |
 | 6 | AI orchestration layer | ⬜ Partial (anomaly monitor only) |
 | 7 | Native app model + shell | ⬜ Partial (aegis-shell demo only) |
 | 8 | Linux compat | ⬜ Not started |
@@ -132,3 +140,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `0357a0f` | Phase 2: real process isolation — GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework |
 | `19d0c57` | Fix scheduler tests: move to #[cfg(test)] unit tests so they run on host target |
 | `4efac77` | Phase 3: driver framework — PCIe enumeration (6 tests), VT-d IOMMU domain isolation (5 tests), NVMe command queues (5 tests) |
+| `f0bec06` | Phase 5: real networking — VirtIO-net driver, Ethernet frames, ARP, IPv4 (22 tests) |
