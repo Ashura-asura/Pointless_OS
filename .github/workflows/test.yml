@@ -78,6 +78,9 @@ jobs:
           cargo test
         working-directory: aegis-kernel
 
+      - name: Install kernel target
+        run: rustup target add x86_64-unknown-none
+
       - name: Kernel release build (x86_64-unknown-none)
         run: cargo build --release --target x86_64-unknown-none --features kernel
         working-directory: aegis-kernel
@@ -97,6 +100,9 @@ jobs:
           rm -f Cargo.lock
           cargo test
         working-directory: uefi-boot
+
+      - name: Install bootloader target
+        run: rustup target add x86_64-unknown-uefi
 
       - name: Bootloader release build (x86_64-unknown-uefi)
         run: cargo build --release --target x86_64-unknown-uefi --features uefi
