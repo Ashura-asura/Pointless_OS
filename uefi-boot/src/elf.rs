@@ -6,6 +6,7 @@ const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1; // Little-endian
 const ET_EXEC: u16 = 2; // Executable file
+const ET_DYN: u16 = 3; // Shared object / PIE (freestanding kernels link as PIE)
 const EM_X86_64: u16 = 0x3E; // x86_64
 
 /// Program header types
@@ -49,7 +50,8 @@ pub struct ElfBinary {
 /// - Magic bytes (7F 45 4C 46)
 /// - Class (ELFCLASS64)
 /// - Endianness (little-endian)
-/// - Type (ET_EXEC)
+/// - Type (ET_EXEC or ET_DYN; PIE kernels link with link-time base 0, so
+///   segments load at their p_vaddr directly)
 /// - Machine (EM_X86_64)
 /// - At least one PT_LOAD segment
 /// - No more than 16 loadable segments
@@ -74,7 +76,7 @@ pub fn parse_elf(data: &[u8]) -> Result<ElfBinary, ElfError> {
 
     // e_type at offset 16 (2 bytes LE)
     let e_type = u16::from_le_bytes([data[16], data[17]]);
-    if e_type != ET_EXEC {
+    if e_type != ET_EXEC && e_type != ET_DYN {
         return Err(ElfError);
     }
 

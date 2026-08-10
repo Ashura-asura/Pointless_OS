@@ -151,7 +151,8 @@ def build_gpt(fs):
     struct.pack_into("<I", gpt, 80, 128)  # entry count
     struct.pack_into("<I", gpt, 84, 128)  # entry size
     struct.pack_into("<I", gpt, 88, part_crc)
-    crc = zlib.crc32(gpt) & 0xFFFFFFFF
+    hdr_len = min(struct.unpack_from("<I", gpt, 12)[0], BYTES_PER_SECTOR)
+    crc = zlib.crc32(bytes(gpt[:hdr_len])) & 0xFFFFFFFF
     struct.pack_into("<I", gpt, 16, crc)
     disk[BYTES_PER_SECTOR:2 * BYTES_PER_SECTOR] = gpt
 
@@ -164,7 +165,7 @@ def build_gpt(fs):
     struct.pack_into("<I", bgpt, 16, 0)
     struct.pack_into("<I", bgpt, 88, part_crc)
     struct.pack_into("<Q", bgpt, 72, last_lba - 32)  # backup's own partition entries LBA
-    crc = zlib.crc32(bgpt) & 0xFFFFFFFF
+    crc = zlib.crc32(bytes(bgpt[:hdr_len])) & 0xFFFFFFFF
     struct.pack_into("<I", bgpt, 16, crc)
     disk[last_lba * BYTES_PER_SECTOR:] = bgpt
 
@@ -188,14 +189,15 @@ def verify(disk, efi_data):
         errors.append("GPT partition-array CRC mismatch")
     gpt_copy = bytearray(gpt)
     struct.pack_into("<I", gpt_copy, 16, 0)
-    if struct.unpack_from("<I", gpt, 16)[0] != (zlib.crc32(bytes(gpt_copy)) & 0xFFFFFFFF):
+    hdr_len = min(struct.unpack_from("<I", gpt, 12)[0], BYTES_PER_SECTOR)
+    if struct.unpack_from("<I", gpt, 16)[0] != (zlib.crc32(bytes(gpt_copy[:hdr_len])) & 0xFFFFFFFF):
         errors.append("GPT header CRC mismatch")
     # Backup GPT header CRC
     last_lba = TOTAL_SECTORS - 1
     bgpt = disk[last_lba * BYTES_PER_SECTOR:(last_lba + 1) * BYTES_PER_SECTOR]
     bgpt_copy = bytearray(bgpt)
     struct.pack_into("<I", bgpt_copy, 16, 0)
-    if struct.unpack_from("<I", bgpt, 16)[0] != (zlib.crc32(bytes(bgpt_copy)) & 0xFFFFFFFF):
+    if struct.unpack_from("<I", bgpt, 16)[0] != (zlib.crc32(bytes(bgpt_copy[:hdr_len])) & 0xFFFFFFFF):
         errors.append("backup GPT header CRC mismatch")
     if struct.unpack_from("<I", disk, 458)[0] != last_lba:
         errors.append("protective MBR size mismatch")

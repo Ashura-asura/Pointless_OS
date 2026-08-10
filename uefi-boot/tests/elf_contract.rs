@@ -16,6 +16,7 @@ const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3; // Shared object / PIE (freestanding kernels link as PIE)
 const EM_X86_64: u16 = 0x3E;
 const PT_LOAD: u32 = 1;
 
@@ -52,7 +53,7 @@ fn parse_elf(data: &[u8]) -> Result<ElfBinary, ElfError> {
         return Err(ElfError);
     }
     let e_type = u16::from_le_bytes([data[16], data[17]]);
-    if e_type != ET_EXEC {
+    if e_type != ET_EXEC && e_type != ET_DYN {
         return Err(ElfError);
     }
     let e_machine = u16::from_le_bytes([data[18], data[19]]);
@@ -168,9 +169,24 @@ fn rejects_wrong_endianness() {
 }
 
 #[test]
+fn accepts_pie_type() {
+    let mut data = build_test_elf(0x1000, &[(0, 0, 0x1000, 5)]);
+    data[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN (PIE kernel)
+    assert_eq!(parse_elf(&data), Ok(ElfBinary {
+        entry: 0x1000,
+        segments: {
+            let mut segs = [ProgramHeader { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 16];
+            segs[0] = ProgramHeader { vaddr: 0, offset: 0, filesz: 0x1000, memsz: 0x1000, flags: 5 };
+            segs
+        },
+        segment_count: 1,
+    }));
+}
+
+#[test]
 fn rejects_non_executable_type() {
     let mut data = build_test_elf(0x1000, &[(0, 0, 0x1000, 5)]);
-    data[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN instead of ET_EXEC
+    data[16..18].copy_from_slice(&4u16.to_le_bytes()); // ET_CORE instead of ET_EXEC/ET_DYN
     assert_eq!(parse_elf(&data), Err(ElfError));
 }
 

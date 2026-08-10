@@ -15,6 +15,7 @@ log = "0.4"
 name = "uefi-boot"
 path = "src/main.rs"
 required-features = ["uefi"]
+test = false
 
 [dev-dependencies]
 
