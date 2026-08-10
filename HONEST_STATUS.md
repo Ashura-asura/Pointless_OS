@@ -68,8 +68,8 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | 0 | Architecture research + capability model | ✅ Done |
 | 1 | Boot + minimal kernel | ✅ Done (model) |
 | 2 | Userspace resource managers + supervision tree | ✅ Done (model) |
-| 3 | Driver framework (IOMMU) | ⬜ Not started |
-| 4 | Storage service + POSIX view | ✅ Done (FlatView projection: create/read/write/delete/list, tested) |
+| 3 | Driver framework (IOMMU) | ✅ Done (model: typed Block/Net/Gpu interfaces, capability scoping, crash containment, GPU isolation, compositor; 4 contract tests. Real IOMMU is hardware, out of scope) |
+| 4 | Storage service + POSIX view | ✅ Done (model: FlatView is a flat, single-level namespace projection — create/read/write/delete/list by name. Not a hierarchical POSIX filesystem — no nested dirs, no path resolution, no permission bits, no symlinks. 8 contract tests) |
 | 5 | Networking stack | ⬜ Partial (loopback only) |
 | 6 | AI orchestration layer | ⬜ Partial (anomaly monitor only) |
 | 7 | Native app model + shell | ⬜ Partial (aegis-shell demo only) |
@@ -94,4 +94,8 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `25ef050` | Fix install_contract.rs 3-tuple collect + GROUND_RULES.md |
 | `7e30671` | Stricter ground rules + constant-time HMAC |
 | `d36d893` | Chaos tests for supervision tree |
+| `e265e90` | Update HONEST_STATUS.md and README: 87 tests verified from clean lockfile |
 | `22c9c0e` | CI + delivery overhang + hardened HMAC |
+| `22e75f3` | Fix HONEST_STATUS.md and README: POSIX view complete, chaos tests done, phase status accurate |
+| `687f975` | Fix CI: cargo fmt, 0 clippy warnings under -Dwarnings, all 87 tests pass from clean lockfile |
+| `1021c3d` | Pin Rust toolchain to 1.97.1 in CI to match local rustfmt version |
