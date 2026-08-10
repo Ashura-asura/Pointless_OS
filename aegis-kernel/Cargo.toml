@@ -3,7 +3,15 @@ name = "aegis-kernel"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+kernel = []
+
 [dependencies]
+
+[[bin]]
+name = "aegis-kernel"
+path = "src/main.rs"
+required-features = ["kernel"]
 
 [profile.dev]
 panic = "abort"

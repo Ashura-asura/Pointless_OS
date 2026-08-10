@@ -4,7 +4,6 @@
 use core::panic::PanicInfo;
 
 /// VGA text mode buffer at physical address 0xB8000.
-/// Each character is (u8 char, u8 attr) = 2 bytes. 80x25 = 4000 bytes.
 const VGA_BUFFER: *mut u8 = 0xB8000 as *mut u8;
 
 unsafe fn vga_print(msg: &str, row: usize, col: usize, attr: u8) {
@@ -18,14 +17,17 @@ unsafe fn vga_print(msg: &str, row: usize, col: usize, attr: u8) {
 #[no_mangle]
 pub extern "sysv64" fn _start() -> ! {
     unsafe {
-        // Clear screen (fill with spaces, white on black = 0x07)
         for i in 0..(80 * 25 * 2) {
             core::ptr::write_volatile(VGA_BUFFER.add(i), if i % 2 == 0 { b' ' } else { 0x07 });
         }
-        // Print message
-        vga_print("Aegis kernel running", 0, 0, 0x0A); // Green on black
-        vga_print("Phase 1: real hardware boot", 1, 0, 0x07); // White on black
+        vga_print("Aegis kernel running", 0, 0, 0x0A);
+        vga_print("Phase 2: process isolation", 1, 0, 0x07);
     }
+
+    unsafe {
+        aegis_kernel::page_tables::init_kernel_tables();
+    }
+
     loop {
         unsafe { core::arch::asm!("hlt") }
     }
