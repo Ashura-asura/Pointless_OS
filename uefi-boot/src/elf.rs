@@ -12,8 +12,14 @@ const EM_X86_64: u16 = 0x3E; // x86_64
 const PT_LOAD: u32 = 1;
 
 /// Program header flags
+/// Documented ELF p_flags values. Not referenced by the current boot path
+/// (the kernel loader has not yet mapped segment permissions); reserved for
+/// page-permission mapping when per-segment protection is enforced.
+#[allow(dead_code)]
 const PF_X: u32 = 1; // Execute
+#[allow(dead_code)]
 const PF_W: u32 = 2; // Write
+#[allow(dead_code)]
 const PF_R: u32 = 4; // Read
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
