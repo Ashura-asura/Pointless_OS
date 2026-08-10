@@ -15,6 +15,7 @@ members = [
     "crates/aegis-shell",
     "crates/macaroon",
     "crates/fleet",
+    "crates/security-audit",
 ]
 
 [workspace.package]

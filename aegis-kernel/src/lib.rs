@@ -34,3 +34,5 @@ pub mod pe_loader;
 pub mod win_compat;
 
 pub mod ceiling;
+
+pub mod hardening;
