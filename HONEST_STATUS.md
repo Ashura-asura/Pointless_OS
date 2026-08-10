@@ -63,6 +63,14 @@ A single-threaded, in-process capability kernel with:
 | ARP | 6 | Table lookup/insert/remove, request/reply construction, packet parsing. UNTESTED: no real network |
 | IPv4 | 6 | Packet parsing/serialization, checksum computation, address formatting, loopback/broadcast detection |
 
+### Real AI orchestration (aegis-kernel)
+| Component | Tests | What it proves |
+|-----------|-------|----------------|
+| Agent runtime | 8 | Agent lifecycle (spawn/suspend/resume/terminate), capability scoping, restrictive vs permissive scopes |
+| Usage profiler | 5 | Syscall histogram tracking, deviation computation, baseline comparison, record management |
+| Adaptive grants | 5 | Auto-tighten on medium deviation, suspend on high, terminate after repeated suspensions, scope reduction |
+| Policy engine | 5 | Rule-based evaluation (max syscalls, memory, network), audit trail logging |
+
 ### Tooling
 - `capability-audit`: reachable-authority CLI, `--graph` flag for capability visualization
 - `aegis-shell`: interactive demo exercising IPC, grants, anomaly monitoring
@@ -105,7 +113,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | 3 | Driver framework (IOMMU) | ✅ Done (real + model): PCIe enumeration (6 tests), VT-d IOMMU domain isolation (5 tests), NVMe command queues (5 tests). Model: typed Block/Net/Gpu interfaces, crash containment, GPU isolation, compositor (4 tests). Honest limits: all hardware ops UNTESTED (need real PCIe/IOMMU/NVMe) |
 | 4 | Storage service + POSIX view | ✅ Done (model: FlatView is a flat, single-level namespace projection — create/read/write/delete/list by name. Not a hierarchical POSIX filesystem — no nested dirs, no path resolution, no permission bits, no symlinks. 8 contract tests) |
 | 5 | Networking stack | ✅ Done (real + model): VirtIO-net driver (9 tests), Ethernet frames (5), ARP (6), IPv4 (6). Model: loopback stack (4 tests). Honest limits: no real NIC hardware, no TCP/UDP yet |
-| 6 | AI orchestration layer | ⬜ Partial (anomaly monitor only) |
+| 6 | AI orchestration layer | ✅ Done (real + model): Agent runtime (8 tests), usage profiler (5), adaptive grants (5), policy engine (5). Model: anomaly monitor (3 tests). Honest limits: no real AI model, profiler is histogram-based not ML, no real-time learning |
 | 7 | Native app model + shell | ⬜ Partial (aegis-shell demo only) |
 | 8 | Linux compat | ⬜ Not started |
 | 9 | Windows compat | ⬜ Not started |
@@ -141,3 +149,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `19d0c57` | Fix scheduler tests: move to #[cfg(test)] unit tests so they run on host target |
 | `4efac77` | Phase 3: driver framework — PCIe enumeration (6 tests), VT-d IOMMU domain isolation (5 tests), NVMe command queues (5 tests) |
 | `f0bec06` | Phase 5: real networking — VirtIO-net driver, Ethernet frames, ARP, IPv4 (22 tests) |
+| `6e82f3f` | Phase 6: AI orchestration — agent runtime, usage profiler, adaptive grants, policy engine (23 tests) |
