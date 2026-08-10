@@ -10,3 +10,8 @@ pub mod syscall;
 pub mod pci;
 pub mod iommu;
 pub mod nvme;
+
+pub mod net;
+pub mod ethernet;
+pub mod arp;
+pub mod ipv4;
