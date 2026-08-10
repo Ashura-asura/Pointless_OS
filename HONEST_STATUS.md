@@ -2,9 +2,9 @@
 
 *Generated: 2026-08-11. Every claim below is verified by `cargo test` on the current commit.*
 
-## What exists (334 tests, 0 failures)
+## What exists (344 tests, 0 failures)
 
-Breakdown: 113 model-crate tests (aegis workspace, incl. fleet + security-audit), 208 aegis-kernel tests (Phases 1-12 + boot-info), 13 uefi-boot ELF parser tests. Verified from clean lockfiles on commit `ff835fb`.
+Breakdown: 113 model-crate tests (aegis workspace, incl. fleet + security-audit), 218 aegis-kernel tests (Phases 1-12 + boot-info + frame allocator), 13 uefi-boot ELF parser tests. Verified from clean lockfiles on commit `6fc8d49`.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -37,7 +37,7 @@ A single-threaded, in-process capability kernel with:
 |-----------|-------|----------------|
 | UEFI boot | — | Boots via OVMF firmware in QEMU, prints memory map, sets up 4-level page tables (identity-mapped first 1GB via 2MB huge pages), loads ELF kernel, **applies base-0 relocations** (R_X86_64_RELATIVE written into .rela.dyn slots before handoff), calls **ExitBootServices**, writes the final memory map as a **boot-info handoff** to 0x10000 (flat 20-byte entries, magic-validated — verified live: 116 descriptors) |
 | ELF64 parser | 13 | Validates ELF headers (magic, class, endianness, type, machine), parses PT_LOAD segments, parses `.rela.dyn`/`.rela.plt` relocation entries, applies R_X86_64_RELATIVE, rejects symbolic relocation types, rejects invalid binaries |
-| Bare-metal kernel | — | `#![no_std]` entry point, 4GB identity paging, COM1 serial output. **VERIFIED under QEMU/OVMF**: prints banner, kernel-started, page tables up, CR3, installs its own GDT + TSS, IDT + PIC masked, arms the APIC timer, consumes the boot-info handoff (116 descriptors, 485 MB conventional) and idle-loops printing `Aegis: tick = ... (timer alive)` — 24576 ticks over a 40 s run, zero exceptions |
+| Bare-metal kernel | — | `#![no_std]` entry point, 4GB identity paging, COM1 serial output, **frame allocator** (bitmap, 4 GiB/1 MiB frames; fed by the boot-info map; reserves `[0, image_end)` + the handoff page). **VERIFIED under QEMU/OVMF**: prints banner, kernel-started, page tables up, CR3, own GDT + TSS, IDT + PIC masked, APIC timer armed, boot-info consumed (120 descriptors, 485 MB conventional), allocator stats + live alloc/free probe (157876 frames free; first frame exactly one page above the 0x30000 image end) and idle-loops printing `Aegis: tick = ... (timer alive)` — 24576 ticks over a 40 s run, zero exceptions |
 | Disk image builder | — | Creates 16MB GPT+FAT16 image with `/EFI/BOOT/BOOTX64.EFI` |
 
 ### Real process isolation (aegis-kernel)
@@ -219,3 +219,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `2213061` | Fix CI: bootloader clippy -D warnings in elf_contract.rs test mirror |
 | `602c1a2` | LAPIC timer delivers under QEMU/TCG: call init_gdt (never called — all IDT deliveries #GP'd on loader's GDT), 16-byte TSS descriptor slot for QEMU `ltr`, periodic LVT 0x20030 (bit 16 was the timer mask); naked exception stubs save GPRs + error code; idle loop prints ticks — verified 24576 ticks, 0 exceptions |
 | `ff835fb` | Boot-info handoff: loader writes final EBS memory map to 0x10000 (20-byte flat entries, magic-validated); kernel parses + prints it — verified live: 116 descriptors, 485 MB conventional (8 parser tests) |
+| `6fc8d49` | Frame allocator: bitmap over boot-info map (4 GiB/1M frames, 128 KiB BSS); handoff v2 carries loader-computed image_end — verified live: 157876 frames free, probe frames land exactly above image end (10 tests) |
