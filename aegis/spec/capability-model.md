@@ -622,3 +622,56 @@ This is a deliberate design choice, not an open gap. If a future threat model
 requires delivery overhang to be a hard gate, the path is: promote
 `AuditWarning::DeliveryOverhang` to `AuditViolation` in `audit.rs`, and the CI
 workflow (`cargo test --workspace`) will enforce it.
+
+---
+
+## 7. Kernel implementation claims (Phases 1-7, `aegis-kernel`)
+
+The Phase 0 formal model above governs the capability-crate workspace (`aegis/crates`).
+Phases 1-7 in `aegis-kernel` implement the real-hardware-facing substrate: boot, process
+isolation, drivers, networking, AI orchestration, and shell. Every claim below is
+machine-checked by `#[cfg(test)]` contract tests in the same crate (99 total), run by
+`cargo test` from `aegis-kernel/`. Honest limits: tests run as host-target unit tests
+proving the *model logic*; every hardware-touching operation (lgdt/lidt/cr3, PCIe config
+I/O, IOMMU tables, NVMe queues, VirtIO MMIO, VGA writes) is UNTESTED on real hardware.
+
+### Machine-checked verification (executable): boot and ELF64 loading (§5, Phase 1)
+
+`uefi-boot/src/elf.rs` (10 tests in `uefi-boot/tests/elf_contract.rs`): header validation
+(magic, class, endianness, type, machine), PT_LOAD segment parsing, rejection of invalid
+binaries. Honest limits: proves the parser against crafted byte buffers, not a boot on
+real firmware.
+
+### Machine-checked verification (executable): process isolation and scheduling (§5, Phase 2)
+
+`scheduler.rs` (10 tests): spawn, schedule_next, tick/preempt, block/wake, round-robin
+cycling, zombie reaping. Honest limits: GDT/TSS, IDT stubs, and per-process page tables
+are code-only; the actual lgdt/lidt/cr3 switching is UNTESTED on real hardware.
+
+### Machine-checked verification (executable): driver framework (§8, Phase 3)
+
+`pci.rs` (6), `iommu.rs` (5), `nvme.rs` (5): config-space address construction, BAR
+parsing (32/64-bit), device identification, DMA page-table mapping, device-to-domain
+assignment, SQ/CQ entry construction, phase-bit tracking. Honest limits: all I/O-port and
+MMIO operations are UNTESTED on real hardware.
+
+### Machine-checked verification (executable): networking stack (§8, Phase 5)
+
+`net.rs` (9), `ethernet.rs` (5), `arp.rs` (6), `ipv4.rs` (6): device init, frame
+parse/serialize, ethertype validation, ARP table ops and packet construction, IPv4
+checksums, loopback/broadcast detection. Honest limits: no real NIC traffic; drivers
+UNTESTED on real hardware.
+
+### Machine-checked verification (executable): AI orchestration (§5, Phase 6)
+
+`agent.rs` (8), `profiler.rs` (5), `adaptive.rs` (5), `policy_engine.rs` (5): agent
+lifecycle and capability scoping, syscall histograms and deviation, auto-tighten/
+suspend/terminate, rule evaluation and audit trail. Honest limits: profiler is
+histogram-based, not ML; no real AI model; no real-time integration.
+
+### Machine-checked verification (executable): native app model and shell (§8, Phase 7)
+
+`shell.rs` (6), `window.rs` (7), `object_graph.rs` (6), `input.rs` (5): app
+launch/stop/restart and focus, window z-order/hit-test/compositor order/dirty regions,
+graph node/relationship CRUD and traversal, input ring buffer and focus dispatch. Honest
+limits: no GPU, no framebuffer output, no real keyboard/mouse hardware.
