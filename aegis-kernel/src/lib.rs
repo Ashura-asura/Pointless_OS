@@ -25,3 +25,7 @@ pub mod input;
 pub mod object_graph;
 pub mod shell;
 pub mod window;
+
+pub mod elf_loader;
+pub mod linux_abi;
+pub mod linux_compat;
