@@ -1,10 +1,10 @@
 # Honest Status — Pointless OS / Aegis
 
-*Generated: 2026-08-10. Every claim below is verified by `cargo test` on the current commit.*
+*Generated: 2026-08-11. Every claim below is verified by `cargo test` on the current commit.*
 
-## What exists (319 tests, 0 failures)
+## What exists (326 tests, 0 failures)
 
-Breakdown: 113 model-crate tests (aegis workspace, incl. fleet + security-audit), 193 aegis-kernel tests (Phases 1-12), 13 uefi-boot ELF parser tests. Verified from clean lockfiles on commit `d54dccd`.
+Breakdown: 113 model-crate tests (aegis workspace, incl. fleet + security-audit), 200 aegis-kernel tests (Phases 1-12), 13 uefi-boot ELF parser tests. Verified from clean lockfiles on commit `602c1a2`.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -37,14 +37,14 @@ A single-threaded, in-process capability kernel with:
 |-----------|-------|----------------|
 | UEFI boot | — | Boots via OVMF firmware in QEMU, prints memory map, sets up 4-level page tables (identity-mapped first 1GB via 2MB huge pages), loads ELF kernel, **applies base-0 relocations** (R_X86_64_RELATIVE written into .rela.dyn slots before handoff) |
 | ELF64 parser | 13 | Validates ELF headers (magic, class, endianness, type, machine), parses PT_LOAD segments, parses `.rela.dyn`/`.rela.plt` relocation entries, applies R_X86_64_RELATIVE, rejects symbolic relocation types, rejects invalid binaries |
-| Bare-metal kernel | — | `#![no_std]` entry point, 4GB identity paging via 1GB pages, COM1 serial output. **VERIFIED under QEMU/OVMF**: prints banner, kernel-started, page tables up, CR3, entering idle loop — 7810 timer interrupts with zero exceptions on the trace |
+| Bare-metal kernel | — | `#![no_std]` entry point, 4GB identity paging, COM1 serial output. **VERIFIED under QEMU/OVMF**: prints banner, kernel-started, page tables up, CR3, installs its own GDT + TSS, IDT + PIC masked, arms the APIC timer and idle-loops printing `Aegis: tick = ... (timer alive)` — 24576 ticks over a 40 s run, zero exceptions |
 | Disk image builder | — | Creates 16MB GPT+FAT16 image with `/EFI/BOOT/BOOTX64.EFI` |
 
 ### Real process isolation (aegis-kernel)
 | Component | Tests | What it proves |
 |-----------|-------|----------------|
-| GDT/TSS | — | Ring 0/3 transitions, kernel/user segment selectors. UNTESTED: requires lgdt/ltr on real hardware |
-| IDT | — | Exception handler stubs for vectors 0-31. UNTESTED: requires lidt on real hardware |
+| GDT/TSS | — | Ring 0/3 transitions, kernel/user segment selectors. **VERIFIED under QEMU/TCG**: `lgdt` installs the kernel's 8-entry GDT (0x08 kcode/0x10 kdata/0x18 ucode/0x20 udata/0x28 TSS/0x30 TSS-upper-half/0x38 kcode mirror), `ltr` needs the 64-bit TSS as a full 16-byte descriptor (QEMU quirk — upper half must be zeroed, else #GP(0x28)); still UNTESTED on real hardware |
+| IDT | — | Exception handler stubs for vectors 0-31 (naked, save GPRs + error code, print vector/RIP/RSP via CPU and halt), install via `lidt` with DPL-0 interrupt/trap gates. **VERIFIED under QEMU/TCG**: gates at selector 0x08/attr 0x8E deliver (timer vector dispatched continuously); still UNTESTED on real hardware |
 | Per-process page tables | — | 4-level paging with kernel/user split (upper half shared, lower half per-process). UNTESTED: requires mov cr3 on real hardware |
 | Process abstraction | — | State machine (Ready/Running/Blocked/Zombie), CpuState for context switch |
 | Round-robin scheduler | 10 | Spawn, schedule_next, tick/preempt, block/wake, round-robin cycling, zombie reaping |
@@ -160,8 +160,8 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 0 | Architecture research + capability model | ✅ Done |
-| 1 | Boot + minimal kernel | ✅ Done (real + model): UEFI boot, page tables, ELF loader + relocations (13 parser tests), bare-metal kernel printing via COM1 serial under QEMU/OVMF (0 exceptions across 7810 timer interrupts). Honest limits: not run on physical hardware (VMware needed); per-process isolation added in Phase 2 |
-| 2 | Userspace resource managers + supervision tree | ✅ Done (real + model): GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework. Honest limits: hardware ops untested (need VMware), no real timer interrupt yet |
+| 1 | Boot + minimal kernel | ✅ Done (real + model): UEFI boot, page tables, ELF loader + relocations (13 parser tests), bare-metal kernel printing via COM1 serial under QEMU/OVMF (0 exceptions across 24576 ticks in a 40 s timer run). Honest limits: not run on physical hardware (VMware needed); per-process isolation added in Phase 2 |
+| 2 | Userspace resource managers + supervision tree | ✅ Done (real + model): GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework. **LAPIC timer verified under QEMU/TCG**: 8-entry GDT installed + TSS loaded (16-byte descriptor quirk), IDT gates deliver, periodic timer (~570 ticks/s) drives the idle loop; honest limits: still not run on physical hardware |
 | 3 | Driver framework (IOMMU) | ✅ Done (real + model): PCIe enumeration (6 tests), VT-d IOMMU domain isolation (5 tests), NVMe command queues (5 tests). Model: typed Block/Net/Gpu interfaces, crash containment, GPU isolation, compositor (4 tests). Honest limits: all hardware ops UNTESTED (need real PCIe/IOMMU/NVMe) |
 | 4 | Storage service + POSIX view | ✅ Done (model: FlatView is a flat, single-level namespace projection — create/read/write/delete/list by name. Not a hierarchical POSIX filesystem — no nested dirs, no path resolution, no permission bits, no symlinks. 8 contract tests) |
 | 5 | Networking stack | ✅ Done (real + model): VirtIO-net driver (9 tests), Ethernet frames (5), ARP (6), IPv4 (6). Model: loopback stack (4 tests). Honest limits: no real NIC hardware, no TCP/UDP yet |
@@ -216,3 +216,5 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `305ce8c` | Phase 12: production hardening — security-audit aggregate gate (10 tests), kernel boundary tests (13), SECURITY_AUDIT.md |
 | `d59ebd9` | Security fixes from audit: fleet recipient binding (HMAC-bound, relay rejected) + ELF/PE checked offset arithmetic (6 regression tests total) |
 | `d54dccd` | Loader applies base-0 R_X86_64_RELATIVE relocations; kernel boots under QEMU/OVMF via COM1 serial (5 lines, idle loop, 0 exceptions / 7810 timer ints); GOT/memset eliminated from kernel; elf_contract 13 tests |
+| `2213061` | Fix CI: bootloader clippy -D warnings in elf_contract.rs test mirror |
+| `602c1a2` | LAPIC timer delivers under QEMU/TCG: call init_gdt (never called — all IDT deliveries #GP'd on loader's GDT), 16-byte TSS descriptor slot for QEMU `ltr`, periodic LVT 0x20030 (bit 16 was the timer mask); naked exception stubs save GPRs + error code; idle loop prints ticks — verified 24576 ticks, 0 exceptions |
