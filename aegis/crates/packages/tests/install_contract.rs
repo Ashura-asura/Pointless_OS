@@ -106,8 +106,15 @@ fn install_grants_exactly_the_manifest_and_nothing_ambient() {
         3,
         "exactly: declared Task CONTROL + declared MemRegion READ + payload READ"
     );
-    let (_, kinds, rights): (Vec<_>, Vec<_>, Vec<_>) =
-        slots.iter().map(|(s, k, r)| (*s, *k, *r)).collect();
+    let (_, kinds, rights): (Vec<_>, Vec<_>, Vec<_>) = slots
+        .iter()
+        .map(|(s, k, r)| (*s, *k, *r))
+        .fold((Vec::new(), Vec::new(), Vec::new()), |(mut a, mut b, mut c), (s, k, r)| {
+            a.push(s);
+            b.push(k);
+            c.push(r);
+            (a, b, c)
+        });
     assert_eq!(kinds.iter().filter(|k| **k == ObjectKind::Task).count(), 1);
     assert_eq!(
         kinds.iter().filter(|k| **k == ObjectKind::MemRegion).count(),
