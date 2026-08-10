@@ -38,6 +38,16 @@ A single-threaded, in-process capability kernel with:
 | Bare-metal kernel | — | `#![no_std]` entry point, writes to VGA text buffer at 0xB8000 |
 | Disk image builder | — | Creates 16MB GPT+FAT16 image with `/EFI/BOOT/BOOTX64.EFI` |
 
+### Real process isolation (aegis-kernel)
+| Component | Tests | What it proves |
+|-----------|-------|----------------|
+| GDT/TSS | — | Ring 0/3 transitions, kernel/user segment selectors. UNTESTED: requires lgdt/ltr on real hardware |
+| IDT | — | Exception handler stubs for vectors 0-31. UNTESTED: requires lidt on real hardware |
+| Per-process page tables | — | 4-level paging with kernel/user split (upper half shared, lower half per-process). UNTESTED: requires mov cr3 on real hardware |
+| Process abstraction | — | State machine (Ready/Running/Blocked/Zombie), CpuState for context switch |
+| Round-robin scheduler | 10 | Spawn, schedule_next, tick/preempt, block/wake, round-robin cycling, zombie reaping |
+| Syscall framework | — | SyscallNum enum, dispatch stub. Returns -1 for unimplemented syscalls |
+
 ### Tooling
 - `capability-audit`: reachable-authority CLI, `--graph` flag for capability visualization
 - `aegis-shell`: interactive demo exercising IPC, grants, anomaly monitoring
@@ -76,7 +86,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 |-------|-------------|--------|
 | 0 | Architecture research + capability model | ✅ Done |
 | 1 | Boot + minimal kernel | ✅ Done (real + model): UEFI boot, page tables, ELF loader (10 parser tests), bare-metal kernel. Honest limits: identity mapping only (no per-process isolation yet), no real hardware test (VMware needed) |
-| 2 | Userspace resource managers + supervision tree | ✅ Done (model) |
+| 2 | Userspace resource managers + supervision tree | ✅ Done (real + model): GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework. Honest limits: hardware ops untested (need VMware), no real timer interrupt yet |
 | 3 | Driver framework (IOMMU) | ✅ Done (model: typed Block/Net/Gpu interfaces, capability scoping, crash containment, GPU isolation, compositor; 4 contract tests. Real IOMMU is hardware, out of scope) |
 | 4 | Storage service + POSIX view | ✅ Done (model: FlatView is a flat, single-level namespace projection — create/read/write/delete/list by name. Not a hierarchical POSIX filesystem — no nested dirs, no path resolution, no permission bits, no symlinks. 8 contract tests) |
 | 5 | Networking stack | ⬜ Partial (loopback only) |
@@ -112,3 +122,5 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `e6ca02e` | Fix uefi-boot: .gitignore, reduce disk image to 16MB |
 | `d34d974` | Phase 1: kernel loader — bare-metal kernel, ELF64 parser (10 tests), UEFI loads and jumps to kernel |
 | `5cb4b18` | Fix uefi-boot: remove .cargo/config.toml so ELF tests run on host target |
+| `0357a0f` | Phase 2: real process isolation — GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework |
+| `19d0c57` | Fix scheduler tests: move to #[cfg(test)] unit tests so they run on host target |
