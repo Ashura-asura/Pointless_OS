@@ -19,7 +19,7 @@ import sys
 SECTOR = 512
 TOTAL_SECTORS = 32 * 1024  # 16 MB
 PART_START_LBA = 2048
-PART_SECTORS = TOTAL_SECTORS - PART_START_LBA - 33  # room for backup GPT
+PART_SECTORS = TOTAL_SECTORS - PART_START_LBA - 34  # room for backup GPT
 
 BYTES_PER_SECTOR = 512
 SECTORS_PER_CLUSTER = 4
@@ -31,8 +31,8 @@ FAT_SECTORS = 128
 DATA_START = RESERVED_SECTORS + FAT_SECTORS + ROOT_SECTORS  # sector 133
 CLUSTER_SIZE = SECTORS_PER_CLUSTER * BYTES_PER_SECTOR
 
-ESP_TYPE_GUID = bytes([0x28, 0x73, 0x2A, 0xC1, 0xC1, 0xF8, 0xD2, 0x11,
-                       0x94, 0xA4, 0x00, 0x50, 0x43, 0x26, 0xF0, 0x02])
+ESP_TYPE_GUID = bytes([0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11,
+                       0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B])
 DISK_GUID = (0x12345678ABCDEF00).to_bytes(8, "little") + (0x00FEDCBA98765432).to_bytes(8, "little")
 PART_GUID = (0x1122334455667788).to_bytes(8, "little") + (0x99AABBCCDDEEFF00).to_bytes(8, "little")
 
@@ -117,7 +117,7 @@ def build_gpt(fs):
     mbr = bytearray(BYTES_PER_SECTOR)
     mbr[450] = 0xEE  # partition type GPT
     struct.pack_into("<I", mbr, 454, 1)  # first LBA
-    struct.pack_into("<I", mbr, 458, last_lba - 1)  # size
+    struct.pack_into("<I", mbr, 458, last_lba)  # size
     mbr[510:512] = b"\x55\xAA"
     disk[0:BYTES_PER_SECTOR] = mbr
 
@@ -163,6 +163,7 @@ def build_gpt(fs):
     struct.pack_into("<Q", bgpt, 32, 1)
     struct.pack_into("<I", bgpt, 16, 0)
     struct.pack_into("<I", bgpt, 88, part_crc)
+    struct.pack_into("<Q", bgpt, 72, last_lba - 32)  # backup's own partition entries LBA
     crc = zlib.crc32(bgpt) & 0xFFFFFFFF
     struct.pack_into("<I", bgpt, 16, crc)
     disk[last_lba * BYTES_PER_SECTOR:] = bgpt
@@ -196,12 +197,31 @@ def verify(disk, efi_data):
     struct.pack_into("<I", bgpt_copy, 16, 0)
     if struct.unpack_from("<I", bgpt, 16)[0] != (zlib.crc32(bytes(bgpt_copy)) & 0xFFFFFFFF):
         errors.append("backup GPT header CRC mismatch")
+    if struct.unpack_from("<I", disk, 458)[0] != last_lba:
+        errors.append("protective MBR size mismatch")
+    if struct.unpack_from("<Q", bgpt, 72)[0] != last_lba - 32:
+        errors.append("backup GPT entries LBA mismatch")
+
+    # partition entry 1 type GUID vs spec (independently of ESP_TYPE_GUID)
+    raw_guid = disk[1024:1040]
+    d1, d2, d3 = struct.unpack_from("<IHH", raw_guid, 0)
+    decoded_guid = (f"{d1:08X}-{d2:04X}-{d3:04X}-"
+                    f"{raw_guid[8:10].hex().upper()}-{raw_guid[10:16].hex().upper()}")
+    if decoded_guid != "C12A7328-F81F-11D2-BA4B-00A0C93EC93B":
+        errors.append(f"partition type GUID mismatch: got {decoded_guid} expected C12A7328-F81F-11D2-BA4B-00A0C93EC93B")
+    part_start_lba = struct.unpack_from("<Q", disk, 1024 + 32)[0]
+    part_end_lba = struct.unpack_from("<Q", disk, 1024 + 40)[0]
+    if part_start_lba < 34 or part_end_lba > 32733:
+        errors.append("partition out of usable range")
 
     fs_off = PART_START_LBA * BYTES_PER_SECTOR
     if disk[fs_off + 510:fs_off + 512] != b"\x55\xAA":
         errors.append("FAT16 boot signature missing")
     if disk[fs_off + 55:fs_off + 63] != b"FAT16   ":
         errors.append("FAT16 type string missing")
+    if (struct.unpack_from("<I", disk, fs_off + 28)[0] != PART_START_LBA or
+            struct.unpack_from("<I", disk, fs_off + 32)[0] != PART_SECTORS):
+        errors.append("BPB partition geometry mismatch")
 
     # walk FAT chain and reconstruct the file
     fat_off = fs_off + RESERVED_SECTORS * BYTES_PER_SECTOR

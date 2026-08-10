@@ -1,2 +1,13 @@
 /target/
 *.img
+vmware*.log
+serial.log
+*.lck
+*.vmem
+*.vmss
+*.vmxf
+*.bak
+*.png
+*.scoreboard
+*.vmsd
+nvram
