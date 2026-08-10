@@ -164,3 +164,139 @@ impl Scheduler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_increments_process_count() {
+        let mut sched = Scheduler::new();
+        assert_eq!(sched.process_count(), 0);
+        sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+        assert_eq!(sched.process_count(), 1);
+        sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+        assert_eq!(sched.process_count(), 2);
+    }
+
+    #[test]
+    fn spawn_beyond_max_fails() {
+        let mut sched = Scheduler::new();
+        for _ in 0..MAX_PROCESSES {
+            sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+        }
+        assert_eq!(sched.spawn(0x1000, 0x2000, 0x3000), Err("no free process slots"));
+    }
+
+    #[test]
+    fn schedule_next_returns_first_spawned() {
+        let mut sched = Scheduler::new();
+        sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+        let proc = sched.schedule_next().unwrap();
+        assert_eq!(proc.pid, 1);
+    }
+
+    #[test]
+    fn tick_false_when_time_remaining() {
+        let mut sched = Scheduler::new();
+        assert!(!sched.tick()); // 10 -> 9
+        assert!(!sched.tick()); // 9 -> 8
+        // Still 8 ticks remaining
+    }
+
+    #[test]
+    fn tick_true_when_time_expires() {
+        let mut sched = Scheduler::new();
+        // time_slice_remaining starts at 10, each tick decrements
+        for _ in 0..(DEFAULT_TIME_SLICE - 1) {
+            assert!(!sched.tick());
+        }
+        // Last tick: decrements to 0, returns true
+        assert!(sched.tick());
+    }
+
+    #[test]
+    fn blocking_removes_from_ready_queue() {
+        let mut sched = Scheduler::new();
+        sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+        sched.schedule_next();
+        sched.block_current();
+        // No ready processes left
+        assert!(sched.schedule_next().is_none());
+    }
+
+    #[test]
+    fn waking_makes_ready() {
+        let mut sched = Scheduler::new();
+        sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+        let pid = sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+        sched.schedule_next();  // pid 1
+        sched.block_current();  // pid 1 blocked
+        // pid 2 is still ready
+        let proc = sched.schedule_next().unwrap();
+        assert_eq!(proc.pid, pid);
+        sched.block_current();  // pid 2 blocked
+        assert!(sched.schedule_next().is_none()); // nothing ready
+        sched.wake(pid);
+        assert!(sched.is_ready(pid));
+        let proc = sched.schedule_next().unwrap();
+        assert_eq!(proc.pid, pid);
+    }
+
+    #[test]
+    fn round_robin_cycles_all_ready() {
+        let mut sched = Scheduler::new();
+        let pid1 = sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+        let pid2 = sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+        let pid3 = sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+
+        let p1 = sched.schedule_next().unwrap().pid;
+        let p2 = sched.schedule_next().unwrap().pid;
+        let p3 = sched.schedule_next().unwrap().pid;
+        let p1_again = sched.schedule_next().unwrap().pid;
+
+        assert_eq!(p1, pid1);
+        assert_eq!(p2, pid2);
+        assert_eq!(p3, pid3);
+        assert_eq!(p1_again, pid1);
+    }
+
+    #[test]
+    fn state_transitions_ready_running_blocked_ready() {
+        let mut sched = Scheduler::new();
+        let pid = sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+
+        // Initially Ready
+        assert!(sched.is_ready(pid));
+
+        // schedule_next -> Running
+        let proc = sched.schedule_next().unwrap();
+        assert_eq!(proc.pid, pid);
+
+        // block_current -> Blocked
+        sched.block_current();
+        assert!(!sched.is_ready(pid));
+
+        // wake -> Ready
+        sched.wake(pid);
+        assert!(sched.is_ready(pid));
+    }
+
+    #[test]
+    fn zombie_removed_from_scheduling() {
+        let mut sched = Scheduler::new();
+        sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+        sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
+        assert_eq!(sched.process_count(), 2);
+
+        // Schedule and mark as zombie
+        sched.schedule_next();
+        {
+            let proc = sched.current_mut().unwrap();
+            proc.state = ProcessState::Zombie;
+        }
+
+        sched.reap_zombies();
+        assert_eq!(sched.process_count(), 1);
+    }
+}
