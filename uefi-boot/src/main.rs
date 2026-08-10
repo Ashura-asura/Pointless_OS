@@ -117,9 +117,74 @@ fn main() -> Status {
             let final_map = unsafe {
                 uefi::boot::exit_boot_services(Some(uefi::boot::MemoryType::LOADER_DATA))
             };
+            let final_count = final_map.entries().count();
             sprintln!(
                 "Aegis: ExitBootServices OK — machine handed over to kernel ({} descriptors in final map)",
-                final_map.entries().count()
+                final_count
+            );
+
+            // Write the boot-info handoff page. The kernel image + BSS +
+            // stack occupy 0x0..0xF000, so 0x10000 is free; we further
+            // verify it sits inside a CONVENTIONAL descriptor of the final
+            // map before writing (checks the contract, and the kernel's
+            // frame allocator will reserve this page).
+            const BOOT_INFO_ADDR: u64 = 0x10000;
+            const BOOT_MAGIC: u64 = 0x4145_4753_4841_4E44; // "AEGSHAND"
+            const MAX_ENTRIES: usize = 256;
+
+            #[repr(C, packed)]
+            #[derive(Copy, Clone)]
+            struct MapEntry {
+                ty: u32,
+                base: u64,
+                pages: u64,
+            }
+
+            #[repr(C, packed)]
+            #[derive(Copy, Clone)]
+            struct BootHandoff {
+                magic: u64,
+                entry_count: u32,
+                _pad: u32,
+                entries: [MapEntry; MAX_ENTRIES],
+            }
+
+            let in_conventional = final_map.entries().any(|d| {
+                d.phys_start <= BOOT_INFO_ADDR
+                    && BOOT_INFO_ADDR < d.phys_start + d.page_count * 4096
+                    && d.ty == uefi::boot::MemoryType::CONVENTIONAL
+            });
+            sprintln!(
+                "Aegis: boot-info page 0x{:X} inside conventional memory: {}",
+                BOOT_INFO_ADDR,
+                in_conventional
+            );
+
+            let mut handoff = BootHandoff {
+                magic: BOOT_MAGIC,
+                entry_count: final_count as u32,
+                _pad: 0,
+                entries: [MapEntry {
+                    ty: 0,
+                    base: 0,
+                    pages: 0,
+                }; MAX_ENTRIES],
+            };
+            for (i, d) in final_map.entries().enumerate().take(MAX_ENTRIES) {
+                handoff.entries[i] = MapEntry {
+                    ty: d.ty.0,
+                    base: d.phys_start,
+                    pages: d.page_count,
+                };
+            }
+            unsafe {
+                core::ptr::write_volatile(BOOT_INFO_ADDR as *mut BootHandoff, handoff);
+            }
+            let written_count = handoff.entry_count;
+            sprintln!(
+                "Aegis: boot-info written at 0x{:X} ({} descriptors)",
+                BOOT_INFO_ADDR,
+                written_count
             );
 
             uefi::println!(

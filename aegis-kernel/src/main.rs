@@ -19,6 +19,24 @@ pub extern "sysv64" fn _start() -> ! {
         aegis_kernel::cpu::stack_top()
     );
 
+    let boot_info = unsafe { aegis_kernel::boot_info::locate() };
+    match &boot_info {
+        Some(info) => {
+            let conv = aegis_kernel::boot_info::total_by_type(
+                info,
+                aegis_kernel::boot_info::TYPE_CONVENTIONAL,
+            );
+            sprintln!(
+                "Aegis: boot-info @ 0x10000: {} descriptors, {} bytes conventional",
+                info.entries.len(),
+                conv
+            );
+        }
+        None => {
+            sprintln!("Aegis: WARNING no boot-info handoff found");
+        }
+    }
+
     unsafe {
         aegis_kernel::cpu::init_gdt();
     }
