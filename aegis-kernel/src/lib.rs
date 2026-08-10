@@ -20,3 +20,8 @@ pub mod agent;
 pub mod profiler;
 pub mod adaptive;
 pub mod policy_engine;
+
+pub mod shell;
+pub mod window;
+pub mod object_graph;
+pub mod input;
