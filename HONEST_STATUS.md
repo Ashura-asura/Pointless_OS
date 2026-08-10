@@ -30,6 +30,14 @@ A single-threaded, in-process capability kernel with:
 | Macaroon tokens | 4 | HMAC-SHA256 chain, caveat narrowing, tamper detection |
 | Chaos testing | 6 | Interleaved faults, budget-zero trips, rapid crash cycles, escalation-clears-budget, exact accounting under interleave |
 
+### Real hardware boot (uefi-boot + aegis-kernel)
+| Component | Tests | What it proves |
+|-----------|-------|----------------|
+| UEFI boot | — | Boots via UEFI firmware, prints memory map, sets up 4-level page tables (identity-mapped first 1GB via 2MB huge pages), loads ELF kernel |
+| ELF64 parser | 10 | Validates ELF headers (magic, class, endianness, type, machine), parses PT_LOAD segments, rejects invalid binaries |
+| Bare-metal kernel | — | `#![no_std]` entry point, writes to VGA text buffer at 0xB8000 |
+| Disk image builder | — | Creates 16MB GPT+FAT16 image with `/EFI/BOOT/BOOTX64.EFI` |
+
 ### Tooling
 - `capability-audit`: reachable-authority CLI, `--graph` flag for capability visualization
 - `aegis-shell`: interactive demo exercising IPC, grants, anomaly monitoring
@@ -41,6 +49,7 @@ A single-threaded, in-process capability kernel with:
 | Claim | Status | Why it's missing |
 |-------|--------|-----------------|
 | Real hardware isolation | Not built | In-process model only; no address spaces, IOMMU, or page tables |
+| Real process isolation (address spaces, page faults) | Not built | Boot creates identity mapping but no per-process page tables yet |
 | seL4-class formal proof | Not built | TLA+ model-checking (finite instance), not inductive proof |
 | Real network driver | Not started | Loopback only; no NIC, no real packets |
 | Linux/Windows compat layers | Not started | Deliberately deferred (Phase 8-9 in design doc) |
@@ -66,7 +75,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 0 | Architecture research + capability model | ✅ Done |
-| 1 | Boot + minimal kernel | ✅ Done (model) |
+| 1 | Boot + minimal kernel | ✅ Done (real + model): UEFI boot, page tables, ELF loader (10 parser tests), bare-metal kernel. Honest limits: identity mapping only (no per-process isolation yet), no real hardware test (VMware needed) |
 | 2 | Userspace resource managers + supervision tree | ✅ Done (model) |
 | 3 | Driver framework (IOMMU) | ✅ Done (model: typed Block/Net/Gpu interfaces, capability scoping, crash containment, GPU isolation, compositor; 4 contract tests. Real IOMMU is hardware, out of scope) |
 | 4 | Storage service + POSIX view | ✅ Done (model: FlatView is a flat, single-level namespace projection — create/read/write/delete/list by name. Not a hierarchical POSIX filesystem — no nested dirs, no path resolution, no permission bits, no symlinks. 8 contract tests) |
@@ -99,3 +108,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `22e75f3` | Fix HONEST_STATUS.md and README: POSIX view complete, chaos tests done, phase status accurate |
 | `687f975` | Fix CI: cargo fmt, 0 clippy warnings under -Dwarnings, all 87 tests pass from clean lockfile |
 | `1021c3d` | Pin Rust toolchain to 1.97.1 in CI to match local rustfmt version |
+| `949b3cc` | Phase 1: UEFI boot crate — boots via UEFI, prints memory map, sets up page tables, halts |
+| `e6ca02e` | Fix uefi-boot: .gitignore, reduce disk image to 16MB |
+| `d34d974` | Phase 1: kernel loader — bare-metal kernel, ELF64 parser (10 tests), UEFI loads and jumps to kernel |
+| `5cb4b18` | Fix uefi-boot: remove .cargo/config.toml so ELF tests run on host target |
