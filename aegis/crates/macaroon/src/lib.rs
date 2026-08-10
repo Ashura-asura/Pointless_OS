@@ -1,4 +1,5 @@
 use capability_core::{ObjectKind, Rights};
+use subtle::ConstantTimeEq;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenObjectKind { Task, Endpoint, MemRegion, GrantRoot, Creator }
@@ -218,19 +219,11 @@ pub fn bind_caveat(signing_key: &[u8; 32], chain: &TokenChain, caveat: Caveat) -
     TokenChain { token: new_token, chain: new_chain }
 }
 
-fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff = 0u8;
-    for i in 0..32 {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
-}
-
 pub fn verify(signing_key: &[u8; 32], chain: &TokenChain) -> Result<(), TokenError> {
     let expected = compute_chain(signing_key, &chain.token);
     if chain.chain.len() != expected.len() { return Err(TokenError::ChainIntegrityError); }
     for (a, b) in chain.chain.iter().zip(expected.iter()) {
-        if !ct_eq(a, b) { return Err(TokenError::ChainIntegrityError); }
+        if a.ct_ne(b).into() { return Err(TokenError::ChainIntegrityError); }
     }
     Ok(())
 }

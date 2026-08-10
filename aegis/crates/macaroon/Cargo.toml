@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 capability-core = { path = "../capability-core" }
 object-store = { path = "../object-store" }
+subtle = "2"

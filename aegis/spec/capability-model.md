@@ -596,3 +596,29 @@ completion queue, which nothing forces the caller to drain eagerly). The
 design doc's own caveat applies: this claims the same performance
 *neighborhood* as seL4 IPC benchmarks, never parity with a bare syscall, and
 the model measures crossings, not wall time.
+
+### Delivery overhang: warning, not a gate (design decision)
+
+The reachable-authority auditor detects **delivery overhang**: a grantor holding a
+GRANT-carrying naming cap into a task could push copies of strictly more than the
+task's manifest declares. This is surfaced as `AuditWarning::DeliveryOverhang`, not
+as an `AuditViolation`.
+
+**Decision: warning, not gate.** Rationale:
+
+1. The overhang is *latent* — it describes what a grantor *could* push, not what
+   has been pushed. The exercised set stays manifest-bounded by I2 (delegation
+   monotonicity) and I6 (grant consent).
+2. The kernel is the real enforcement boundary: every `grant`/`grant_mint` re-checks
+   authority at delivery time. The auditor is a build-time cross-check, not the
+   enforcement mechanism.
+3. Making it a violation would produce false positives for legitimate patterns: a
+   session granting an assistant more than the assistant declared is the *intended*
+   use case for the session-as-orchestrator model (§9).
+4. The existing test `delivery_overhang_tracks_the_declared_ceiling` verifies the
+   warning fires correctly and disappears when the target's manifest is wide enough.
+
+This is a deliberate design choice, not an open gap. If a future threat model
+requires delivery overhang to be a hard gate, the path is: promote
+`AuditWarning::DeliveryOverhang` to `AuditViolation` in `audit.rs`, and the CI
+workflow (`cargo test --workspace`) will enforce it.

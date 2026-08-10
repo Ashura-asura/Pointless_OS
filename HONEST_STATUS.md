@@ -48,6 +48,7 @@ A single-threaded, in-process capability kernel with:
 | Distributed consensus | Not started | Macaroon tokens exist; real cross-machine orchestration is Phase 11 |
 | Subdirectory support in POSIX view (flat namespace only) | Not started | Would require hierarchical namespace mapping |
 | File metadata (timestamps, permissions beyond capability rights) | Not started | Currently no metadata beyond capability rights |
+| Delivery overhang as hard gate | Deliberately warning | Kernel enforces at delivery time (I2/I6); auditor is build-time cross-check, not enforcement |
 
 ## What the tests actually prove
 
