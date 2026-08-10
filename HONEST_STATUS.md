@@ -2,7 +2,9 @@
 
 *Generated: 2026-08-10. Every claim below is verified by `cargo test` on the current commit.*
 
-## What exists (110 tests, 0 failures)
+## What exists (197 tests, 0 failures)
+
+Breakdown: 88 model-crate tests (aegis workspace), 99 aegis-kernel tests (Phases 1-7), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `df5a6d7`.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -89,16 +91,17 @@ A single-threaded, in-process capability kernel with:
 
 | Claim | Status | Why it's missing |
 |-------|--------|-----------------|
-| Real hardware isolation | Not built | In-process model only; no address spaces, IOMMU, or page tables |
-| Real process isolation (address spaces, page faults) | Not built | Boot creates identity mapping but no per-process page tables yet |
+| Real hardware isolation (verified on actual hardware) | Model-level code only | Page tables, IOMMU, NVMe, VirtIO drivers exist but are UNTESTED on real hardware (need VMware) |
+| Real process isolation on hardware (page faults, cr3 switching) | Code + 10 contract tests | Scheduler/page-table code tested in-process; lgdt/lidt/mov-cr3 ops UNTESTED on real hardware |
 | seL4-class formal proof | Not built | TLA+ model-checking (finite instance), not inductive proof |
-| Real network driver | Not started | Loopback only; no NIC, no real packets |
-| Linux/Windows compat layers | Not started | Deliberately deferred (Phase 8-9 in design doc) |
-| AI orchestration layer | Not started | Phase 6 in design doc; anomaly monitor is the first step |
-| Graphical shell | Not started | Phase 7 in design doc |
+| Real network I/O on a NIC | Driver code + 22 tests | VirtIO-net driver exists; no real NIC traffic, no TCP/UDP yet |
+| Linux/Windows compat layers | Not started | Phase 8-9 in design doc; Phase 8 starts next |
+| AI orchestration on real hardware | Model-level code only | Agent/profiler/adaptive/policy tested in-process (23 tests); no real-time integration |
+| Graphical shell on a real display | Model-level code only | Shell/window/graph/input tested in-process (24 tests); no GPU, no framebuffer, no real input |
 | Cross-machine transport for macaroon tokens | Not started | Token format exists; network transport between kernels is Phase 11 |
 | File metadata (timestamps, permissions beyond capability rights) | Not started | Currently no metadata beyond capability rights |
 | Delivery overhang as hard gate | Deliberately warning | Kernel enforces at delivery time (I2/I6); auditor is build-time cross-check, not enforcement |
+| Linux kernel in a lightweight VM (WSL2-lineage) | Not built | Phase 8 execution vehicle; needs a hypervisor. Translation layer is the testable part |
 
 ## What the tests actually prove
 
@@ -159,3 +162,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `f0bec06` | Phase 5: real networking — VirtIO-net driver, Ethernet frames, ARP, IPv4 (22 tests) |
 | `6e82f3f` | Phase 6: AI orchestration — agent runtime, usage profiler, adaptive grants, policy engine (23 tests) |
 | `86f8686` | Phase 7: shell — app runtime, window manager, object-relationship graph, input dispatcher (23 tests) |
+| `df5a6d7` | Update HONEST_STATUS: Phase 7 now has real shell (runtime/window/graph/input, 23 tests) |
