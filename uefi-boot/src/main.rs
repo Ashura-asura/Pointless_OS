@@ -4,6 +4,7 @@
 mod elf;
 mod memory_map;
 mod page_tables;
+mod serial;
 
 use uefi::prelude::*;
 
@@ -15,8 +16,11 @@ static KERNEL_ELF: &[u8] = include_bytes!("../aegis-kernel.bin");
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
+    serial::SerialWriter::init();
 
+    sprintln!("=== Aegis Phase 1: Real Hardware Boot ===");
     uefi::println!("=== Aegis Phase 1: Real Hardware Boot ===");
+    sprintln!("Aegis: UEFI boot successful");
     uefi::println!("Aegis: UEFI boot successful");
 
     // Print UEFI memory map
@@ -24,21 +28,34 @@ fn main() -> Status {
 
     // Set up 4-level identity-mapped page tables
     uefi::println!("Aegis: Setting up page tables...");
+    sprintln!("Aegis: Setting up page tables...");
     unsafe {
         page_tables::setup_identity_mapping();
     }
     let cr3 = page_tables::read_cr3();
     uefi::println!("Aegis: Page tables configured, CR3 = 0x{:016X}", cr3);
+    sprintln!("Aegis: Page tables configured, CR3 = 0x{:016X}", cr3);
 
     // Parse kernel ELF
     uefi::println!("Aegis: Parsing kernel ELF ({} bytes)...", KERNEL_ELF.len());
+    sprintln!("Aegis: Parsing kernel ELF ({} bytes)...", KERNEL_ELF.len());
     match elf::parse_elf(KERNEL_ELF) {
         Ok(kernel) => {
             uefi::println!("Aegis: Kernel entry point: 0x{:016X}", kernel.entry);
+            sprintln!("Aegis: Kernel entry point: 0x{:016X}", kernel.entry);
             uefi::println!("Aegis: Kernel segments: {}", kernel.segment_count);
+            sprintln!("Aegis: Kernel segments: {}", kernel.segment_count);
             for i in 0..kernel.segment_count {
                 let seg = &kernel.segments[i];
                 uefi::println!(
+                    "  Segment {}: vaddr=0x{:016X} filesz=0x{:X} memsz=0x{:X} flags=0x{:X}",
+                    i,
+                    seg.vaddr,
+                    seg.filesz,
+                    seg.memsz,
+                    seg.flags
+                );
+                sprintln!(
                     "  Segment {}: vaddr=0x{:016X} filesz=0x{:X} memsz=0x{:X} flags=0x{:X}",
                     i,
                     seg.vaddr,
@@ -76,6 +93,10 @@ fn main() -> Status {
                 "Aegis: Kernel loaded. Jumping to 0x{:016X}...",
                 kernel.entry
             );
+            sprintln!(
+                "Aegis: Kernel loaded. Jumping to 0x{:016X}...",
+                kernel.entry
+            );
 
             // Jump to kernel entry point
             // UNTESTED on real hardware: requires VMware/QEMU to verify
@@ -85,6 +106,8 @@ fn main() -> Status {
         Err(_) => {
             uefi::println!("Aegis: ERROR: Invalid kernel ELF");
             uefi::println!("Aegis: Halting.");
+            sprintln!("Aegis: ERROR: Invalid kernel ELF");
+            sprintln!("Aegis: Halting.");
         }
     }
 
