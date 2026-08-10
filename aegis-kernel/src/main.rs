@@ -20,7 +20,7 @@ pub extern "sysv64" fn _start() -> ! {
     );
 
     let boot_info = unsafe { aegis_kernel::boot_info::locate() };
-    match &boot_info {
+    match boot_info.as_ref() {
         Some(info) => {
             let conv = aegis_kernel::boot_info::total_by_type(
                 info,
@@ -30,6 +30,39 @@ pub extern "sysv64" fn _start() -> ! {
                 "Aegis: boot-info @ 0x10000: {} descriptors, {} bytes conventional",
                 info.entries.len(),
                 conv
+            );
+
+            unsafe {
+                aegis_kernel::frame::init_global(info);
+            }
+            let (total, free) = unsafe { aegis_kernel::frame::stats_global() };
+            sprintln!(
+                "Aegis: frame allocator: {} usable frames ({} MiB), {} free",
+                total,
+                total * 4 / 1024,
+                free
+            );
+
+            let f0 = unsafe { aegis_kernel::frame::alloc_global() };
+            let f1 = unsafe { aegis_kernel::frame::alloc_global() };
+            let f2 = unsafe { aegis_kernel::frame::alloc_global() };
+            sprintln!(
+                "Aegis: allocator probe: frames @ 0x{:X}, 0x{:X}, 0x{:X}",
+                f0.unwrap_or(0),
+                f1.unwrap_or(0),
+                f2.unwrap_or(0)
+            );
+            let freed = unsafe {
+                let a = aegis_kernel::frame::free_global(f0.unwrap_or(0));
+                let b = aegis_kernel::frame::free_global(f2.unwrap_or(0));
+                (a, b)
+            };
+            let (_, free_after) = unsafe { aegis_kernel::frame::stats_global() };
+            sprintln!(
+                "Aegis: allocator probe: freed f0={}, f2={}, {} free now",
+                freed.0,
+                freed.1,
+                free_after
             );
         }
         None => {

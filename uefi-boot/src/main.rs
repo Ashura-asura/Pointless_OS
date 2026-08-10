@@ -123,14 +123,26 @@ fn main() -> Status {
                 final_count
             );
 
-            // Write the boot-info handoff page. The kernel image + BSS +
-            // stack occupy 0x0..0xF000, so 0x10000 is free; we further
-            // verify it sits inside a CONVENTIONAL descriptor of the final
-            // map before writing (checks the contract, and the kernel's
-            // frame allocator will reserve this page).
+            // Write the boot-info handoff page. The kernel image's final bounds
+            // are computed from the loaded segments and rounded up to a
+            // page so the kernel can reserve exactly [0, image_end) —
+            // plus we verify the page itself (0x10000..0x11000) sits
+            // inside a CONVENTIONAL descriptor of the final map before
+            // writing (checks the contract; the kernel's frame allocator
+            // also reserves this page regardless).
             const BOOT_INFO_ADDR: u64 = 0x10000;
             const BOOT_MAGIC: u64 = 0x4145_4753_4841_4E44; // "AEGSHAND"
             const MAX_ENTRIES: usize = 256;
+
+            let mut image_end: u64 = 0;
+            for i in 0..kernel.segment_count {
+                let seg = &kernel.segments[i];
+                let end = seg.vaddr + seg.memsz;
+                if end > image_end {
+                    image_end = end;
+                }
+            }
+            image_end = (image_end + 4095) & !4095;
 
             #[repr(C, packed)]
             #[derive(Copy, Clone)]
@@ -140,12 +152,15 @@ fn main() -> Status {
                 pages: u64,
             }
 
+            /// Matches aegis-kernel/src/boot_info.rs layout: magic,
+            /// entry_count, pad, image_end, then entries at offset 24.
             #[repr(C, packed)]
             #[derive(Copy, Clone)]
             struct BootHandoff {
                 magic: u64,
                 entry_count: u32,
                 _pad: u32,
+                image_end: u64,
                 entries: [MapEntry; MAX_ENTRIES],
             }
 
@@ -155,15 +170,17 @@ fn main() -> Status {
                     && d.ty == uefi::boot::MemoryType::CONVENTIONAL
             });
             sprintln!(
-                "Aegis: boot-info page 0x{:X} inside conventional memory: {}",
+                "Aegis: boot-info page 0x{:X} inside conventional memory: {} (kernel image ends 0x{:X})",
                 BOOT_INFO_ADDR,
-                in_conventional
+                in_conventional,
+                image_end
             );
 
             let mut handoff = BootHandoff {
                 magic: BOOT_MAGIC,
                 entry_count: final_count as u32,
                 _pad: 0,
+                image_end,
                 entries: [MapEntry {
                     ty: 0,
                     base: 0,
@@ -182,9 +199,10 @@ fn main() -> Status {
             }
             let written_count = handoff.entry_count;
             sprintln!(
-                "Aegis: boot-info written at 0x{:X} ({} descriptors)",
+                "Aegis: boot-info written at 0x{:X} ({} descriptors, image end 0x{:X})",
                 BOOT_INFO_ADDR,
-                written_count
+                written_count,
+                image_end
             );
 
             uefi::println!(

@@ -2,6 +2,7 @@
 
 pub mod boot_info;
 pub mod cpu;
+pub mod frame;
 pub mod gdt;
 pub mod idt;
 pub mod page_tables;

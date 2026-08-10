@@ -9,7 +9,9 @@
 //!   offset 0:  magic u64 = 0x4145_4753_4841_4E44 ("AEGSHAND")
 //!   offset 8:  entry_count u32
 //!   offset 12: pad u32
-//!   offset 16: entries, each 20 bytes (ty u32, base u64, pages u64)
+//!   offset 16: image_end u64 — first page above the loaded kernel image
+//!              (loader rounds max(segment vaddr+memsz) up to 4 KiB)
+//!   offset 24: entries, each 20 bytes (ty u32, base u64, pages u64)
 //!
 //! Only the first `entry_count` entries are valid; the loader zero-fills
 //! the page so stale entries read as ty=0 (reserved).
@@ -50,6 +52,8 @@ impl MapEntry {
 pub struct BootInfo<'a> {
     /// Valid entries, slice into the raw page.
     pub entries: &'a [MapEntry],
+    /// First byte above the loaded kernel image (4 KiB aligned).
+    pub image_end: u64,
 }
 
 /// Parse and validate a raw handoff page. Pure and total: any garbage
@@ -64,14 +68,18 @@ pub fn parse(raw: &[u8]) -> Option<BootInfo<'_>> {
         return None;
     }
     let count = count_raw as usize;
-    let needed = 16 + MapEntry::size() * count;
+    let image_end = read_u64(raw, 16)?;
+    if image_end == 0 || image_end > 0x1_0000_0000 {
+        return None;
+    }
+    let needed = 24 + MapEntry::size() * count;
     if raw.len() < needed {
         return None;
     }
     // MapEntry is repr(packed) (align 1), so the unaligned offset is fine.
-    let entries_ptr = unsafe { raw.as_ptr().add(16).cast::<MapEntry>() };
+    let entries_ptr = unsafe { raw.as_ptr().add(24).cast::<MapEntry>() };
     let entries = unsafe { core::slice::from_raw_parts(entries_ptr, count) };
-    Some(BootInfo { entries })
+    Some(BootInfo { entries, image_end })
 }
 
 /// Total bytes in entries of the given type.
@@ -120,12 +128,16 @@ fn read_u64(raw: &[u8], off: usize) -> Option<u64> {
 
 /// Build a handoff page image (used by tests; the bootloader writes its own
 /// matching struct at runtime).
-pub fn build_image(entries: &[MapEntry]) -> [u8; 16 + MapEntry::size() * MAX_ENTRIES] {
-    let mut img = [0u8; 16 + MapEntry::size() * MAX_ENTRIES];
+pub fn build_image(
+    entries: &[MapEntry],
+    image_end: u64,
+) -> [u8; 24 + MapEntry::size() * MAX_ENTRIES] {
+    let mut img = [0u8; 24 + MapEntry::size() * MAX_ENTRIES];
     img[0..8].copy_from_slice(&MAGIC.to_le_bytes());
     img[8..12].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    img[16..24].copy_from_slice(&image_end.to_le_bytes());
     for (i, e) in entries.iter().enumerate() {
-        let base = 16 + i * MapEntry::size();
+        let base = 24 + i * MapEntry::size();
         let mut src = [0u8; 20];
         src[0..4].copy_from_slice(&e.ty.to_le_bytes());
         src[4..12].copy_from_slice(&e.base.to_le_bytes());
@@ -162,32 +174,46 @@ mod tests {
     #[test]
     fn parses_valid_image() {
         let entries = sample_entries();
-        let img = build_image(&entries);
+        let img = build_image(&entries, 0x1_1000);
         let info = parse(&img).expect("valid image must parse");
         assert_eq!(info.entries.len(), 3);
         assert_eq!(info.entries[0], entries[0]);
         assert_eq!(info.entries[1], entries[1]);
         assert_eq!(info.entries[2], entries[2]);
+        assert_eq!(info.image_end, 0x1_1000);
     }
 
     #[test]
     fn rejects_wrong_magic() {
-        let mut img = build_image(&sample_entries());
+        let mut img = build_image(&sample_entries(), 0x1_1000);
         img[0] ^= 0xFF;
         assert_eq!(parse(&img), None);
     }
 
     #[test]
     fn rejects_absurd_entry_count() {
-        let mut img = build_image(&sample_entries());
+        let mut img = build_image(&sample_entries(), 0x1_1000);
         img[8..12].copy_from_slice(&(u32::MAX).to_le_bytes());
         assert_eq!(parse(&img), None);
     }
 
     #[test]
+    fn rejects_zero_or_absurd_image_end() {
+        let entries = sample_entries();
+        let ok = build_image(&entries, 0x1_1000);
+        assert!(parse(&ok).is_some());
+        let mut zero = build_image(&entries, 0x1_1000);
+        zero[16..24].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(parse(&zero), None);
+        let mut huge = build_image(&entries, 0x1_1000);
+        huge[16..24].copy_from_slice(&0x2_0000_0000u64.to_le_bytes());
+        assert_eq!(parse(&huge), None);
+    }
+
+    #[test]
     fn rejects_short_buffer() {
         let entries = sample_entries();
-        let img = build_image(&entries);
+        let img = build_image(&entries, 0x1_1000);
         let (need, cut) = (16 + 20 * entries.len(), 16 + 20 * 2 + 1);
         assert!(cut < need);
         assert_eq!(parse(&img[..cut]), None);
@@ -201,7 +227,7 @@ mod tests {
     #[test]
     fn counts_conventional_bytes() {
         let entries = sample_entries();
-        let img = build_image(&entries);
+        let img = build_image(&entries, 0x1_1000);
         let info = parse(&img).unwrap();
         assert_eq!(total_by_type(&info, TYPE_CONVENTIONAL), 0x1000 * 4096);
         assert_eq!(total_by_type(&info, 99), 0);
@@ -221,7 +247,7 @@ mod tests {
                 pages: 1,
             })
             .collect();
-        let img = build_image(&entries);
+        let img = build_image(&entries, 0x1_1000);
         let info = parse(&img).expect("max-size image must parse");
         assert_eq!(info.entries.len(), MAX_ENTRIES);
     }
