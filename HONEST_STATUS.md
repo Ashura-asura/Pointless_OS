@@ -2,7 +2,7 @@
 
 *Generated: 2026-08-10. Every claim below is verified by `cargo test` on the current commit.*
 
-## What exists (77 tests, 0 failures)
+## What exists (87 tests, 0 failures)
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -28,6 +28,7 @@ A single-threaded, in-process capability kernel with:
 | Anomaly monitor | 3 | Op-shape profiling, deviation suspension, zero authority |
 | Batched I/O | 3 | Per-entry capability checks, completions drained apart |
 | Macaroon tokens | 4 | HMAC-SHA256 chain, caveat narrowing, tamper detection |
+| Chaos testing | 6 | Interleaved faults, budget-zero trips, rapid crash cycles, escalation-clears-budget, exact accounting under interleave |
 
 ### Tooling
 - `capability-audit`: reachable-authority CLI, `--graph` flag for capability visualization
@@ -40,14 +41,13 @@ A single-threaded, in-process capability kernel with:
 |-------|--------|-----------------|
 | Real hardware isolation | Not built | In-process model only; no address spaces, IOMMU, or page tables |
 | seL4-class formal proof | Not built | TLA+ model-checking (finite instance), not inductive proof |
-| POSIX filesystem projection | Not started | Would project object store into file semantics |
 | Real network driver | Not started | Loopback only; no NIC, no real packets |
 | Linux/Windows compat layers | Not started | Deliberately deferred (Phase 8-9 in design doc) |
 | AI orchestration layer | Not started | Phase 6 in design doc; anomaly monitor is the first step |
 | Graphical shell | Not started | Phase 7 in design doc |
-| Constant-time HMAC | Not built | `!=` comparison in macaroon verify; production needs `subtle` crate |
 | Distributed consensus | Not started | Macaroon tokens exist; real cross-machine orchestration is Phase 11 |
-| Chaos testing | Not started | Phase 10 in design doc |
+| Subdirectory support in POSIX view (flat namespace only) | Not started | Would require hierarchical namespace mapping |
+| File metadata (timestamps, permissions beyond capability rights) | Not started | Currently no metadata beyond capability rights |
 
 ## What the tests actually prove
 
@@ -90,3 +90,6 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `2f2eeea` | Capability-graph debug tool + README |
 | `fccfac4` | Package-driven exec demo (1 test) |
 | `ee3865b` | Macaroon capability tokens (4 tests) |
+| `25ef050` | Fix install_contract.rs 3-tuple collect + GROUND_RULES.md |
+| `7e30671` | Stricter ground rules + constant-time HMAC |
+| `d36d893` | Chaos tests for supervision tree |
