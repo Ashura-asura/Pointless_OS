@@ -129,11 +129,11 @@ fn parse_relocations(data: &[u8]) -> Result<Vec<Relocation>, ElfError> {
     if shoff == 0 || shnum == 0 || shentsize < 64 {
         return Ok(Vec::new());
     }
-    if shstrndx as usize >= shnum as usize {
+    if shstrndx >= shnum {
         return Err(ElfError);
     }
 
-    let shstr_off = shoff + shstrndx as usize * shentsize;
+    let shstr_off = shoff + shstrndx * shentsize;
     let shstr_offset = u64::from_le_bytes(
         data[shstr_off + 24..shstr_off + 32]
             .try_into()
@@ -151,7 +151,7 @@ fn parse_relocations(data: &[u8]) -> Result<Vec<Relocation>, ElfError> {
 
     let mut relocations = Vec::new();
     for i in 0..shnum {
-        let sec_off = shoff + i as usize * shentsize;
+        let sec_off = shoff + i * shentsize;
         let name_idx = u32::from_le_bytes(
             data[sec_off..sec_off + 4]
                 .try_into()
@@ -177,7 +177,7 @@ fn parse_relocations(data: &[u8]) -> Result<Vec<Relocation>, ElfError> {
         if name != b".rela.dyn" && name != b".rela.plt" {
             continue;
         }
-        if sec_offset + sec_size > data.len() || sec_size % 24 != 0 {
+        if sec_offset + sec_size > data.len() || !sec_size.is_multiple_of(24) {
             return Err(ElfError);
         }
 
@@ -293,7 +293,6 @@ fn accepts_pie_type() {
 fn append_rela_section(mut data: Vec<u8>, relas: &[(u64, u64, i64)]) -> Vec<u8> {
     let relas_bytes = relas.len() * 24;
     let shstr = b"\0.rela.dyn\0";
-    let shstr_offset = data.len() + relas_bytes;
 
     let rela_start = data.len();
     data.extend_from_slice(&vec![0u8; relas_bytes]);
@@ -312,14 +311,14 @@ fn append_rela_section(mut data: Vec<u8>, relas: &[(u64, u64, i64)]) -> Vec<u8> 
     data.extend_from_slice(&vec![0u8; shnum * 64]);
 
     // shstrtab section header (index 1)
-    let shstr_sec = shoff + 1 * 64;
-    data[shstr_sec + 0..shstr_sec + 4].copy_from_slice(&0u32.to_le_bytes());
+    let shstr_sec = shoff + 64;
+    data[shstr_sec..shstr_sec + 4].copy_from_slice(&0u32.to_le_bytes());
     data[shstr_sec + 24..shstr_sec + 32].copy_from_slice(&(shstr_start as u64).to_le_bytes());
     data[shstr_sec + 32..shstr_sec + 40].copy_from_slice(&(shstr.len() as u64).to_le_bytes());
 
     // .rela.dyn section header (index 2)
     let rela_sec = shoff + 2 * 64;
-    data[rela_sec + 0..rela_sec + 4].copy_from_slice(&1u32.to_le_bytes()); // name idx = 1
+    data[rela_sec..rela_sec + 4].copy_from_slice(&1u32.to_le_bytes()); // name idx = 1
     data[rela_sec + 24..rela_sec + 32].copy_from_slice(&(rela_start as u64).to_le_bytes());
     data[rela_sec + 32..rela_sec + 40].copy_from_slice(&(relas_bytes as u64).to_le_bytes());
 
