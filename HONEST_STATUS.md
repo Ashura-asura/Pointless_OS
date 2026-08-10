@@ -2,9 +2,9 @@
 
 *Generated: 2026-08-10. Every claim below is verified by `cargo test` on the current commit.*
 
-## What exists (316 tests, 0 failures)
+## What exists (319 tests, 0 failures)
 
-Breakdown: 113 model-crate tests (aegis workspace, incl. fleet + security-audit), 193 aegis-kernel tests (Phases 1-12), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `d59ebd9`.
+Breakdown: 113 model-crate tests (aegis workspace, incl. fleet + security-audit), 193 aegis-kernel tests (Phases 1-12), 13 uefi-boot ELF parser tests. Verified from clean lockfiles on commit `d54dccd`.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -35,9 +35,9 @@ A single-threaded, in-process capability kernel with:
 ### Real hardware boot (uefi-boot + aegis-kernel)
 | Component | Tests | What it proves |
 |-----------|-------|----------------|
-| UEFI boot | — | Boots via UEFI firmware, prints memory map, sets up 4-level page tables (identity-mapped first 1GB via 2MB huge pages), loads ELF kernel |
-| ELF64 parser | 10 | Validates ELF headers (magic, class, endianness, type, machine), parses PT_LOAD segments, rejects invalid binaries |
-| Bare-metal kernel | — | `#![no_std]` entry point, writes to VGA text buffer at 0xB8000 |
+| UEFI boot | — | Boots via OVMF firmware in QEMU, prints memory map, sets up 4-level page tables (identity-mapped first 1GB via 2MB huge pages), loads ELF kernel, **applies base-0 relocations** (R_X86_64_RELATIVE written into .rela.dyn slots before handoff) |
+| ELF64 parser | 13 | Validates ELF headers (magic, class, endianness, type, machine), parses PT_LOAD segments, parses `.rela.dyn`/`.rela.plt` relocation entries, applies R_X86_64_RELATIVE, rejects symbolic relocation types, rejects invalid binaries |
+| Bare-metal kernel | — | `#![no_std]` entry point, 4GB identity paging via 1GB pages, COM1 serial output. **VERIFIED under QEMU/OVMF**: prints banner, kernel-started, page tables up, CR3, entering idle loop — 7810 timer interrupts with zero exceptions on the trace |
 | Disk image builder | — | Creates 16MB GPT+FAT16 image with `/EFI/BOOT/BOOTX64.EFI` |
 
 ### Real process isolation (aegis-kernel)
@@ -160,7 +160,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 0 | Architecture research + capability model | ✅ Done |
-| 1 | Boot + minimal kernel | ✅ Done (real + model): UEFI boot, page tables, ELF loader (10 parser tests), bare-metal kernel. Honest limits: no real hardware test (VMware needed); per-process isolation added in Phase 2 |
+| 1 | Boot + minimal kernel | ✅ Done (real + model): UEFI boot, page tables, ELF loader + relocations (13 parser tests), bare-metal kernel printing via COM1 serial under QEMU/OVMF (0 exceptions across 7810 timer interrupts). Honest limits: not run on physical hardware (VMware needed); per-process isolation added in Phase 2 |
 | 2 | Userspace resource managers + supervision tree | ✅ Done (real + model): GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework. Honest limits: hardware ops untested (need VMware), no real timer interrupt yet |
 | 3 | Driver framework (IOMMU) | ✅ Done (real + model): PCIe enumeration (6 tests), VT-d IOMMU domain isolation (5 tests), NVMe command queues (5 tests). Model: typed Block/Net/Gpu interfaces, crash containment, GPU isolation, compositor (4 tests). Honest limits: all hardware ops UNTESTED (need real PCIe/IOMMU/NVMe) |
 | 4 | Storage service + POSIX view | ✅ Done (model: FlatView is a flat, single-level namespace projection — create/read/write/delete/list by name. Not a hierarchical POSIX filesystem — no nested dirs, no path resolution, no permission bits, no symlinks. 8 contract tests) |
@@ -215,3 +215,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `91165ff` | Phase 11: fleet crate — cross-machine capability transport, explicit locality, wire envelope, peer trust, verification (13 tests) |
 | `305ce8c` | Phase 12: production hardening — security-audit aggregate gate (10 tests), kernel boundary tests (13), SECURITY_AUDIT.md |
 | `d59ebd9` | Security fixes from audit: fleet recipient binding (HMAC-bound, relay rejected) + ELF/PE checked offset arithmetic (6 regression tests total) |
+| `d54dccd` | Loader applies base-0 R_X86_64_RELATIVE relocations; kernel boots under QEMU/OVMF via COM1 serial (5 lines, idle loop, 0 exceptions / 7810 timer ints); GOT/memset eliminated from kernel; elf_contract 13 tests |
