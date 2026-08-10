@@ -707,3 +707,15 @@ real bug*: `tighten_scope` previously floored `(budget / 2)` at 1, expanding a
 restrictive 0-file-handle budget to 1. Honest limits: finite deterministic property
 tests, not an inductive proof; the ceiling (not the policy) is what is verified, per the
 design doc.
+
+### Machine-checked verification (executable): distributed extension (§3/§5/§7 Phase 11)
+
+`crates/fleet` (13): cross-machine capability transport over the macaroon token format.
+Node identity, explicit locality (`Local`/`Remote` — never hidden, per the design doc),
+a wire-format `RemoteCapability` envelope (serialize/deserialize round-trip), a peer
+trust registry, and verification that checks HMAC chain integrity under the issuer's
+key, issuer trust, and expiry. Remote attenuation (rights narrow + expiry clamp) is
+verified across nodes. Honest limits: two-node in-process model — no sockets, no
+consensus, no partition/split-brain modeling (the design doc's CAP warning explicitly
+applies); `bind_caveat` requires the issuer key, whereas real macaroons allow keyless
+attenuation (documented model difference).
