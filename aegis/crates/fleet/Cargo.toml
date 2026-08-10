@@ -1,0 +1,8 @@
+[package]
+name = "fleet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+capability-core = { path = "../capability-core" }
+macaroon = { path = "../macaroon" }
