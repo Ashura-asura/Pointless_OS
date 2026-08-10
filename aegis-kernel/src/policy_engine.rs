@@ -1,6 +1,6 @@
+use crate::adaptive::PolicyDecision;
 use crate::agent::{Agent, AgentId, CapabilityScope};
 use crate::profiler::Profiler;
-use crate::adaptive::PolicyDecision;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PolicyRule {
@@ -147,7 +147,11 @@ impl PolicyEngine {
                 PolicyDecision::Terminate(_) => 3,
             }
         }
-        if severity(&b) > severity(&a) { b } else { a }
+        if severity(&b) > severity(&a) {
+            b
+        } else {
+            a
+        }
     }
 
     fn log_entry(&mut self, entry: AuditEntry) {
@@ -245,7 +249,10 @@ mod tests {
         agent.scope.network_allowed = true;
         let mut engine = PolicyEngine::new();
         engine.add_rule(PolicyRule::NoNetwork);
-        assert_eq!(engine.evaluate(&agent, &prof), PolicyDecision::Tighten(CapabilityScope::restrictive()));
+        assert_eq!(
+            engine.evaluate(&agent, &prof),
+            PolicyDecision::Tighten(CapabilityScope::restrictive())
+        );
     }
 
     #[test]

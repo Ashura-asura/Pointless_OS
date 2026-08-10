@@ -22,11 +22,17 @@ pub struct IPv4Address {
 }
 
 impl IPv4Address {
-    pub const LOOPBACK: IPv4Address = IPv4Address { octets: [127, 0, 0, 1] };
-    pub const BROADCAST: IPv4Address = IPv4Address { octets: [255, 255, 255, 255] };
+    pub const LOOPBACK: IPv4Address = IPv4Address {
+        octets: [127, 0, 0, 1],
+    };
+    pub const BROADCAST: IPv4Address = IPv4Address {
+        octets: [255, 255, 255, 255],
+    };
 
     pub fn new(a: u8, b: u8, c: u8, d: u8) -> Self {
-        IPv4Address { octets: [a, b, c, d] }
+        IPv4Address {
+            octets: [a, b, c, d],
+        }
     }
 
     pub fn is_loopback(&self) -> bool {
@@ -258,9 +264,8 @@ mod tests {
     fn compute_checksum_is_correct() {
         // RFC 1071 test vector: header bytes
         let header: [u8; 20] = [
-            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00,
-            0x40, 0x06, 0x00, 0x00, 0xC0, 0xA8, 0x01, 0x64,
-            0xC0, 0xA8, 0x01, 0x01,
+            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0xC0, 0xA8,
+            0x01, 0x64, 0xC0, 0xA8, 0x01, 0x01,
         ];
         // The checksum field is 0x0000 so computed checksum should match the
         // actual checksum. With zero checksum, the ones'-complement sum should

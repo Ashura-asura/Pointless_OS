@@ -8,7 +8,13 @@ pub fn print_memory_map() {
     let map = boot::memory_map(MemoryType::LOADER_DATA).unwrap();
 
     uefi::println!("Aegis: UEFI memory map ({} entries):", map.len());
-    uefi::println!("  {:<20} {:<12} {:<12} {:<10}", "Type", "Physical", "Pages", "Attr");
+    uefi::println!(
+        "  {:<20} {:<12} {:<12} {:<10}",
+        "Type",
+        "Physical",
+        "Pages",
+        "Attr"
+    );
 
     for desc in map.entries() {
         let phys = desc.phys_start;
@@ -30,6 +36,12 @@ pub fn print_memory_map() {
             MemoryType::PERSISTENT_MEMORY => "PMem",
             _ => "Other",
         };
-        uefi::println!("  {:<20} 0x{:010X} {:<12} 0x{:X}", ty, phys, pages, desc.att.bits());
+        uefi::println!(
+            "  {:<20} 0x{:010X} {:<12} 0x{:X}",
+            ty,
+            phys,
+            pages,
+            desc.att.bits()
+        );
     }
 }

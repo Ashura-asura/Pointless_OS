@@ -7,21 +7,21 @@ pub mod process;
 pub mod scheduler;
 pub mod syscall;
 
-pub mod pci;
 pub mod iommu;
 pub mod nvme;
+pub mod pci;
 
-pub mod net;
-pub mod ethernet;
 pub mod arp;
+pub mod ethernet;
 pub mod ipv4;
+pub mod net;
 
-pub mod agent;
-pub mod profiler;
 pub mod adaptive;
+pub mod agent;
 pub mod policy_engine;
+pub mod profiler;
 
+pub mod input;
+pub mod object_graph;
 pub mod shell;
 pub mod window;
-pub mod object_graph;
-pub mod input;

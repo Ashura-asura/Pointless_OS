@@ -1,4 +1,4 @@
-use crate::process::{Process, ProcessState, Pid, CpuState};
+use crate::process::{CpuState, Pid, Process, ProcessState};
 
 const MAX_PROCESSES: usize = 64;
 const DEFAULT_TIME_SLICE: u32 = 10;
@@ -148,9 +148,11 @@ impl Scheduler {
     }
 
     pub fn is_ready(&self, pid: Pid) -> bool {
-        self.processes
-            .iter()
-            .any(|p| p.as_ref().map_or(false, |proc| proc.pid == pid && proc.state == ProcessState::Ready))
+        self.processes.iter().any(|p| {
+            p.as_ref().map_or(false, |proc| {
+                proc.pid == pid && proc.state == ProcessState::Ready
+            })
+        })
     }
 
     /// Remove zombie processes from the table
@@ -185,7 +187,10 @@ mod tests {
         for _ in 0..MAX_PROCESSES {
             sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
         }
-        assert_eq!(sched.spawn(0x1000, 0x2000, 0x3000), Err("no free process slots"));
+        assert_eq!(
+            sched.spawn(0x1000, 0x2000, 0x3000),
+            Err("no free process slots")
+        );
     }
 
     #[test]
@@ -201,7 +206,7 @@ mod tests {
         let mut sched = Scheduler::new();
         assert!(!sched.tick()); // 10 -> 9
         assert!(!sched.tick()); // 9 -> 8
-        // Still 8 ticks remaining
+                                // Still 8 ticks remaining
     }
 
     #[test]
@@ -230,12 +235,12 @@ mod tests {
         let mut sched = Scheduler::new();
         sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
         let pid = sched.spawn(0x1000, 0x2000, 0x3000).unwrap();
-        sched.schedule_next();  // pid 1
-        sched.block_current();  // pid 1 blocked
-        // pid 2 is still ready
+        sched.schedule_next(); // pid 1
+        sched.block_current(); // pid 1 blocked
+                               // pid 2 is still ready
         let proc = sched.schedule_next().unwrap();
         assert_eq!(proc.pid, pid);
-        sched.block_current();  // pid 2 blocked
+        sched.block_current(); // pid 2 blocked
         assert!(sched.schedule_next().is_none()); // nothing ready
         sched.wake(pid);
         assert!(sched.is_ready(pid));

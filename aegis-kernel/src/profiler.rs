@@ -99,10 +99,16 @@ impl Profiler {
         let timestamp = rec.timestamp;
 
         if self.record_count < self.records.len() {
-            self.records[self.record_count] = RecordSlot { record: rec, used: true };
+            self.records[self.record_count] = RecordSlot {
+                record: rec,
+                used: true,
+            };
             self.record_count += 1;
         } else {
-            self.records[0] = RecordSlot { record: rec, used: true };
+            self.records[0] = RecordSlot {
+                record: rec,
+                used: true,
+            };
         }
 
         let profile = self.get_or_create_profile(agent_id);
@@ -181,14 +187,17 @@ impl Profiler {
         for read in 0..self.records.len() {
             if self.records[read].used {
                 if write != read {
-                    let tmp = RecordSlot { record: SyscallRecord {
-                        agent_id: self.records[read].record.agent_id,
-                        syscall_num: self.records[read].record.syscall_num,
-                        timestamp: self.records[read].record.timestamp,
-                        arg1: self.records[read].record.arg1,
-                        arg2: self.records[read].record.arg2,
-                        success: self.records[read].record.success,
-                    }, used: true };
+                    let tmp = RecordSlot {
+                        record: SyscallRecord {
+                            agent_id: self.records[read].record.agent_id,
+                            syscall_num: self.records[read].record.syscall_num,
+                            timestamp: self.records[read].record.timestamp,
+                            arg1: self.records[read].record.arg1,
+                            arg2: self.records[read].record.arg2,
+                            success: self.records[read].record.success,
+                        },
+                        used: true,
+                    };
                     self.records[read].used = false;
                     self.records[write] = tmp;
                 }

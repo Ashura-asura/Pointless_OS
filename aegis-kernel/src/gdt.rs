@@ -109,7 +109,7 @@ impl Gdt {
         // Granularity: 0x00
         // Base/limit will be filled by install() since we can't reference self in const
         let tss_entry = GdtEntry {
-            limit_low: 0,   // placeholder, set in install()
+            limit_low: 0, // placeholder, set in install()
             base_low: 0,
             base_mid: 0,
             access: 0x89,
@@ -118,7 +118,14 @@ impl Gdt {
         };
 
         Gdt {
-            entries: [null, kernel_code, kernel_data, user_code, user_data, tss_entry],
+            entries: [
+                null,
+                kernel_code,
+                kernel_data,
+                user_code,
+                user_data,
+                tss_entry,
+            ],
             tss: TssStruct::new(),
         }
     }

@@ -66,7 +66,13 @@ fn parse_elf(data: &[u8]) -> Result<ElfBinary, ElfError> {
     if phentsize == 0 || phnum == 0 {
         return Err(ElfError);
     }
-    let mut segments = [ProgramHeader { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 16];
+    let mut segments = [ProgramHeader {
+        vaddr: 0,
+        offset: 0,
+        filesz: 0,
+        memsz: 0,
+        flags: 0,
+    }; 16];
     let mut segment_count = 0usize;
     for i in 0..phnum {
         if segment_count >= 16 {
@@ -84,7 +90,11 @@ fn parse_elf(data: &[u8]) -> Result<ElfBinary, ElfError> {
         let p_memsz = u64::from_le_bytes(data[start + 40..start + 48].try_into().unwrap());
         if p_type == PT_LOAD {
             segments[segment_count] = ProgramHeader {
-                vaddr: p_vaddr, offset: p_offset, filesz: p_filesz, memsz: p_memsz, flags: p_flags,
+                vaddr: p_vaddr,
+                offset: p_offset,
+                filesz: p_filesz,
+                memsz: p_memsz,
+                flags: p_flags,
             };
             segment_count += 1;
         }
@@ -92,7 +102,11 @@ fn parse_elf(data: &[u8]) -> Result<ElfBinary, ElfError> {
     if segment_count == 0 {
         return Err(ElfError);
     }
-    Ok(ElfBinary { entry, segments, segment_count })
+    Ok(ElfBinary {
+        entry,
+        segments,
+        segment_count,
+    })
 }
 
 /// Build a minimal valid ELF64 binary in memory.
@@ -190,10 +204,13 @@ fn parses_single_text_segment() {
 
 #[test]
 fn parses_text_and_data_segments() {
-    let data = build_test_elf(0x1000, &[
-        (0x1000, 0x000, 0x3000, 5), // .text: READ+EXEC
-        (0x4000, 0x3000, 0x1000, 6), // .data: READ+WRITE
-    ]);
+    let data = build_test_elf(
+        0x1000,
+        &[
+            (0x1000, 0x000, 0x3000, 5),  // .text: READ+EXEC
+            (0x4000, 0x3000, 0x1000, 6), // .data: READ+WRITE
+        ],
+    );
     let elf = parse_elf(&data).unwrap();
     assert_eq!(elf.entry, 0x1000);
     assert_eq!(elf.segment_count, 2);
@@ -204,11 +221,14 @@ fn parses_text_and_data_segments() {
 
 #[test]
 fn parses_multiple_segments() {
-    let data = build_test_elf(0xFFFF_FFFF_8000_0000, &[
-        (0xFFFF_FFFF_8000_0000, 0x0000, 0x5000, 5), // .text
-        (0xFFFF_FFFF_8000_5000, 0x5000, 0x1000, 6), // .rodata
-        (0xFFFF_FFFF_8000_6000, 0x6000, 0x2000, 7), // .data (RWX for test)
-    ]);
+    let data = build_test_elf(
+        0xFFFF_FFFF_8000_0000,
+        &[
+            (0xFFFF_FFFF_8000_0000, 0x0000, 0x5000, 5), // .text
+            (0xFFFF_FFFF_8000_5000, 0x5000, 0x1000, 6), // .rodata
+            (0xFFFF_FFFF_8000_6000, 0x6000, 0x2000, 7), // .data (RWX for test)
+        ],
+    );
     let elf = parse_elf(&data).unwrap();
     assert_eq!(elf.entry, 0xFFFF_FFFF_8000_0000);
     assert_eq!(elf.segment_count, 3);

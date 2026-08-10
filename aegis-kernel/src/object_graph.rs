@@ -43,33 +43,24 @@ impl ObjectGraph {
     pub fn new() -> Self {
         Self {
             nodes: [
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
                 None, None, None, None, None, None, None, None,
             ],
             node_count: 0,
             relationships: [
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None,
             ],
             rel_count: 0,
         }
@@ -126,8 +117,14 @@ impl ObjectGraph {
         if self.rel_count >= self.relationships.len() {
             return Err("maximum relationships reached");
         }
-        let from_exists = self.nodes.iter().any(|s| s.as_ref().map_or(false, |n| n.id == from));
-        let to_exists = self.nodes.iter().any(|s| s.as_ref().map_or(false, |n| n.id == to));
+        let from_exists = self
+            .nodes
+            .iter()
+            .any(|s| s.as_ref().map_or(false, |n| n.id == from));
+        let to_exists = self
+            .nodes
+            .iter()
+            .any(|s| s.as_ref().map_or(false, |n| n.id == to));
         if !from_exists || !to_exists {
             return Err("node not found");
         }
@@ -147,7 +144,11 @@ impl ObjectGraph {
         Err("add_relationship failed")
     }
 
-    pub fn remove_relationship(&mut self, from: ObjectId, to: ObjectId) -> Result<(), &'static str> {
+    pub fn remove_relationship(
+        &mut self,
+        from: ObjectId,
+        to: ObjectId,
+    ) -> Result<(), &'static str> {
         let mut found = false;
         for slot in self.relationships.iter_mut() {
             if let Some(r) = slot {

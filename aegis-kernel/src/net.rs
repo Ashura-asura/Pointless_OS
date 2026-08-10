@@ -55,7 +55,9 @@ impl MacAddress {
     pub const BROADCAST: MacAddress = MacAddress { octets: [0xFF; 6] };
 
     pub fn new(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8) -> Self {
-        MacAddress { octets: [a, b, c, d, e, f] }
+        MacAddress {
+            octets: [a, b, c, d, e, f],
+        }
     }
 
     pub fn is_broadcast(&self) -> bool {
@@ -80,8 +82,12 @@ impl core::fmt::Display for MacAddress {
         write!(
             f,
             "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            self.octets[0], self.octets[1], self.octets[2],
-            self.octets[3], self.octets[4], self.octets[5]
+            self.octets[0],
+            self.octets[1],
+            self.octets[2],
+            self.octets[3],
+            self.octets[4],
+            self.octets[5]
         )
     }
 }
@@ -161,7 +167,10 @@ mod tests {
         let mac = MacAddress::new(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF);
         let mut buf = [0u8; 24];
         use core::fmt::Write;
-        struct BufWriter<'a> { buf: &'a mut [u8], pos: usize }
+        struct BufWriter<'a> {
+            buf: &'a mut [u8],
+            pos: usize,
+        }
         impl<'a> core::fmt::Write for BufWriter<'a> {
             fn write_str(&mut self, s: &str) -> core::fmt::Result {
                 let bytes = s.as_bytes();
@@ -173,7 +182,10 @@ mod tests {
             }
         }
         {
-            let mut w = BufWriter { buf: &mut buf, pos: 0 };
+            let mut w = BufWriter {
+                buf: &mut buf,
+                pos: 0,
+            };
             write!(w, "{}", mac).unwrap();
         }
         let s = core::str::from_utf8(&buf[..17]).unwrap();

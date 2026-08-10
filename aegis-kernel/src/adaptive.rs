@@ -119,7 +119,11 @@ mod tests {
         let agent = make_agent(1);
         let mut policy = AdaptivePolicy::new(CapabilityScope::permissive());
         let dev = prof.compute_deviation(1);
-        assert!(dev >= 0.3 && dev < 0.7, "deviation {} not in medium range", dev);
+        assert!(
+            dev >= 0.3 && dev < 0.7,
+            "deviation {} not in medium range",
+            dev
+        );
         match policy.evaluate(&agent, &prof) {
             PolicyDecision::Tighten(_) => {}
             other => panic!("expected Tighten, got {:?}", other),
@@ -141,7 +145,10 @@ mod tests {
         }
         let agent = make_agent(1);
         let mut policy = AdaptivePolicy::new(CapabilityScope::permissive());
-        assert_eq!(policy.evaluate(&agent, &prof), PolicyDecision::Suspend("high deviation"));
+        assert_eq!(
+            policy.evaluate(&agent, &prof),
+            PolicyDecision::Suspend("high deviation")
+        );
     }
 
     #[test]

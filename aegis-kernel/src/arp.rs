@@ -1,5 +1,4 @@
 /// ARP protocol implementation.
-
 use crate::ethernet::{EthernetFrame, ETHERTYPE_ARP};
 use crate::net::MacAddress;
 
@@ -183,7 +182,11 @@ impl ArpPacket {
 
 pub struct ArpRequest;
 impl ArpRequest {
-    pub fn build_request(sender_mac: MacAddress, sender_ip: [u8; 4], target_ip: [u8; 4]) -> EthernetFrame<'static> {
+    pub fn build_request(
+        sender_mac: MacAddress,
+        sender_ip: [u8; 4],
+        target_ip: [u8; 4],
+    ) -> EthernetFrame<'static> {
         let arp = ArpPacket {
             hw_type: HW_TYPE_ETHERNET,
             proto_type: PROTO_TYPE_IPV4,

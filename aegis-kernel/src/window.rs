@@ -34,16 +34,20 @@ impl WindowManager {
     pub fn new(width: u16, height: u16) -> Self {
         Self {
             windows: [
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None,
             ],
             count: 0,
             next_id: 1,
             screen_width: width,
             screen_height: height,
-            dirty_regions: [Region { x: 0, y: 0, width: 0, height: 0 }; 32],
+            dirty_regions: [Region {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            }; 32],
             dirty_count: 0,
         }
     }
@@ -238,7 +242,12 @@ mod tests {
     use super::*;
 
     fn test_region() -> Region {
-        Region { x: 10, y: 20, width: 100, height: 200 }
+        Region {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 200,
+        }
     }
 
     #[test]
@@ -262,8 +271,30 @@ mod tests {
     #[test]
     fn hit_test_finds_topmost_window() {
         let mut wm = WindowManager::new(800, 600);
-        let id1 = wm.create_window(1, b"bottom", Region { x: 0, y: 0, width: 200, height: 200 }).unwrap();
-        let id2 = wm.create_window(1, b"top", Region { x: 50, y: 50, width: 200, height: 200 }).unwrap();
+        let id1 = wm
+            .create_window(
+                1,
+                b"bottom",
+                Region {
+                    x: 0,
+                    y: 0,
+                    width: 200,
+                    height: 200,
+                },
+            )
+            .unwrap();
+        let id2 = wm
+            .create_window(
+                1,
+                b"top",
+                Region {
+                    x: 50,
+                    y: 50,
+                    width: 200,
+                    height: 200,
+                },
+            )
+            .unwrap();
         let hit = wm.hit_test(100, 100).unwrap();
         assert_eq!(hit, id2);
     }
@@ -271,7 +302,17 @@ mod tests {
     #[test]
     fn hit_test_returns_none_outside() {
         let mut wm = WindowManager::new(800, 600);
-        wm.create_window(1, b"w", Region { x: 0, y: 0, width: 100, height: 100 }).unwrap();
+        wm.create_window(
+            1,
+            b"w",
+            Region {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+        )
+        .unwrap();
         assert!(wm.hit_test(500, 500).is_none());
     }
 

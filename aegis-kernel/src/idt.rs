@@ -118,13 +118,33 @@ pub fn install_exception_handlers(idt: &mut Idt) {
     idt.set_handler(4, handler_overflow as *const () as u64, selector, 3);
     idt.set_handler(5, handler_bound_range as *const () as u64, selector, 0);
     idt.set_handler(6, handler_invalid_opcode as *const () as u64, selector, 0);
-    idt.set_handler(7, handler_device_not_available as *const () as u64, selector, 0);
+    idt.set_handler(
+        7,
+        handler_device_not_available as *const () as u64,
+        selector,
+        0,
+    );
     idt.set_handler(8, handler_double_fault as *const () as u64, selector, 0);
-    idt.set_handler(9, handler_coprocessor_segment as *const () as u64, selector, 0);
+    idt.set_handler(
+        9,
+        handler_coprocessor_segment as *const () as u64,
+        selector,
+        0,
+    );
     idt.set_handler(10, handler_invalid_tss as *const () as u64, selector, 0);
-    idt.set_handler(11, handler_segment_not_present as *const () as u64, selector, 0);
+    idt.set_handler(
+        11,
+        handler_segment_not_present as *const () as u64,
+        selector,
+        0,
+    );
     idt.set_handler(12, handler_stack_fault as *const () as u64, selector, 0);
-    idt.set_handler(13, handler_general_protection as *const () as u64, selector, 0);
+    idt.set_handler(
+        13,
+        handler_general_protection as *const () as u64,
+        selector,
+        0,
+    );
     idt.set_handler(14, handler_page_fault as *const () as u64, selector, 0);
     idt.set_handler(15, handler_x87_fpu as *const () as u64, selector, 0);
     idt.set_handler(16, handler_alignment_check as *const () as u64, selector, 0);

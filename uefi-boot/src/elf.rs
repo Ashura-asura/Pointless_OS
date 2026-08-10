@@ -5,7 +5,7 @@
 const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1; // Little-endian
-const ET_EXEC: u16 = 2;    // Executable file
+const ET_EXEC: u16 = 2; // Executable file
 const EM_X86_64: u16 = 0x3E; // x86_64
 
 /// Program header types

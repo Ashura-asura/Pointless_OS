@@ -40,7 +40,11 @@ fn main() -> Status {
                 let seg = &kernel.segments[i];
                 uefi::println!(
                     "  Segment {}: vaddr=0x{:016X} filesz=0x{:X} memsz=0x{:X} flags=0x{:X}",
-                    i, seg.vaddr, seg.filesz, seg.memsz, seg.flags
+                    i,
+                    seg.vaddr,
+                    seg.filesz,
+                    seg.memsz,
+                    seg.flags
                 );
             }
 
@@ -68,12 +72,14 @@ fn main() -> Status {
                 }
             }
 
-            uefi::println!("Aegis: Kernel loaded. Jumping to 0x{:016X}...", kernel.entry);
+            uefi::println!(
+                "Aegis: Kernel loaded. Jumping to 0x{:016X}...",
+                kernel.entry
+            );
 
             // Jump to kernel entry point
             // UNTESTED on real hardware: requires VMware/QEMU to verify
-            let entry_fn: extern "sysv64" fn() -> ! =
-                unsafe { core::mem::transmute(kernel.entry) };
+            let entry_fn: extern "sysv64" fn() -> ! = unsafe { core::mem::transmute(kernel.entry) };
             entry_fn();
         }
         Err(_) => {

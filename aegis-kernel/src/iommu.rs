@@ -30,7 +30,10 @@ pub struct IommuPageTable {
 impl IommuPageTable {
     pub fn new() -> Self {
         Self {
-            entries: [IommuPageTableEntry { phys_addr: 0, flags: 0 }; 512],
+            entries: [IommuPageTableEntry {
+                phys_addr: 0,
+                flags: 0,
+            }; 512],
         }
     }
 
@@ -46,7 +49,10 @@ impl IommuPageTable {
         if index >= 512 {
             return false;
         }
-        self.entries[index] = IommuPageTableEntry { phys_addr: 0, flags: 0 };
+        self.entries[index] = IommuPageTableEntry {
+            phys_addr: 0,
+            flags: 0,
+        };
         true
     }
 

@@ -14,9 +14,7 @@ struct PageTable {
 
 impl PageTable {
     const fn new() -> Self {
-        PageTable {
-            entries: [0; 512],
-        }
+        PageTable { entries: [0; 512] }
     }
 }
 

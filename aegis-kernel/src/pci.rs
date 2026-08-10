@@ -52,7 +52,11 @@ pub struct PciAddress {
 
 impl PciAddress {
     pub fn new(bus: u8, device: u8, function: u8) -> Self {
-        Self { bus, device, function }
+        Self {
+            bus,
+            device,
+            function,
+        }
     }
 
     pub fn to_config_address(&self, register: u16) -> u32 {

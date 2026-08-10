@@ -64,8 +64,8 @@ fn empty_entry() -> AppEntry {
 impl ShellRuntime {
     pub fn new() -> Self {
         let mut apps: [Option<AppEntry>; 16] = [
-            None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None,
         ];
         Self {
             apps,
@@ -119,7 +119,11 @@ impl ShellRuntime {
         let manifest = self
             .apps
             .iter()
-            .find_map(|s| s.as_ref().filter(|e| e.id == app_id).map(|e| e.manifest.clone()))
+            .find_map(|s| {
+                s.as_ref()
+                    .filter(|e| e.id == app_id)
+                    .map(|e| e.manifest.clone())
+            })
             .ok_or("app not found")?;
         for slot in self.apps.iter_mut() {
             if let Some(e) = slot {
@@ -143,10 +147,22 @@ impl ShellRuntime {
 
     pub fn list(&self) -> [AppEntry; 16] {
         let mut out = [
-            empty_entry(), empty_entry(), empty_entry(), empty_entry(),
-            empty_entry(), empty_entry(), empty_entry(), empty_entry(),
-            empty_entry(), empty_entry(), empty_entry(), empty_entry(),
-            empty_entry(), empty_entry(), empty_entry(), empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
+            empty_entry(),
         ];
         for (i, slot) in self.apps.iter().enumerate() {
             if let Some(e) = slot {

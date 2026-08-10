@@ -1,5 +1,4 @@
 /// Ethernet frame parsing and serialization.
-
 use crate::net::MacAddress;
 
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -40,13 +39,16 @@ impl<'a> EthernetFrame<'a> {
             _ => return Err(ParseError::InvalidEthertype),
         }
 
-        let src_mac = MacAddress::from_bytes(&[data[6], data[7], data[8], data[9], data[10], data[11]]);
+        let src_mac =
+            MacAddress::from_bytes(&[data[6], data[7], data[8], data[9], data[10], data[11]]);
         if src_mac.octets == [0u8; 6] {
             return Err(ParseError::ZeroSourceMac);
         }
 
         Ok(EthernetFrame {
-            dst_mac: MacAddress::from_bytes(&[data[0], data[1], data[2], data[3], data[4], data[5]]),
+            dst_mac: MacAddress::from_bytes(&[
+                data[0], data[1], data[2], data[3], data[4], data[5],
+            ]),
             src_mac,
             ethertype,
             payload: &data[ETH_HEADER_SIZE..],
@@ -79,7 +81,9 @@ impl<'a> EthernetFrame<'a> {
 
     pub fn broadcast() -> Self {
         EthernetFrame {
-            dst_mac: MacAddress { octets: BROADCAST_MAC },
+            dst_mac: MacAddress {
+                octets: BROADCAST_MAC,
+            },
             src_mac: MacAddress::new(0, 0, 0, 0, 0, 0),
             ethertype: ETHERTYPE_IPV4,
             payload: &[],
@@ -97,11 +101,20 @@ mod tests {
 
     fn valid_frame_bytes() -> [u8; 64] {
         let mut buf = [0u8; 64];
-        buf[0] = 0xFF; buf[1] = 0xFF; buf[2] = 0xFF;
-        buf[3] = 0xFF; buf[4] = 0xFF; buf[5] = 0xFF; // dst
-        buf[6] = 0xAA; buf[7] = 0xBB; buf[8] = 0xCC;
-        buf[9] = 0xDD; buf[10] = 0xEE; buf[11] = 0xFF; // src
-        buf[12] = 0x08; buf[13] = 0x00; // IPv4
+        buf[0] = 0xFF;
+        buf[1] = 0xFF;
+        buf[2] = 0xFF;
+        buf[3] = 0xFF;
+        buf[4] = 0xFF;
+        buf[5] = 0xFF; // dst
+        buf[6] = 0xAA;
+        buf[7] = 0xBB;
+        buf[8] = 0xCC;
+        buf[9] = 0xDD;
+        buf[10] = 0xEE;
+        buf[11] = 0xFF; // src
+        buf[12] = 0x08;
+        buf[13] = 0x00; // IPv4
         buf
     }
 
@@ -110,7 +123,10 @@ mod tests {
         let buf = valid_frame_bytes();
         let frame = EthernetFrame::parse(&buf).unwrap();
         assert_eq!(frame.ethertype, ETHERTYPE_IPV4);
-        assert_eq!(frame.src_mac, MacAddress::new(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF));
+        assert_eq!(
+            frame.src_mac,
+            MacAddress::new(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        );
         assert_eq!(frame.dst_mac, MacAddress::BROADCAST);
     }
 
@@ -154,8 +170,12 @@ mod tests {
     #[test]
     fn rejects_zero_source_mac() {
         let mut buf = valid_frame_bytes();
-        buf[6] = 0; buf[7] = 0; buf[8] = 0;
-        buf[9] = 0; buf[10] = 0; buf[11] = 0;
+        buf[6] = 0;
+        buf[7] = 0;
+        buf[8] = 0;
+        buf[9] = 0;
+        buf[10] = 0;
+        buf[11] = 0;
         assert_eq!(EthernetFrame::parse(&buf), Err(ParseError::ZeroSourceMac));
     }
 }
