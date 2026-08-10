@@ -4,7 +4,7 @@ import struct
 import os
 import sys
 
-def create_disk_image(efi_path, output_path, size_mb=64):
+def create_disk_image(efi_path, output_path, size_mb=16):
     """Create a GPT disk image with FAT16 EFI System Partition."""
     
     sector_size = 512
