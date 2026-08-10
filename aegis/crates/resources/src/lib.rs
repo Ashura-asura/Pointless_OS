@@ -99,11 +99,11 @@ impl Alloc {
         if given
             .cpu
             .checked_add(budget.cpu)
-            .map_or(true, |c| c > self.nodes[parent_idx].budget.cpu)
+            .is_none_or(|c| c > self.nodes[parent_idx].budget.cpu)
             || given
                 .mem
                 .checked_add(budget.mem)
-                .map_or(true, |m| m > self.nodes[parent_idx].budget.mem)
+                .is_none_or(|m| m > self.nodes[parent_idx].budget.mem)
         {
             return Err("overcommit refused: a parent cannot subdivide more than it holds");
         }
@@ -179,6 +179,7 @@ impl Meter {
 /// (every minted cap dies) — exactly the revocation any software is subject
 /// to; the controller holds no special authority, only the anchors installs
 /// created. The kernel remains the only enforcer of anything.
+#[allow(clippy::result_unit_err)]
 pub fn recycle(k: &mut Kernel, owner: TaskHandle, anchor: CapHandle) -> Result<(), ()> {
     k.revoke(owner, anchor).map_err(|_| ())
 }

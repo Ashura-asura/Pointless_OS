@@ -19,10 +19,7 @@ pub type Authority = BTreeSet<Declared>;
 
 /// Per-task live caps, projected by the kernel (expiry already filtered).
 pub fn snapshot(kernel: &Kernel, tasks: &[TaskHandle]) -> BTreeMap<TaskHandle, Vec<CapView>> {
-    tasks
-        .iter()
-        .map(|&t| (t, kernel.caps_of(t)))
-        .collect()
+    tasks.iter().map(|&t| (t, kernel.caps_of(t))).collect()
 }
 
 /// One self cap is mandatory for every task (kernel-enforced); it confers control of
@@ -32,7 +29,7 @@ fn is_structural_self(t: TaskHandle, cap: CapView) -> bool {
 }
 
 /// What each task can currently exercise, self cap excluded.
-pub fn holdings<'a>(snap: &'a BTreeMap<TaskHandle, Vec<CapView>>) -> BTreeMap<TaskHandle, Authority> {
+pub fn holdings(snap: &BTreeMap<TaskHandle, Vec<CapView>>) -> BTreeMap<TaskHandle, Authority> {
     snap.iter()
         .map(|(&t, caps)| {
             let authority = caps

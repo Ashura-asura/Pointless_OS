@@ -14,7 +14,7 @@
 
 use crate::audit::{AuditLog, AuditRecord, OpKind};
 use crate::batch::{BatchEntry, BatchResult};
-use crate::cspace::{CapHandle, CapInstance, CSpace};
+use crate::cspace::{CSpace, CapHandle, CapInstance};
 use crate::error::{KernelError, KernelResult};
 use crate::objects::{
     CapId, CreatorObj, EndpointObj, GrantRootObj, MemRegionObj, Message, Object, ObjectId,
@@ -149,10 +149,7 @@ impl Kernel {
     /// Resolve `handle` against `caller`'s own CSpace, checking liveness and expiry.
     fn lookup(&self, caller: ObjectId, handle: CapHandle) -> KernelResult<(u32, CapInstance)> {
         let cspace = self.cspaces.get(&caller).ok_or(KernelError::NoSuchObject)?;
-        let cap = cspace
-            .get(handle.0)
-            .ok_or(KernelError::NoCap)?
-            .to_owned();
+        let cap = cspace.get(handle.0).ok_or(KernelError::NoCap)?.to_owned();
         if let Some(deadline) = cap.expires_at {
             if self.now > deadline {
                 return Err(KernelError::CapExpired);
@@ -370,9 +367,12 @@ impl Kernel {
             k.ensure_task(&caller)?;
             k.require_creator(caller.0, creator)?;
             let id = k.fresh_obj();
-            k.objects.insert(id, Object::Endpoint(EndpointObj {
-                queue: VecDeque::new(),
-            }));
+            k.objects.insert(
+                id,
+                Object::Endpoint(EndpointObj {
+                    queue: VecDeque::new(),
+                }),
+            );
             let rights = Rights::SEND.union(Rights::RECV).union(Rights::GRANT);
             let slot = k.mint_into(caller.0, id, rights, None, None, None)?;
             k.audit_op(caller.0, OpKind::CreateEndpoint, None, true, "created");
@@ -391,9 +391,8 @@ impl Kernel {
             k.ensure_task(&caller)?;
             k.require_creator(caller.0, creator)?;
             let id = k.fresh_obj();
-            k.objects.insert(id, Object::MemRegion(MemRegionObj {
-                data: initial,
-            }));
+            k.objects
+                .insert(id, Object::MemRegion(MemRegionObj { data: initial }));
             let rights = Rights::READ.union(Rights::WRITE).union(Rights::GRANT);
             let slot = k.mint_into(caller.0, id, rights, None, None, None)?;
             k.audit_op(caller.0, OpKind::CreateMemRegion, None, true, "created");
@@ -590,12 +589,7 @@ impl Kernel {
     // ---------------------------------------------------------------- IPC (endpoints)
 
     /// Send a message on an endpoint. Requires SEND on the cap.
-    pub fn ep_send(
-        &mut self,
-        caller: TaskHandle,
-        ep: CapHandle,
-        msg: Message,
-    ) -> KernelResult<()> {
+    pub fn ep_send(&mut self, caller: TaskHandle, ep: CapHandle, msg: Message) -> KernelResult<()> {
         self.guarded(caller.0, OpKind::Send, |k| {
             k.ensure_task(&caller)?;
             let (_, cap) = k.lookup(caller.0, ep)?;
@@ -617,11 +611,7 @@ impl Kernel {
 
     /// Receive one message, or None. Requires RECV on the cap. Non-blocking: scheduling
     /// is a userspace concern in Aegis, so blocking happens in the harness, not here.
-    pub fn ep_recv(
-        &mut self,
-        caller: TaskHandle,
-        ep: CapHandle,
-    ) -> KernelResult<Option<Message>> {
+    pub fn ep_recv(&mut self, caller: TaskHandle, ep: CapHandle) -> KernelResult<Option<Message>> {
         self.guarded(caller.0, OpKind::Recv, |k| {
             k.ensure_task(&caller)?;
             let (_, cap) = k.lookup(caller.0, ep)?;
@@ -668,7 +658,9 @@ impl Kernel {
             k.require_right(cap, Rights::READ)?;
             match k.objects.get(&cap.obj) {
                 Some(Object::MemRegion(r)) => {
-                    let end = offset.checked_add(len).ok_or(KernelError::InvalidOperation)?;
+                    let end = offset
+                        .checked_add(len)
+                        .ok_or(KernelError::InvalidOperation)?;
                     r.data
                         .get(offset..end)
                         .ok_or(KernelError::InvalidOperation)
@@ -693,7 +685,9 @@ impl Kernel {
             k.require_right(cap, Rights::WRITE)?;
             match k.objects.get_mut(&cap.obj) {
                 Some(Object::MemRegion(r)) => {
-                    let end = offset.checked_add(bytes.len()).ok_or(KernelError::InvalidOperation)?;
+                    let end = offset
+                        .checked_add(bytes.len())
+                        .ok_or(KernelError::InvalidOperation)?;
                     if end > r.data.len() {
                         return Err(KernelError::InvalidOperation);
                     }
@@ -786,7 +780,9 @@ impl Kernel {
                     self.require_right(cap, Rights::READ)?;
                     match self.objects.get(&cap.obj) {
                         Some(Object::MemRegion(r)) => {
-                            let end = offset.checked_add(len).ok_or(KernelError::InvalidOperation)?;
+                            let end = offset
+                                .checked_add(len)
+                                .ok_or(KernelError::InvalidOperation)?;
                             Ok(BatchResult::Read(
                                 r.data
                                     .get(offset..end)
@@ -882,7 +878,13 @@ impl Kernel {
                 }
                 _ => return Err(KernelError::WrongObjectType),
             };
-            k.audit_op(caller.0, OpKind::TaskKill, Some(cap), true, format!("killed {label}"));
+            k.audit_op(
+                caller.0,
+                OpKind::TaskKill,
+                Some(cap),
+                true,
+                format!("killed {label}"),
+            );
             Ok(())
         })
     }
@@ -900,7 +902,13 @@ impl Kernel {
                 }
                 _ => return Err(KernelError::WrongObjectType),
             };
-            k.audit_op(caller.0, OpKind::TaskSpawn, Some(cap), true, format!("spawned {label}"));
+            k.audit_op(
+                caller.0,
+                OpKind::TaskSpawn,
+                Some(cap),
+                true,
+                format!("spawned {label}"),
+            );
             Ok(())
         })
     }
@@ -997,7 +1005,10 @@ mod tests {
         // one self cap, one creator cap
         let kinds: Vec<_> = caps.iter().map(|c| c.kind).collect();
         assert!(kinds.contains(&ObjectKind::Creator));
-        assert_eq!(caps.iter().filter(|c| c.kind == ObjectKind::Task).count(), 1);
+        assert_eq!(
+            caps.iter().filter(|c| c.kind == ObjectKind::Task).count(),
+            1
+        );
     }
 
     #[test]
@@ -1019,7 +1030,9 @@ mod tests {
         // …but `plain`, whose CSpace holds only a Task self-cap (its slot 0), cannot:
         // a self cap is a Task cap, not a Creator cap. (The cap handle root received
         // for `plain` is likewise unusable by anyone outside root's CSpace.)
-        let err = k.create_task(plain, CapHandle(0), "grandchild").unwrap_err();
+        let err = k
+            .create_task(plain, CapHandle(0), "grandchild")
+            .unwrap_err();
         assert_eq!(err, KernelError::NoCreationRight);
     }
 }

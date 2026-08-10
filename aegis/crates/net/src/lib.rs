@@ -143,11 +143,7 @@ impl LoopbackStack {
     /// with the channel revocable at the stack's will, the socket is gone from
     /// the interface. (The subscriber's own channel cap can later be revoked
     /// by ordinary revocation, which closes the channel for good.)
-    pub fn unsubscribe(
-        &mut self,
-        k: &mut Kernel,
-        channel: CapHandle,
-    ) -> KernelResult<()> {
+    pub fn unsubscribe(&mut self, k: &mut Kernel, channel: CapHandle) -> KernelResult<()> {
         let info = k.cap_info(self.service, channel)?;
         k.destroy(self.service, channel)?;
         self.sockets.remove(&info.obj);

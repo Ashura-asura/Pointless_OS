@@ -2,7 +2,13 @@ use capability_core::{ObjectKind, Rights};
 use subtle::ConstantTimeEq;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenObjectKind { Task, Endpoint, MemRegion, GrantRoot, Creator }
+pub enum TokenObjectKind {
+    Task,
+    Endpoint,
+    MemRegion,
+    GrantRoot,
+    Creator,
+}
 
 impl From<ObjectKind> for TokenObjectKind {
     fn from(k: ObjectKind) -> Self {
@@ -97,8 +103,13 @@ fn serialize_identifier(token: &CapabilityToken) -> Vec<u8> {
     });
     buf.extend_from_slice(&token.rights.to_le_bytes());
     match token.expiry {
-        Some(e) => { buf.push(1); buf.extend_from_slice(&e.to_le_bytes()); }
-        None => { buf.push(0); }
+        Some(e) => {
+            buf.push(1);
+            buf.extend_from_slice(&e.to_le_bytes());
+        }
+        None => {
+            buf.push(0);
+        }
     }
     buf
 }
@@ -106,8 +117,14 @@ fn serialize_identifier(token: &CapabilityToken) -> Vec<u8> {
 fn serialize_caveat(c: &Caveat) -> Vec<u8> {
     let mut buf = Vec::new();
     match c {
-        Caveat::RightsNarrow(r) => { buf.push(0); buf.extend_from_slice(&r.to_le_bytes()); }
-        Caveat::ExpiryClamp(e) => { buf.push(1); buf.extend_from_slice(&e.to_le_bytes()); }
+        Caveat::RightsNarrow(r) => {
+            buf.push(0);
+            buf.extend_from_slice(&r.to_le_bytes());
+        }
+        Caveat::ExpiryClamp(e) => {
+            buf.push(1);
+            buf.extend_from_slice(&e.to_le_bytes());
+        }
         Caveat::Custom(data) => {
             buf.push(2);
             buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -118,27 +135,50 @@ fn serialize_caveat(c: &Caveat) -> Vec<u8> {
 }
 
 fn deserialize_caveat(data: &[u8], pos: &mut usize) -> Result<Caveat, TokenError> {
-    if *pos >= data.len() { return Err(TokenError::DeserializationError); }
-    let tag = data[*pos]; *pos += 1;
+    if *pos >= data.len() {
+        return Err(TokenError::DeserializationError);
+    }
+    let tag = data[*pos];
+    *pos += 1;
     match tag {
         0 => {
-            if *pos + 4 > data.len() { return Err(TokenError::DeserializationError); }
-            let r = u32::from_le_bytes(data[*pos..*pos+4].try_into().map_err(|_| TokenError::DeserializationError)?);
+            if *pos + 4 > data.len() {
+                return Err(TokenError::DeserializationError);
+            }
+            let r = u32::from_le_bytes(
+                data[*pos..*pos + 4]
+                    .try_into()
+                    .map_err(|_| TokenError::DeserializationError)?,
+            );
             *pos += 4;
             Ok(Caveat::RightsNarrow(r))
         }
         1 => {
-            if *pos + 8 > data.len() { return Err(TokenError::DeserializationError); }
-            let e = u64::from_le_bytes(data[*pos..*pos+8].try_into().map_err(|_| TokenError::DeserializationError)?);
+            if *pos + 8 > data.len() {
+                return Err(TokenError::DeserializationError);
+            }
+            let e = u64::from_le_bytes(
+                data[*pos..*pos + 8]
+                    .try_into()
+                    .map_err(|_| TokenError::DeserializationError)?,
+            );
             *pos += 8;
             Ok(Caveat::ExpiryClamp(e))
         }
         2 => {
-            if *pos + 4 > data.len() { return Err(TokenError::DeserializationError); }
-            let len = u32::from_le_bytes(data[*pos..*pos+4].try_into().map_err(|_| TokenError::DeserializationError)?) as usize;
+            if *pos + 4 > data.len() {
+                return Err(TokenError::DeserializationError);
+            }
+            let len = u32::from_le_bytes(
+                data[*pos..*pos + 4]
+                    .try_into()
+                    .map_err(|_| TokenError::DeserializationError)?,
+            ) as usize;
             *pos += 4;
-            if *pos + len > data.len() { return Err(TokenError::DeserializationError); }
-            let d = data[*pos..*pos+len].to_vec();
+            if *pos + len > data.len() {
+                return Err(TokenError::DeserializationError);
+            }
+            let d = data[*pos..*pos + len].to_vec();
             *pos += len;
             Ok(Caveat::Custom(d))
         }
@@ -147,33 +187,79 @@ fn deserialize_caveat(data: &[u8], pos: &mut usize) -> Result<Caveat, TokenError
 }
 
 fn deserialize_token_full(data: &[u8]) -> Result<(CapabilityToken, usize), TokenError> {
-    if data.len() < 49 { return Err(TokenError::DeserializationError); }
+    if data.len() < 49 {
+        return Err(TokenError::DeserializationError);
+    }
     let mut pos = 0;
     let mut kid = [0u8; 32];
-    kid.copy_from_slice(&data[pos..pos+32]); pos += 32;
-    let oid = u64::from_le_bytes(data[pos..pos+8].try_into().map_err(|_| TokenError::DeserializationError)?); pos += 8;
+    kid.copy_from_slice(&data[pos..pos + 32]);
+    pos += 32;
+    let oid = u64::from_le_bytes(
+        data[pos..pos + 8]
+            .try_into()
+            .map_err(|_| TokenError::DeserializationError)?,
+    );
+    pos += 8;
     let kind = match data[pos] {
-        0 => TokenObjectKind::Task, 1 => TokenObjectKind::Endpoint,
-        2 => TokenObjectKind::MemRegion, 3 => TokenObjectKind::GrantRoot,
-        4 => TokenObjectKind::Creator, _ => return Err(TokenError::DeserializationError),
-    }; pos += 1;
-    let rights = u32::from_le_bytes(data[pos..pos+4].try_into().map_err(|_| TokenError::DeserializationError)?); pos += 4;
+        0 => TokenObjectKind::Task,
+        1 => TokenObjectKind::Endpoint,
+        2 => TokenObjectKind::MemRegion,
+        3 => TokenObjectKind::GrantRoot,
+        4 => TokenObjectKind::Creator,
+        _ => return Err(TokenError::DeserializationError),
+    };
+    pos += 1;
+    let rights = u32::from_le_bytes(
+        data[pos..pos + 4]
+            .try_into()
+            .map_err(|_| TokenError::DeserializationError)?,
+    );
+    pos += 4;
     let expiry = if data[pos] == 1 {
         pos += 1;
-        let e = u64::from_le_bytes(data[pos..pos+8].try_into().map_err(|_| TokenError::DeserializationError)?); pos += 8;
+        let e = u64::from_le_bytes(
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| TokenError::DeserializationError)?,
+        );
+        pos += 8;
         Some(e)
-    } else { pos += 1; None };
-    if pos + 4 > data.len() { return Err(TokenError::DeserializationError); }
-    let n = u32::from_le_bytes(data[pos..pos+4].try_into().map_err(|_| TokenError::DeserializationError)?) as usize; pos += 4;
+    } else {
+        pos += 1;
+        None
+    };
+    if pos + 4 > data.len() {
+        return Err(TokenError::DeserializationError);
+    }
+    let n = u32::from_le_bytes(
+        data[pos..pos + 4]
+            .try_into()
+            .map_err(|_| TokenError::DeserializationError)?,
+    ) as usize;
+    pos += 4;
     let mut caveats = Vec::new();
-    for _ in 0..n { caveats.push(deserialize_caveat(data, &mut pos)?); }
-    Ok((CapabilityToken { kernel_id: kid, object_id: oid, kind, rights, expiry, caveats }, pos))
+    for _ in 0..n {
+        caveats.push(deserialize_caveat(data, &mut pos)?);
+    }
+    Ok((
+        CapabilityToken {
+            kernel_id: kid,
+            object_id: oid,
+            kind,
+            rights,
+            expiry,
+            caveats,
+        },
+        pos,
+    ))
 }
 
 fn serialize_token_full(token: &CapabilityToken) -> Vec<u8> {
     let mut buf = serialize_identifier(token);
     buf.extend_from_slice(&(token.caveats.len() as u32).to_le_bytes());
-    for c in &token.caveats { buf.extend_from_slice(&serialize_caveat(c)); }
+    for c in &token.caveats {
+        buf.extend_from_slice(&serialize_caveat(c));
+    }
     buf
 }
 
@@ -201,7 +287,14 @@ pub fn mint(
     rights: Rights,
     expiry: Option<u64>,
 ) -> TokenChain {
-    let token = CapabilityToken { kernel_id, object_id, kind: TokenObjectKind::from(kind), rights: rights.bits(), expiry, caveats: Vec::new() };
+    let token = CapabilityToken {
+        kernel_id,
+        object_id,
+        kind: TokenObjectKind::from(kind),
+        rights: rights.bits(),
+        expiry,
+        caveats: Vec::new(),
+    };
     let chain = compute_chain(signing_key, &token);
     TokenChain { token, chain }
 }
@@ -212,18 +305,28 @@ pub fn bind_caveat(signing_key: &[u8; 32], chain: &TokenChain, caveat: Caveat) -
         new_token.rights &= mask;
     }
     if let Caveat::ExpiryClamp(e) = &caveat {
-        new_token.expiry = Some(match new_token.expiry { Some(c) => c.min(*e), None => *e });
+        new_token.expiry = Some(match new_token.expiry {
+            Some(c) => c.min(*e),
+            None => *e,
+        });
     }
     new_token.caveats.push(caveat);
     let new_chain = compute_chain(signing_key, &new_token);
-    TokenChain { token: new_token, chain: new_chain }
+    TokenChain {
+        token: new_token,
+        chain: new_chain,
+    }
 }
 
 pub fn verify(signing_key: &[u8; 32], chain: &TokenChain) -> Result<(), TokenError> {
     let expected = compute_chain(signing_key, &chain.token);
-    if chain.chain.len() != expected.len() { return Err(TokenError::ChainIntegrityError); }
+    if chain.chain.len() != expected.len() {
+        return Err(TokenError::ChainIntegrityError);
+    }
     for (a, b) in chain.chain.iter().zip(expected.iter()) {
-        if a.ct_ne(b).into() { return Err(TokenError::ChainIntegrityError); }
+        if a.ct_ne(b).into() {
+            return Err(TokenError::ChainIntegrityError);
+        }
     }
     Ok(())
 }
@@ -234,22 +337,49 @@ pub fn serialize_chain(chain: &TokenChain) -> Vec<u8> {
     buf.extend_from_slice(&(tb.len() as u32).to_le_bytes());
     buf.extend_from_slice(&tb);
     buf.extend_from_slice(&(chain.chain.len() as u32).to_le_bytes());
-    for e in &chain.chain { buf.extend_from_slice(e); }
+    for e in &chain.chain {
+        buf.extend_from_slice(e);
+    }
     buf
 }
 
 pub fn deserialize_chain(data: &[u8]) -> Result<TokenChain, TokenError> {
-    if data.len() < 8 { return Err(TokenError::DeserializationError); }
+    if data.len() < 8 {
+        return Err(TokenError::DeserializationError);
+    }
     let mut pos = 0;
-    let tl = u32::from_le_bytes(data[pos..pos+4].try_into().map_err(|_| TokenError::DeserializationError)?) as usize; pos += 4;
-    if pos + tl > data.len() { return Err(TokenError::DeserializationError); }
-    let (token, _) = deserialize_token_full(&data[pos..pos+tl])?; pos += tl;
-    if pos + 4 > data.len() { return Err(TokenError::DeserializationError); }
-    let cl = u32::from_le_bytes(data[pos..pos+4].try_into().map_err(|_| TokenError::DeserializationError)?) as usize; pos += 4;
-    if pos + cl * 32 > data.len() { return Err(TokenError::DeserializationError); }
+    let tl = u32::from_le_bytes(
+        data[pos..pos + 4]
+            .try_into()
+            .map_err(|_| TokenError::DeserializationError)?,
+    ) as usize;
+    pos += 4;
+    if pos + tl > data.len() {
+        return Err(TokenError::DeserializationError);
+    }
+    let (token, _) = deserialize_token_full(&data[pos..pos + tl])?;
+    pos += tl;
+    if pos + 4 > data.len() {
+        return Err(TokenError::DeserializationError);
+    }
+    let cl = u32::from_le_bytes(
+        data[pos..pos + 4]
+            .try_into()
+            .map_err(|_| TokenError::DeserializationError)?,
+    ) as usize;
+    pos += 4;
+    if pos + cl * 32 > data.len() {
+        return Err(TokenError::DeserializationError);
+    }
     let mut entries = Vec::new();
     for _ in 0..cl {
-        let mut e = [0u8; 32]; e.copy_from_slice(&data[pos..pos+32]); entries.push(e); pos += 32;
+        let mut e = [0u8; 32];
+        e.copy_from_slice(&data[pos..pos + 32]);
+        entries.push(e);
+        pos += 32;
     }
-    Ok(TokenChain { token, chain: entries })
+    Ok(TokenChain {
+        token,
+        chain: entries,
+    })
 }

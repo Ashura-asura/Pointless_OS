@@ -30,7 +30,10 @@ fn bind_caveat_narrows_rights() {
     macaroon::verify(&key, &narrowed).expect("narrowed token must verify");
     assert_eq!(narrowed.token.rights, Rights::READ.bits());
     assert_eq!(narrowed.token.caveats.len(), 1);
-    assert!(narrowed.token.caveats.contains(&Caveat::RightsNarrow(Rights::READ.bits())));
+    assert!(narrowed
+        .token
+        .caveats
+        .contains(&Caveat::RightsNarrow(Rights::READ.bits())));
 }
 
 #[test]
@@ -40,7 +43,8 @@ fn tampered_token_fails_verification() {
     let chain = macaroon::mint(&key, kid, 99, ObjectKind::Endpoint, Rights::SEND, None);
     let mut bytes = macaroon::serialize_chain(&chain);
     bytes[4] ^= 0xFF;
-    let tampered = macaroon::deserialize_chain(&bytes).expect("deserialize still works on bit-flip");
+    let tampered =
+        macaroon::deserialize_chain(&bytes).expect("deserialize still works on bit-flip");
     let err = macaroon::verify(&key, &tampered).unwrap_err();
     assert_eq!(err, TokenError::ChainIntegrityError);
 }
@@ -55,5 +59,8 @@ fn custom_caveat_preserved_through_roundtrip() {
     let bytes = macaroon::serialize_chain(&with_custom);
     let restored = macaroon::deserialize_chain(&bytes).expect("roundtrip");
     macaroon::verify(&key, &restored).expect("roundtripped custom caveat must verify");
-    assert_eq!(restored.token.caveats, vec![Caveat::Custom(b"ip:10.0.0.1".to_vec())]);
+    assert_eq!(
+        restored.token.caveats,
+        vec![Caveat::Custom(b"ip:10.0.0.1".to_vec())]
+    );
 }

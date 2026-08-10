@@ -17,7 +17,8 @@ const K: [u32; 64] = [
 /// Hash `data` and return the 32-byte digest.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
     let mut w = [0u32; 64];
     let mut chunk = [0u8; 64];
@@ -50,9 +51,8 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
                 .wrapping_add(s1);
         }
 
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) = (
-            h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
-        );
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
         for t in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ (!e & g);
@@ -113,7 +113,9 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
-            hex(&sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            hex(&sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
         let million_a = vec![b'a'; 1_000_000];

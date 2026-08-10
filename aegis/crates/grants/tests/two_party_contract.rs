@@ -13,7 +13,12 @@ fn boot() -> (Kernel, TaskHandle, CapHandle) {
     (k, root, creator)
 }
 
-fn task(k: &mut Kernel, root: TaskHandle, creator: CapHandle, label: &str) -> (TaskHandle, CapHandle) {
+fn task(
+    k: &mut Kernel,
+    root: TaskHandle,
+    creator: CapHandle,
+    label: &str,
+) -> (TaskHandle, CapHandle) {
     k.create_task(root, creator, label).unwrap()
 }
 
@@ -60,11 +65,17 @@ fn a_single_click_cannot_confirm_a_high_risk_grant() {
     assert_eq!(err, capability_core::KernelError::InvalidOperation);
     assert!(svc.policy_log().iter().any(|e| matches!(
         e,
-        grants::PolicyEvent::ConfirmationRefused { role: "modify-security-policy", .. }
+        grants::PolicyEvent::ConfirmationRefused {
+            role: "modify-security-policy",
+            ..
+        }
     )));
     // No mint happened: no grants active, and the agent holds nothing.
     assert!(svc.list_active().is_empty());
-    assert!(k.caps_of(agent).len() == 1, "agent still holds only its self-cap");
+    assert!(
+        k.caps_of(agent).len() == 1,
+        "agent still holds only its self-cap"
+    );
     let _ = policy_svc;
 }
 
@@ -85,13 +96,13 @@ fn two_party_confirmation_mints_only_after_two_distinct_people() {
     // (The grant does not exist yet either way.)
     assert!(svc.confirm_second(&mut k, two_party, alice).is_err());
     assert!(svc.list_active().is_empty());
-    assert!(svc
-        .policy_log()
-        .iter()
-        .any(|e| matches!(e, grants::PolicyEvent::ConfirmationRefused {
+    assert!(svc.policy_log().iter().any(|e| matches!(
+        e,
+        grants::PolicyEvent::ConfirmationRefused {
             reason: "second confirmer must be a different person",
             ..
-        })));
+        }
+    )));
 
     // Bob (a different person) confirms: the mint happens, and the grant
     // records both approvals — the "distinct, more visible confirmation flow".
@@ -125,7 +136,10 @@ fn non_high_risk_role_cannot_abuse_the_two_party_path() {
             "restart-service",
             "agent",
             agent_cap,
-            GrantTarget { label: "smtp".into(), source: smtp_cap },
+            GrantTarget {
+                label: "smtp".into(),
+                source: smtp_cap,
+            },
             GrantPolicy::TaskScoped { ticks: 5 },
         )
         .unwrap();

@@ -105,7 +105,7 @@ impl GraphicsService {
         queue_cap: CapHandle,
         record: Vec<u8>,
     ) -> KernelResult<()> {
-        k.ep_send(context, queue_cap, record.into())
+        k.ep_send(context, queue_cap, record)
     }
 
     /// Render into the context's own framebuffer, through the caller's own cap.

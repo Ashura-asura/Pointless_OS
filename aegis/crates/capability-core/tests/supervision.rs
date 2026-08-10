@@ -18,7 +18,12 @@ fn boot() -> (Kernel, TaskHandle, CapHandle) {
     (k, root, creator)
 }
 
-fn task(k: &mut Kernel, root: TaskHandle, creator: CapHandle, label: &str) -> (TaskHandle, CapHandle) {
+fn task(
+    k: &mut Kernel,
+    root: TaskHandle,
+    creator: CapHandle,
+    label: &str,
+) -> (TaskHandle, CapHandle) {
     k.create_task(root, creator, label).unwrap()
 }
 
@@ -83,14 +88,19 @@ fn crash_containment_is_a_full_subtree_revoke() {
     s.k.revoke(s.root, s.smtp_cap).unwrap();
     let after = s.k.caps_of(s.agent);
     assert!(
-        after.iter().all(|c| c.kind != ObjectKind::Task || c.obj != s.smtp.id()),
+        after
+            .iter()
+            .all(|c| c.kind != ObjectKind::Task || c.obj != s.smtp.id()),
         "the role's task cap must be gone from the agent: {after:?}"
     );
     let refused_restart = s.k.task_spawn(s.agent, CapHandle(s.role_slot)).unwrap_err();
     assert_eq!(refused_restart, KernelError::NoCap);
     // Forensics survive the containment: the death is on record as a kill (not a
     // destroy), so diagnosis did not lose the dead task.
-    assert!(s.k.audit().ever_succeeded(s.root.id(), OpKind::TaskKill, s.smtp.id()));
+    assert!(s
+        .k
+        .audit()
+        .ever_succeeded(s.root.id(), OpKind::TaskKill, s.smtp.id()));
 }
 
 /// The restart window: while the role is live, a restart is a distinct, audited
@@ -107,28 +117,32 @@ fn the_supervision_cycle_is_reconstructable_from_the_audit() {
     // itself stays on record.
     s.k.task_spawn(s.agent, CapHandle(s.role_slot)).unwrap();
 
-    assert!(s.k.audit().ever_succeeded(s.root.id(), OpKind::TaskKill, s.smtp.id()));
-    let spawns = s
+    assert!(s
         .k
         .audit()
-        .query(Some(s.agent.id()), AuditFilter::Ops(&[OpKind::TaskSpawn]))
-        .filter(|r| r.ok && r.target == Some(s.smtp.id()))
-        .count();
+        .ever_succeeded(s.root.id(), OpKind::TaskKill, s.smtp.id()));
+    let spawns =
+        s.k.audit()
+            .query(Some(s.agent.id()), AuditFilter::Ops(&[OpKind::TaskSpawn]))
+            .filter(|r| r.ok && r.target == Some(s.smtp.id()))
+            .count();
     assert_eq!(spawns, 2, "both restart attempts are on record");
-    let unrelated = s
-        .k
-        .audit()
-        .query(Some(s.agent.id()), AuditFilter::Ops(&[
-            OpKind::CreateTask,
-            OpKind::CreateEndpoint,
-            OpKind::CreateMemRegion,
-            OpKind::CreateGrantRoot,
-            OpKind::Grant,
-            OpKind::Revoke,
-            OpKind::TaskKill,
-        ]))
-        .filter(|r| r.ok)
-        .count();
+    let unrelated =
+        s.k.audit()
+            .query(
+                Some(s.agent.id()),
+                AuditFilter::Ops(&[
+                    OpKind::CreateTask,
+                    OpKind::CreateEndpoint,
+                    OpKind::CreateMemRegion,
+                    OpKind::CreateGrantRoot,
+                    OpKind::Grant,
+                    OpKind::Revoke,
+                    OpKind::TaskKill,
+                ]),
+            )
+            .filter(|r| r.ok)
+            .count();
     assert_eq!(unrelated, 0, "the role bought restart only");
 }
 
@@ -142,11 +156,10 @@ fn escalation_stops_the_retry_loop_and_logs_it() {
     s.k.revoke(s.root, s.smtp_cap).unwrap();
 
     assert!(s.k.task_spawn(s.agent, CapHandle(s.role_slot)).is_err());
-    let refusals = s
-        .k
-        .audit()
-        .query(Some(s.agent.id()), AuditFilter::Ops(&[OpKind::TaskSpawn]))
-        .filter(|r| !r.ok)
-        .count();
+    let refusals =
+        s.k.audit()
+            .query(Some(s.agent.id()), AuditFilter::Ops(&[OpKind::TaskSpawn]))
+            .filter(|r| !r.ok)
+            .count();
     assert_eq!(refusals, 1, "the refused retry is on record, not silent");
 }

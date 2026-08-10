@@ -36,7 +36,6 @@ pub fn escalation_suite() -> Vec<Attempt> {
             expected_failure: true,
             run: |k, ctx| {
                 k.task_kill(ctx.me, CapHandle(u32::MAX))
-                    .map_err(|e| e)
             },
         },
         Attempt {
@@ -45,7 +44,6 @@ pub fn escalation_suite() -> Vec<Attempt> {
             expected_failure: true,
             run: |k, ctx| {
                 k.task_kill(ctx.me, ctx.leaked_owner_slot)
-                    .map_err(|e| e)
             },
         },
         Attempt {
@@ -55,7 +53,6 @@ pub fn escalation_suite() -> Vec<Attempt> {
             run: |k, ctx| {
                 k.copy(ctx.me, ctx.my_slots[1], Rights::ALL)
                     .map(|_| ())
-                    .map_err(|e| e)
             },
         },
         Attempt {
@@ -64,7 +61,6 @@ pub fn escalation_suite() -> Vec<Attempt> {
             expected_failure: true,
             run: |k, ctx| {
                 k.grant(ctx.me, ctx.my_slots[1], ctx.my_slots[0], Rights::ALL, None)
-                    .map_err(|e| e)
             },
         },
         Attempt {
@@ -72,7 +68,7 @@ pub fn escalation_suite() -> Vec<Attempt> {
             explains: "revocation requires GRANT on the source",
             expected_failure: true,
             run: |k, ctx| {
-                k.revoke(ctx.me, ctx.my_slots[1]).map_err(|e| e)
+                k.revoke(ctx.me, ctx.my_slots[1])
             },
         },
         Attempt {
@@ -82,7 +78,6 @@ pub fn escalation_suite() -> Vec<Attempt> {
             run: |k, ctx| {
                 k.grant_mint(ctx.me, ctx.my_slots[0], ctx.my_slots[1], ctx.my_slots[0], Rights::ALL, None)
                     .map(|_| ())
-                    .map_err(|e| e)
             },
         },
         Attempt {
@@ -92,7 +87,6 @@ pub fn escalation_suite() -> Vec<Attempt> {
             run: |k, ctx| {
                 k.create_task(ctx.me, ctx.my_slots[0], "skunkworks")
                     .map(|_| ())
-                    .map_err(|e| e)
             },
         },
         Attempt {
@@ -102,7 +96,6 @@ pub fn escalation_suite() -> Vec<Attempt> {
             run: |k, ctx| {
                 k.create_endpoint(ctx.me, ctx.my_slots[0])
                     .map(|_| ())
-                    .map_err(|e| e)
             },
         },
         Attempt {
@@ -111,7 +104,6 @@ pub fn escalation_suite() -> Vec<Attempt> {
             expected_failure: true,
             run: |k, ctx| {
                 k.ep_send(ctx.me, ctx.my_slots[0], b"hi".to_vec())
-                    .map_err(|e| e)
             },
         },
         Attempt {
@@ -119,14 +111,14 @@ pub fn escalation_suite() -> Vec<Attempt> {
             explains: "no MemRegion cap in the agent's CSpace",
             expected_failure: true,
             run: |k, ctx| {
-                k.mem_len(ctx.me, ctx.my_slots[0]).map(|_| ()).map_err(|e| e)
+                k.mem_len(ctx.me, ctx.my_slots[0]).map(|_| ())
             },
         },
         Attempt {
             name: "kill itself (confined success)",
             explains: "CONTROL is held on its own task via the self cap — legal, but the only object it can control is itself",
             expected_failure: false,
-            run: |k, ctx| k.task_kill(ctx.me, ctx.my_slots[0]).map_err(|e| e),
+            run: |k, ctx| k.task_kill(ctx.me, ctx.my_slots[0]),
         },
     ]
 }

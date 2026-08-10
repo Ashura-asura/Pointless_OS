@@ -56,14 +56,22 @@ impl SubmissionQueue {
 
     /// Queue a read from a region the caller holds (file I/O: a block read).
     pub fn read(&mut self, region: CapHandle, offset: usize, len: usize) -> &mut Self {
-        self.entries.push(BatchEntry::MemRead { region, offset, len });
+        self.entries.push(BatchEntry::MemRead {
+            region,
+            offset,
+            len,
+        });
         self
     }
 
     /// Queue a write into a region the caller holds (file I/O: a block
     /// write). Bounds and rights are re-checked by the kernel at execution.
     pub fn write(&mut self, region: CapHandle, offset: usize, bytes: Vec<u8>) -> &mut Self {
-        self.entries.push(BatchEntry::MemWrite { region, offset, bytes });
+        self.entries.push(BatchEntry::MemWrite {
+            region,
+            offset,
+            bytes,
+        });
         self
     }
 
@@ -73,7 +81,10 @@ impl SubmissionQueue {
     pub fn submit(&mut self, k: &mut Kernel, caller: TaskHandle) -> CompletionQueue {
         let entries = std::mem::take(&mut self.entries);
         let results = k.batch_submit(caller, entries).unwrap_or_default();
-        CompletionQueue { results, drained: 0 }
+        CompletionQueue {
+            results,
+            drained: 0,
+        }
     }
 }
 

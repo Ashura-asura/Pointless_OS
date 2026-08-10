@@ -69,12 +69,7 @@ impl PackageManager {
     /// A cap the manager itself holds that can supply the declared request:
     /// same kind, superset of rights. The manager grants nothing it does not
     /// first hold — a package can never endow itself.
-    fn source_for(
-        &self,
-        k: &Kernel,
-        kind: ObjectKind,
-        rights: Rights,
-    ) -> KernelResult<CapHandle> {
+    fn source_for(&self, k: &Kernel, kind: ObjectKind, rights: Rights) -> KernelResult<CapHandle> {
         for slot in 0..256u32 {
             if let Ok(info) = k.cap_info(self.service, CapHandle(slot)) {
                 if info.kind == kind && info.rights.superset_of(rights) {
@@ -121,14 +116,7 @@ impl PackageManager {
                     return Err(e);
                 }
             };
-            match k.grant_mint(
-                self.service,
-                anchor,
-                source,
-                app_cap,
-                declared.rights,
-                None,
-            ) {
+            match k.grant_mint(self.service, anchor, source, app_cap, declared.rights, None) {
                 Ok(slot) => cap_slots.push(slot.0),
                 Err(e) => {
                     rollback(k);
@@ -144,14 +132,7 @@ impl PackageManager {
                     return Err(KernelError::NoCap);
                 }
             };
-            match k.grant_mint(
-                self.service,
-                anchor,
-                source,
-                app_cap,
-                Rights::READ,
-                None,
-            ) {
+            match k.grant_mint(self.service, anchor, source, app_cap, Rights::READ, None) {
                 Ok(slot) => cap_slots.push(slot.0),
                 Err(e) => {
                     rollback(k);

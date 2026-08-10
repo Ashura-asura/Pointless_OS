@@ -121,7 +121,7 @@ impl Supervisor {
         task_cap: CapHandle,
         policy: RestartPolicy,
     ) -> usize {
-        let _ = k.task_spawn(self.service, task_cap).unwrap();
+        k.task_spawn(self.service, task_cap).unwrap();
         let idx = self.subsystems.len();
         self.subsystems.push(Subsystem {
             name: name.to_string(),
@@ -151,8 +151,7 @@ impl Supervisor {
     /// The kernel's live answer for one subsystem.
     pub fn is_running(&self, k: &mut Kernel, idx: usize) -> bool {
         self.subsystems[idx].state == NodeState::Running
-            && k
-                .task_running(self.service, self.subsystems[idx].task_cap)
+            && k.task_running(self.service, self.subsystems[idx].task_cap)
                 .unwrap_or(false)
     }
 
@@ -211,8 +210,10 @@ impl Supervisor {
     pub fn escalate(&mut self, k: &mut Kernel, idx: usize, to: &mut Supervisor) {
         let node = self.subsystems[idx].name.clone();
         self.subsystems[idx].state = NodeState::Faulted;
-        self.log
-            .push(RuntimeEvent::Escalate { at: k.now(), node: node.clone() });
+        self.log.push(RuntimeEvent::Escalate {
+            at: k.now(),
+            node: node.clone(),
+        });
         let mut s = self.subsystems.swap_remove(idx);
         if k.task_spawn(to.service, s.task_cap).is_ok() {
             s.restarts = 0;

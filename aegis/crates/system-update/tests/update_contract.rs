@@ -54,7 +54,7 @@ fn health_bad(_: &Kernel, _: &InstalledApp) -> bool {
 }
 
 /// The authority ops whose records must not appear during a pointer flip.
-const AUTHORITY_OPS: &'static [OpKind] = &[
+const AUTHORITY_OPS: &[OpKind] = &[
     OpKind::Grant,
     OpKind::Copy,
     OpKind::Revoke,
@@ -87,21 +87,36 @@ fn staging_a_candidate_does_not_disturb_the_current_generation() {
     let mut w = world();
     let pkg = editor_package(&mut w);
     let staged = w.updates.stage(&mut w.k, &mut w.store, &pkg).unwrap();
-    let app1 = w.updates.activate(&mut w.k, &mut w.store, staged, health_ok).unwrap();
+    let app1 = w
+        .updates
+        .activate(&mut w.k, &mut w.store, staged, health_ok)
+        .unwrap();
     assert!(boot_target(&mut w).n == 1);
 
     let staged2 = w.updates.stage(&mut w.k, &mut w.store, &pkg).unwrap();
     assert_eq!(staged2.descriptor.n, 2);
 
-    assert_eq!(boot_target(&mut w).n, 1, "the boot target is untouched by staging");
     assert_eq!(
-        w.k.audit().query(Some(staged2.app.task.id()), AuditFilter::All).count(),
+        boot_target(&mut w).n,
+        1,
+        "the boot target is untouched by staging"
+    );
+    assert_eq!(
+        w.k.audit()
+            .query(Some(staged2.app.task.id()), AuditFilter::All)
+            .count(),
         0,
         "the staged app has not run and drove no operations"
     );
-    assert!(live_slot_count(&w.k, app1.task) >= 2, "the current generation keeps its caps");
+    assert!(
+        live_slot_count(&w.k, app1.task) >= 2,
+        "the current generation keeps its caps"
+    );
     let report = audit(&w.k, &[(app1.task, &pkg.manifest)]);
-    assert!(report.is_clean(), "the current generation still passes its ceiling");
+    assert!(
+        report.is_clean(),
+        "the current generation still passes its ceiling"
+    );
 }
 
 /// §8: activation is gated on health; a failing candidate leaves the current
@@ -111,14 +126,23 @@ fn a_failed_health_check_blocks_activation_and_preserves_the_current_generation(
     let mut w = world();
     let pkg = editor_package(&mut w);
     let staged = w.updates.stage(&mut w.k, &mut w.store, &pkg).unwrap();
-    assert!(w.updates.activate(&mut w.k, &mut w.store, staged, health_ok).is_some());
+    assert!(w
+        .updates
+        .activate(&mut w.k, &mut w.store, staged, health_ok)
+        .is_some());
 
     let staged2 = w.updates.stage(&mut w.k, &mut w.store, &pkg).unwrap();
     assert!(
-        w.updates.activate(&mut w.k, &mut w.store, staged2, health_bad).is_none(),
+        w.updates
+            .activate(&mut w.k, &mut w.store, staged2, health_bad)
+            .is_none(),
         "activation refused: health check failed"
     );
-    assert_eq!(boot_target(&mut w).n, 1, "the refused generation never became default");
+    assert_eq!(
+        boot_target(&mut w).n,
+        1,
+        "the refused generation never became default"
+    );
 }
 
 /// §8: an activation flip is store content, not capability authority — the
@@ -128,11 +152,17 @@ fn activation_is_a_content_pointer_flip_with_no_capability_authority() {
     let mut w = world();
     let pkg = editor_package(&mut w);
     let staged = w.updates.stage(&mut w.k, &mut w.store, &pkg).unwrap();
-    assert!(w.updates.activate(&mut w.k, &mut w.store, staged, health_ok).is_some());
+    assert!(w
+        .updates
+        .activate(&mut w.k, &mut w.store, staged, health_ok)
+        .is_some());
 
     let staged2 = w.updates.stage(&mut w.k, &mut w.store, &pkg).unwrap();
     let authority_before = authority_record_count(&w.k);
-    assert!(w.updates.activate(&mut w.k, &mut w.store, staged2, health_ok).is_some());
+    assert!(w
+        .updates
+        .activate(&mut w.k, &mut w.store, staged2, health_ok)
+        .is_some());
 
     assert_eq!(boot_target(&mut w).n, 2);
     assert_eq!(
@@ -150,10 +180,16 @@ fn rollback_restores_the_last_known_good_generation_without_touching_installed_c
     let mut w = world();
     let pkg = editor_package(&mut w);
     let staged = w.updates.stage(&mut w.k, &mut w.store, &pkg).unwrap();
-    let app1 = w.updates.activate(&mut w.k, &mut w.store, staged, health_ok).unwrap();
+    let app1 = w
+        .updates
+        .activate(&mut w.k, &mut w.store, staged, health_ok)
+        .unwrap();
 
     let staged2 = w.updates.stage(&mut w.k, &mut w.store, &pkg).unwrap();
-    let app2 = w.updates.activate(&mut w.k, &mut w.store, staged2, health_ok).unwrap();
+    let app2 = w
+        .updates
+        .activate(&mut w.k, &mut w.store, staged2, health_ok)
+        .unwrap();
     assert_eq!(boot_target(&mut w).n, 2);
 
     // Gen-2 dies after activation (its install anchor is revoked — an external
@@ -162,7 +198,10 @@ fn rollback_restores_the_last_known_good_generation_without_touching_installed_c
 
     let authority_before = authority_record_count(&w.k);
     let rolled = w.updates.rollback(&mut w.k, &mut w.store).unwrap();
-    assert_eq!(rolled, 1, "restored the last generation healthy at activation");
+    assert_eq!(
+        rolled, 1,
+        "restored the last generation healthy at activation"
+    );
     assert_eq!(boot_target(&mut w).n, 1);
     assert_eq!(
         authority_record_count(&w.k),
@@ -170,9 +209,15 @@ fn rollback_restores_the_last_known_good_generation_without_touching_installed_c
         "rollback performed zero authority operations: it is a content pointer flip"
     );
 
-    assert!(live_slot_count(&w.k, app1.task) >= 2, "the survivor still holds its caps");
+    assert!(
+        live_slot_count(&w.k, app1.task) >= 2,
+        "the survivor still holds its caps"
+    );
     let report = audit(&w.k, &[(app1.task, &pkg.manifest)]);
-    assert!(report.is_clean(), "the survivor still passes its manifest ceiling");
+    assert!(
+        report.is_clean(),
+        "the survivor still passes its manifest ceiling"
+    );
 
     assert!(
         w.updates.rollback(&mut w.k, &mut w.store).is_err(),
@@ -191,9 +236,15 @@ fn the_updater_holds_no_special_authority() {
     let mut w = world();
     let pkg = editor_package(&mut w);
     let staged = w.updates.stage(&mut w.k, &mut w.store, &pkg).unwrap();
-    assert!(w.updates.activate(&mut w.k, &mut w.store, staged, health_ok).is_some());
+    assert!(w
+        .updates
+        .activate(&mut w.k, &mut w.store, staged, health_ok)
+        .is_some());
     let staged2 = w.updates.stage(&mut w.k, &mut w.store, &pkg).unwrap();
-    assert!(w.updates.activate(&mut w.k, &mut w.store, staged2, health_ok).is_some());
+    assert!(w
+        .updates
+        .activate(&mut w.k, &mut w.store, staged2, health_ok)
+        .is_some());
     w.updates.rollback(&mut w.k, &mut w.store).unwrap();
 
     let (mut grant_roots, mut creators, mut tasks) = (0, 0, 0);
@@ -209,5 +260,8 @@ fn the_updater_holds_no_special_authority() {
     }
     assert_eq!(grant_roots, 2, "exactly the two install anchors exist");
     assert_eq!(creators, 1, "the boot role's own creator — nothing new");
-    assert_eq!(tasks, 3, "boot task + the two installed apps, all from the installs");
+    assert_eq!(
+        tasks, 3,
+        "boot task + the two installed apps, all from the installs"
+    );
 }

@@ -7,7 +7,7 @@ use capability_audit::{Manifest, Repo};
 use capability_core::{CapHandle, Kernel, ObjectKind, Rights, TaskHandle};
 use object_store::Store;
 use packages::{Package, PackageManager};
-use resources::{Alloc, Budget, Meter, recycle};
+use resources::{recycle, Alloc, Budget, Meter};
 
 struct World {
     k: Kernel,
@@ -70,7 +70,9 @@ fn worker_package(w: &mut World) -> Package {
 
 fn endpoint_slot(k: &Kernel, task: TaskHandle) -> u32 {
     (1..256u32)
-        .find(|s| matches!(k.cap_info(task, CapHandle(*s)), Ok(i) if i.kind == ObjectKind::Endpoint))
+        .find(
+            |s| matches!(k.cap_info(task, CapHandle(*s)), Ok(i) if i.kind == ObjectKind::Endpoint),
+        )
         .unwrap()
 }
 
@@ -92,24 +94,81 @@ fn hierarchical_allocation_cannot_overcommit() {
     let a2 = spawn(&mut w, "svc-a2");
     let loner = spawn(&mut w, "svc-loner");
 
-    let mut alloc = Alloc::root(w.root, Budget { cpu: 1000, mem: 1_048_576 });
-    alloc.give(w.root, a, Budget { cpu: 400, mem: 200_000 }).unwrap();
-    alloc.give(w.root, b, Budget { cpu: 300, mem: 150_000 }).unwrap();
-    alloc.give(a, a1, Budget { cpu: 200, mem: 100_000 }).unwrap();
-    alloc.give(a, a2, Budget { cpu: 100, mem: 50_000 }).unwrap();
+    let mut alloc = Alloc::root(
+        w.root,
+        Budget {
+            cpu: 1000,
+            mem: 1_048_576,
+        },
+    );
+    alloc
+        .give(
+            w.root,
+            a,
+            Budget {
+                cpu: 400,
+                mem: 200_000,
+            },
+        )
+        .unwrap();
+    alloc
+        .give(
+            w.root,
+            b,
+            Budget {
+                cpu: 300,
+                mem: 150_000,
+            },
+        )
+        .unwrap();
+    alloc
+        .give(
+            a,
+            a1,
+            Budget {
+                cpu: 200,
+                mem: 100_000,
+            },
+        )
+        .unwrap();
+    alloc
+        .give(
+            a,
+            a2,
+            Budget {
+                cpu: 100,
+                mem: 50_000,
+            },
+        )
+        .unwrap();
 
     assert_eq!(
         alloc.remaining(a),
-        Some(Budget { cpu: 100, mem: 50_000 }),
+        Some(Budget {
+            cpu: 100,
+            mem: 50_000
+        }),
         "a parent keeps exactly what it did not hand down"
     );
     assert_eq!(
         alloc.remaining(w.root),
-        Some(Budget { cpu: 300, mem: 698_576 }),
+        Some(Budget {
+            cpu: 300,
+            mem: 698_576
+        }),
         "root committed 700 cpu to its two children and keeps the difference"
     );
     assert!(
-        alloc.give(a, spawn(&mut w, "svc-a3"), Budget { cpu: 200, mem: 100_000 }).is_err(),
+        alloc
+            .give(
+                a,
+                spawn(&mut w, "svc-a3"),
+                Budget {
+                    cpu: 200,
+                    mem: 100_000
+                }
+            )
+            .is_err(),
         "A has only 100 cpu left; a 200 cpu child would exceed the envelope"
     );
     assert!(
@@ -123,7 +182,10 @@ fn hierarchical_allocation_cannot_overcommit() {
         1000,
         "allocation conserves the total: root kept + subtree tops = the root's budget"
     );
-    assert!(alloc.remaining(loner).is_none(), "never-budgeted services have no envelope");
+    assert!(
+        alloc.remaining(loner).is_none(),
+        "never-budgeted services have no envelope"
+    );
 }
 
 /// §8: metering is kernel truth — every successful record is attributed by the
@@ -134,12 +196,19 @@ fn metering_is_kernel_truth_partitioning_the_log_by_task() {
     let mut w = world();
     let app = {
         let pkg = editor_package(&mut w, false);
-        w.manager.install(&mut w.k, &mut w.store, "editor", &pkg).unwrap()
+        w.manager
+            .install(&mut w.k, &mut w.store, "editor", &pkg)
+            .unwrap()
     };
 
-    let total: usize = w.k.audit().query(None, capability_core::AuditFilter::All).count();
+    let total: usize =
+        w.k.audit()
+            .query(None, capability_core::AuditFilter::All)
+            .count();
     let root_ops: usize =
-        w.k.audit().query(Some(w.root.id()), capability_core::AuditFilter::Success).count();
+        w.k.audit()
+            .query(Some(w.root.id()), capability_core::AuditFilter::Success)
+            .count();
     let app_ops = Meter::cpu_spent(&w.k, app.task) as usize;
 
     assert_eq!(
@@ -163,13 +232,23 @@ fn the_governor_recycles_an_over_budget_service_and_siblings_survive() {
     let pkg = worker_package(&mut w);
     let _ep = w.k.create_endpoint(w.root, w.creator).unwrap();
 
-    let a = w.manager.install(&mut w.k, &mut w.store, "worker-a", &pkg).unwrap();
-    let b = w.manager.install(&mut w.k, &mut w.store, "worker-b", &pkg).unwrap();
+    let a = w
+        .manager
+        .install(&mut w.k, &mut w.store, "worker-a", &pkg)
+        .unwrap();
+    let b = w
+        .manager
+        .install(&mut w.k, &mut w.store, "worker-b", &pkg)
+        .unwrap();
     let a_ep = endpoint_slot(&w.k, a.task);
 
     let mut alloc = Alloc::root(w.root, Budget { cpu: 100, mem: 0 });
-    alloc.give(w.root, a.task, Budget { cpu: 2, mem: 0 }).unwrap();
-    alloc.give(w.root, b.task, Budget { cpu: 98, mem: 0 }).unwrap();
+    alloc
+        .give(w.root, a.task, Budget { cpu: 2, mem: 0 })
+        .unwrap();
+    alloc
+        .give(w.root, b.task, Budget { cpu: 98, mem: 0 })
+        .unwrap();
 
     for i in 0..3u8 {
         w.k.ep_send(a.task, CapHandle(a_ep), vec![i]).unwrap();
@@ -196,9 +275,16 @@ fn the_governor_recycles_an_over_budget_service_and_siblings_survive() {
     );
 
     // A clean reinstall = a clean envelope: fresh task, zero spent.
-    let a2 = w.manager.install(&mut w.k, &mut w.store, "worker-a2", &pkg).unwrap();
+    let a2 = w
+        .manager
+        .install(&mut w.k, &mut w.store, "worker-a2", &pkg)
+        .unwrap();
     assert_ne!(a2.task, a.task);
-    assert_eq!(Meter::cpu_spent(&w.k, a2.task), 0, "the fresh envelope starts clean");
+    assert_eq!(
+        Meter::cpu_spent(&w.k, a2.task),
+        0,
+        "the fresh envelope starts clean"
+    );
 }
 
 /// §8: memory metering is the cap-table truth — a WRITE region sized N meters
@@ -208,7 +294,9 @@ fn resident_memory_is_the_writable_regions_a_task_can_reach() {
     let mut w = world();
     let app = {
         let pkg = editor_package(&mut w, true);
-        w.manager.install(&mut w.k, &mut w.store, "editor", &pkg).unwrap()
+        w.manager
+            .install(&mut w.k, &mut w.store, "editor", &pkg)
+            .unwrap()
     };
 
     let mut total = 0u64;
@@ -227,8 +315,7 @@ fn resident_memory_is_the_writable_regions_a_task_can_reach() {
         }
     }
     assert_eq!(
-        count,
-        3,
+        count, 3,
         "the declared R|W region, the declared READ pair, and the payload READ \
          delivery — every declared pair is granted, and the payload is READ-only"
     );

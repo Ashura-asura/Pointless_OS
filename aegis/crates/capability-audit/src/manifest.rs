@@ -68,10 +68,7 @@ mod tests {
             .allow(ObjectKind::Task, Rights::READ)
             .allow(ObjectKind::MemRegion, Rights::READ.union(Rights::WRITE));
         assert!(m.declares(ObjectKind::Task, Rights::READ));
-        assert!(m.declares(
-            ObjectKind::MemRegion,
-            Rights::READ.union(Rights::WRITE)
-        ));
+        assert!(m.declares(ObjectKind::MemRegion, Rights::READ.union(Rights::WRITE)));
         assert!(!m.declares(ObjectKind::Task, Rights::CONTROL));
         assert!(!m.declares(ObjectKind::GrantRoot, Rights::GRANT));
     }

@@ -15,7 +15,12 @@ fn boot() -> (Kernel, TaskHandle, CapHandle) {
     (k, root, creator)
 }
 
-fn task(k: &mut Kernel, root: TaskHandle, creator: CapHandle, label: &str) -> (TaskHandle, CapHandle) {
+fn task(
+    k: &mut Kernel,
+    root: TaskHandle,
+    creator: CapHandle,
+    label: &str,
+) -> (TaskHandle, CapHandle) {
     k.create_task(root, creator, label).unwrap()
 }
 
@@ -50,7 +55,8 @@ fn send_and_recv_are_independent_rights() {
     let smtp_ep = endpoint_slot(&k, smtp);
     let ntp_ep = endpoint_slot(&k, ntp);
 
-    k.ep_send(smtp, CapHandle(smtp_ep), b"hello".to_vec()).unwrap();
+    k.ep_send(smtp, CapHandle(smtp_ep), b"hello".to_vec())
+        .unwrap();
     assert_eq!(
         k.ep_recv(ntp, CapHandle(ntp_ep)).unwrap(),
         Some(b"hello".to_vec()),
@@ -63,7 +69,8 @@ fn send_and_recv_are_independent_rights() {
         KernelError::InsufficientRights(Rights::RECV)
     );
     assert_eq!(
-        k.ep_send(ntp, CapHandle(ntp_ep), b"reply".to_vec()).unwrap_err(),
+        k.ep_send(ntp, CapHandle(ntp_ep), b"reply".to_vec())
+            .unwrap_err(),
         KernelError::InsufficientRights(Rights::SEND)
     );
 }
@@ -100,7 +107,8 @@ fn fabricated_handles_cannot_name_an_endpoint() {
     // ntp's table: the agent's own slot carries nothing.
     let leaked = endpoint_slot(&k, ntp);
     assert_eq!(
-        k.ep_send(agent, CapHandle(leaked), b"x".to_vec()).unwrap_err(),
+        k.ep_send(agent, CapHandle(leaked), b"x".to_vec())
+            .unwrap_err(),
         KernelError::NoCap
     );
     // Its own slot 0 holds the self cap, a Task cap: not an endpoint.
@@ -131,7 +139,8 @@ fn ipc_is_fully_audited() {
     let smtp_ep = endpoint_slot(&k, smtp);
     let ntp_ep = endpoint_slot(&k, ntp);
 
-    k.ep_send(smtp, CapHandle(smtp_ep), b"ping".to_vec()).unwrap();
+    k.ep_send(smtp, CapHandle(smtp_ep), b"ping".to_vec())
+        .unwrap();
     k.ep_recv(ntp, CapHandle(ntp_ep)).unwrap();
     assert_eq!(
         k.ep_send(agent, CapHandle(0), b"x".to_vec()).unwrap_err(),
@@ -168,9 +177,18 @@ fn async_senders_never_block_and_fifo_survives_the_buffer() {
         k.ep_send(sensor, CapHandle(sensor_ep), vec![i]).unwrap();
     }
     // Nothing lost or reordered, drained one at a time.
-    assert_eq!(k.ep_recv(daemon, CapHandle(daemon_ep)).unwrap(), Some(vec![0]));
-    assert_eq!(k.ep_recv(daemon, CapHandle(daemon_ep)).unwrap(), Some(vec![1]));
-    assert_eq!(k.ep_recv(daemon, CapHandle(daemon_ep)).unwrap(), Some(vec![2]));
+    assert_eq!(
+        k.ep_recv(daemon, CapHandle(daemon_ep)).unwrap(),
+        Some(vec![0])
+    );
+    assert_eq!(
+        k.ep_recv(daemon, CapHandle(daemon_ep)).unwrap(),
+        Some(vec![1])
+    );
+    assert_eq!(
+        k.ep_recv(daemon, CapHandle(daemon_ep)).unwrap(),
+        Some(vec![2])
+    );
     assert_eq!(
         k.ep_recv(daemon, CapHandle(daemon_ep)).unwrap(),
         None,
@@ -201,8 +219,10 @@ fn two_endpoints_keep_separate_queues() {
         .find(|s| *s != ep_a_slot)
         .unwrap();
 
-    k.ep_send(peer, CapHandle(ep_a_slot), b"a".to_vec()).unwrap();
-    k.ep_send(peer, CapHandle(ep_b_slot), b"b".to_vec()).unwrap();
+    k.ep_send(peer, CapHandle(ep_a_slot), b"a".to_vec())
+        .unwrap();
+    k.ep_send(peer, CapHandle(ep_b_slot), b"b".to_vec())
+        .unwrap();
     assert_eq!(
         k.ep_recv(root, ep_a).unwrap(),
         Some(b"a".to_vec()),
@@ -224,38 +244,57 @@ fn bulk_data_moves_by_capability_grant_not_byte_copy() {
     let region = k.create_mem(root, creator, vec![7u8; 64 * 1024]).unwrap();
     let ep = k.create_endpoint(root, creator).unwrap();
 
-    k.grant(root, region, producer_cap, Rights::WRITE, None).unwrap();
-    k.grant(root, region, consumer_cap, Rights::READ, None).unwrap();
+    k.grant(root, region, producer_cap, Rights::WRITE, None)
+        .unwrap();
+    k.grant(root, region, consumer_cap, Rights::READ, None)
+        .unwrap();
     k.grant(root, ep, producer_cap, Rights::SEND, None).unwrap();
     k.grant(root, ep, consumer_cap, Rights::RECV, None).unwrap();
     let producer_slot = |k: &Kernel| endpoint_slot(k, producer);
     let producer_region = {
         let caps = k.authorized(producer);
-        caps.iter().find(|c| c.kind == ObjectKind::MemRegion).unwrap().slot
+        caps.iter()
+            .find(|c| c.kind == ObjectKind::MemRegion)
+            .unwrap()
+            .slot
     };
     let consumer_region = {
         let caps = k.authorized(consumer);
-        caps.iter().find(|c| c.kind == ObjectKind::MemRegion).unwrap().slot
+        caps.iter()
+            .find(|c| c.kind == ObjectKind::MemRegion)
+            .unwrap()
+            .slot
     };
 
     // Producer writes the payload into the shared region, then notifies.
-    k.mem_write(producer, CapHandle(producer_region), 0, b"log line #1".to_vec())
-        .unwrap();
+    k.mem_write(
+        producer,
+        CapHandle(producer_region),
+        0,
+        b"log line #1".to_vec(),
+    )
+    .unwrap();
     k.ep_send(producer, CapHandle(producer_slot(&k)), b"ready".to_vec())
         .unwrap();
 
     // Consumer is woken by the notification — a 5-byte message — and reads the
     // 64 KiB payload straight out of the region through its own cap.
     assert_eq!(
-        k.ep_recv(consumer, CapHandle(endpoint_slot(&k, consumer))).unwrap(),
+        k.ep_recv(consumer, CapHandle(endpoint_slot(&k, consumer)))
+            .unwrap(),
         Some(b"ready".to_vec())
     );
     assert_eq!(
-        k.mem_read(consumer, CapHandle(consumer_region), 0, 11).unwrap(),
+        k.mem_read(consumer, CapHandle(consumer_region), 0, 11)
+            .unwrap(),
         b"log line #1".to_vec()
     );
     // The rest of the region is intact behind the read window.
-    assert_eq!(k.mem_read(consumer, CapHandle(consumer_region), 11, 3).unwrap(), vec![7, 7, 7]);
+    assert_eq!(
+        k.mem_read(consumer, CapHandle(consumer_region), 11, 3)
+            .unwrap(),
+        vec![7, 7, 7]
+    );
     // READ-only cannot be turned into WRITE: the grant narrowed the cap (I2).
     assert_eq!(
         k.mem_write(consumer, CapHandle(consumer_region), 0, b"x".to_vec())
@@ -269,5 +308,8 @@ fn bulk_data_moves_by_capability_grant_not_byte_copy() {
         .query(Some(producer.id()), AuditFilter::Ops(&[OpKind::Send]))
         .filter(|r| r.ok && r.target == Some(ep_obj))
         .count();
-    assert_eq!(sent, 1, "exactly one byte-copy class of traffic: the notification");
+    assert_eq!(
+        sent, 1,
+        "exactly one byte-copy class of traffic: the notification"
+    );
 }

@@ -20,7 +20,12 @@ fn world() -> World {
     let (root, _, creator) = k.boot("session").unwrap();
     let store = Store::new(root, creator);
     let manager = PackageManager::new(root, creator);
-    World { k, root, store, manager }
+    World {
+        k,
+        root,
+        store,
+        manager,
+    }
 }
 
 const CONFIG: &[u8] = b"max_cols=80";
@@ -98,7 +103,10 @@ fn install_grants_exactly_the_manifest_and_nothing_ambient() {
     let mut w = world();
     let pkg = editor_package(&mut w, false);
     let before = live_cap_count(&w.k, w.root);
-    let app = w.manager.install(&mut w.k, &mut w.store, "editor", &pkg).unwrap();
+    let app = w
+        .manager
+        .install(&mut w.k, &mut w.store, "editor", &pkg)
+        .unwrap();
 
     let slots = app_slots(&w.k, app.task);
     assert_eq!(
@@ -106,18 +114,22 @@ fn install_grants_exactly_the_manifest_and_nothing_ambient() {
         3,
         "exactly: declared Task CONTROL + declared MemRegion READ + payload READ"
     );
-    let (_, kinds, rights): (Vec<_>, Vec<_>, Vec<_>) = slots
-        .iter()
-        .map(|(s, k, r)| (*s, *k, *r))
-        .fold((Vec::new(), Vec::new(), Vec::new()), |(mut a, mut b, mut c), (s, k, r)| {
-            a.push(s);
-            b.push(k);
-            c.push(r);
-            (a, b, c)
-        });
+    let (_, kinds, rights): (Vec<_>, Vec<_>, Vec<_>) =
+        slots.iter().map(|(s, k, r)| (*s, *k, *r)).fold(
+            (Vec::new(), Vec::new(), Vec::new()),
+            |(mut a, mut b, mut c), (s, k, r)| {
+                a.push(s);
+                b.push(k);
+                c.push(r);
+                (a, b, c)
+            },
+        );
     assert_eq!(kinds.iter().filter(|k| **k == ObjectKind::Task).count(), 1);
     assert_eq!(
-        kinds.iter().filter(|k| **k == ObjectKind::MemRegion).count(),
+        kinds
+            .iter()
+            .filter(|k| **k == ObjectKind::MemRegion)
+            .count(),
         2
     );
     assert!(rights.iter().all(|r| !r.contains(Rights::WRITE)));
@@ -130,7 +142,8 @@ fn install_grants_exactly_the_manifest_and_nothing_ambient() {
     );
     for (slot, _) in &regions {
         assert!(
-            w.k.mem_write(app.task, CapHandle(*slot), 0, b"x".to_vec()).is_err(),
+            w.k.mem_write(app.task, CapHandle(*slot), 0, b"x".to_vec())
+                .is_err(),
             "READ-only by derivation"
         );
     }
@@ -153,21 +166,26 @@ fn install_runs_no_code_and_spawns_nothing_but_the_app() {
     let mut w = world();
     let before = create_task_count(&w.k);
     let pkg = editor_package(&mut w, false);
-    let app = w.manager.install(&mut w.k, &mut w.store, "editor", &pkg).unwrap();
+    let app = w
+        .manager
+        .install(&mut w.k, &mut w.store, "editor", &pkg)
+        .unwrap();
 
-    let spawned: Vec<_> = w
-        .k
-        .audit()
-        .query(None, AuditFilter::Ops(&[OpKind::CreateTask]))
-        .skip(before)
-        .collect();
+    let spawned: Vec<_> =
+        w.k.audit()
+            .query(None, AuditFilter::Ops(&[OpKind::CreateTask]))
+            .skip(before)
+            .collect();
     assert_eq!(spawned.len(), 1, "exactly one task was created: the app");
     assert_eq!(
-        spawned[0].caller, w.root.id(),
+        spawned[0].caller,
+        w.root.id(),
         "the single spawn is attributable to the manager, not to anything the install ran"
     );
     assert_eq!(
-        w.k.audit().query(Some(app.task.id()), AuditFilter::All).count(),
+        w.k.audit()
+            .query(Some(app.task.id()), AuditFilter::All)
+            .count(),
         0,
         "the app never performed any operation during install"
     );
@@ -193,7 +211,11 @@ fn kernel_equivalent_install_is_refused_and_rolls_back() {
         .manager
         .install(&mut w.k, &mut w.store, "root-wanter", &pkg)
         .unwrap_err();
-    assert_eq!(err.to_string(), "invalid operation", "refused by the manifest audit");
+    assert_eq!(
+        err.to_string(),
+        "invalid operation",
+        "refused by the manifest audit"
+    );
 
     assert_eq!(
         live_cap_count(&w.k, w.root),
@@ -221,7 +243,11 @@ fn an_unholdable_request_is_refused_up_front_and_rolled_back() {
         .manager
         .install(&mut w.k, &mut w.store, "mem-tyrant", &pkg)
         .unwrap_err();
-    assert_eq!(err.to_string(), "no capability in slot", "no source cap exists");
+    assert_eq!(
+        err.to_string(),
+        "no capability in slot",
+        "no source cap exists"
+    );
 
     assert_eq!(
         live_cap_count(&w.k, w.root),
@@ -237,11 +263,16 @@ fn identical_payloads_share_blocks_across_installs() {
     let mut w = world();
     let blocks_after_first = {
         let pkg = editor_package(&mut w, true);
-        w.manager.install(&mut w.k, &mut w.store, "editor-a", &pkg).unwrap();
+        w.manager
+            .install(&mut w.k, &mut w.store, "editor-a", &pkg)
+            .unwrap();
         w.store.block_count()
     };
     let pkg_b = editor_package(&mut w, true);
-    let app_b = w.manager.install(&mut w.k, &mut w.store, "editor-b", &pkg_b).unwrap();
+    let app_b = w
+        .manager
+        .install(&mut w.k, &mut w.store, "editor-b", &pkg_b)
+        .unwrap();
 
     assert_eq!(
         w.store.block_count(),
@@ -260,8 +291,14 @@ fn revoking_the_anchor_removes_every_minted_cap_of_that_install_only() {
     let mut w = world();
     let pkg_a = editor_package(&mut w, false);
     let pkg_b = editor_package(&mut w, true);
-    let app_a = w.manager.install(&mut w.k, &mut w.store, "editor-a", &pkg_a).unwrap();
-    let app_b = w.manager.install(&mut w.k, &mut w.store, "editor-b", &pkg_b).unwrap();
+    let app_a = w
+        .manager
+        .install(&mut w.k, &mut w.store, "editor-a", &pkg_a)
+        .unwrap();
+    let app_b = w
+        .manager
+        .install(&mut w.k, &mut w.store, "editor-b", &pkg_b)
+        .unwrap();
     assert_eq!(app_slots(&w.k, app_a.task).len(), 3);
 
     w.k.revoke(w.root, app_a.anchor).unwrap();

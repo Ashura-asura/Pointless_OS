@@ -38,14 +38,23 @@ fn budget_zero_trips_on_first_crash() {
     let mut w = world();
     let mut sup = Supervisor::new(w.root);
     let (a, a_cap) = spawn(&mut w, "svc-a");
-    let idx = sup.add(&mut w.k, "svc-a", a, a_cap, RestartPolicy { max_restarts: 0 });
+    let idx = sup.add(
+        &mut w.k,
+        "svc-a",
+        a,
+        a_cap,
+        RestartPolicy { max_restarts: 0 },
+    );
 
     w.k.task_kill(w.root, a_cap).unwrap();
     sup.pump(&mut w.k);
 
     assert!(!sup.is_running(&mut w.k, idx));
     assert_eq!(sup.restarts_of(idx), 0);
-    assert!(sup.log().iter().any(|e| matches!(e, RuntimeEvent::Trip { .. })));
+    assert!(sup
+        .log()
+        .iter()
+        .any(|e| matches!(e, RuntimeEvent::Trip { .. })));
 }
 
 /// Interleaved crashes: A crashes, B crashes, A crashes again, B crashes
@@ -59,9 +68,27 @@ fn interleaved_crashes_track_independently() {
     let (b, b_cap) = spawn(&mut w, "svc-b");
     let (c, c_cap) = spawn(&mut w, "svc-c");
 
-    let idx_a = sup.add(&mut w.k, "svc-a", a, a_cap, RestartPolicy { max_restarts: 2 });
-    let idx_b = sup.add(&mut w.k, "svc-b", b, b_cap, RestartPolicy { max_restarts: 1 });
-    let idx_c = sup.add(&mut w.k, "svc-c", c, c_cap, RestartPolicy { max_restarts: 3 });
+    let idx_a = sup.add(
+        &mut w.k,
+        "svc-a",
+        a,
+        a_cap,
+        RestartPolicy { max_restarts: 2 },
+    );
+    let idx_b = sup.add(
+        &mut w.k,
+        "svc-b",
+        b,
+        b_cap,
+        RestartPolicy { max_restarts: 1 },
+    );
+    let idx_c = sup.add(
+        &mut w.k,
+        "svc-c",
+        c,
+        c_cap,
+        RestartPolicy { max_restarts: 3 },
+    );
 
     let c_before = census(&w.k, c);
 
@@ -86,14 +113,20 @@ fn interleaved_crashes_track_independently() {
     sup.pump(&mut w.k);
     assert!(!sup.is_running(&mut w.k, idx_b));
     assert_eq!(sup.restarts_of(idx_b), 1);
-    assert!(sup.log().iter().any(|e| matches!(e, RuntimeEvent::Trip { node, .. } if node == "svc-b")));
+    assert!(sup
+        .log()
+        .iter()
+        .any(|e| matches!(e, RuntimeEvent::Trip { node, .. } if node == "svc-b")));
 
     // A's third crash exhausts budget 2.
     w.k.task_kill(w.root, a_cap).unwrap();
     sup.pump(&mut w.k);
     assert!(!sup.is_running(&mut w.k, idx_a));
     assert_eq!(sup.restarts_of(idx_a), 2);
-    assert!(sup.log().iter().any(|e| matches!(e, RuntimeEvent::Trip { node, .. } if node == "svc-a")));
+    assert!(sup
+        .log()
+        .iter()
+        .any(|e| matches!(e, RuntimeEvent::Trip { node, .. } if node == "svc-a")));
 
     // C never crashed: untouched.
     assert!(sup.is_running(&mut w.k, idx_c));
@@ -108,7 +141,13 @@ fn rapid_crash_restart_cycle_stays_consistent() {
     let mut sup = Supervisor::new(w.root);
 
     let (a, a_cap) = spawn(&mut w, "svc-a");
-    let idx = sup.add(&mut w.k, "svc-a", a, a_cap, RestartPolicy { max_restarts: 3 });
+    let idx = sup.add(
+        &mut w.k,
+        "svc-a",
+        a,
+        a_cap,
+        RestartPolicy { max_restarts: 3 },
+    );
 
     // 7 rapid cycles: 3 restarts within budget, then trip. After the trip,
     // pump() skips faulted subsystems — further crashes are not logged.
@@ -122,9 +161,20 @@ fn rapid_crash_restart_cycle_stays_consistent() {
 
     // pump() skips faulted subsystems, so only crashes before the trip are
     // recorded: 4 (3 within budget + 1 that triggers the trip).
-    let crashes = sup.log().iter().filter(|e| matches!(e, RuntimeEvent::Crash { .. })).count();
-    let trips = sup.log().iter().filter(|e| matches!(e, RuntimeEvent::Trip { .. })).count();
-    assert_eq!(crashes, 4, "crashes before trip: 3 within budget + 1 that trips");
+    let crashes = sup
+        .log()
+        .iter()
+        .filter(|e| matches!(e, RuntimeEvent::Crash { .. }))
+        .count();
+    let trips = sup
+        .log()
+        .iter()
+        .filter(|e| matches!(e, RuntimeEvent::Trip { .. }))
+        .count();
+    assert_eq!(
+        crashes, 4,
+        "crashes before trip: 3 within budget + 1 that trips"
+    );
     assert_eq!(trips, 1, "exactly one trip event");
 }
 
@@ -137,7 +187,13 @@ fn escalation_clears_budget_for_parent() {
     let mut parent = Supervisor::new(w.root);
 
     let (a, a_cap) = spawn(&mut w, "svc-a");
-    child.add(&mut w.k, "svc-a", a, a_cap, RestartPolicy { max_restarts: 1 });
+    child.add(
+        &mut w.k,
+        "svc-a",
+        a,
+        a_cap,
+        RestartPolicy { max_restarts: 1 },
+    );
 
     // Trip the child.
     w.k.task_kill(w.root, a_cap).unwrap();
@@ -167,8 +223,20 @@ fn new_crash_during_existing_fault() {
 
     let (a, a_cap) = spawn(&mut w, "svc-a");
     let (b, b_cap) = spawn(&mut w, "svc-b");
-    let idx_a = sup.add(&mut w.k, "svc-a", a, a_cap, RestartPolicy { max_restarts: 0 });
-    let idx_b = sup.add(&mut w.k, "svc-b", b, b_cap, RestartPolicy { max_restarts: 2 });
+    let idx_a = sup.add(
+        &mut w.k,
+        "svc-a",
+        a,
+        a_cap,
+        RestartPolicy { max_restarts: 0 },
+    );
+    let idx_b = sup.add(
+        &mut w.k,
+        "svc-b",
+        b,
+        b_cap,
+        RestartPolicy { max_restarts: 2 },
+    );
 
     // Trip A immediately.
     w.k.task_kill(w.root, a_cap).unwrap();
@@ -195,8 +263,20 @@ fn budget_accounting_is_exact_under_interleave() {
 
     let (a, a_cap) = spawn(&mut w, "svc-a");
     let (b, b_cap) = spawn(&mut w, "svc-b");
-    let idx_a = sup.add(&mut w.k, "svc-a", a, a_cap, RestartPolicy { max_restarts: 3 });
-    let idx_b = sup.add(&mut w.k, "svc-b", b, b_cap, RestartPolicy { max_restarts: 3 });
+    let idx_a = sup.add(
+        &mut w.k,
+        "svc-a",
+        a,
+        a_cap,
+        RestartPolicy { max_restarts: 3 },
+    );
+    let idx_b = sup.add(
+        &mut w.k,
+        "svc-b",
+        b,
+        b_cap,
+        RestartPolicy { max_restarts: 3 },
+    );
 
     // 4 crashes each, alternating. After 3 restarts each, both breakers
     // trip on the 4th crash. Further crashes are skipped by pump().
@@ -217,8 +297,13 @@ fn budget_accounting_is_exact_under_interleave() {
     assert_eq!(sup.restarts_of(idx_b), 3);
 
     // Total spawns: 2 initial + 3 A restarts + 3 B restarts = 8.
-    let spawns = w.k.audit().query(None, capability_core::AuditFilter::Ops(&[OpKind::TaskSpawn]))
-        .filter(|r| r.caller == w.root.id())
-        .count();
+    let spawns =
+        w.k.audit()
+            .query(
+                None,
+                capability_core::AuditFilter::Ops(&[OpKind::TaskSpawn]),
+            )
+            .filter(|r| r.caller == w.root.id())
+            .count();
     assert_eq!(spawns, 8);
 }

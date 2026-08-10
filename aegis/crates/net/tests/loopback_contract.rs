@@ -19,7 +19,12 @@ fn world() -> World {
     let mut k = Kernel::new();
     let (root, _, creator) = k.boot("session").unwrap();
     let stack = LoopbackStack::new(root, creator);
-    World { k, root, creator, stack }
+    World {
+        k,
+        root,
+        creator,
+        stack,
+    }
 }
 
 fn spawn(w: &mut World, label: &str) -> TaskHandle {
@@ -58,16 +63,25 @@ fn sockets_are_capability_scoped_and_ports_are_not_ambient_authority() {
 
     // The outsider knows the port numbers but holds no channel cap.
     assert!(
-        w.stack.send(&mut w.k, outsider, CapHandle(0), port_a, b"x".to_vec()).is_err(),
+        w.stack
+            .send(&mut w.k, outsider, CapHandle(0), port_a, b"x".to_vec())
+            .is_err(),
         "a task without a channel cap cannot speak, even knowing the port"
     );
     assert!(
-        w.k.ep_send(outsider, CapHandle(0), b"raw".to_vec()).is_err(),
+        w.k.ep_send(outsider, CapHandle(0), b"raw".to_vec())
+            .is_err(),
         "and the kernel agrees: no SEND cap, no injection at any layer"
     );
 
-    w.stack.send(&mut w.k, app_a, CapHandle(slot_a), port_b, b"ping".to_vec()).unwrap();
-    let b_to_a = w.stack.recv(&mut w.k, app_b, CapHandle(slot_b)).unwrap().unwrap();
+    w.stack
+        .send(&mut w.k, app_a, CapHandle(slot_a), port_b, b"ping".to_vec())
+        .unwrap();
+    let b_to_a = w
+        .stack
+        .recv(&mut w.k, app_b, CapHandle(slot_b))
+        .unwrap()
+        .unwrap();
     assert_eq!(b_to_a, b"ping");
 }
 
@@ -90,12 +104,18 @@ fn every_hop_is_an_attributed_endpoint_op_in_the_audit_log() {
     let _ = (port_a, slot_a);
 
     for i in 0..3u8 {
-        w.stack.send(&mut w.k, app_a, CapHandle(slot_a), port_b, vec![i]).unwrap();
+        w.stack
+            .send(&mut w.k, app_a, CapHandle(slot_a), port_b, vec![i])
+            .unwrap();
     }
 
     // FIFO over the loopback: the endpoint queue preserves order exactly.
     for i in 0..3u8 {
-        let got = w.stack.recv(&mut w.k, app_b, CapHandle(slot_b)).unwrap().unwrap();
+        let got = w
+            .stack
+            .recv(&mut w.k, app_b, CapHandle(slot_b))
+            .unwrap()
+            .unwrap();
         assert_eq!(got, vec![i], "packets arrive in the order they were sent");
     }
     assert_eq!(
@@ -106,22 +126,28 @@ fn every_hop_is_an_attributed_endpoint_op_in_the_audit_log() {
 
     // Every hop is attributed: the three injection sends are A's, the three
     // forward hops are the stack's — the log tells the whole path.
-    let a_sends = w
-        .k
-        .audit()
-        .query(Some(app_a.id()), capability_core::AuditFilter::Ops(&[
-            capability_core::OpKind::Send,
-        ]))
-        .count();
-    let stack_sends = w
-        .k
-        .audit()
-        .query(Some(w.root.id()), capability_core::AuditFilter::Ops(&[
-            capability_core::OpKind::Send,
-        ]))
-        .count();
-    assert_eq!(a_sends, 3, "injection sends are attributed to the sender task");
-    assert!(stack_sends >= 3, "forward hops are attributed to the router");
+    let a_sends =
+        w.k.audit()
+            .query(
+                Some(app_a.id()),
+                capability_core::AuditFilter::Ops(&[capability_core::OpKind::Send]),
+            )
+            .count();
+    let stack_sends =
+        w.k.audit()
+            .query(
+                Some(w.root.id()),
+                capability_core::AuditFilter::Ops(&[capability_core::OpKind::Send]),
+            )
+            .count();
+    assert_eq!(
+        a_sends, 3,
+        "injection sends are attributed to the sender task"
+    );
+    assert!(
+        stack_sends >= 3,
+        "forward hops are attributed to the router"
+    );
 }
 
 /// §8: network capabilities are revocable rights. Once the stack drops its
@@ -146,7 +172,10 @@ fn a_socket_can_be_torn_down_without_touching_its_peers() {
         .unwrap();
     w.stack.unsubscribe(&mut w.k, CapHandle(channel_a)).unwrap();
 
-    assert!(!w.stack.is_listening(port_a), "A's socket is gone from the interface");
+    assert!(
+        !w.stack.is_listening(port_a),
+        "A's socket is gone from the interface"
+    );
     assert!(w.stack.is_listening(port_b), "B's socket is untouched");
 }
 

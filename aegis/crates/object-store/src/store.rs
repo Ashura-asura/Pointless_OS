@@ -54,6 +54,10 @@ impl Wal {
         self.recs.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.recs.is_empty()
+    }
+
     pub fn recs(&self) -> impl Iterator<Item = &WalRec> {
         self.recs.iter()
     }
@@ -143,8 +147,7 @@ fn decode_entries(bytes: &[u8]) -> Vec<(String, u64)> {
         return out; // an empty node (no block yet): the empty namespace
     }
     let mut at = 0usize;
-    let count =
-        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
     at += 4;
     for _ in 0..count {
         let nlen = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
@@ -188,7 +191,9 @@ impl Store {
             loc.refs += 1;
             return Some(id);
         }
-        let cap = k.create_mem(self.service, self.creator, data.to_vec()).ok()?;
+        let cap = k
+            .create_mem(self.service, self.creator, data.to_vec())
+            .ok()?;
         let obj = k.cap_info(self.service, cap).ok()?.obj;
         self.blocks.insert(
             id,
@@ -239,8 +244,14 @@ impl Store {
         id: &BlockId,
     ) -> Option<u32> {
         let loc = self.blocks.get(id)?;
-        k.grant(self.service, loc.service_cap, recipient_name, Rights::READ, None)
-            .ok()?;
+        k.grant(
+            self.service,
+            loc.service_cap,
+            recipient_name,
+            Rights::READ,
+            None,
+        )
+        .ok()?;
         for slot in 0..256u32 {
             if let Ok(info) = k.cap_info(recipient_task, CapHandle(slot)) {
                 if info.obj == loc.obj {
@@ -262,7 +273,9 @@ impl Store {
         prev: Option<u64>,
         block: Option<BlockId>,
     ) -> Option<u64> {
-        let cap = k.create_mem(self.service, self.creator, encode_node(prev, block)).ok()?;
+        let cap = k
+            .create_mem(self.service, self.creator, encode_node(prev, block))
+            .ok()?;
         let obj = k.cap_info(self.service, cap).ok()?.obj;
         let id = obj.as_u64();
         self.nodes.insert(id, cap);
@@ -281,7 +294,8 @@ impl Store {
             None => Some(Vec::new()),
             Some(id) => {
                 let loc = self.blocks.get(&id)?;
-                k.mem_read(self.service, loc.service_cap, 0, loc.len as usize).ok()
+                k.mem_read(self.service, loc.service_cap, 0, loc.len as usize)
+                    .ok()
             }
         }
     }
@@ -352,7 +366,13 @@ impl FlatView {
         self.write_dir(k, store, &entries)
     }
 
-    pub fn write_file(&mut self, k: &mut Kernel, store: &mut Store, name: &str, data: &[u8]) -> bool {
+    pub fn write_file(
+        &mut self,
+        k: &mut Kernel,
+        store: &mut Store,
+        name: &str,
+        data: &[u8],
+    ) -> bool {
         let mut entries = self.read_dir(k, store);
         let pos = match entries.iter().position(|(n, _)| n == name) {
             Some(p) => p,

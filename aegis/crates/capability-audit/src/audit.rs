@@ -12,8 +12,7 @@ use std::collections::BTreeMap;
 
 /// A capability pair that is too powerful for a userspace service to request.
 pub fn is_kernel_equivalent(pair: &Declared) -> bool {
-    matches!(pair.kind, ObjectKind::Creator | ObjectKind::GrantRoot)
-        || pair.rights == Rights::ALL
+    matches!(pair.kind, ObjectKind::Creator | ObjectKind::GrantRoot) || pair.rights == Rights::ALL
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,8 +137,7 @@ pub fn audit(
         }
     }
 
-    let bind: BTreeMap<TaskHandle, &Manifest> =
-        bindings.iter().map(|(t, m)| (*t, *m)).collect();
+    let bind: BTreeMap<TaskHandle, &Manifest> = bindings.iter().map(|(t, m)| (*t, *m)).collect();
     for &(from, into) in &edges {
         let (Some(mf), Some(mi)) = (bind.get(&from), bind.get(&into)) else {
             continue;

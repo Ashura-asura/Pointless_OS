@@ -38,7 +38,9 @@ pub struct OpShape {
 /// the audit log it reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MonitorEvent {
-    Trained { shapes: usize },
+    Trained {
+        shapes: usize,
+    },
     Deviation {
         op: OpKind,
         seen: usize,

@@ -62,8 +62,10 @@ pub fn run() -> Outcome {
 
     println!("--- confirmation diff (human review, section 9.3) ---");
     for line in GrantService::diff(&pending) {
-        println!("  + grant agent 'assistant': {:<56} kind={} rights={} policy={} -> target '{}'",
-            line.note, line.kind, line.rights, line.policy, line.target_label);
+        println!(
+            "  + grant agent 'assistant': {:<56} kind={} rights={} policy={} -> target '{}'",
+            line.note, line.kind, line.rights, line.policy, line.target_label
+        );
     }
 
     let granted = svc.confirm(&mut k, pending).unwrap();
@@ -120,21 +122,27 @@ pub fn run() -> Outcome {
             Ok(()) => "ok (confined)".to_string(),
             Err(e) => format!("rejected: {e}"),
         };
-        println!("[{marker}] {:<42} {outcome:<24} ({})", attempt.name, attempt.explains);
+        println!(
+            "[{marker}] {:<42} {outcome:<24} ({})",
+            attempt.name, attempt.explains
+        );
         assert!(ok, "ceiling broken by '{}': {result:?}", attempt.name);
     }
 
     // ---- audit trail: "what did the agent actually do" is answerable
     assert!(
-        k.audit().ever_succeeded(agent.id(), OpKind::TaskSpawn, smtp.id()),
+        k.audit()
+            .ever_succeeded(agent.id(), OpKind::TaskSpawn, smtp.id()),
         "audit lost the authorized restart"
     );
     assert!(
-        !k.audit().ever_succeeded(agent.id(), OpKind::TaskKill, ntp.id()),
+        !k.audit()
+            .ever_succeeded(agent.id(), OpKind::TaskKill, ntp.id()),
         "audit shows the agent touched ntp — the ceiling did not hold"
     );
     assert!(
-        !k.audit().ever_succeeded(agent.id(), OpKind::CreateTask, ntp.id()),
+        !k.audit()
+            .ever_succeeded(agent.id(), OpKind::CreateTask, ntp.id()),
         "audit shows the agent created objects"
     );
     let ok_ops = k
@@ -153,22 +161,10 @@ pub fn run() -> Outcome {
     // services; the agent holds no endpoint cap and cannot talk, even knowing the
     // exact slot numbers in the other tables.
     let ep = k.create_endpoint(root, root_creator).unwrap();
-    k.grant(
-        root,
-        ep,
-        smtp_cap,
-        Rights::SEND.union(Rights::RECV),
-        None,
-    )
-    .unwrap();
-    k.grant(
-        root,
-        ep,
-        ntp_cap,
-        Rights::SEND.union(Rights::RECV),
-        None,
-    )
-    .unwrap();
+    k.grant(root, ep, smtp_cap, Rights::SEND.union(Rights::RECV), None)
+        .unwrap();
+    k.grant(root, ep, ntp_cap, Rights::SEND.union(Rights::RECV), None)
+        .unwrap();
     // The harness (userland scheduling) drives the services addressing their own
     // tables; the session's endpoint identity comes from kernel introspection.
     let smtp_ep = k
@@ -183,7 +179,8 @@ pub fn run() -> Outcome {
         .find(|c| c.kind == ObjectKind::Endpoint)
         .unwrap()
         .slot;
-    k.ep_send(smtp, CapHandle(smtp_ep), b"health?".to_vec()).unwrap();
+    k.ep_send(smtp, CapHandle(smtp_ep), b"health?".to_vec())
+        .unwrap();
     assert_eq!(
         k.ep_recv(ntp, CapHandle(ntp_ep)).unwrap(),
         Some(b"health?".to_vec()),
@@ -198,8 +195,12 @@ pub fn run() -> Outcome {
     // The agent: it knows both slot numbers, it holds no endpoint cap. Whether a
     // slot index lands in its table (WrongObjectType) or past it (NoCap) depends on
     // the world's layout — what is guaranteed is that every send is refused.
-    assert!(k.ep_send(agent, CapHandle(smtp_ep), b"pwn".to_vec()).is_err());
-    assert!(k.ep_send(agent, CapHandle(ntp_ep), b"pwn".to_vec()).is_err());
+    assert!(k
+        .ep_send(agent, CapHandle(smtp_ep), b"pwn".to_vec())
+        .is_err());
+    assert!(k
+        .ep_send(agent, CapHandle(ntp_ep), b"pwn".to_vec())
+        .is_err());
     assert!(k.ep_send(agent, CapHandle(0), b"pwn".to_vec()).is_err());
     println!("[PASS] agent without an endpoint cap cannot send, even knowing the slot numbers");
     // Endpoint identity is a stable audit key: the exchange and the refusals are all
@@ -270,7 +271,10 @@ pub fn run() -> Outcome {
         .unwrap();
     let g2 = svc2.confirm(&mut k, pending2).unwrap();
     let g2_slot = CapHandle(g2.caps[0].slot);
-    assert!(k.task_running(agent, g2_slot).is_ok(), "fresh grant unusable");
+    assert!(
+        k.task_running(agent, g2_slot).is_ok(),
+        "fresh grant unusable"
+    );
     k.advance(11);
     assert_eq!(
         k.task_running(agent, g2_slot).unwrap_err(),
@@ -292,7 +296,10 @@ pub fn run() -> Outcome {
         },
         GrantPolicy::Persistent,
     );
-    assert!(persistent.is_err(), "persistent grant slipped through the §9.2 gate");
+    assert!(
+        persistent.is_err(),
+        "persistent grant slipped through the §9.2 gate"
+    );
     println!("[PASS] persistent grant refused for an ephemeral-only role");
     svc2.revoke(&mut k).unwrap();
     assert_eq!(k.authorized(agent).len(), 1, "second revoke left trace");

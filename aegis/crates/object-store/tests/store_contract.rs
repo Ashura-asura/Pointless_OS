@@ -48,8 +48,7 @@ fn world() -> World {
 /// own CSpace (grants resolve all handles against the grantor's table), carrying
 /// RECEIVE as I6 requires of naming caps.
 fn svc_name_for(w: &mut World, t: TaskHandle, task_cap_in_root: CapHandle) -> CapHandle {
-    w.k
-        .grant(w.root, task_cap_in_root, w.svc_cap, Rights::RECEIVE, None)
+    w.k.grant(w.root, task_cap_in_root, w.svc_cap, Rights::RECEIVE, None)
         .unwrap();
     let slot = (0..256u32)
         .map(|s| (s, w.k.cap_info(w.svc, CapHandle(s))))
@@ -66,7 +65,11 @@ fn identical_bytes_are_one_block() {
     let a = w.store.commit(&mut w.k, b"same bytes").unwrap();
     let b = w.store.commit(&mut w.k, b"same bytes").unwrap();
     assert_eq!(a, b, "content addressing: same content, same block");
-    assert_eq!(w.store.block_count(), 1, "dedup: one region for both commits");
+    assert_eq!(
+        w.store.block_count(),
+        1,
+        "dedup: one region for both commits"
+    );
 }
 
 /// A block id is a *name*, not an address: a consumer who knows both the hash
@@ -78,11 +81,14 @@ fn blocks_are_capability_addressed() {
     let id = w.store.commit(&mut w.k, b"classified payload").unwrap();
     let obj = w.store.block_obj(&id).unwrap();
 
-    let (reader, reader_cap) =
-        w.k.create_task(w.root, w.creator, "reader").unwrap();
+    let (reader, reader_cap) = w.k.create_task(w.root, w.creator, "reader").unwrap();
     // The reader "knows" the object id — and its CSpace holds no region cap.
     let _ = obj;
-    assert_eq!(w.k.caps_of(reader).len(), 1, "reader holds only its self cap");
+    assert_eq!(
+        w.k.caps_of(reader).len(),
+        1,
+        "reader holds only its self cap"
+    );
     // Fabricated handles into the reader's (mostly empty) table fail cleanly.
     assert!(w.k.mem_read(reader, CapHandle(255), 0, 1).is_err());
     assert_eq!(
@@ -92,17 +98,15 @@ fn blocks_are_capability_addressed() {
 
     // The store grants READ — placed in the reader's own CSpace.
     let name = svc_name_for(&mut w, reader, reader_cap);
-    let slot = w
-        .store
-        .grant_read(&mut w.k, reader, name, &id)
-        .unwrap();
+    let slot = w.store.grant_read(&mut w.k, reader, name, &id).unwrap();
     assert_eq!(
         w.k.mem_read(reader, CapHandle(slot), 0, 18).unwrap(),
         b"classified payload".to_vec()
     );
     // The granted cap is a narrowed copy: WRITE on it is refused.
     assert_eq!(
-        w.k.mem_write(reader, CapHandle(slot), 0, b"x".to_vec()).unwrap_err(),
+        w.k.mem_write(reader, CapHandle(slot), 0, b"x".to_vec())
+            .unwrap_err(),
         KernelError::InsufficientRights(Rights::WRITE)
     );
 }
@@ -116,18 +120,28 @@ fn cow_write_versions_are_immutable_snapshots() {
     let v0 = w.store.new_object(&mut w.k).unwrap();
     let v1 = w.store.write_version(&mut w.k, v0, b"draft one").unwrap();
     assert_eq!(w.store.snapshot(&mut w.k, v0).unwrap(), b"".to_vec());
-    assert_eq!(w.store.snapshot(&mut w.k, v1).unwrap(), b"draft one".to_vec());
+    assert_eq!(
+        w.store.snapshot(&mut w.k, v1).unwrap(),
+        b"draft one".to_vec()
+    );
 
     let v2 = w
         .store
         .write_version(&mut w.k, v1, b"draft two, bigger")
         .unwrap();
-    assert_eq!(w.store.snapshot(&mut w.k, v1).unwrap(), b"draft one".to_vec());
+    assert_eq!(
+        w.store.snapshot(&mut w.k, v1).unwrap(),
+        b"draft one".to_vec()
+    );
     assert_eq!(
         w.store.snapshot(&mut w.k, v2).unwrap(),
         b"draft two, bigger".to_vec()
     );
-    assert_eq!(w.store.block_count(), 2, "two content blocks, zero mutations");
+    assert_eq!(
+        w.store.block_count(),
+        2,
+        "two content blocks, zero mutations"
+    );
 }
 
 /// The index consumes only the write-ahead log and rebuilds purely from it:
@@ -174,7 +188,12 @@ fn the_index_can_never_participate_in_a_write() {
     let mut w = world();
     let mut view = FlatView::new(&mut w.k, &mut w.store).unwrap();
     view.create_file(&mut w.k, &mut w.store, "memo.txt");
-    view.write_file(&mut w.k, &mut w.store, "memo.txt", b"appears even though no index exists");
+    view.write_file(
+        &mut w.k,
+        &mut w.store,
+        "memo.txt",
+        b"appears even though no index exists",
+    );
     assert_eq!(
         view.read_file(&mut w.k, &mut w.store, "memo.txt").unwrap(),
         b"appears even though no index exists".to_vec()

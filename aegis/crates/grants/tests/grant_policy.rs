@@ -16,7 +16,12 @@ fn boot() -> (Kernel, TaskHandle, CapHandle) {
     (k, root, creator)
 }
 
-fn task(k: &mut Kernel, root: TaskHandle, creator: CapHandle, label: &str) -> (TaskHandle, CapHandle) {
+fn task(
+    k: &mut Kernel,
+    root: TaskHandle,
+    creator: CapHandle,
+    label: &str,
+) -> (TaskHandle, CapHandle) {
     k.create_task(root, creator, label).unwrap()
 }
 
@@ -35,46 +40,52 @@ fn persistent_policy_is_gated_per_role() {
     let persistent = GrantPolicy::Persistent;
 
     // Ephemeral: fine for both roles.
-    assert!(
-        svc.propose(
+    assert!(svc
+        .propose(
             &k,
             &lib,
             "restart-service",
             "agent",
             agent_cap,
-            GrantTarget { label: "smtp".into(), source: smtp_cap },
+            GrantTarget {
+                label: "smtp".into(),
+                source: smtp_cap
+            },
             ephemeral,
         )
-        .is_ok()
-    );
+        .is_ok());
     // Persistent on an ephemeral-only role: refused.
-    assert!(
-        svc.propose(
+    assert!(svc
+        .propose(
             &k,
             &lib,
             "restart-service",
             "agent",
             agent_cap,
-            GrantTarget { label: "smtp".into(), source: smtp_cap },
+            GrantTarget {
+                label: "smtp".into(),
+                source: smtp_cap
+            },
             persistent,
         )
-        .is_err()
-    );
+        .is_err());
     // Persistent on a role that permits it: accepted. Triage-inbox's target is an
     // endpoint, and the grantor must be able to supply one.
     let inbox_ep = k.create_endpoint(root, creator).unwrap();
-    assert!(
-        svc.propose(
+    assert!(svc
+        .propose(
             &k,
             &lib,
             "triage-inbox",
             "agent",
             agent_cap,
-            GrantTarget { label: "inbox".into(), source: inbox_ep },
+            GrantTarget {
+                label: "inbox".into(),
+                source: inbox_ep
+            },
             persistent,
         )
-        .is_ok()
-    );
+        .is_ok());
 }
 
 /// Task-scoped means real: the kernel clock kills the grant, and the ActiveGrant
@@ -94,7 +105,10 @@ fn ephemeral_grants_die_on_the_kernel_clock() {
             "restart-service",
             "agent",
             agent_cap,
-            GrantTarget { label: "smtp".into(), source: smtp_cap },
+            GrantTarget {
+                label: "smtp".into(),
+                source: smtp_cap,
+            },
             GrantPolicy::TaskScoped { ticks: 5 },
         )
         .unwrap();
@@ -131,7 +145,10 @@ fn completion_revoke_removes_the_grant_and_only_the_grant() {
             "restart-service",
             "agent",
             agent_cap,
-            GrantTarget { label: "smtp".into(), source: smtp_cap },
+            GrantTarget {
+                label: "smtp".into(),
+                source: smtp_cap,
+            },
             GrantPolicy::TaskScoped { ticks: 100 },
         )
         .unwrap();
@@ -143,8 +160,15 @@ fn completion_revoke_removes_the_grant_and_only_the_grant() {
     // …the grantor kept its own.
     assert!(k.task_running(root, smtp_cap).is_ok());
     // The whole life of the grant is on record: mint and revoke, both audited.
-    assert!(k.audit().ever_succeeded(root.id(), OpKind::Grant, smtp.id()));
-    assert_eq!(k.audit().query(Some(root.id()), AuditFilter::Ops(&[OpKind::Revoke])).count(), 1);
+    assert!(k
+        .audit()
+        .ever_succeeded(root.id(), OpKind::Grant, smtp.id()));
+    assert_eq!(
+        k.audit()
+            .query(Some(root.id()), AuditFilter::Ops(&[OpKind::Revoke]))
+            .count(),
+        1
+    );
 }
 
 /// The §9.2 visibility claim: the always-visible grant list is a queryable
@@ -167,7 +191,10 @@ fn the_active_grant_list_is_queryable_and_honest() {
             "restart-service",
             "agent",
             agent_cap,
-            GrantTarget { label: "smtp".into(), source: smtp_cap },
+            GrantTarget {
+                label: "smtp".into(),
+                source: smtp_cap,
+            },
             GrantPolicy::TaskScoped { ticks: 100 },
         )
         .unwrap();
@@ -179,24 +206,40 @@ fn the_active_grant_list_is_queryable_and_honest() {
             "triage-inbox",
             "agent",
             agent_cap,
-            GrantTarget { label: "inbox".into(), source: inbox_ep },
+            GrantTarget {
+                label: "inbox".into(),
+                source: inbox_ep,
+            },
             GrantPolicy::Persistent,
         )
         .unwrap();
     svc.confirm(&mut k, persistent).unwrap();
 
     let list = svc.list_active();
-    assert_eq!(list.len(), 2, "both grants are visible, persistent one included");
+    assert_eq!(
+        list.len(),
+        2,
+        "both grants are visible, persistent one included"
+    );
     let persistent_grant = list.iter().find(|g| g.role_id == "triage-inbox").unwrap();
-    assert_eq!(persistent_grant.caps[0].deadline, None, "persistent is honestly marked");
-    let task_scoped = list.iter().find(|g| g.role_id == "restart-service").unwrap();
+    assert_eq!(
+        persistent_grant.caps[0].deadline, None,
+        "persistent is honestly marked"
+    );
+    let task_scoped = list
+        .iter()
+        .find(|g| g.role_id == "restart-service")
+        .unwrap();
     assert!(
         task_scoped.caps[0].deadline.is_some(),
         "task-scoped grants carry their deadline"
     );
 
     svc.revoke(&mut k).unwrap();
-    assert!(svc.list_active().is_empty(), "revoked grants leave the visible list");
+    assert!(
+        svc.list_active().is_empty(),
+        "revoked grants leave the visible list"
+    );
 }
 /// A review is never a TOCTOU hole: if the grantor's authority disappears between
 /// propose and confirm, confirm fails — the mint re-checks every assumption.
@@ -215,7 +258,10 @@ fn confirm_rechecks_authority_after_review() {
             "restart-service",
             "agent",
             agent_cap,
-            GrantTarget { label: "smtp".into(), source: smtp_cap },
+            GrantTarget {
+                label: "smtp".into(),
+                source: smtp_cap,
+            },
             GrantPolicy::TaskScoped { ticks: 100 },
         )
         .unwrap();

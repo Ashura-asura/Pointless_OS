@@ -45,6 +45,7 @@ pub struct AuditRecord {
 }
 
 impl AuditRecord {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         tick: u64,
         caller: ObjectId,
@@ -117,12 +118,7 @@ impl AuditLog {
     }
 
     /// Has this caller ever successfully performed `op` on `target`?
-    pub fn ever_succeeded(
-        &self,
-        caller: ObjectId,
-        op: OpKind,
-        target: ObjectId,
-    ) -> bool {
+    pub fn ever_succeeded(&self, caller: ObjectId, op: OpKind, target: ObjectId) -> bool {
         self.query(Some(caller), AuditFilter::All)
             .any(|r| r.ok && r.op == op && r.target == Some(target))
     }

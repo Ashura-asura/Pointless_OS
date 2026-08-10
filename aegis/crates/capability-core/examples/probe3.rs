@@ -13,13 +13,15 @@ fn main() {
 
     // attacker gets ONLY a zero-rights naming reference to victim — no CONTROL,
     // no GRANT, no RECEIVE. It only proves the victim exists.
-    k.grant(root, victim_cap, attacker_cap, Rights::NONE, None).unwrap();
+    k.grant(root, victim_cap, attacker_cap, Rights::NONE, None)
+        .unwrap();
     let victim_naming = CapHandle(1);
 
     // One reusable GRANT-capable resource: grant() mints a fresh cap into a fresh
     // slot on every call, even from the same source.
     let (_r, r_cap) = k.create_task(root, creator, "junk").unwrap();
-    k.grant(root, r_cap, attacker_cap, Rights::GRANT, None).unwrap();
+    k.grant(root, r_cap, attacker_cap, Rights::GRANT, None)
+        .unwrap();
     let resource = CapHandle(2);
 
     let mut successes = 0;
@@ -32,7 +34,10 @@ fn main() {
             }
         }
     }
-    assert_eq!(successes, 0, "attacker injected {successes} caps without consent");
+    assert_eq!(
+        successes, 0,
+        "attacker injected {successes} caps without consent"
+    );
     println!("[PASS] attacker with a zero-rights naming cap injected {successes} caps");
 
     // The legitimate orchestrator's grants still land — the victim's CSpace is open.

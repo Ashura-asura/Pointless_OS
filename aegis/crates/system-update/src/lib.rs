@@ -112,7 +112,9 @@ impl UpdateManager {
         if !self.view.create_file(k, store, &name) {
             return Err(KernelError::InvalidOperation);
         }
-        let _ = self.view.write_file(k, store, &name, &encode_descriptor(&descriptor));
+        let _ = self
+            .view
+            .write_file(k, store, &name, &encode_descriptor(&descriptor));
         Ok(StagedGen { descriptor, app })
     }
 
@@ -167,7 +169,11 @@ impl UpdateManager {
         let _ = self
             .view
             .write_file(k, store, "current", &encode_descriptor(&descriptor));
-        if let Some(pos) = self.applied.iter().rposition(|g| g.descriptor.n == current_n) {
+        if let Some(pos) = self
+            .applied
+            .iter()
+            .rposition(|g| g.descriptor.n == current_n)
+        {
             self.applied.truncate(pos);
         }
         Ok(descriptor.n)

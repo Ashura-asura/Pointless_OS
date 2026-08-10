@@ -67,10 +67,7 @@ impl RelationshipIndex {
 
     /// Direct children of `parent` (object ids).
     pub fn children_of(&self, parent: u64) -> Vec<u64> {
-        self.children
-            .get(&parent)
-            .cloned()
-            .unwrap_or_default()
+        self.children.get(&parent).cloned().unwrap_or_default()
     }
 
     /// Is `node` reachable from `ancestor` through derivation edges? (BFS)
@@ -109,12 +106,18 @@ mod tests {
         seq += 1;
         recs.push(crate::store::WalRec {
             seq,
-            op: WalOp::Put { id: [1u8; 32], len: 5 },
+            op: WalOp::Put {
+                id: [1u8; 32],
+                len: 5,
+            },
         });
         seq += 1;
         recs.push(crate::store::WalRec {
             seq,
-            op: WalOp::Link { child: 9, parent: 7 },
+            op: WalOp::Link {
+                child: 9,
+                parent: 7,
+            },
         });
         for r in recs {
             wal.push(r);

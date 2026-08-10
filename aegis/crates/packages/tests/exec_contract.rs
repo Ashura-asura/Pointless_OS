@@ -18,7 +18,12 @@ fn world() -> World {
     let (root, _, creator) = k.boot("session").unwrap();
     let store = Store::new(root, creator);
     let manager = PackageManager::new(root, creator);
-    World { k, root, store, manager }
+    World {
+        k,
+        root,
+        store,
+        manager,
+    }
 }
 
 #[test]
@@ -29,8 +34,14 @@ fn install_then_execute_then_verify_caps() {
     //    over a config file.
     let config = w.store.commit(&mut w.k, b"interval=5\n").unwrap();
     let manifest = capability_audit::Manifest::new("monitor", capability_audit::Repo::Service)
-        .allow(capability_core::ObjectKind::Task, capability_core::Rights::CONTROL)
-        .allow(capability_core::ObjectKind::MemRegion, capability_core::Rights::READ);
+        .allow(
+            capability_core::ObjectKind::Task,
+            capability_core::Rights::CONTROL,
+        )
+        .allow(
+            capability_core::ObjectKind::MemRegion,
+            capability_core::Rights::READ,
+        );
     let pkg = Package {
         name: "monitor",
         manifest,
@@ -38,11 +49,17 @@ fn install_then_execute_then_verify_caps() {
     };
 
     // 2. Install the package.
-    let app = w.manager.install(&mut w.k, &mut w.store, "monitor-app", &pkg).unwrap();
+    let app = w
+        .manager
+        .install(&mut w.k, &mut w.store, "monitor-app", &pkg)
+        .unwrap();
 
     // 3. Start the installed app.
     w.k.task_spawn(w.root, app.task_cap).unwrap();
-    assert!(w.k.task_running(w.root, app.task_cap).unwrap(), "app is running");
+    assert!(
+        w.k.task_running(w.root, app.task_cap).unwrap(),
+        "app is running"
+    );
 
     // 4. The app reads its config file (uses its READ MemRegion cap).
     let mut found_config = false;
@@ -61,7 +78,10 @@ fn install_then_execute_then_verify_caps() {
             }
         }
     }
-    assert!(found_config, "app holds a readable MemRegion with config data");
+    assert!(
+        found_config,
+        "app holds a readable MemRegion with config data"
+    );
 
     // 5. The app tries to write to a READ-only region — refused.
     for slot in 0..256u32 {
@@ -69,7 +89,8 @@ fn install_then_execute_then_verify_caps() {
             if info.kind == capability_core::ObjectKind::MemRegion
                 && info.rights == capability_core::Rights::READ
             {
-                let result = w.k.mem_write(app.task, CapHandle(slot), 0, b"hacked".to_vec());
+                let result =
+                    w.k.mem_write(app.task, CapHandle(slot), 0, b"hacked".to_vec());
                 assert!(result.is_err(), "READ-only region refuses write");
                 break;
             }
@@ -92,5 +113,8 @@ fn install_then_execute_then_verify_caps() {
         }
     }
     // self-cap + Task CONTROL + MemRegion READ (config) + MemRegion READ (declared) = 4
-    assert_eq!(cap_count, 4, "app holds exactly 4 caps: self + declared + payload");
+    assert_eq!(
+        cap_count, 4,
+        "app holds exactly 4 caps: self + declared + payload"
+    );
 }

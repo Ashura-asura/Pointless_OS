@@ -29,9 +29,7 @@
 
 use std::collections::HashMap;
 
-use capability_core::{
-    CapHandle, Kernel, KernelError, KernelResult, ObjectId, Rights, TaskHandle,
-};
+use capability_core::{CapHandle, Kernel, KernelError, KernelResult, ObjectId, Rights, TaskHandle};
 
 pub mod graphics;
 
@@ -148,7 +146,12 @@ impl Devices {
     /// Discover a block device: a region the licenced driver can serve
     /// sectors from. "Discovery" here is registration by the platform layer;
     /// the kernel never offers devices up on its own.
-    pub fn register_block(&mut self, k: &mut Kernel, name: &str, sectors: Vec<u8>) -> KernelResult<DeviceId> {
+    pub fn register_block(
+        &mut self,
+        k: &mut Kernel,
+        name: &str,
+        sectors: Vec<u8>,
+    ) -> KernelResult<DeviceId> {
         let cap = k.create_mem(self.service, self.creator, sectors)?;
         let info = k.cap_info(self.service, cap)?;
         Ok(self.insert(DeviceSpec {
@@ -180,7 +183,12 @@ impl Devices {
     }
 
     /// Discover a GPU: a command queue endpoint plus a framebuffer window.
-    pub fn register_gpu(&mut self, k: &mut Kernel, name: &str, fb: Vec<u8>) -> KernelResult<DeviceId> {
+    pub fn register_gpu(
+        &mut self,
+        k: &mut Kernel,
+        name: &str,
+        fb: Vec<u8>,
+    ) -> KernelResult<DeviceId> {
         let queue = k.create_endpoint(self.service, self.creator)?;
         let fbc = k.create_mem(self.service, self.creator, fb)?;
         let qi = k.cap_info(self.service, queue)?;
@@ -325,7 +333,7 @@ impl Devices {
             ));
         }
         let cap = cap_for(k, caller, spec.command_obj).map_err(|_| DeviceError::NotHeld)?;
-        Ok(k.ep_send(caller, cap, frame.into())?)
+        Ok(k.ep_send(caller, cap, frame)?)
     }
 
     /// GPU command-queue submission (design doc §8 graphics): the caller must
@@ -346,6 +354,6 @@ impl Devices {
             ));
         }
         let cap = cap_for(k, caller, spec.command_obj).map_err(|_| DeviceError::NotHeld)?;
-        Ok(k.ep_send(caller, cap, record.into())?)
+        Ok(k.ep_send(caller, cap, record)?)
     }
 }

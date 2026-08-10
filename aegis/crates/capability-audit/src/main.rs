@@ -46,7 +46,11 @@ fn render(report: &AuditReport) -> String {
     out.push_str("reachable-authority audit\n");
     out.push_str("-------------------------\n");
     for e in &report.entries {
-        let repo = if e.repo.is_kernel() { "kernel" } else { "service" };
+        let repo = if e.repo.is_kernel() {
+            "kernel"
+        } else {
+            "service"
+        };
         out.push_str(&format!(
             "  {:<10} ({:>7} repo)  reachable={:<2} declared={}\n",
             e.service, repo, e.reachable, e.declared
@@ -78,10 +82,7 @@ fn format_rights(rights: capability_core::Rights) -> String {
     }
 }
 
-fn render_graph(
-    k: &Kernel,
-    bindings: &[(TaskHandle, &Manifest)],
-) -> String {
+fn render_graph(k: &Kernel, bindings: &[(TaskHandle, &Manifest)]) -> String {
     let mut out = String::new();
     out.push_str("capability graph\n");
     out.push_str("----------------\n");
@@ -158,8 +159,7 @@ fn main() -> ExitCode {
     let (k, root, agent, _agent_cap, _smtp_cap) = build_reference_world();
     let session = session();
     let assistant = assistant();
-    let bindings: Vec<(TaskHandle, &Manifest)> =
-        vec![(root, &session), (agent, &assistant)];
+    let bindings: Vec<(TaskHandle, &Manifest)> = vec![(root, &session), (agent, &assistant)];
     let report = audit(&k, &bindings);
     print!("{}", render(&report));
 

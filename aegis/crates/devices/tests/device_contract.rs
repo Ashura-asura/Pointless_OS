@@ -90,7 +90,8 @@ fn devices_are_capability_scoped_objects_with_typed_interfaces_owned_by_a_driver
     devs.grant_surface(&mut w.k, disk0, client_name, Rights::READ)
         .unwrap();
     assert_eq!(
-        devs.read_sector(&mut w.k, client, disk0, 0, SECTORS.len()).unwrap(),
+        devs.read_sector(&mut w.k, client, disk0, 0, SECTORS.len())
+            .unwrap(),
         SECTORS
     );
 
@@ -102,7 +103,9 @@ fn devices_are_capability_scoped_objects_with_typed_interfaces_owned_by_a_driver
             "read_sector is a block-device interface"
         ))
     );
-    let err = devs.submit_commands(&mut w.k, client, disk0, vec![0xAA]).unwrap_err();
+    let err = devs
+        .submit_commands(&mut w.k, client, disk0, vec![0xAA])
+        .unwrap_err();
     assert_eq!(
         err,
         DeviceError::WrongInterface("submit_commands is a GPU-command-queue interface")
@@ -118,7 +121,9 @@ fn devices_are_capability_scoped_objects_with_typed_interfaces_owned_by_a_driver
     // cannot write, and the kernel says so (not the registry).
     assert_eq!(
         devs.write_sector(&mut w.k, client, disk0, 0, b"pwn".to_vec()),
-        Err(DeviceError::Kernel(KernelError::InsufficientRights(Rights::WRITE)))
+        Err(DeviceError::Kernel(KernelError::InsufficientRights(
+            Rights::WRITE
+        )))
     );
 
     // No ambient access: a task that knows the device id but holds no cap
@@ -150,9 +155,10 @@ fn a_driver_crash_is_contained_to_its_context_and_recovered_by_supervision() {
     devs.grant_surface(&mut w.k, disk0, client_name, Rights::READ)
         .unwrap();
     let (other, other_name) = spawn(&mut w, "unrelated");
-    let scratch = w.k.create_mem(w.root, w.creator, b"scratch".to_vec()).unwrap();
-    w.k
-        .grant(w.root, scratch, other_name, Rights::READ, None)
+    let scratch =
+        w.k.create_mem(w.root, w.creator, b"scratch".to_vec())
+            .unwrap();
+    w.k.grant(w.root, scratch, other_name, Rights::READ, None)
         .unwrap();
     let scratch_obj = w.k.cap_info(w.root, scratch).unwrap().obj;
     let other_before = census(&w.k, other);
@@ -175,15 +181,13 @@ fn a_driver_crash_is_contained_to_its_context_and_recovered_by_supervision() {
     // ride through (revocation is explicit), and the unrelated app is
     // untouched in census and in operation.
     assert_eq!(
-        devs.read_sector(&mut w.k, client, disk0, 0, SECTORS.len()).unwrap(),
+        devs.read_sector(&mut w.k, client, disk0, 0, SECTORS.len())
+            .unwrap(),
         SECTORS
     );
     assert_eq!(census(&w.k, other), other_before);
     let other_cap = cap_for(&w.k, other, scratch_obj).unwrap();
-    assert_eq!(
-        w.k.mem_read(other, other_cap, 0, 7).unwrap(),
-        b"scratch"
-    );
+    assert_eq!(w.k.mem_read(other, other_cap, 0, 7).unwrap(), b"scratch");
 
     // Recovery: the supervision tree restarts the driver...
     w.k.task_spawn(w.root, driver_name).unwrap();
@@ -193,7 +197,8 @@ fn a_driver_crash_is_contained_to_its_context_and_recovered_by_supervision() {
     devs.grant_surface(&mut w.k, disk0, fresh_name, Rights::READ)
         .unwrap();
     assert_eq!(
-        devs.read_sector(&mut w.k, fresh, disk0, 0, SECTORS.len()).unwrap(),
+        devs.read_sector(&mut w.k, fresh, disk0, 0, SECTORS.len())
+            .unwrap(),
         SECTORS
     );
 }
@@ -228,8 +233,13 @@ fn gpu_memory_and_command_queues_are_isolated_between_contexts() {
     // User-mode submission is an ordinary endpoint send, attributed to the
     // submitting context in the audit log.
     let a_queue_slot = slots_of(&w.k, ctx_a, a.queue_obj)[0];
-    gfx.submit(&mut w.k, ctx_a, CapHandle(a_queue_slot), b"draw x3".to_vec())
-        .unwrap();
+    gfx.submit(
+        &mut w.k,
+        ctx_a,
+        CapHandle(a_queue_slot),
+        b"draw x3".to_vec(),
+    )
+    .unwrap();
     assert_eq!(send_count(&w.k, ctx_a.id()), 1);
 
     // Isolation both ways: a context cannot reach its neighbour's queue or
@@ -252,7 +262,10 @@ fn gpu_memory_and_command_queues_are_isolated_between_contexts() {
     let b_queue_slot = slots_of(&w.k, ctx_b, b.queue_obj)[0];
     match w.k.cap_info(ctx_a, CapHandle(b_queue_slot)) {
         Err(_) => {}
-        Ok(info) => assert_eq!(info.obj, a.queue_obj, "A resolved B's reported queue slot to a foreign object"),
+        Ok(info) => assert_eq!(
+            info.obj, a.queue_obj,
+            "A resolved B's reported queue slot to a foreign object"
+        ),
     }
     // The framework's resolution path is equally deaf to foreign objects.
     assert_eq!(
@@ -283,8 +296,12 @@ fn a_compositor_is_a_replaceable_userspace_service() {
 
     let (ctx_a, name_a) = spawn(&mut w, "ctx-a");
     let (ctx_b, name_b) = spawn(&mut w, "ctx-b");
-    let a = gfx.attach(&mut w.k, ctx_a, name_a, b"AAAA".to_vec()).unwrap();
-    let b = gfx.attach(&mut w.k, ctx_b, name_b, b"BBBB".to_vec()).unwrap();
+    let a = gfx
+        .attach(&mut w.k, ctx_a, name_a, b"AAAA".to_vec())
+        .unwrap();
+    let b = gfx
+        .attach(&mut w.k, ctx_b, name_b, b"BBBB".to_vec())
+        .unwrap();
     gfx.write_fb(&mut w.k, ctx_a, a, 0, b"xxxx".to_vec())
         .unwrap();
     gfx.write_fb(&mut w.k, ctx_b, b, 0, b"yyyy".to_vec())
@@ -293,8 +310,7 @@ fn a_compositor_is_a_replaceable_userspace_service() {
     // The display server is a userspace service with READ grants onto every
     // framebuffer; the screen comes out of *its* caps.
     let (compositor1, name1) = spawn(&mut w, "compositor-v1");
-    gfx.attach_compositor(&mut w.k, compositor1, name1)
-        .unwrap();
+    gfx.attach_compositor(&mut w.k, compositor1, name1).unwrap();
     w.k.task_spawn(w.root, name1).unwrap();
     let screen = gfx.compose(&mut w.k).unwrap();
     assert_eq!(screen, vec![b"xxxx".to_vec(), b"yyyy".to_vec()]);
@@ -312,8 +328,7 @@ fn a_compositor_is_a_replaceable_userspace_service() {
     // Replacement: a fresh display server, re-licenced, composites the same
     // screen. The kernel state never moved.
     let (compositor2, name2) = spawn(&mut w, "compositor-v2");
-    gfx.attach_compositor(&mut w.k, compositor2, name2)
-        .unwrap();
+    gfx.attach_compositor(&mut w.k, compositor2, name2).unwrap();
     w.k.task_spawn(w.root, name2).unwrap();
     assert_eq!(gfx.compose(&mut w.k).unwrap(), screen);
     assert_eq!(census(&w.k, ctx_a), ctx_a_before);

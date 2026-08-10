@@ -5,9 +5,7 @@
 //! pending human review. Suspension is reversible and logged; revocation is
 //! permanent and is never performed by the monitor.
 
-use capability_core::{
-    AuditFilter, CapHandle, Kernel, ObjectId, OpKind, TaskHandle,
-};
+use capability_core::{AuditFilter, CapHandle, Kernel, ObjectId, OpKind, TaskHandle};
 use grants::monitor::{Monitor, MonitorEvent};
 use grants::role::RoleLibrary;
 use grants::{GrantPolicy, GrantService, GrantTarget};
@@ -18,7 +16,12 @@ fn boot() -> (Kernel, TaskHandle, CapHandle) {
     (k, root, creator)
 }
 
-fn spawn(k: &mut Kernel, root: TaskHandle, creator: CapHandle, label: &str) -> (TaskHandle, CapHandle) {
+fn spawn(
+    k: &mut Kernel,
+    root: TaskHandle,
+    creator: CapHandle,
+    label: &str,
+) -> (TaskHandle, CapHandle) {
     k.create_task(root, creator, label).unwrap()
 }
 
@@ -81,7 +84,10 @@ fn a_significant_deviation_auto_suspends_without_revoking() {
         assert!(k.task_running(agent, agent_svc).unwrap());
     }
     let mut monitor = Monitor::train(&k, agent);
-    assert!(monitor.log().iter().any(|e| matches!(e, MonitorEvent::Trained { shapes: 1 })));
+    assert!(monitor
+        .log()
+        .iter()
+        .any(|e| matches!(e, MonitorEvent::Trained { shapes: 1 })));
 
     // Still doing what its shape says: no deviation, no suspension.
     assert!(k.task_running(agent, agent_svc).unwrap());
@@ -92,7 +98,7 @@ fn a_significant_deviation_auto_suspends_without_revoking() {
     // — endpoint sends. The refused ops still land in the kernel log with the
     // caller attributed, which is exactly the kernel truth the monitor reads.
     for _ in 0..4 {
-        let _ = k.ep_send(agent, CapHandle(0), vec![1u8].into());
+        let _ = k.ep_send(agent, CapHandle(0), vec![1u8]);
     }
     assert!(monitor.observe(&k, &mut svc));
     assert!(svc.is_suspended(agent.id()));
@@ -108,7 +114,11 @@ fn a_significant_deviation_auto_suspends_without_revoking() {
     // Suspended is not revoked: the already-minted cap still works — the
     // agent's state checks pass — because the monitor took nothing away.
     assert!(k.task_running(agent, agent_svc).unwrap());
-    assert_eq!(op_count(&k, agent.id(), OpKind::Revoke), 0, "the monitor never revokes");
+    assert_eq!(
+        op_count(&k, agent.id(), OpKind::Revoke),
+        0,
+        "the monitor never revokes"
+    );
 
     // But the grant flow is frozen: a new confirmation for the suspended
     // agent is refused, and the refusal is a visible policy event.
@@ -128,7 +138,11 @@ fn a_significant_deviation_auto_suspends_without_revoking() {
         )
         .unwrap();
     assert!(svc.confirm(&mut k, pending).is_err());
-    assert_eq!(svc.list_active().len(), 1, "the original grant is untouched");
+    assert_eq!(
+        svc.list_active().len(),
+        1,
+        "the original grant is untouched"
+    );
 }
 
 #[test]
@@ -146,7 +160,7 @@ fn suspension_is_reversible_logged_and_never_silent() {
     let mut monitor = Monitor::train(&k, agent);
 
     // Deviation: an op kind the profile never saw.
-    let _ = k.ep_send(agent, CapHandle(0), vec![1u8].into());
+    let _ = k.ep_send(agent, CapHandle(0), vec![1u8]);
     assert!(monitor.observe(&k, &mut svc));
     assert!(svc.is_suspended(agent.id()));
 
@@ -196,7 +210,10 @@ fn the_monitor_is_a_read_only_service_with_no_authority() {
     // empty. (Failed ops are still logged with attribution; training would
     // otherwise see them.)
     let watch = Monitor::train(&k, monitor_task);
-    assert!(watch.log().iter().any(|e| matches!(e, MonitorEvent::Trained { shapes: 0 })));
+    assert!(watch
+        .log()
+        .iter()
+        .any(|e| matches!(e, MonitorEvent::Trained { shapes: 0 })));
 
     // Fabricated authority is refused at the kernel: it cannot kill, revoke,
     // or create — its only "power" is reading the audit log and asking a

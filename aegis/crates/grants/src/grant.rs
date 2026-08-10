@@ -160,6 +160,7 @@ impl GrantService {
     /// Validate a role grant request and produce its diff for human review. Rejected
     /// up front if: the role is unknown, the grantor cannot supply the requested
     /// rights, or the policy is persistent on a role that forbids it.
+    #[allow(clippy::too_many_arguments)]
     pub fn propose(
         &self,
         kernel: &Kernel,
@@ -170,9 +171,7 @@ impl GrantService {
         target: GrantTarget,
         policy: GrantPolicy,
     ) -> KernelResult<PendingGrant> {
-        let role = library
-            .get(role_id)
-            .ok_or(KernelError::InvalidOperation)?;
+        let role = library.get(role_id).ok_or(KernelError::InvalidOperation)?;
         if role.requests.len() != 1 {
             return Err(KernelError::InvalidOperation); // v1: single-request roles
         }

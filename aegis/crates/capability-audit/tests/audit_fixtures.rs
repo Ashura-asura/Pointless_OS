@@ -72,13 +72,16 @@ fn honest_system_audits_clean() {
     grant_restart(&mut w);
     let report = audit(
         &w.kernel,
-        &[(w.root, &session_manifest()), (w.agent, &assistant_manifest())],
+        &[
+            (w.root, &session_manifest()),
+            (w.agent, &assistant_manifest()),
+        ],
     );
     assert!(report.is_clean(), "honest system flagged: {report:?}");
     // The session holds GRANT-carrying naming caps into the assistant, so the
     // overhang of what it *could* push beyond the assistant's manifest is surfaced.
     assert!(
-        report.warnings.get("assistant").is_some(),
+        report.warnings.contains_key("assistant"),
         "expected the session->assistant delivery overhang to be surfaced: {report:?}"
     );
 }
@@ -115,7 +118,10 @@ fn kernel_equivalent_request_gated_by_repo_class() {
     let service_wants_creator =
         Manifest::new("service", Repo::Service).allow(ObjectKind::Creator, Rights::ALL);
     let report = audit(&w.kernel, &[(w.root, &service_wants_creator)]);
-    assert!(!report.is_clean(), "service repo with Creator audited clean");
+    assert!(
+        !report.is_clean(),
+        "service repo with Creator audited clean"
+    );
     assert!(
         report
             .violations
@@ -148,12 +154,15 @@ fn delivery_overhang_tracks_the_declared_ceiling() {
 
     let report = audit(
         &w.kernel,
-        &[(w.root, &session_manifest()), (w.agent, &assistant_manifest())],
+        &[
+            (w.root, &session_manifest()),
+            (w.agent, &assistant_manifest()),
+        ],
     );
-    let has_overhang = report
-        .warnings
-        .get("assistant")
-        .is_some_and(|ws| ws.iter().any(|x| matches!(x, AuditWarning::DeliveryOverhang { .. })));
+    let has_overhang = report.warnings.get("assistant").is_some_and(|ws| {
+        ws.iter()
+            .any(|x| matches!(x, AuditWarning::DeliveryOverhang { .. }))
+    });
     assert!(has_overhang, "narrow target not warned: {report:?}");
 
     let wide_pet = assistant_manifest()
@@ -165,7 +174,7 @@ fn delivery_overhang_tracks_the_declared_ceiling() {
         &[(w.root, &session_manifest()), (w.agent, &wide_pet)],
     );
     assert!(
-        report2.warnings.get("assistant").is_none(),
+        !report2.warnings.contains_key("assistant"),
         "wide target still warned: {report2:?}"
     );
 }

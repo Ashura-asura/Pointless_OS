@@ -18,10 +18,7 @@ fn smtp_server(k: &mut Kernel, root: TaskHandle, creator: CapHandle) -> (TaskHan
 }
 
 fn caps_of(k: &Kernel, t: TaskHandle) -> Vec<(ObjectKind, Rights)> {
-    k.authorized(t)
-        .iter()
-        .map(|c| (c.kind, c.rights))
-        .collect()
+    k.authorized(t).iter().map(|c| (c.kind, c.rights)).collect()
 }
 
 /// Every task's self cap lives in slot 0, and within a test the grant order is fixed
@@ -29,7 +26,6 @@ fn caps_of(k: &Kernel, t: TaskHandle) -> Vec<(ObjectKind, Rights)> {
 /// into a task's fresh CSpace lands in slot N. Tests therefore address caps by slot
 /// rather than by matching rights — matching on compound right sets is brittle, and
 /// slot addressing is exactly how a task would address its own CSpace.
-
 /// I2 — delegation monotonicity: a grant can never carry more rights than the source
 /// cap the grantor holds, however much is requested.
 #[test]
@@ -44,8 +40,14 @@ fn delegation_can_never_expand_rights() {
     // root -> bob: CONTROL|GRANT on smtp (slot 1) + naming cap to zed (slot 2).
     // The naming cap must carry RECEIVE — it consents to zed being targeted as a
     // grant destination (I6); a bare naming reference is not a mailbox.
-    k.grant(root, smtp_cap, bob_cap, Rights::GRANT.union(Rights::CONTROL), None)
-        .unwrap();
+    k.grant(
+        root,
+        smtp_cap,
+        bob_cap,
+        Rights::GRANT.union(Rights::CONTROL),
+        None,
+    )
+    .unwrap();
     k.grant(
         root,
         zed_cap,
@@ -57,7 +59,8 @@ fn delegation_can_never_expand_rights() {
 
     // bob -> zed: bob asks for EVERYTHING. The kernel clamps to bob's CONTROL|GRANT.
     // Zed now holds: self (0), smtp C|G (1).
-    k.grant(bob, CapHandle(1), CapHandle(2), Rights::ALL, None).unwrap();
+    k.grant(bob, CapHandle(1), CapHandle(2), Rights::ALL, None)
+        .unwrap();
     assert_eq!(
         caps_of(&k, zed),
         vec![
@@ -81,13 +84,15 @@ fn delegation_can_never_expand_rights() {
         None,
     )
     .unwrap();
-    k.grant(zed, CapHandle(1), CapHandle(2), Rights::CONTROL, None).unwrap();
+    k.grant(zed, CapHandle(1), CapHandle(2), Rights::CONTROL, None)
+        .unwrap();
     assert!(k.task_spawn(wally, CapHandle(1)).is_ok());
 
     // wally cannot delegate: no GRANT on its source (wally's cap is exactly C). The
     // kernel refuses, loudly — nobody can mint rights they don't hold (I2).
     assert_eq!(
-        k.grant(wally, CapHandle(1), CapHandle(0), Rights::READ, None).unwrap_err(),
+        k.grant(wally, CapHandle(1), CapHandle(0), Rights::READ, None)
+            .unwrap_err(),
         KernelError::InsufficientRights(Rights::GRANT)
     );
     // Wally's smtp cap is precisely CONTROL — narrowly scoped, no more.
@@ -111,8 +116,14 @@ fn revocation_removes_derived_caps_from_all_cspaces() {
     // task cap to carol carrying RECEIVE so bob may target carol (I6).
     let (bob, bob_cap) = k.create_task(root, creator, "bob").unwrap();
     let (carol, carol_cap) = k.create_task(root, creator, "carol").unwrap();
-    k.grant(root, smtp_cap, bob_cap, Rights::GRANT.union(Rights::CONTROL), None)
-        .unwrap();
+    k.grant(
+        root,
+        smtp_cap,
+        bob_cap,
+        Rights::GRANT.union(Rights::CONTROL),
+        None,
+    )
+    .unwrap();
     k.grant(
         root,
         carol_cap,
@@ -124,10 +135,14 @@ fn revocation_removes_derived_caps_from_all_cspaces() {
 
     // bob -> carol: bob hands carol CONTROL (subset of bob's own C|G — the kernel
     // mints rights ∩ source, so carol can never exceed bob). Carol: self (0), smtp C (1).
-    k.grant(bob, CapHandle(1), CapHandle(2), Rights::CONTROL, None).unwrap();
+    k.grant(bob, CapHandle(1), CapHandle(2), Rights::CONTROL, None)
+        .unwrap();
     assert_eq!(
         caps_of(&k, carol),
-        vec![(ObjectKind::Task, Rights::ALL), (ObjectKind::Task, Rights::CONTROL)]
+        vec![
+            (ObjectKind::Task, Rights::ALL),
+            (ObjectKind::Task, Rights::CONTROL)
+        ]
     );
 
     // Root revokes its smtp cap. The whole subtree dies: bob's C|G and carol's C.
@@ -179,7 +194,8 @@ fn expiry_kills_caps_and_cannot_be_extended() {
     // bob gets ALL on smtp, but only until t=100 (a grant, not an ownership).
     let (bob, bob_cap) = k.create_task(root, creator, "bob").unwrap();
     let (carol, carol_cap) = k.create_task(root, creator, "carol").unwrap();
-    k.grant(root, smtp_cap, bob_cap, Rights::ALL, Some(100)).unwrap();
+    k.grant(root, smtp_cap, bob_cap, Rights::ALL, Some(100))
+        .unwrap();
     // bob also gets a task cap to carol carrying RECEIVE so bob may target carol (I6).
     k.grant(
         root,
@@ -193,21 +209,36 @@ fn expiry_kills_caps_and_cannot_be_extended() {
     // Bob: self (0), smtp ALL exp100 (1), carol cap (2). Bob copies — the copy is an
     // exact derivation of the parent grant (slot 3), so it inherits the deadline.
     let copy = k.copy(bob, CapHandle(1), Rights::READ).unwrap();
-    assert!(k.task_running(bob, copy).is_ok(), "copy should work pre-deadline");
+    assert!(
+        k.task_running(bob, copy).is_ok(),
+        "copy should work pre-deadline"
+    );
 
     // bob tries to extend: grant carol the cap with expiry 5000. The kernel clamps
     // to the source's remaining life (I5) — no op may push a deadline forward.
     k.grant(bob, CapHandle(1), CapHandle(2), Rights::CONTROL, Some(5000))
         .unwrap();
     let carol_smtp = CapHandle(1); // carol: self (0), smtp CONTROL exp100 (1).
-    assert!(k.task_kill(carol, carol_smtp).is_ok(), "carol usable before deadline");
+    assert!(
+        k.task_kill(carol, carol_smtp).is_ok(),
+        "carol usable before deadline"
+    );
 
     // At t=101 everything derived from that grant is dead: bob's original, bob's
     // copy, and carol's would-be-extended cap.
     k.advance(101);
-    assert_eq!(k.task_running(bob, CapHandle(1)).unwrap_err(), KernelError::CapExpired);
-    assert_eq!(k.task_running(bob, copy).unwrap_err(), KernelError::CapExpired);
-    assert_eq!(k.task_kill(carol, carol_smtp).unwrap_err(), KernelError::CapExpired);
+    assert_eq!(
+        k.task_running(bob, CapHandle(1)).unwrap_err(),
+        KernelError::CapExpired
+    );
+    assert_eq!(
+        k.task_running(bob, copy).unwrap_err(),
+        KernelError::CapExpired
+    );
+    assert_eq!(
+        k.task_kill(carol, carol_smtp).unwrap_err(),
+        KernelError::CapExpired
+    );
 }
 
 /// Every failed operation lands in the audit log (spec §2), even failures that carry
@@ -247,10 +278,12 @@ fn grant_requires_receiver_consent() {
 
     // attacker gets ONLY a zero-rights naming reference to victim — "the attacker
     // merely knows the victim exists," no authority over it.
-    k.grant(root, victim_cap, attacker_cap, Rights::NONE, None).unwrap();
+    k.grant(root, victim_cap, attacker_cap, Rights::NONE, None)
+        .unwrap();
     // and one GRANT-capable resource (a valid source cap for grant()).
     let (_r, r_cap) = k.create_task(root, creator, "junk").unwrap();
-    k.grant(root, r_cap, attacker_cap, Rights::GRANT, None).unwrap();
+    k.grant(root, r_cap, attacker_cap, Rights::GRANT, None)
+        .unwrap();
 
     // First injection attempt already fails: the kernel demands RECEIVE (I6).
     assert_eq!(

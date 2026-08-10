@@ -4,9 +4,7 @@
 //! renews the whole subsystem, and a decision log that cross-checks the
 //! kernel audit (neither side can rewrite the other).
 
-use capability_core::{
-    AuditFilter, CapHandle, Kernel, ObjectId, OpKind, Rights, TaskHandle,
-};
+use capability_core::{AuditFilter, CapHandle, Kernel, ObjectId, OpKind, Rights, TaskHandle};
 use supervision_tree::{RestartPolicy, RuntimeEvent, Supervisor};
 
 struct World {
@@ -146,7 +144,10 @@ fn the_circuit_breaker_trips_instead_of_retrying_forever() {
     let spawns_without_init = ops(&w.k, w.root.id(), OpKind::TaskSpawn) - 2;
     assert_eq!(spawns_without_init, 3, "exactly the budget was burned");
     assert_eq!(
-        sup.log().iter().filter(|e| matches!(e, RuntimeEvent::Crash { .. })).count(),
+        sup.log()
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::Crash { .. }))
+            .count(),
         4
     );
     assert!(sup
@@ -163,15 +164,27 @@ fn the_circuit_breaker_trips_instead_of_retrying_forever() {
     assert_eq!(sup.log().len(), log_before, "trip is already on record");
     assert_eq!(sup.restarts_of(idx_a), 3);
     assert!(!sup.is_running(&mut w.k, idx_a));
-    assert_eq!(sup.log().iter().filter(|e| matches!(e, RuntimeEvent::Restart { .. })).count(), 3);
+    assert_eq!(
+        sup.log()
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::Restart { .. }))
+            .count(),
+        3
+    );
 
     // Containment holds even through the trip: the sibling never crashed,
     // never restarted, and is untouched.
     assert!(sup.is_running(&mut w.k, idx_b));
     assert_eq!(census(&w.k, b), b_before);
     assert_eq!(
-        sup.log().iter().filter(|e| matches!(e, RuntimeEvent::Crash { .. })).count(),
-        sup.log().iter().filter(|e| matches!(e, RuntimeEvent::Crash { node, .. } if node == "svc-a")).count(),
+        sup.log()
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::Crash { .. }))
+            .count(),
+        sup.log()
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::Crash { node, .. } if node == "svc-a"))
+            .count(),
         "the only crash on record is A's"
     );
 }
@@ -233,8 +246,20 @@ fn the_policy_decision_log_crosschecks_the_kernel_audit() {
 
     let (a, a_cap) = spawn(&mut w, "svc-a");
     let (b, b_cap) = spawn(&mut w, "svc-b");
-    let _ia = sup.add(&mut w.k, "svc-a", a, a_cap, RestartPolicy { max_restarts: 2 });
-    let _ib = sup.add(&mut w.k, "svc-b", b, b_cap, RestartPolicy { max_restarts: 1 });
+    let _ia = sup.add(
+        &mut w.k,
+        "svc-a",
+        a,
+        a_cap,
+        RestartPolicy { max_restarts: 2 },
+    );
+    let _ib = sup.add(
+        &mut w.k,
+        "svc-b",
+        b,
+        b_cap,
+        RestartPolicy { max_restarts: 1 },
+    );
 
     let log = |s: &Supervisor| {
         s.log()
@@ -287,5 +312,8 @@ fn the_policy_decision_log_crosschecks_the_kernel_audit() {
     // does not know about policy at all — its spawn count IS the restart
     // count the runtime claims, no more, no less.
     let runtime_restarts = seq.iter().filter(|(k, _)| *k == "restart").count();
-    assert_eq!(runtime_restarts, ops(&w.k, w.root.id(), OpKind::TaskSpawn) - 2);
+    assert_eq!(
+        runtime_restarts,
+        ops(&w.k, w.root.id(), OpKind::TaskSpawn) - 2
+    );
 }

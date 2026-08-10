@@ -44,7 +44,11 @@ fn many_queued_operations_cross_the_kernel_once() {
         sq.read(region, i * 9, 9);
     }
     assert_eq!(sq.len(), 64);
-    assert_eq!(caller_ops(&k, root, OpKind::Batch), 0, "queued entries cost nothing");
+    assert_eq!(
+        caller_ops(&k, root, OpKind::Batch),
+        0,
+        "queued entries cost nothing"
+    );
 
     let mut cq = sq.submit(&mut k, root);
     assert!(sq.is_empty(), "entries are consumed by the submission");
@@ -52,8 +56,16 @@ fn many_queued_operations_cross_the_kernel_once() {
     // Exactly one kernel crossing: one Batch record, no individual
     // MemRead/MemWrite records from the queued entries.
     assert_eq!(batch_records(&k, root).len(), 1);
-    assert_eq!(caller_ops(&k, root, OpKind::MemRead), 0, "reads rode the one crossing");
-    assert_eq!(caller_ops(&k, root, OpKind::MemWrite), 0, "writes rode the one crossing");
+    assert_eq!(
+        caller_ops(&k, root, OpKind::MemRead),
+        0,
+        "reads rode the one crossing"
+    );
+    assert_eq!(
+        caller_ops(&k, root, OpKind::MemWrite),
+        0,
+        "writes rode the one crossing"
+    );
 
     // Per-entry results, in submission order, drained at the caller's pace.
     assert_eq!(cq.remaining(), 64);
@@ -138,7 +150,12 @@ fn completions_are_drained_apart_from_submission() {
     // Two crossings, two Batch records — each submission is one, never one
     // per queued entry.
     assert_eq!(batch_records(&k, root).len(), 2);
-    let text: Vec<u8> = b"one".iter().chain(b"two").chain(b"three").copied().collect();
+    let text: Vec<u8> = b"one"
+        .iter()
+        .chain(b"two")
+        .chain(b"three")
+        .copied()
+        .collect();
     assert_eq!(
         k.mem_read(root, region, 0, text.len()).unwrap().to_vec(),
         text
