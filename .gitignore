@@ -1,3 +1,7 @@
 aegis/target/
 aegis/spec/states/
 aegis/spec/AegisCapabilities_TTrace_*
+
+# Rust
+Cargo.lock
+target/
