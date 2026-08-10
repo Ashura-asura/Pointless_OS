@@ -34,6 +34,7 @@ A single-threaded, in-process capability kernel with:
 - `capability-audit`: reachable-authority CLI, `--graph` flag for capability visualization
 - `aegis-shell`: interactive demo exercising IPC, grants, anomaly monitoring
 - Model-doc sections in `spec/capability-model.md` for every implemented claim
+- GitHub Actions CI: `cargo fmt --check`, `cargo clippy`, `cargo test --workspace` on every push
 
 ## What doesn't exist (honest list)
 
@@ -45,8 +46,7 @@ A single-threaded, in-process capability kernel with:
 | Linux/Windows compat layers | Not started | Deliberately deferred (Phase 8-9 in design doc) |
 | AI orchestration layer | Not started | Phase 6 in design doc; anomaly monitor is the first step |
 | Graphical shell | Not started | Phase 7 in design doc |
-| Distributed consensus | Not started | Macaroon tokens exist; real cross-machine orchestration is Phase 11 |
-| Subdirectory support in POSIX view (flat namespace only) | Not started | Would require hierarchical namespace mapping |
+| Cross-machine transport for macaroon tokens | Not started | Token format exists; network transport between kernels is Phase 11 |
 | File metadata (timestamps, permissions beyond capability rights) | Not started | Currently no metadata beyond capability rights |
 | Delivery overhang as hard gate | Deliberately warning | Kernel enforces at delivery time (I2/I6); auditor is build-time cross-check, not enforcement |
 
@@ -69,14 +69,14 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | 1 | Boot + minimal kernel | ✅ Done (model) |
 | 2 | Userspace resource managers + supervision tree | ✅ Done (model) |
 | 3 | Driver framework (IOMMU) | ⬜ Not started |
-| 4 | Storage service + POSIX view | ⬜ Partial (storage yes, POSIX no) |
+| 4 | Storage service + POSIX view | ✅ Done (FlatView projection: create/read/write/delete/list, tested) |
 | 5 | Networking stack | ⬜ Partial (loopback only) |
 | 6 | AI orchestration layer | ⬜ Partial (anomaly monitor only) |
 | 7 | Native app model + shell | ⬜ Partial (aegis-shell demo only) |
 | 8 | Linux compat | ⬜ Not started |
 | 9 | Windows compat | ⬜ Not started |
-| 10 | Self-healing hardening + chaos testing | ⬜ Not started |
-| 11 | Distributed extension (macaroons) | 🟡 Scaffold (token crate exists, no transport) |
+| 10 | Self-healing hardening + chaos testing | ✅ Done (6 chaos tests + 4 supervision tests) |
+| 11 | Distributed extension (macaroons) | 🟡 Token crate complete (HMAC-SHA256 chain, constant-time verify, serialization); no cross-machine transport |
 | 12 | Production hardening | ⬜ Not started |
 
 ## Commits (this session)
@@ -94,3 +94,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `25ef050` | Fix install_contract.rs 3-tuple collect + GROUND_RULES.md |
 | `7e30671` | Stricter ground rules + constant-time HMAC |
 | `d36d893` | Chaos tests for supervision tree |
+| `22c9c0e` | CI + delivery overhang + hardened HMAC |

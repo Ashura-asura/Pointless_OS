@@ -22,6 +22,8 @@ The kernel model (`capability-core`) proves six authority invariants (I1-I6) via
 - **Two-party confirmation**: high-risk roles refuse single-click, require two distinct people (3 tests)
 - **Anomaly circuit breaker**: monitor trains on actual op-shape, suspends on deviation, never revokes, has zero authority (3 tests)
 - **Batched I/O**: one kernel crossing for N operations (io_uring pattern), per-entry capability checks (3 tests)
+- **POSIX file view**: flat namespace projection over object store — create, read, write, delete, list (tested as projection with no second source of truth)
+- **Chaos testing**: 6 contract tests injecting interleaved faults into supervision tree
 - **Package-driven exec**: install a package, start its app, app reads granted payload, refuses writes and Creator access (1 test)
 - **Macaroon capability tokens**: HMAC-SHA256 chained portable tokens for cross-machine authority transfer (4 tests)
 - **Constant-time HMAC comparison**: production-grade token verification using `subtle::ConstantTimeEq`
@@ -30,8 +32,11 @@ The kernel model (`capability-core`) proves six authority invariants (I1-I6) via
 
 ## What Is Not Done
 
-- POSIX filesystem view projection (not started)
-- Network transport (loopback only, no real NIC driver)
+- Real hardware isolation (address spaces, IOMMU) — not in scope for model
+- Linux/Windows compatibility layers — deliberately deferred (Phase 8-9)
+- Graphical shell — Phase 7 in design doc
+- Cross-machine transport for macaroon tokens — token format exists, no network transport
+- Real network driver — loopback only, no NIC
 
 ## Honest Limits
 
