@@ -32,3 +32,5 @@ pub mod linux_compat;
 pub mod nt_abi;
 pub mod pe_loader;
 pub mod win_compat;
+
+pub mod ceiling;

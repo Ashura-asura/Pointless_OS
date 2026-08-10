@@ -47,8 +47,12 @@ impl AdaptivePolicy {
     pub fn tighten_scope(scope: &CapabilityScope) -> CapabilityScope {
         let mut new_scope = scope.clone();
         new_scope.network_allowed = false;
-        new_scope.max_memory_pages = (new_scope.max_memory_pages / 2).max(1);
-        new_scope.max_file_handles = (new_scope.max_file_handles / 2).max(1);
+        // Floor at min(current, 1): halve budgets but never raise a zero
+        // budget to a nonzero one (monotonic non-expansion).
+        let mem = new_scope.max_memory_pages;
+        new_scope.max_memory_pages = (mem / 2).max(mem.min(1));
+        let fh = new_scope.max_file_handles;
+        new_scope.max_file_handles = (fh / 2).max(fh.min(1));
         for i in 0..32 {
             new_scope.allowed_syscalls[i] = scope.allowed_syscalls[i] && (i % 2 == 0);
         }
