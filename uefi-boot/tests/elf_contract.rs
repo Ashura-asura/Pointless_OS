@@ -261,16 +261,31 @@ fn rejects_wrong_endianness() {
 fn accepts_pie_type() {
     let mut data = build_test_elf(0x1000, &[(0, 0, 0x1000, 5)]);
     data[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN (PIE kernel)
-    assert_eq!(parse_elf(&data), Ok(ElfBinary {
-        entry: 0x1000,
-        segments: {
-            let mut segs = [ProgramHeader { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 16];
-            segs[0] = ProgramHeader { vaddr: 0, offset: 0, filesz: 0x1000, memsz: 0x1000, flags: 5 };
-            segs
-        },
-        segment_count: 1,
-        relocations: vec![],
-    }));
+    assert_eq!(
+        parse_elf(&data),
+        Ok(ElfBinary {
+            entry: 0x1000,
+            segments: {
+                let mut segs = [ProgramHeader {
+                    vaddr: 0,
+                    offset: 0,
+                    filesz: 0,
+                    memsz: 0,
+                    flags: 0,
+                }; 16];
+                segs[0] = ProgramHeader {
+                    vaddr: 0,
+                    offset: 0,
+                    filesz: 0x1000,
+                    memsz: 0x1000,
+                    flags: 5,
+                };
+                segs
+            },
+            segment_count: 1,
+            relocations: vec![],
+        })
+    );
 }
 
 /// Append section headers + shstrtab + a .rela.dyn section to a built ELF.
@@ -325,11 +340,17 @@ fn parses_relative_relocations() {
     assert_eq!(elf.relocations.len(), 2);
     assert_eq!(
         elf.relocations[0],
-        Relocation { offset: 0x2BF0, addend: 0x16E0 }
+        Relocation {
+            offset: 0x2BF0,
+            addend: 0x16E0
+        }
     );
     assert_eq!(
         elf.relocations[1],
-        Relocation { offset: 0x2BF8, addend: 0x13B0 }
+        Relocation {
+            offset: 0x2BF8,
+            addend: 0x13B0
+        }
     );
 }
 

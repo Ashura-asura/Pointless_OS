@@ -1,8 +1,8 @@
 #![no_std]
 #![no_main]
 
-use core::panic::PanicInfo;
 use aegis_kernel::sprintln;
+use core::panic::PanicInfo;
 
 /// VGA text mode buffer at physical address 0xB8000.
 const VGA_BUFFER: *mut u8 = 0xB8000 as *mut u8;
@@ -34,7 +34,10 @@ pub extern "sysv64" fn _start() -> ! {
         aegis_kernel::page_tables::init_kernel_tables();
     }
     sprintln!("Aegis: kernel page tables up (4GB identity via 1GB pages)");
-    sprintln!("Aegis: CR3 = 0x{:016X}", aegis_kernel::page_tables::kernel_pml4_phys());
+    sprintln!(
+        "Aegis: CR3 = 0x{:016X}",
+        aegis_kernel::page_tables::kernel_pml4_phys()
+    );
     sprintln!("Aegis: entering idle loop");
 
     loop {
