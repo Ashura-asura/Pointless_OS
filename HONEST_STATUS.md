@@ -4,7 +4,7 @@
 
 ## What exists (310 tests, 0 failures)
 
-Breakdown: 111 model-crate tests (aegis workspace, incl. fleet + security-audit), 189 aegis-kernel tests (Phases 1-12), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `305ce8c`.
+Breakdown: 111 model-crate tests (aegis workspace, incl. fleet + security-audit), 189 aegis-kernel tests (Phases 1-12), 10 uefi-boot ELF parser tests. Verified from clean lockfile on commit `76471bb`.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -160,7 +160,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 0 | Architecture research + capability model | ✅ Done |
-| 1 | Boot + minimal kernel | ✅ Done (real + model): UEFI boot, page tables, ELF loader (10 parser tests), bare-metal kernel. Honest limits: identity mapping only (no per-process isolation yet), no real hardware test (VMware needed) |
+| 1 | Boot + minimal kernel | ✅ Done (real + model): UEFI boot, page tables, ELF loader (10 parser tests), bare-metal kernel. Honest limits: no real hardware test (VMware needed); per-process isolation added in Phase 2 |
 | 2 | Userspace resource managers + supervision tree | ✅ Done (real + model): GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework. Honest limits: hardware ops untested (need VMware), no real timer interrupt yet |
 | 3 | Driver framework (IOMMU) | ✅ Done (real + model): PCIe enumeration (6 tests), VT-d IOMMU domain isolation (5 tests), NVMe command queues (5 tests). Model: typed Block/Net/Gpu interfaces, crash containment, GPU isolation, compositor (4 tests). Honest limits: all hardware ops UNTESTED (need real PCIe/IOMMU/NVMe) |
 | 4 | Storage service + POSIX view | ✅ Done (model: FlatView is a flat, single-level namespace projection — create/read/write/delete/list by name. Not a hierarchical POSIX filesystem — no nested dirs, no path resolution, no permission bits, no symlinks. 8 contract tests) |
