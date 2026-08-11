@@ -81,6 +81,38 @@ impl<'a> FrameAllocator<'a> {
         None
     }
 
+    /// Claim `n` consecutive free frames, returning the physical address of
+    /// the first. Fails if no run of `n` exists.
+    pub fn alloc_contiguous(&mut self, n: u64) -> Option<u64> {
+        if n == 0 || self.free < n {
+            return None;
+        }
+        let mut run: u64 = 0;
+        let mut run_start: u64 = 0;
+        for (wi, word) in self.bitmap.iter().enumerate() {
+            for bit in 0..64u32 {
+                let frame = wi as u64 * 64 + bit as u64;
+                if frame >= MAX_FRAMES {
+                    return None;
+                }
+                if word >> bit & 1 == 0 {
+                    if run == 0 {
+                        run_start = frame;
+                    }
+                    run += 1;
+                    if run == n {
+                        set_bits(self.bitmap, run_start, frame + 1);
+                        self.free -= n;
+                        return Some(run_start * PAGE_SIZE);
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+        }
+        None
+    }
+
     /// Return a frame to the pool. `false` if it was never allocated or is
     /// outside the covered address space.
     pub fn free(&mut self, phys: u64) -> bool {
@@ -210,6 +242,18 @@ pub unsafe fn free_global(phys: u64) -> bool {
     let ok = a.free(phys);
     core::ptr::write(core::ptr::addr_of_mut!(FREE), a.free);
     ok
+}
+
+/// Allocate `n` consecutive frames from the global pool.
+///
+/// # Safety
+/// Single-threaded kernel; must run after `init_global`.
+pub unsafe fn alloc_contiguous_global(n: u64) -> Option<u64> {
+    let mut a = FrameAllocator::empty(global_slice());
+    a.free = core::ptr::read(core::ptr::addr_of_mut!(FREE));
+    let f = a.alloc_contiguous(n);
+    core::ptr::write(core::ptr::addr_of_mut!(FREE), a.free);
+    f
 }
 
 /// (total usable frames, currently free frames).
@@ -359,6 +403,56 @@ mod tests {
         ];
         let t = make(&map);
         assert_eq!(t.alloc.stats().1, 160 - 17);
+    }
+
+    #[test]
+    fn alloc_contiguous_returns_consecutive_run() {
+        let mut t = make(&sample_map());
+        // Free pool: frames 17..176 (low region) then 256+ (1 MiB region).
+        let base = t.alloc.alloc_contiguous(8).unwrap();
+        assert_eq!(base, 17 * PAGE_SIZE);
+        // Second call wraps to the next 8-frame hole.
+        let base2 = t.alloc.alloc_contiguous(8).unwrap();
+        assert_eq!(base2, 25 * PAGE_SIZE);
+        assert_eq!(t.alloc.stats().1, 160 + 256 - 17 - 16);
+    }
+
+    #[test]
+    fn alloc_contiguous_spans_word_boundary() {
+        // Region that makes the run cross a 64-frame word boundary:
+        // frames 60..70 must stay 10-consecutive even though 64 is a
+        // word edge. Build a map with conventional frames 60..70 only.
+        let map = vec![MapEntry {
+            ty: TYPE_CONVENTIONAL,
+            base: 60 * PAGE_SIZE,
+            pages: 10,
+        }];
+        let mut t = make_with_image_end(&map, 0x1000);
+        let base = t.alloc.alloc_contiguous(10).unwrap();
+        assert_eq!(base, 60 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn alloc_contiguous_fails_when_fragmented() {
+        // Two free frames separated by a used one must not merge.
+        let map = vec![MapEntry {
+            ty: TYPE_CONVENTIONAL,
+            base: 17 * PAGE_SIZE,
+            pages: 3,
+        }];
+        let mut t = make_with_image_end(&map, 0x1000);
+        let _mid = t.alloc.alloc().unwrap(); // takes frame 17
+        let base = t.alloc.alloc_contiguous(2).unwrap();
+        // Only frames 18..19 remain contiguous; the run at 17 is gone.
+        assert_eq!(base, 18 * PAGE_SIZE);
+        let base2 = t.alloc.alloc_contiguous(2);
+        assert_eq!(base2, None);
+    }
+
+    #[test]
+    fn alloc_contiguous_zero_rejected() {
+        let mut t = make(&sample_map());
+        assert_eq!(t.alloc.alloc_contiguous(0), None);
     }
 
     #[test]

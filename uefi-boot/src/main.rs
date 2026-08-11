@@ -231,3 +231,4 @@ fn main() -> Status {
         unsafe { core::arch::asm!("hlt") }
     }
 }
+

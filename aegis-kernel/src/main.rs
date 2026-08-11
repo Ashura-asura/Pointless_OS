@@ -3,6 +3,7 @@
 
 use aegis_kernel::sprintln;
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[no_mangle]
 pub extern "sysv64" fn _start() -> ! {
@@ -96,6 +97,32 @@ pub extern "sysv64" fn _start() -> ! {
     }
     sprintln!("Aegis: LAPIC timer armed (periodic, vector 0x30)");
 
+    // Two kernel tasks, each on a 16 KiB stack carved from the frame
+    // allocator (4 consecutive frames per task).
+    let stack_alpha = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    let stack_beta = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    match (stack_alpha, stack_beta) {
+        (Some(sa), Some(sb)) => {
+            unsafe {
+                aegis_kernel::tasks::spawn("alpha", task_alpha, sa);
+                aegis_kernel::tasks::spawn("beta", task_beta, sb);
+            }
+            sprintln!(
+                "Aegis: tasks spawned: alpha @ 0x{:X}, beta @ 0x{:X} ({} tasks)",
+                sa,
+                sb,
+                aegis_kernel::tasks::spawned_count()
+            );
+        }
+        _ => {
+            sprintln!("Aegis: WARNING could not allocate task stacks");
+        }
+    }
+
     unsafe {
         core::arch::asm!("sti");
     }
@@ -103,12 +130,48 @@ pub extern "sysv64" fn _start() -> ! {
 
     let mut next_print: u64 = 512;
     loop {
-        unsafe { core::arch::asm!("hlt") };
+        unsafe { aegis_kernel::tasks::run_idle() };
         let t = aegis_kernel::cpu::timer_ticks();
         if t >= next_print {
             next_print = t + 512;
             sprintln!("Aegis: tick = {} (timer alive)", t);
         }
+        unsafe { core::arch::asm!("hlt") };
+    }
+}
+
+static ALPHA_NEXT: AtomicU64 = AtomicU64::new(2048);
+static BETA_NEXT: AtomicU64 = AtomicU64::new(4096);
+
+extern "sysv64" fn task_alpha() -> ! {
+    loop {
+        let t = aegis_kernel::cpu::timer_ticks();
+        let n = ALPHA_NEXT.load(Ordering::Relaxed);
+        if t >= n {
+            ALPHA_NEXT.store(n + 2048, Ordering::Relaxed);
+            let mut rsp: u64 = 0;
+            unsafe {
+                core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, preserves_flags));
+            }
+            sprintln!("Aegis: [alpha] tick = {} (rsp 0x{:X})", t, rsp);
+        }
+        unsafe { aegis_kernel::tasks::yield_now() };
+    }
+}
+
+extern "sysv64" fn task_beta() -> ! {
+    loop {
+        let t = aegis_kernel::cpu::timer_ticks();
+        let n = BETA_NEXT.load(Ordering::Relaxed);
+        if t >= n {
+            BETA_NEXT.store(n + 2048, Ordering::Relaxed);
+            let mut rsp: u64 = 0;
+            unsafe {
+                core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, preserves_flags));
+            }
+            sprintln!("Aegis: [beta] tick = {} (rsp 0x{:X})", t, rsp);
+        }
+        unsafe { aegis_kernel::tasks::yield_now() };
     }
 }
 
