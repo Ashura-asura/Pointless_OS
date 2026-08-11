@@ -286,6 +286,29 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
         asm!("mov {}, cr2", out(reg) cr2, options(nomem, preserves_flags));
         asm!("mov {}, cr3", out(reg) cr3, options(nomem, preserves_flags));
     }
+
+    // Page-fault-driven isolation: a ring-3 task faulted (U/S violation in
+    // the isolation demo, or an NX violation in the NX demo). Kill the task
+    // and let the kernel continue; the vector-14 stub resumes the scheduler.
+    if vector == 0x0E {
+        let cs = unsafe { *frame.add(frame_rip_index(has_err != 0) + 1) };
+        if (cs & 3) == 3 {
+            if err & (1 << 4) != 0 {
+                crate::sprintln!(
+                    "Aegis: NX violation: instruction fetch at CR2=0x{:016X} - non-executable page verified (task killed, kernel survives)",
+                    cr2
+                );
+            } else {
+                crate::sprintln!(
+                    "Aegis: PAGE FAULT at CR2=0x{:016X} - memory isolation verified (task killed, kernel survives)",
+                    cr2
+                );
+            }
+            crate::tasks::kill_current();
+            return;
+        }
+    }
+
     crate::sprintln!(
         "KERNEL EXCEPTION vector=0x{:02X} err=0x{:X} RIP=0x{:016X} RSP=0x{:016X} CR2=0x{:016X} CR3=0x{:016X}",
         vector,
@@ -331,10 +354,7 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
     );
 
     if vector == 0x0E {
-        crate::sprintln!(
-            "Aegis: PAGE FAULT at CR2=0x{:016X} - memory isolation verified",
-            cr2
-        );
+        crate::sprintln!("Aegis: KERNEL page fault at CR2=0x{:016X} - halting", cr2);
     }
 
     loop {

@@ -18,11 +18,13 @@ pub const MAX_TASKS: usize = 8;
 pub const MAX_CAPS: usize = 16;
 
 /// Scheduling state of a task. `Blocked` tasks are skipped by the scheduler
-/// (e.g. while waiting for an IPC reply).
+/// (e.g. while waiting for an IPC reply). `Zombie` tasks are killed (they
+/// faulted as ring-3 isolation/NX victims) and never scheduled again.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Ready,
     Blocked,
+    Zombie,
 }
 
 /// Full register context of a running task. The `#[repr(C)]` layout
@@ -532,6 +534,28 @@ pub fn arm_isolation_test(idx: usize, tick: u64) {
     ISO_ARM_TICK.store(tick, Ordering::Relaxed);
 }
 
+/// One-shot demo hook for the NX-test task (same pattern as ISO_ARM_*):
+/// hold task `idx` blocked until the LAPIC tick counter reaches `tick`.
+pub static NX_ARM_TICK: AtomicU64 = AtomicU64::new(u64::MAX);
+static NX_ARM_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Arm the one-shot unblock hook for the NX-test demo task.
+pub fn arm_nx_test(idx: usize, tick: u64) {
+    set_task_state(idx, TaskState::Blocked);
+    NX_ARM_IDX.store(idx, Ordering::Relaxed);
+    NX_ARM_TICK.store(tick, Ordering::Relaxed);
+}
+
+/// Kill the currently running task: it faulted in ring 3 (page-fault-driven
+/// isolation/NX demo) and must never be scheduled again. The scheduler skips
+/// non-Ready tasks, so Zombie is permanent.
+pub fn kill_current() {
+    let cur = current_idx();
+    if cur != usize::MAX {
+        set_task_state(cur, TaskState::Zombie);
+    }
+}
+
 /// Switch away from `cur` to the next runnable context. Does not return to
 /// `cur` (the caller is resumed later by a future switch). Used by both the
 /// timer preemption path and the blocking IPC syscalls.
@@ -634,6 +658,11 @@ pub unsafe fn timer_preempt() {
     if crate::cpu::timer_ticks() >= ISO_ARM_TICK.load(Ordering::Relaxed) {
         ISO_ARM_TICK.store(u64::MAX, Ordering::Relaxed);
         unblock_task(ISO_ARM_IDX.load(Ordering::Relaxed));
+    }
+    // Same one-shot hook for the NX-test task.
+    if crate::cpu::timer_ticks() >= NX_ARM_TICK.load(Ordering::Relaxed) {
+        NX_ARM_TICK.store(u64::MAX, Ordering::Relaxed);
+        unblock_task(NX_ARM_IDX.load(Ordering::Relaxed));
     }
     let cur = current_idx();
     let Some(next) = schedule_next(cur) else {

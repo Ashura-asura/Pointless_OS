@@ -1,11 +1,39 @@
+//! Kernel page tables: identity-mapped first 4 GB with NX (non-executable)
+//! enforcement on every data page.
+//!
+//! Layout (kernel PML4):
+//! - Entries 0-2: 1 GB huge pages (identity). Entry 0 is broken into a PD
+//!   of 2 MB pages; its first 2 MB region is further broken into 4 KB pages
+//!   so the executable window (the kernel image's R+X PT_LOAD, parsed from
+//!   the ELF at runtime) can be the ONLY executable pages in the low map.
+//! - Entry 3: the 0xC0000000-0xFFFFFFFF scratch window (2 MB pages), with
+//!   the local APIC page broken out into 4 KB pages (QEMU TCG cannot do
+//!   MMIO writes through huge pages).
+//! - The NX bit (bit 63) is set on every non-code mapping: kernel stacks,
+//!   BSS, the VGA framebuffer, LAPIC MMIO, allocator frames. Kernel data is
+//!   never executable; ring-3 data pages (user stacks, video memory) are
+//!   also NX, so a user task fetching an instruction from 0xB8000 #PFs
+//!   (verified live by `task_nx_test`).
+//!
+//! Honest limits: 4 KB granularity only for the first 2 MB; the rest of the
+//! low map uses 2 MB/1 GB huge pages. Verified under QEMU/TCG, not on
+//! physical hardware.
+
 use core::arch::asm;
 
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const HUGE_PAGE: u64 = 1 << 7;
-#[allow(dead_code)]
 const NX: u64 = 1 << 63;
+
+/// IA32_EFER MSR. NXE (bit 11) must be set or the hardware ignores the NX
+/// page-table bit.
+const IA32_EFER: u32 = 0xC000_0080;
+const EFER_NXE: u64 = 1 << 11;
+
+/// ELF program-header flag: executable segment.
+const PF_X: u32 = 1;
 
 #[repr(C, align(4096))]
 #[derive(Copy, Clone)]
@@ -32,9 +60,14 @@ impl Default for PageTable {
     }
 }
 
-// Static kernel page tables — identity-mapped, shared by all processes
+// Static kernel page tables — identity-mapped, shared by all processes.
 static mut KERNEL_PML4: PageTable = PageTable::new();
 static mut KERNEL_PDPT: PageTable = PageTable::new();
+
+// First 1 GB broken into 2 MB pages (so data can be marked NX).
+static mut KERNEL_PD0: PageTable = PageTable::new();
+// First 2 MB broken into 4 KB pages (so code and data can be separated).
+static mut KERNEL_PT_LOW0: PageTable = PageTable::new();
 
 // Scratch area for the 0xC0000000-0xFFFFFFFF window (splits the huge page so
 // the local APIC page can be mapped with ordinary 4 KB pages: QEMU TCG cannot
@@ -44,18 +77,120 @@ static mut SCRATCH_PT: PageTable = PageTable::new();
 
 const LAPIC_PHYS: u64 = 0xFEE0_0000;
 
-/// End of everything ring-3 code needs in the low identity map: the kernel
-/// image (text+rodata+data+bss, ends just above 0x35000 today) and every
-/// task stack/CPL0 stack carved by the frame allocator. The corresponding
-/// 2 MB PD entry is marked USER so ring-3 tasks can fetch their own code
-/// and use their stacks; everything else in the lower half stays kernel-only
-/// and ring-3 access to it faults (see `task_isolation_test`).
-const USER_LOW_END: u64 = 0x200_000;
+/// Page index (4 KB) of a virtual address.
+pub fn pt_index(addr: u64) -> usize {
+    ((addr >> 12) & 0x1FF) as usize
+}
 
-/// Set up identity-mapped kernel page tables (first 1GB, same as Phase 1).
-/// Maps first 4 GB using 1GB huge pages via PDPT entries, except the local
-/// APIC page (0xFEE00000) which is mapped through a 4 KB page table so MMIO
-/// writes reach the device.
+/// 2 MB page index of a virtual address.
+pub fn pd_index(addr: u64) -> usize {
+    ((addr >> 21) & 0x1FF) as usize
+}
+
+/// 1 GB page index of a virtual address.
+pub fn pdpt_index(addr: u64) -> usize {
+    ((addr >> 30) & 0x1FF) as usize
+}
+
+/// First and last 4 KB page index *containing* the half-open window
+/// `[start, end)`.
+pub fn exec_page_range(text_start: u64, text_end: u64) -> (usize, usize) {
+    let first = (text_start >> 12) as usize;
+    let last = ((text_end + 0xFFF) >> 12) as usize;
+    (first, last)
+}
+
+/// Is 4 KB page `page` inside the executable window?
+pub fn is_exec_page(page: usize, text_start: u64, text_end: u64) -> bool {
+    let (first, last) = exec_page_range(text_start, text_end);
+    page >= first && page < last
+}
+
+/// Wait, is the page at virtual address `addr` inside the window?
+pub fn addr_is_exec(addr: u64, text_start: u64, text_end: u64) -> bool {
+    is_exec_page(pt_index(addr), text_start, text_end)
+}
+
+/// Parse the executable (R+X) PT_LOAD window of an ELF64 image from raw
+/// bytes. Pure and unit-testable; `kernel_text_window` feeds it the kernel
+/// image at identity address 0.
+pub fn text_window_from_elf(data: &[u8]) -> Result<(u64, u64), &'static str> {
+    if data.len() < 64 || &data[0..4] != b"\x7fELF" {
+        return Err("bad ELF magic");
+    }
+    let is64 = data[4] == 2;
+    let le = data[5] == 1;
+    if !is64 || !le {
+        return Err("not ELF64 little-endian");
+    }
+    let e_phoff = u64::from_le_bytes(data[32..40].try_into().unwrap());
+    let e_phentsize = u16::from_le_bytes(data[54..56].try_into().unwrap());
+    let e_phnum = u16::from_le_bytes(data[56..58].try_into().unwrap());
+    if e_phentsize < 56 || e_phnum == 0 {
+        return Err("bad program header table");
+    }
+    let mut window: Option<(u64, u64)> = None;
+    for i in 0..e_phnum {
+        let off = e_phoff as usize + i as usize * e_phentsize as usize;
+        if off + 56 > data.len() {
+            return Err("program header out of bounds");
+        }
+        let p_type = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+        let p_flags = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
+        let p_vaddr = u64::from_le_bytes(data[off + 16..off + 24].try_into().unwrap());
+        let p_filesz = u64::from_le_bytes(data[off + 32..off + 40].try_into().unwrap());
+        if p_type != 1 {
+            continue; // PT_LOAD only
+        }
+        if p_flags & PF_X == 0 {
+            continue;
+        }
+        let start = p_vaddr;
+        let end = p_vaddr + p_filesz;
+        let w = window.get_or_insert((start, end));
+        w.0 = w.0.min(start);
+        w.1 = w.1.max(end);
+    }
+    window.ok_or("no executable PT_LOAD")
+}
+
+/// Executable window of the running kernel image (ELF at identity address
+/// 0). `None` if the image's program headers cannot be parsed — a build
+/// problem, not a runtime one.
+pub fn kernel_text_window() -> Option<(u64, u64)> {
+    // Address 0 is the identity-mapped kernel image (ELF header + program
+    // header table). Copy the headers into a stack buffer with volatile
+    // reads (no raw-null slice), then run the pure parser on it.
+    let mut buf = [0u8; 1024];
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = unsafe { core::ptr::read_volatile((i as u64) as *const u8) };
+    }
+    text_window_from_elf(&buf).ok()
+}
+
+/// Ensure IA32_EFER.NXE is set so the NX page-table bit is honored.
+///
+/// # Safety
+///
+/// Must be called at boot in ring 0 while the EFER MSR is writable.
+pub unsafe fn enable_nxe() {
+    let lo: u32;
+    let hi: u32;
+    asm!("rdmsr", in("ecx") IA32_EFER, out("eax") lo, out("edx") hi, options(nostack));
+    let efer = ((hi as u64) << 32) | lo as u64;
+    let efer = efer | EFER_NXE;
+    asm!(
+        "wrmsr",
+        in("ecx") IA32_EFER,
+        in("eax") efer as u32,
+        in("edx") (efer >> 32) as u32,
+        options(nostack)
+    );
+}
+
+/// Set up identity-mapped kernel page tables (first 4 GB) with NX on every
+/// data mapping. The only executable pages are those overlapping the kernel
+/// image's R+X PT_LOAD window (parsed from the ELF at address 0).
 ///
 /// **Memory isolation**: The kernel PML4 has NO USER flags. Ring-3 tasks
 /// cannot access kernel memory through this page table. Per-user-task PML4s
@@ -68,34 +203,60 @@ const USER_LOW_END: u64 = 0x200_000;
 /// Must be called exactly once at boot, before any address-space switch. The
 /// static page tables are mutated in place; concurrent access is undefined.
 pub unsafe fn init_kernel_tables() {
+    enable_nxe();
+
     let pml4 = (&raw mut KERNEL_PML4).as_mut().unwrap();
     let pdpt = (&raw mut KERNEL_PDPT).as_mut().unwrap();
+    let pd0 = (&raw mut KERNEL_PD0).as_mut().unwrap();
+    let pt_low0 = (&raw mut KERNEL_PT_LOW0).as_mut().unwrap();
     let pd = (&raw mut SCRATCH_PD).as_mut().unwrap();
     let pt = (&raw mut SCRATCH_PT).as_mut().unwrap();
 
     pml4.clear();
     pdpt.clear();
+    pd0.clear();
+    pt_low0.clear();
     pd.clear();
     pt.clear();
 
-    // Map first 3 entries as 1GB each = 3GB identity.
-    // NO USER flag on any entry — kernel-only access through this PML4.
-    for i in 0..3 {
-        let flags = PRESENT | WRITABLE | HUGE_PAGE;
-        pdpt.entries[i] = (i as u64 * 0x4000_0000) | flags;
+    // Executable window of the kernel image. Everything outside it is NX.
+    let window = kernel_text_window();
+
+    // First 1 GB: PD of 2 MB pages. Every 2 MB region is NX by default;
+    // the first 2 MB is split into 4 KB pages (below), which is where the
+    // kernel image and the VGA text framebuffer live.
+    pdpt.entries[0] = core::ptr::addr_of!(KERNEL_PD0) as u64 | PRESENT | WRITABLE;
+    for i in 0..512u64 {
+        pd0.entries[i as usize] = (i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX;
+    }
+    // First 2 MB: 4 KB pages. Executable only where the kernel text lives.
+    pd0.entries[0] = core::ptr::addr_of!(KERNEL_PT_LOW0) as u64 | PRESENT | WRITABLE;
+    for i in 0..512u64 {
+        let addr = i * 0x1000;
+        let flags = PRESENT | WRITABLE | NX;
+        pt_low0.entries[i as usize] = match window {
+            Some((ts, te)) if addr_is_exec(addr, ts, te) => addr | (flags & !NX),
+            _ => addr | flags,
+        };
     }
 
-    // 4th entry (0xC0000000-0xFFFFFFFF): PD of 2MB pages, with the LAPIC
-    // page broken out into a 4KB page table.
+    // GBs 1-2: 1 GB huge pages, NX (no executable content lives there).
+    for i in 1..3 {
+        pdpt.entries[i] = (i as u64 * 0x4000_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX;
+    }
+
+    // 4th GB (0xC0000000-0xFFFFFFFF): PD of 2 MB pages, NX, with the LAPIC
+    // page broken out into a 4 KB page table (also NX — MMIO, never code).
     pdpt.entries[3] = core::ptr::addr_of!(SCRATCH_PD) as u64 | PRESENT | WRITABLE;
     for i in 0..512u64 {
-        pd.entries[i as usize] = (0xC000_0000 + i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE;
+        pd.entries[i as usize] =
+            (0xC000_0000 + i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX;
     }
     let lapic_pd_index = ((LAPIC_PHYS >> 21) & 0x1FF) as usize;
     pd.entries[lapic_pd_index] = core::ptr::addr_of!(SCRATCH_PT) as u64 | PRESENT | WRITABLE;
     let lapic_window = LAPIC_PHYS & !0x1F_FFFF;
     for i in 0..512u64 {
-        pt.entries[i as usize] = (lapic_window + i * 0x1000) | PRESENT | WRITABLE;
+        pt.entries[i as usize] = (lapic_window + i * 0x1000) | PRESENT | WRITABLE | NX;
     }
 
     // Link PDPT into PML4. NO USER flag — ring-3 cannot access any memory
@@ -105,17 +266,18 @@ pub unsafe fn init_kernel_tables() {
 
 /// Create a per-user-task PML4 with memory isolation.
 ///
-/// The new PML4 copies the kernel PML4 entirely (kernel code accessible from
-/// ring-0 during interrupts), then breaks the 1GB huge page containing the
-/// task's stack into 2MB entries and sets the USER flag on:
-///   - the 2MB region(s) covering the kernel image (the ring-3 task's own
-///     code runs from there — a teaching-kernel compromise: coarse 2MB
-///     granularity makes the low 2MB readable by ring-3), and
-///   - the 2MB region containing the task's stack.
+/// The new PML4 copies the kernel PML4 (kernel code accessible from ring-0
+/// during interrupts), then clones the kernel's tables so USER flags can be
+/// added without mutating the shared kernel tables:
+///   - the first 2 MB region becomes a per-user 4 KB clone of the kernel's
+///     low PT (every leaf USER — the ring-3 task's own code runs from the
+///     kernel image in the low identity map, a teaching-kernel compromise —
+///     but NX is preserved, so only text pages are executable), and
+///   - the 2 MB region containing the task's stack is marked USER (and stays
+///     NX: a ring-3 stack is data, never executable).
 ///
-/// Every other 2MB entry stays kernel-only, so ring-3 access to the rest
-/// of the identity map (e.g. 16 MiB, where `task_isolation_test` reads)
-/// faults.
+/// Every other entry stays kernel-only, so ring-3 access to the rest of the
+/// identity map (e.g. 16 MiB, where `task_isolation_test` reads) faults.
 ///
 /// Returns the physical address of the new PML4, or 0 on allocation failure.
 ///
@@ -132,42 +294,34 @@ pub unsafe fn create_user_pml4(stack_phys: u64) -> u64 {
     let user_pml4 = &mut *(pml4_frame as *mut PageTable);
 
     // Copy the entire kernel PML4 entries (identity-mapped lower half).
-    // This provides kernel code/stack access at ring-0 for interrupts.
     *user_pml4 = *((&raw const KERNEL_PML4).as_ref().unwrap());
 
-    // The stack is in the first 1GB, which is mapped as a 1GB huge page
-    // by KERNEL_PDPT. We must allocate a NEW PDPT for the user PML4
-    // (to avoid corrupting the shared KERNEL_PDPT), then break the 1GB
-    // page into 2MB entries with the USER flag on just the stack region.
-    let pml4_idx = ((stack_phys >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((stack_phys >> 30) & 0x1FF) as usize;
-    let pd_idx = ((stack_phys >> 21) & 0x1FF) as usize;
+    let pml4_idx = pdpt_index(stack_phys); // == pml4 index of the stack's 1 GB
+    let pdpt_idx = pdpt_index(stack_phys);
+    let pd_idx = pd_index(stack_phys);
 
-    // Read the original 1GB entry from the kernel's shared PDPT
+    // Read the stack's 1 GB entry from the kernel's shared PDPT.
     let kernel_pdpt_phys = user_pml4.entries[pml4_idx] & !0xFFF;
     let kernel_pdpt = &*(kernel_pdpt_phys as *const PageTable);
-    let original_1gb_entry = kernel_pdpt.entries[pdpt_idx];
+    let gb_entry = kernel_pdpt.entries[pdpt_idx];
 
-    // Allocate a new PDPT for the user PML4
+    // Fresh per-user PDPT: full copy of the kernel's, then the stack's 1 GB
+    // entry is replaced with USER-accessible clones below.
     let user_pdpt_frame = match alloc_global() {
         Some(f) => f,
         None => return 0,
     };
     let user_pdpt = &mut *(user_pdpt_frame as *mut PageTable);
-
-    // Copy ALL entries from the kernel PDPT to the user PDPT
     for i in 0..512 {
         user_pdpt.entries[i] = kernel_pdpt.entries[i];
     }
-
-    // Point the user PML4 at the new PDPT. USER is required on every level
-    // a ring-3 page walk crosses: the PML4 entry and the PDPT entry below,
-    // otherwise the walk faults before reaching the leaf.
+    // USER is required on every level a ring-3 page walk crosses.
     user_pml4.entries[pml4_idx] = user_pdpt_frame | PRESENT | WRITABLE | USER;
 
-    if original_1gb_entry & HUGE_PAGE != 0 {
-        // 1GB huge page -> break into 512 x 2MB entries in a new PD
-        let base_1gb = original_1gb_entry & !0x1F_FFFF;
+    if gb_entry & HUGE_PAGE != 0 {
+        // 1 GB huge page -> break into 512 x 2 MB NX entries in a fresh PD;
+        // only the stack's 2 MB region becomes USER.
+        let base_1gb = gb_entry & !0x1F_FFFF;
         let new_pd_frame = match alloc_global() {
             Some(f) => f,
             None => return 0,
@@ -175,22 +329,41 @@ pub unsafe fn create_user_pml4(stack_phys: u64) -> u64 {
         let new_pd = &mut *(new_pd_frame as *mut PageTable);
         for i in 0..512u64 {
             new_pd.entries[i as usize] =
-                (base_1gb + i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE;
-        }
-        // USER on the 2MB region(s) the task needs to run: its own code
-        // (the kernel image in the low identity map) and its stack.
-        let low_end_pd = (USER_LOW_END >> 21) as usize;
-        for i in 0..low_end_pd {
-            new_pd.entries[i] |= USER;
+                (base_1gb + i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX;
         }
         new_pd.entries[pd_idx] |= USER;
-        // Point the user PDPT at the new PD (USER: ring-3 walks this level)
         user_pdpt.entries[pdpt_idx] = new_pd_frame | PRESENT | WRITABLE | USER;
     } else {
-        // Already a PD pointer -- just add USER to the stack's 2MB entry
-        let pd_phys = original_1gb_entry & !0xFFF;
-        let pd = &mut *(pd_phys as *mut PageTable);
-        pd.entries[pd_idx] |= USER;
+        // The stack's 1 GB is already a PD pointer (like GB 0 after NX).
+        // Clone the kernel PD into a fresh one so USER flags never leak
+        // into the shared kernel tables.
+        let kernel_pd = &*((gb_entry & !0xFFF) as *const PageTable);
+        let new_pd_frame = match alloc_global() {
+            Some(f) => f,
+            None => return 0,
+        };
+        let new_pd = &mut *(new_pd_frame as *mut PageTable);
+        for i in 0..512 {
+            new_pd.entries[i] = kernel_pd.entries[i];
+        }
+        if pdpt_idx == 0 {
+            // First 2 MB of GB 0 is a 4 KB PT (kernel image + VGA text).
+            // Clone it per-user and mark every leaf USER (code fetch for
+            // ring-3). NX is preserved, so only text pages are executable.
+            let kernel_pt_phys = new_pd.entries[0] & !0xFFF;
+            let kernel_pt = &*(kernel_pt_phys as *const PageTable);
+            let new_pt_frame = match alloc_global() {
+                Some(f) => f,
+                None => return 0,
+            };
+            let new_pt = &mut *(new_pt_frame as *mut PageTable);
+            for i in 0..512 {
+                new_pt.entries[i] = kernel_pt.entries[i] | USER;
+            }
+            new_pd.entries[0] = new_pt_frame | PRESENT | WRITABLE | USER;
+        }
+        new_pd.entries[pd_idx] |= USER;
+        user_pdpt.entries[pdpt_idx] = new_pd_frame | PRESENT | WRITABLE | USER;
     }
 
     pml4_frame
@@ -209,4 +382,92 @@ pub unsafe fn switch_to(pml4_phys: u64) {
 /// Get the physical address of the kernel PML4
 pub fn kernel_pml4_phys() -> u64 {
     core::ptr::addr_of!(KERNEL_PML4) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal ELF64 little-endian image with the given program
+    /// headers: (p_type, p_flags, p_vaddr, p_filesz).
+    fn elf_with(phdrs: &[(u32, u32, u64, u64)]) -> Vec<u8> {
+        let mut b = vec![0u8; 64 + phdrs.len() * 56];
+        b[0..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2; // ELF64
+        b[5] = 1; // little-endian
+        b[32..40].copy_from_slice(&(64u64).to_le_bytes()); // e_phoff
+        b[54..56].copy_from_slice(&(56u16).to_le_bytes()); // e_phentsize
+        b[56..58].copy_from_slice(&(phdrs.len() as u16).to_le_bytes()); // e_phnum
+        for (i, &(p_type, p_flags, p_vaddr, p_filesz)) in phdrs.iter().enumerate() {
+            let off = 64 + i * 56;
+            b[off..off + 4].copy_from_slice(&p_type.to_le_bytes());
+            b[off + 4..off + 8].copy_from_slice(&p_flags.to_le_bytes());
+            b[off + 16..off + 24].copy_from_slice(&p_vaddr.to_le_bytes());
+            b[off + 32..off + 40].copy_from_slice(&p_filesz.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn text_window_from_elf_takes_rx_segment_only() {
+        let elf = elf_with(&[
+            (1, 4, 0x0, 0x2000),     // PT_LOAD R only
+            (1, 5, 0x3000, 0x5000),  // PT_LOAD R+X -> text
+            (1, 6, 0x9000, 0x10000), // PT_LOAD R+W data
+        ]);
+        assert_eq!(text_window_from_elf(&elf), Ok((0x3000, 0x8000)));
+    }
+
+    #[test]
+    fn text_window_from_elf_merges_multiple_rx_segments() {
+        let elf = elf_with(&[(1, 5, 0x1000, 0x800), (1, 5, 0x2000, 0x100)]);
+        assert_eq!(text_window_from_elf(&elf), Ok((0x1000, 0x2100)));
+    }
+
+    #[test]
+    fn text_window_rejects_garbage() {
+        assert!(text_window_from_elf(b"not an elf at all").is_err());
+        assert!(text_window_from_elf(&[0u8; 64]).is_err());
+    }
+
+    #[test]
+    fn text_window_without_exec_segment_fails() {
+        let elf = elf_with(&[(1, 4, 0x0, 0x1000), (1, 6, 0x2000, 0x1000)]);
+        assert!(text_window_from_elf(&elf).is_err());
+    }
+
+    #[test]
+    fn exec_page_range_rounds_window_to_page_boundaries() {
+        // 0x32F0..0x8AA4 spans 4 KB pages 3..8 (0x3000..0x9000).
+        assert_eq!(exec_page_range(0x32F0, 0x8AA4), (3, 9));
+        // Exact page boundary: page 4 is inside, page 4+1 starts after end.
+        assert_eq!(exec_page_range(0x4000, 0x5000), (4, 5));
+    }
+
+    #[test]
+    fn is_exec_page_matches_window() {
+        let (ts, te) = (0x4000u64, 0x9000u64);
+        assert!(is_exec_page(4, ts, te));
+        assert!(!is_exec_page(3, ts, te));
+        assert!(!is_exec_page(9, ts, te));
+        assert!(addr_is_exec(0x57F0, ts, te));
+        assert!(!addr_is_exec(0xB8000, ts, te));
+    }
+
+    #[test]
+    fn index_helpers_are_spec_correct() {
+        assert_eq!(pt_index(0xB8000), (0xB8000 >> 12) & 0x1FF);
+        assert_eq!(pd_index(0x1000000), (0x1000000 >> 21) & 0x1FF);
+        assert_eq!(pdpt_index(0x40000000), 1);
+        assert_eq!(pdpt_index(0xFEE00000), pdpt_index(0xFEE0_0000));
+        assert_eq!(pt_index(0), 0);
+    }
+
+    #[test]
+    fn elfs_with_out_of_bounds_phdrs_fail() {
+        let mut elf = elf_with(&[(1, 5, 0x4000, 0x1000)]);
+        // Corrupt e_phoff to point past the buffer.
+        elf[32..40].copy_from_slice(&0xFFFFusize.to_le_bytes());
+        assert!(text_window_from_elf(&elf).is_err());
+    }
 }

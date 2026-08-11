@@ -22,11 +22,13 @@ All critical issues have been resolved. The kernel boots and runs in both QEMU a
 - ✅ **STARTUP.NSH** — Added `add_startup.py` to patch `FS0:\EFI\BOOT\BOOTX64.EFI` into FAT16 ESP root so EFI shell auto-boots kernel.
 - ✅ **CI workflows** — `.github/workflows/ci.yml` (kernel+UEFI builds, clippy) and `.github/workflows/test.yml` (fmt, clippy, test for `aegis` workspace + `aegis-kernel`). 242 tests pass.
 - ✅ **Blank/garbled VM display** — the GTK window showed no text or wrong glyphs. Root causes (all fixed in `aegis-kernel/src/vga.rs`): SR4 chain4 bit made QEMU scatter text writes by `addr&3`; SR2=0x0F let the odd/even parity rule stamp plane 2 (the font area) with screen characters (SR2=0x03 keeps chars on plane 0 / attrs on plane 1); a 0x3C0 readback during the flip-flop data phase corrupted `ar[0]` (green background); cursor + light-gray attr cleaned up. Verified: plane-2 glyph probe returns the embedded font, DAC readback matches the palette, screendump decodes to the exact Aegis log lines, pixels = black `000000` bg + white `ffffff` fg.
+- ✅ **NX bit enforcement** — every non-code mapping (kernel stacks/BSS, VGA framebuffer, LAPIC MMIO, ring-3 stacks) is now NX; the executable window is the kernel image's R+X PT_LOAD parsed from the ELF at runtime; per-user PML4s clone the low tables (USER bits never leak into shared kernel tables); IA32_EFER.NXE set explicitly. Ring-3 page faults now KILL the faulting task and resume the scheduler instead of halting the whole kernel. Verified: boot banner prints the parsed text window, `nx-test` fetching from 0xB8000 faults with the NX instruction-fetch bit, isolation-test + nx-test + IPC demo all complete in one boot, 0 exceptions.
 
 ### Verified
 - ✅ **QEMU**: `echo reply: ping from client`, 0 exceptions, 11k+ lines of output
 - ✅ **QEMU display**: white-on-black boot log visible (VGA text console, screendump-verified glyph-for-glyph)
-- ✅ **QEMU**: per-task memory isolation — `iso-test` task's kernel-only read #PFs, isolated task killed
+- ✅ **QEMU**: per-task memory isolation — `iso-test` task's kernel-only read #PFs, task killed, kernel keeps running
+- ✅ **QEMU**: NX enforcement — only kernel text executable; `nx-test` instruction fetch from 0xB8000 #PFs (NX bit set in error code), task killed, kernel keeps running (0 exceptions, 13k ticks)
 - ✅ **VMware**: idle stack at `0x34000`, full IPC flow (`ipc_serve`→`ipc_call`→`ipc_serve`→`echo reply`), 0 exceptions, runs past tick 4200
 
 ## What Was Built

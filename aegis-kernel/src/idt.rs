@@ -150,6 +150,34 @@ macro_rules! exception_handler_stub {
     };
 }
 
+// Vector 14 (page fault) with a resume tail: when a RING-3 task faults
+// (isolation/NX demo), `exception_trap_rust` kills the task and returns;
+// the tail then switches the scheduler to the next context (same primitive
+// the timer stub uses — the saved dead task's frame is never resumed). If
+// a KERNEL fault occurs, `exception_trap_rust` never returns (it halts).
+macro_rules! exception_handler_stub_page_fault {
+    () => {
+        #[unsafe(naked)]
+        #[no_mangle]
+        pub extern "sysv64" fn handler_page_fault() -> ! {
+            naked_asm!(
+                "push 0",
+                "push rax", "push rbx", "push rcx", "push rdx",
+                "push rsi", "push rdi", "push r8", "push r9",
+                "push r10", "push r11",
+                "sub rsp, 8",
+                "mov rdi, 14",
+                "mov esi, 1",
+                "mov rdx, rsp",
+                "call {trap}",
+                "call {preempt}",
+                trap = sym crate::cpu::exception_trap_rust,
+                preempt = sym crate::tasks::timer_preempt,
+            )
+        }
+    };
+}
+
 exception_handler_stub!(handler_divide_error, 0, 0);
 exception_handler_stub!(handler_debug, 1, 0);
 exception_handler_stub!(handler_nmi, 2, 0);
@@ -164,7 +192,7 @@ exception_handler_stub!(handler_invalid_tss, 10, 1);
 exception_handler_stub!(handler_segment_not_present, 11, 1);
 exception_handler_stub!(handler_stack_fault, 12, 1);
 exception_handler_stub!(handler_general_protection, 13, 1);
-exception_handler_stub!(handler_page_fault, 14, 1);
+exception_handler_stub_page_fault!(); // vector 14
 exception_handler_stub!(handler_x87_fpu, 15, 0);
 exception_handler_stub!(handler_alignment_check, 16, 0);
 exception_handler_stub!(handler_machine_check, 17, 1);

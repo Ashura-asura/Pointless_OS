@@ -122,6 +122,18 @@ pub extern "sysv64" fn _start() -> ! {
         aegis_kernel::page_tables::switch_to(aegis_kernel::page_tables::kernel_pml4_phys());
     }
     sprintln!("Aegis: CR3 switched to kernel page tables (identity with 4 KB LAPIC mapping)");
+    match aegis_kernel::page_tables::kernel_text_window() {
+        Some((ts, te)) => {
+            sprintln!(
+                "Aegis: NX enabled: kernel text 0x{:X}-0x{:X} executable; all other pages non-executable",
+                ts,
+                te
+            );
+        }
+        None => {
+            sprintln!("Aegis: WARNING could not parse kernel ELF text window (NX state unknown)");
+        }
+    }
 
     unsafe {
         aegis_kernel::cpu::init_lapic_timer();
@@ -208,6 +220,35 @@ pub extern "sysv64" fn _start() -> ! {
         }
         _ => {
             sprintln!("Aegis: WARNING could not allocate isolation test stack");
+        }
+    }
+
+    // NX test: a ring-3 task that tries to execute a non-executable page
+    // (0xB8000 = VGA text framebuffer: present, USER-readable, but NX). If
+    // NX works, the instruction fetch #PFs and the task is killed while the
+    // rest of the kernel keeps running.
+    let stack_nx = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    let cpl0_nx = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    match (stack_nx, cpl0_nx) {
+        (Some(sn), Some(cn)) => {
+            unsafe {
+                aegis_kernel::tasks::spawn_user("nx-test", task_nx_test, sn, cn);
+            }
+            sprintln!(
+                "Aegis: NX test spawned @ 0x{:X} ({} tasks total)",
+                sn,
+                aegis_kernel::tasks::spawned_count()
+            );
+            // After the isolation test faults (tick 15), let the NX test run
+            // and fault too (tick 22).
+            aegis_kernel::tasks::arm_nx_test(5, 22);
+        }
+        _ => {
+            sprintln!("Aegis: WARNING could not allocate NX test stack");
         }
     }
 
@@ -394,6 +435,21 @@ extern "sysv64" fn task_isolation_test() -> ! {
     }
     // Should never reach here — the page fault handler kills us first.
     user_print(b"Aegis: [isolation-test] UNREACHABLE\r\n");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Ring-3 NX test: attempts to execute an instruction from 0xB8000 (VGA
+/// text framebuffer). The page is present and USER-readable, but marked
+/// NX — the instruction fetch must #PF, the exception handler kills the
+/// task, and the kernel keeps running.
+extern "sysv64" fn task_nx_test() -> ! {
+    user_print(b"Aegis: [nx-test] attempting to execute 0xB8000 (VGA memory, NX)...\r\n");
+    unsafe {
+        core::arch::asm!("call rax", in("rax") 0xB8000usize);
+    }
+    user_print(b"Aegis: [nx-test] NX FAILED - instruction fetch succeeded\r\n");
     loop {
         core::hint::spin_loop();
     }
