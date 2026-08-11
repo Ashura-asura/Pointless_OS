@@ -130,7 +130,6 @@ pub extern "sysv64" fn _start() -> ! {
 
     let mut next_print: u64 = 512;
     loop {
-        unsafe { aegis_kernel::tasks::run_idle() };
         let t = aegis_kernel::cpu::timer_ticks();
         if t >= next_print {
             next_print = t + 512;
@@ -142,6 +141,10 @@ pub extern "sysv64" fn _start() -> ! {
 
 static ALPHA_NEXT: AtomicU64 = AtomicU64::new(2048);
 static BETA_NEXT: AtomicU64 = AtomicU64::new(4096);
+
+// The demo tasks NEVER yield: progress only happens because the timer
+// stub preempts them every tick (round-robin). If preemption stops
+// working, neither task prints again.
 
 extern "sysv64" fn task_alpha() -> ! {
     loop {
@@ -155,7 +158,7 @@ extern "sysv64" fn task_alpha() -> ! {
             }
             sprintln!("Aegis: [alpha] tick = {} (rsp 0x{:X})", t, rsp);
         }
-        unsafe { aegis_kernel::tasks::yield_now() };
+        core::hint::spin_loop();
     }
 }
 
@@ -171,7 +174,7 @@ extern "sysv64" fn task_beta() -> ! {
             }
             sprintln!("Aegis: [beta] tick = {} (rsp 0x{:X})", t, rsp);
         }
-        unsafe { aegis_kernel::tasks::yield_now() };
+        core::hint::spin_loop();
     }
 }
 

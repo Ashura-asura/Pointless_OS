@@ -182,7 +182,10 @@ pub extern "sysv64" fn timer_trap_rust() {
     }
 }
 
-/// Interrupt gate stub for the LAPIC timer.
+/// Interrupt gate stub for the LAPIC timer: count the tick, send the EOI,
+/// then preemptively switch to the next task (round-robin). When the
+/// switch lands back here on a later tick, the pop/iretq tail resumes the
+/// interrupted context.
 #[unsafe(naked)]
 #[no_mangle]
 pub extern "sysv64" fn timer_stub() -> ! {
@@ -193,11 +196,13 @@ pub extern "sysv64" fn timer_stub() -> ! {
         "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
         "sub rsp, 8",
         "call {trap}",
+        "call {preempt}",
         "add rsp, 8",
         "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx",
         "pop r11", "pop r10", "pop r9", "pop r8",
         "pop rdi", "pop rsi", "pop rdx", "pop rcx", "pop rax",
         "iretq",
         trap = sym crate::cpu::timer_trap_rust,
+        preempt = sym crate::tasks::timer_preempt,
     )
 }

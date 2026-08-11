@@ -240,34 +240,57 @@ pub fn spawned_count() -> usize {
     unsafe { core::ptr::read(core::ptr::addr_of_mut!(SPAWNED)) }
 }
 
-/// Cooperative yield: switch back to the idle loop. The scheduler resumes
-/// us on its next round.
-///
-/// # Safety
-/// Must be called from a spawned task (not from the idle loop).
-pub unsafe fn yield_now() {
-    let current = core::ptr::read(core::ptr::addr_of_mut!(CURRENT));
-    let from = task_frame_ptr(current);
-    let to = core::ptr::addr_of_mut!(IDLE_FRAME).cast::<TaskFrame>();
-    switch_frame(from, to)
+/// Index of the currently running context (`usize::MAX` = the idle loop).
+fn current_idx() -> usize {
+    unsafe { core::ptr::read(core::ptr::addr_of_mut!(CURRENT)) }
 }
 
-/// Run one round: give every spawned task a turn, then return to the
-/// caller (the idle loop).
+/// Next context in round-robin order: idle -> task 0 -> ... -> last task
+/// -> idle. Returns `None` when no tasks are spawned.
+fn next_after(cur: usize, spawned: usize) -> Option<usize> {
+    match (spawned, cur) {
+        (0, _) => None,
+        (_, usize::MAX) => Some(0),
+        (n, c) if c + 1 >= n => Some(usize::MAX),
+        (_, c) => Some(c + 1),
+    }
+}
+
+/// Frame pointer of a context: a numeric task index, or the idle loop for
+/// `usize::MAX`.
+fn context_frame(idx: usize) -> *mut TaskFrame {
+    if idx == usize::MAX {
+        core::ptr::addr_of_mut!(IDLE_FRAME).cast::<TaskFrame>()
+    } else {
+        task_frame_ptr(idx)
+    }
+}
+
+/// Preemptive round-robin tick hook, called from the timer stub on every
+/// timer interrupt, with the interrupt frame on the current context's
+/// stack. Saves the interrupted context (including this call's own stub
+/// frame) and resumes the next context; `CURRENT` is advanced before the
+/// switch so the save-load bookkeeping stays consistent.
 ///
 /// # Safety
-/// Must be called from the idle context only, with interrupts masked or a
-/// stable scheduler frame.
-pub unsafe fn run_idle() {
+/// Must run with at least one spawned task and a valid `CURRENT`; the
+/// timer stub calls it with interrupts masked.
+pub unsafe fn timer_preempt() {
     let spawned = spawned_count();
-    let mut i = 0;
-    while i < spawned {
-        core::ptr::write(core::ptr::addr_of_mut!(CURRENT), i);
-        let from = core::ptr::addr_of_mut!(IDLE_FRAME).cast::<TaskFrame>();
-        let to = task_frame_ptr(i);
-        switch_frame(from, to);
-        i += 1;
+    if spawned == 0 {
+        return;
     }
+    let cur = current_idx();
+    let Some(next) = next_after(cur, spawned) else {
+        return;
+    };
+    if next == cur {
+        return;
+    }
+    core::ptr::write(core::ptr::addr_of_mut!(CURRENT), next);
+    let from = context_frame(cur);
+    let to = context_frame(next);
+    switch_frame(from, to)
 }
 
 #[cfg(test)]
@@ -288,6 +311,22 @@ mod tests {
     #[test]
     fn frame_size_is_176_bytes() {
         assert_eq!(TaskFrame::size(), 176);
+    }
+
+    #[test]
+    fn next_after_round_robins_tasks_and_idle() {
+        assert_eq!(next_after(usize::MAX, 2), Some(0));
+        assert_eq!(next_after(0, 2), Some(1));
+        assert_eq!(next_after(1, 2), Some(usize::MAX));
+        assert_eq!(next_after(usize::MAX, 3), Some(0));
+        assert_eq!(next_after(1, 3), Some(2));
+        assert_eq!(next_after(2, 3), Some(usize::MAX));
+    }
+
+    #[test]
+    fn next_after_without_tasks_returns_none() {
+        assert_eq!(next_after(usize::MAX, 0), None);
+        assert_eq!(next_after(0, 0), None);
     }
 
     #[test]
