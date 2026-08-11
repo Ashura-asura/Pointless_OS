@@ -1,6 +1,6 @@
 # Open Problems — Pointless OS / Aegis Boot
 
-*Last updated: 2026-08-12. Session state at commit `d81ea68` (pending push).*
+*Last updated: 2026-08-12. Session state at commit `88f4e3c`.*
 
 ## Current Status
 All critical issues have been resolved. The kernel boots and runs in both QEMU and VMware Workstation 26 with 0 exceptions. The IPC system (endpoints, call/serve/reply, capabilities) is functional at the model level. The boot demo is now **visible on the VM display** — a VGA text console mirrors the COM1 log white-on-black (verified via screendump glyph decoding).

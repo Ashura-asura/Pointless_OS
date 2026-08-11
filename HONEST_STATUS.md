@@ -245,3 +245,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `8a29c1b` | Per-task memory isolation via page-table U/S bits (verified under QEMU) |
 | `eacd5c4` | Fix exception stub arg order; verify per-task memory isolation under QEMU |
 | `d81ea68` | VGA text console: visible demo on QEMU/VMware display (vga.rs + font.rs, route SR2/SR4, palette + font upload verified; 4 new tests, 242 kernel tests total) |
+| `88f4e3c` | NX enforcement: only kernel text executable, data pages NX; ring-3 fault kills task, kernel survives (8 new tests, 250 kernel tests total; live-verified isolation + NX faults, 0 exceptions) |
