@@ -1,0 +1,422 @@
+﻿cargo :     Updating crates.io index
+At line:1 char:1
++ cargo test --workspace 2>&1 | Out-File -Encoding utf8 verify-aegis.tx ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Updating crates.io index:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+     Locking 1 package to latest compatible version
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.46s
+     Running unittests src\lib.rs (target\debug\deps\aegis_shell-76675a3065a0835f.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\aegis_shell-3131be2e39a0367a.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\capability_audit-b9f3ef8a99a774f3.exe)
+
+running 1 test
+test manifest::tests::manifest_is_a_declared_ceiling ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\capability_audit-5ea0b2d4d7911e25.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\audit_fixtures.rs (target\debug\deps\audit_fixtures-8c89f8f963e71131.exe)
+
+running 5 tests
+test reach_beyond_manifest_is_a_violation ... ok
+test honest_system_audits_clean ... ok
+test kernel_equivalent_request_gated_by_repo_class ... ok
+test delivery_overhang_tracks_the_declared_ceiling ... ok
+test structural_self_cap_is_exempt ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\capability_core-80255f23fcf42894.exe)
+
+running 5 tests
+test rights::tests::intersection_narrows ... ok
+test kernel::tests::boot_creates_root_with_full_self_authority ... ok
+test kernel::tests::child_self_cap_is_derived_from_creator_cap ... ok
+test rights::tests::subset_semantics ... ok
+test kernel::tests::creation_requires_a_creator_cap ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\invariants.rs (target\debug\deps\invariants-4d1d21381182ea8f.exe)
+
+running 6 tests
+test failed_operations_are_audited ... ok
+test expiry_kills_caps_and_cannot_be_extended ... ok
+test delegation_can_never_expand_rights ... ok
+test grant_requires_receiver_consent ... ok
+test revocation_removes_derived_caps_from_all_cspaces ... ok
+test grant_root_revocation_cleans_every_grantee ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\ipc.rs (target\debug\deps\ipc-f08255907c19f4a8.exe)
+
+running 7 tests
+test narrowed_copies_preserve_the_narrowing ... ok
+test send_and_recv_are_independent_rights ... ok
+test async_senders_never_block_and_fifo_survives_the_buffer ... ok
+test fabricated_handles_cannot_name_an_endpoint ... ok
+test bulk_data_moves_by_capability_grant_not_byte_copy ... ok
+test ipc_is_fully_audited ... ok
+test two_endpoints_keep_separate_queues ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\supervision.rs (target\debug\deps\supervision-a2f7493b7ca02bb7.exe)
+
+running 3 tests
+test the_supervision_cycle_is_reconstructable_from_the_audit ... ok
+test escalation_stops_the_retry_loop_and_logs_it ... ok
+test crash_containment_is_a_full_subtree_revoke ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\devices-6327613a257a603a.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\device_contract.rs (target\debug\deps\device_contract-f48dd53dea2fdcd8.exe)
+
+running 4 tests
+test a_driver_crash_is_contained_to_its_context_and_recovered_by_supervision ... ok
+test devices_are_capability_scoped_objects_with_typed_interfaces_owned_by_a_driver ... ok
+test a_compositor_is_a_replaceable_userspace_service ... ok
+test gpu_memory_and_command_queues_are_isolated_between_contexts ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\fleet-a5f21f358872b4a3.exe)
+
+running 15 tests
+test tests::envelope_round_trip_local ... ok
+test tests::issue_mints_verifiable_local_capability ... ok
+test tests::expiry_clamp_caveat_binds_before_expiry_check ... ok
+test tests::envelope_rejects_bad_headers ... ok
+test tests::expired_token_rejected ... ok
+test tests::forged_recipient_field_still_rejected ... ok
+test tests::register_peer_duplicate_and_full ... ok
+test tests::envelope_round_trip_remote ... ok
+test tests::relayed_token_rejected_by_unintended_recipient ... ok
+test tests::send_to_requires_trusted_peer ... ok
+test tests::remote_verification_with_peer_key ... ok
+test tests::rights_narrowing_reduces_authority ... ok
+test tests::unknown_issuer_fails_verification ... ok
+test tests::unregistered_peer_cannot_verify ... ok
+test tests::tampered_chain_fails_integrity_check ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\grants-08777859d9aa5192.exe)
+
+running 1 test
+test role::tests::restart_role_is_narrow_and_never_persistent ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\anomaly_contract.rs (target\debug\deps\anomaly_contract-f519c2fb0c3fbdb2.exe)
+
+running 3 tests
+test the_monitor_is_a_read_only_service_with_no_authority ... ok
+test suspension_is_reversible_logged_and_never_silent ... ok
+test a_significant_deviation_auto_suspends_without_revoking ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\grant_policy.rs (target\debug\deps\grant_policy-35d2e087eef45651.exe)
+
+running 5 tests
+test confirm_rechecks_authority_after_review ... ok
+test ephemeral_grants_die_on_the_kernel_clock ... ok
+test completion_revoke_removes_the_grant_and_only_the_grant ... ok
+test persistent_policy_is_gated_per_role ... ok
+test the_active_grant_list_is_queryable_and_honest ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\two_party_contract.rs (target\debug\deps\two_party_contract-4b0ed631db6385e1.exe)
+
+running 3 tests
+test a_single_click_cannot_confirm_a_high_risk_grant ... ok
+test non_high_risk_role_cannot_abuse_the_two_party_path ... ok
+test two_party_confirmation_mints_only_after_two_distinct_people ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\io_batch-07890de2c686300e.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\batch_contract.rs (target\debug\deps\batch_contract-953c61b14278109f.exe)
+
+running 3 tests
+test completions_are_drained_apart_from_submission ... ok
+test capability_mediation_rides_every_entry_not_just_the_submission ... ok
+test many_queued_operations_cross_the_kernel_once ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\macaroon-63b248ed05108be7.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\token_contract.rs (target\debug\deps\token_contract-c0603b0e42c4d1ad.exe)
+
+running 4 tests
+test mint_and_verify_roundtrip ... ok
+test bind_caveat_narrows_rights ... ok
+test custom_caveat_preserved_through_roundtrip ... ok
+test tampered_token_fails_verification ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\net-be77bfbcc8468b88.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\loopback_contract.rs (target\debug\deps\loopback_contract-068d11ddf91f332f.exe)
+
+running 4 tests
+test sockets_are_capability_scoped_and_ports_are_not_ambient_authority ... ok
+test every_hop_is_an_attributed_endpoint_op_in_the_audit_log ... ok
+test a_socket_can_be_torn_down_without_touching_its_peers ... ok
+test the_stack_holds_no_authority_beyond_its_sockets ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\object_store-a337889f16a9eb32.exe)
+
+running 2 tests
+test index::tests::index_rebuilds_identically_from_the_log ... ok
+test sha256::tests::known_vectors ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests\store_contract.rs (target\debug\deps\store_contract-937765f370c04b37.exe)
+
+running 6 tests
+test identical_bytes_are_one_block ... ok
+test cow_write_versions_are_immutable_snapshots ... ok
+test the_index_can_never_participate_in_a_write ... ok
+test index_is_a_consumer_of_the_wal_and_rebuilds_from_it ... ok
+test blocks_are_capability_addressed ... ok
+test posix_view_is_a_projection_with_no_second_source_of_truth ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\packages-e46e5de00d31cb45.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\exec_contract.rs (target\debug\deps\exec_contract-439033109a341137.exe)
+
+running 1 test
+test install_then_execute_then_verify_caps ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\install_contract.rs (target\debug\deps\install_contract-a0faca8cf2cb97be.exe)
+
+running 6 tests
+test install_runs_no_code_and_spawns_nothing_but_the_app ... ok
+test kernel_equivalent_install_is_refused_and_rolls_back ... ok
+test identical_payloads_share_blocks_across_installs ... ok
+test an_unholdable_request_is_refused_up_front_and_rolled_back ... ok
+test install_grants_exactly_the_manifest_and_nothing_ambient ... ok
+test revoking_the_anchor_removes_every_minted_cap_of_that_install_only ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\resources-8d6299e62b3e81a9.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\resource_contract.rs (target\debug\deps\resource_contract-178116b8708eb2b3.exe)
+
+running 4 tests
+test hierarchical_allocation_cannot_overcommit ... ok
+test metering_is_kernel_truth_partitioning_the_log_by_task ... ok
+test resident_memory_is_the_writable_regions_a_task_can_reach ... ok
+test the_governor_recycles_an_over_budget_service_and_siblings_survive ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\security_audit-15d9e8f17d9ee57b.exe)
+
+running 10 tests
+test classifier_identifies_kernel_equivalent_pairs ... ok
+test empty_audit_is_clean ... ok
+test kernel_repo_may_declare_kernel_authority ... ok
+test holdings_exclude_structural_self_cap ... ok
+test delivery_overhang_warns_but_stays_clean ... ok
+test reference_report_renders_without_panic ... ok
+test unbound_tasks_are_not_audited ... ok
+test undeclared_holdings_fail ... ok
+test reference_world_is_clean ... ok
+test userspace_kernel_equivalent_demand_is_a_violation ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\supervision_tree-33a4f7b9647dde8c.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\chaos_contract.rs (target\debug\deps\chaos_contract-8cbaf6e2b6ff4e2f.exe)
+
+running 6 tests
+test budget_zero_trips_on_first_crash ... ok
+test escalation_clears_budget_for_parent ... ok
+test new_crash_during_existing_fault ... ok
+test rapid_crash_restart_cycle_stays_consistent ... ok
+test budget_accounting_is_exact_under_interleave ... ok
+test interleaved_crashes_track_independently ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\supervision_contract.rs (target\debug\deps\supervision_contract-4de8066abcb5dba8.exe)
+
+running 4 tests
+test escalation_to_a_parent_renews_the_budget_for_the_whole_subsystem ... ok
+test crashes_are_restarted_within_budget_and_siblings_are_untouched ... ok
+test the_circuit_breaker_trips_instead_of_retrying_forever ... ok
+test the_policy_decision_log_crosschecks_the_kernel_audit ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\system_update-76a85285cea1409e.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\update_contract.rs (target\debug\deps\update_contract-d17320c054ca657c.exe)
+
+running 5 tests
+test activation_is_a_content_pointer_flip_with_no_capability_authority ... ok
+test a_failed_health_check_blocks_activation_and_preserves_the_current_generation ... ok
+test staging_a_candidate_does_not_disturb_the_current_generation ... ok
+test the_updater_holds_no_special_authority ... ok
+test rollback_restores_the_last_known_good_generation_without_touching_installed_caps ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aegis_shell
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests capability_audit
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests capability_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests devices
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests fleet
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests grants
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests io_batch
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests macaroon
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests net
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests object_store
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests packages
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests resources
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests security_audit
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests supervision_tree
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests system_update
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
