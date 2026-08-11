@@ -35,7 +35,8 @@ Proves six authority invariants (I1-I6) via TLA+ model checking (331k states, 0 
 - **UEFI boot**: prints memory map, sets up 4-level identity page tables (first 1 GiB via 2 MB huge pages), loads the ELF kernel, applies base-0 relocations, calls ExitBootServices, hands off the final memory map as boot-info at 0x10000
 - **ELF64 loader**: header validation, PT_LOAD parsing, R_X86_64_RELATIVE relocation application (13 tests)
 - **Bare-metal kernel**: COM1 serial, 4 GiB identity paging, frame allocator (bitmap over boot-info map; 157876 frames verified free live)
-- **GDT/TSS/IDT**: kernel + user selectors, TSS, exception stubs for vectors 0-31
+- **GDT/TSS/IDT**: kernel + user selectors, TSS, exception stubs for vectors 0-31, DPL-3 `int 0x80` syscall gate
+- **Ring-3 user task**: a demo task dropped to CPL3 via `iretq` (user CS=0x1B/SS=0x23) and serviced by the `int 0x80` syscall gate (Write prints to COM1) — verified under QEMU/TCG: runs on its own user stack, preempted every tick alongside CPL0 tasks, 0 exceptions
 - **LAPIC timer**: periodic, vector 0x30, drives the tick counter (~570 ticks/s)
 - **Preemptive scheduler**: iretq-based `switch_frame`, the timer stub preempts round-robin every tick — tasks never yield, yet alpha/beta interleave every 2048 ticks at stable stack addresses, 0 exceptions
 
@@ -47,7 +48,7 @@ PCIe/VT-d/NVMe drivers, VirtIO-net/Ethernet/ARP/IPv4, Linux syscall ABI + ELF lo
 
 - Physical hardware verification (needs VMware) — everything runs under QEMU/TCG
 - Priority/blocking scheduling — single fixed-priority round-robin; no wait queues
-- User-mode isolation — no ring-3 processes, no page-fault-driven isolation yet
+- User-mode isolation — a ring-3 demo task + syscall gate exist and are verified under QEMU/TCG, but per-process *page-fault-driven* isolation (separate user page tables per process) is not built yet
 - Hypervisor-based Linux/Windows execution vehicles (WSL2-lineage design paths)
 - Real NIC traffic (no TCP/UDP), real GPU/display output, real input devices
 - Cross-machine macaroon transport (in-process model only, no network)

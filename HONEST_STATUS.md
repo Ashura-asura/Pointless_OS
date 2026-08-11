@@ -2,9 +2,15 @@
 
 *Generated: 2026-08-11. Every claim below is verified by `cargo test` on the current commit.*
 
-## What exists (355 tests, 0 failures)
+## What exists (verified clean)
 
-Breakdown: 113 model-crate tests (aegis workspace, incl. fleet + security-audit), 229 aegis-kernel tests (Phases 1-12 + boot-info + frame allocator + scheduler), 13 uefi-boot ELF parser tests. Verified from clean lockfiles on commit `2e35c90`.
+Test counts are kept separate on purpose: `aegis-kernel` is a **standalone bare-metal crate that is NOT a member of the `aegis` workspace**, so its tests are never covered by `cargo test --workspace`.
+
+- **aegis workspace (model crates):** 113 contract tests, 0 failures — `cargo test --workspace` from a clean lockfile (Rule 1/10).
+- **aegis-kernel (bare-metal, separate crate):** 238 contract tests, 0 failures — `cargo test` on the host target; the ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
+- **uefi-boot:** 13 ELF parser contract tests.
+
+Combined contract-test count across all crates: **364**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -49,7 +55,8 @@ A single-threaded, in-process capability kernel with:
 | Per-process page tables | — | 4-level paging with kernel/user split (upper half shared, lower half per-process). UNTESTED: requires mov cr3 on real hardware |
 | Process abstraction | — | State machine (Ready/Running/Blocked/Zombie), CpuState for context switch |
 | Round-robin scheduler | 10 | Spawn, schedule_next, tick/preempt, block/wake, round-robin cycling, zombie reaping |
-| Syscall framework | — | SyscallNum enum, dispatch stub. Returns -1 for unimplemented syscalls |
+| Ring-3 user task | — | A demo task dropped to CPL3 via `iretq` (fresh frame carries user CS=0x1B/SS=0x23), serviced by a DPL-3 `int 0x80` interrupt-gate (`syscall_stub` + `syscall_trap_rust` dispatch: Exit/Write/Read/Yield/Fork). **VERIFIED under QEMU/TCG**: a CPL3 task (`george`) runs on its own user stack, prints `Aegis: [user] ring 3 hello via int 0x80` through the syscall gate, and is preempted by the LAPIC timer every tick alongside two CPL0 tasks (`alpha`/`beta`) and the idle loop — privilege transitions both ways work, 0 exceptions across an 18 s boot (5 user prints interleaved with kernel prints). Two real bugs were found and fixed live: (1) `PML4[0]` lacked the `USER` bit, so the user page table walk faulted at the very first fetch — every level needs `USER`; (2) the syscall stub saves `rax…r11` such that `rax` lands at frame slot 10, not slot 1, so the handler was reading the wrong registers and syscalls silently returned -1 — indices corrected. CR4 SMEP/SMAP are also cleared at boot (defensive; firmware had them off here, but correct for real hardware). Still UNTESTED on real hardware |
+| Syscall framework | — | SyscallNum enum, dispatch stub. Returns -1 for unimplemented syscalls. The ring-3 `Write` path (untrusted buffer pointer + capped length) prints to COM1 |
 
 ### Real driver framework (aegis-kernel)
 | Component | Tests | What it proves |
@@ -134,7 +141,7 @@ Honest limits: two-node in-process model (no sockets, no real network); no conse
 | Claim | Status | Why it's missing |
 |-------|--------|-----------------|
 | Real hardware isolation (verified on actual hardware) | Model-level code only | Page tables, IOMMU, NVMe, VirtIO drivers exist but are UNTESTED on real hardware (need VMware) |
-| Real process isolation on hardware (page faults, cr3 switching) | Code + 10 contract tests + scheduler live under QEMU | Cooperative task switching verified live (alpha/beta interleave); preemptive scheduling, user mode, and page-fault-driven isolation still UNTESTED on real hardware |
+| Real process isolation on hardware (page faults, cr3 switching) | Code + 10 contract tests + scheduler + ring-3 task live under QEMU | Cooperative task switching and a ring-3 user task (CPL3 `iretq` + `int 0x80` syscall) verified live under QEMU/TCG; page-fault-driven *per-process* isolation (separate user page tables) still UNTESTED on real hardware |
 | seL4-class formal proof | Not built | TLA+ model-checking (finite instance), not inductive proof |
 | Real network I/O on a NIC | Driver code + 22 tests | VirtIO-net driver exists; no real NIC traffic, no TCP/UDP yet |
 | Linux/Windows compat layers | Partially built (Phase 8+9 model-level) | Linux (32 tests) + Windows (31 tests) translation/loader/personality; no hypervisor VM vehicles; full Windows fidelity explicitly not solved by translation alone |
@@ -223,3 +230,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `6fc8d49` | Frame allocator: bitmap over boot-info map (4 GiB/1M frames, 128 KiB BSS); handoff v2 carries loader-computed image_end — verified live: 157876 frames free, probe frames land exactly above image end (10 tests) |
 | `2e35c90` | Cooperative scheduler: iretq-based `switch_frame` (GPR save into frame slots, pop + iretq resume, `yield_now`/`run_idle`, 16 KiB task stacks), fixed resume-rsp drift (stored pre-call rsp — the call-pushed return address was making every resume 8 bytes deeper; −16/tick → ~1 s triple-fault) — verified live: alpha/beta interleave every 512 ticks, stable rsp, 6665/6665 int deltas = 0 (229 tests) |
 | `79bac4d` | Preemptive scheduling: timer stub preempts every tick (`timer_preempt`, round-robin `next_after`: idle→task0…→idle); demo tasks never yield, so their progress proves preemption — verified live 14 s: alpha/beta print every 2048 ticks at stable rsp, idle keeps its tick prints, 0 exceptions (231 tests) |
+| `ring3` | Ring-3 user task verified under QEMU/TCG: CPL3 `george` task + `int 0x80` syscall gate; fixed PML4 `USER` bit (user walk faulted at first fetch) and syscall stub register-save index bug (rax landed at slot 10, handler read slot 1); clear CR4 SMEP/SMAP at boot; 0 exceptions, 5 user prints interleaved with kernel prints (238 tests) |

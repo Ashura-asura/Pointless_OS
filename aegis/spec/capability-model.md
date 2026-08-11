@@ -670,8 +670,42 @@ now stores the pre-call RSP (`rsp+8`).
 
 Honest limits: verified under QEMU/TCG only, not on physical hardware; single
 fixed-priority round-robin (no priorities, no blocking/wait queues); no dynamic spawn
-after boot, no task removal; tasks and scheduler share ring 0 (user mode is a later
-phase).
+after boot, no task removal; user mode now exists (see below) but per-process
+page-fault-driven isolation (separate user page tables per process) is not built yet.
+
+### Machine-checked verification (live): ring-3 user task + `int 0x80` syscall gate (§5, Phase 2 extension)
+
+`aegis-kernel/src/main.rs` (`task_user`) plus `syscall.rs` (`syscall_stub` + `syscall_trap_rust`)
++ `gdt.rs`/`idt.rs`: a demo task is dropped to CPL3 by the scheduler's `switch_frame`,
+whose `iretq` target frame carries the user selectors (CS=0x1B, SS=0x23 with RPL=3);
+the task runs on its own user stack and its kernel transitions use a dedicated CPL0
+stack via `TSS.RSP0` (`timer_preempt` writes the next task's CPL0 top before the
+switch). A DPL-3 `int 0x80` interrupt gate (`SYS_VECTOR`) enters the kernel; the stub
+saves the GPR block (rax/rsi/rcx/rdx carry num/args), `dispatch` serves the `Write`
+syscall (prints the untrusted buffer to COM1, length capped at `WRITE_MAX_LEN`), and
+`iretq` returns to CPL3. VERIFIED live under QEMU/TCG on the current commit: `george`
+runs at CPL3, prints `Aegis: [user] ring 3 hello via int 0x80`, and is preempted by
+the LAPIC timer every tick alongside two CPL0 tasks (`alpha`/`beta`) and the idle loop
+— privilege transitions both directions work, 0 exceptions across an 18 s boot (5
+user prints interleaved with kernel prints). The live verification caught two real
+bugs: (1) the kernel PML4 entry linking the user window lacked the `USER` bit, so the
+user page-table walk faulted at the very first instruction fetch — every level of the
+walk must set `USER`; (2) the syscall stub saves `rax…r11` in the order
+`push 0; push rax; …; push r11`, so `rax` lands at frame slot 10 (not slot 1) — the
+handler was reading the wrong registers and syscalls silently returned -1, fixed by
+correcting the slot indices. CR4 SMEP/SMAP are also cleared at boot (defensive; the
+firmware had them off here, but correct for real hardware).
+
+Honest limits: verified under QEMU/TCG only, not on physical hardware; the first 1 GiB
+is mapped with a single user-accessible huge page, so this proves the *privilege
+transition* machinery (CPL3 entry, syscall gate, TSS.RSP0, per-task CPL0 stacks), not
+memory isolation between processes. **There is no Rust contract test for the bare-metal
+CPL3 transition** (it requires a CPU in ring 3); the contract tests that back this
+section live in `tasks.rs` (`fresh_user_frame_uses_ring3_selectors`, `next_after`
+round-robins idle→0→1→2→idle for 3 tasks, `task_new_user_places_both_stack_tops_correctly`)
+and `syscall.rs` (`dispatch` for each syscall number, `clamp_write_len`, unknown→-1).
+Those prove the frame/selector/scheduler/dispatch building blocks; the end-to-end
+transition is proven only by the live QEMU boot above.
 
 ### Machine-checked verification (executable): driver framework (§8, Phase 3)
 

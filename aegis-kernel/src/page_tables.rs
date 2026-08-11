@@ -64,9 +64,19 @@ pub unsafe fn init_kernel_tables() {
     pd.clear();
     pt.clear();
 
-    // Map first 3 entries as 1GB each = 3GB identity
+    // Map first 3 entries as 1GB each = 3GB identity. The first 1 GB gets
+    // the USER flag so ring-3 code (the demo user task + its stacks, and
+    // the whole kernel image below 1 MB) is executable/readable at CPL3.
+    // HONEST LIMIT: with a 1 GB huge page the whole window becomes
+    // user-accessible — this demo enforces privilege TRANSITIONS, not
+    // memory isolation (per-process page tables with ring-3-only regions
+    // are a separate phase).
     for i in 0..3 {
-        pdpt.entries[i] = (i as u64 * 0x4000_0000) | PRESENT | WRITABLE | HUGE_PAGE;
+        let mut flags = PRESENT | WRITABLE | HUGE_PAGE;
+        if i == 0 {
+            flags |= USER;
+        }
+        pdpt.entries[i] = (i as u64 * 0x4000_0000) | flags;
     }
 
     // 4th entry (0xC0000000-0xFFFFFFFF): PD of 2MB pages, with the LAPIC
@@ -82,8 +92,10 @@ pub unsafe fn init_kernel_tables() {
         pt.entries[i as usize] = (lapic_window + i * 0x1000) | PRESENT | WRITABLE;
     }
 
-    // Link PDPT into PML4
-    pml4.entries[0] = core::ptr::addr_of!(KERNEL_PDPT) as u64 | PRESENT | WRITABLE;
+    // Link PDPT into PML4. The first 1 GB is reachable by ring-3, so the
+    // PML4 entry itself must carry USER too — user-mode access requires the
+    // U/S bit at EVERY paging level, not just the leaf.
+    pml4.entries[0] = core::ptr::addr_of!(KERNEL_PDPT) as u64 | PRESENT | WRITABLE | USER;
 }
 
 /// Create new user page tables.

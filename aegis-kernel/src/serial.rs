@@ -35,6 +35,14 @@ impl SerialWriter {
         }
     }
 
+    /// Write raw bytes (no length prefix, no trailing newline). Used by
+    /// the syscall `Write` path to emit user buffers verbatim.
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.putc(b);
+        }
+    }
+
     fn putc(&mut self, c: u8) {
         unsafe {
             // Wait for the transmit-holding-register-empty bit (bit 5 of LSR).

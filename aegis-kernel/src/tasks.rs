@@ -81,6 +81,39 @@ impl TaskFrame {
             saved_to: 0,
         }
     }
+
+    /// Frame for a fresh RING-3 task: same shape as `fresh`, but the iretq
+    /// words carry the user selectors (CS=0x1B, SS=0x23 with RPL=3), so the
+    /// first switch drops the CPU to CPL3 with the user stack live.
+    /// RFLAGS keeps IF set (IOPL=0: `sti`/`cli` from user mode would #GP,
+    /// which the demo user code never attempts).
+    #[allow(clippy::missing_const_for_fn)] // fn-pointer-to-int cast is not const
+    pub fn fresh_user(entry: extern "sysv64" fn() -> !, stack_top: u64) -> TaskFrame {
+        TaskFrame {
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            rbx: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            error: 0,
+            rip: entry as usize as u64,
+            cs: crate::gdt::USER_CODE_SELECTOR as u64,
+            rflags: 0x202,
+            rsp: stack_top - 40,
+            ss: crate::gdt::USER_DATA_SELECTOR as u64,
+            saved_to: 0,
+        }
+    }
 }
 
 /// A scheduled kernel task.
@@ -89,6 +122,13 @@ pub struct Task {
     pub frame: TaskFrame,
     /// Physical address of the stack region (16 KiB).
     pub stack_base: u64,
+    /// Top of the task's dedicated CPL0 (ring-3 -> ring-0 transition)
+    /// stack, or 0 for kernel-only tasks (which never transition into the
+    /// kernel — their interrupts nest on their own 16 KiB execution
+    /// stack). Every task entering ring 3 needs one: the TSS.RSP0 is read
+    /// at transition time, and the single shared kernel stack would be
+    /// overwritten by interleaved transitions of other tasks.
+    pub cpl0_stack_top: u64,
 }
 
 impl Task {
@@ -97,6 +137,21 @@ impl Task {
             name,
             frame: TaskFrame::fresh(entry, stack_base + TASK_STACK_SIZE),
             stack_base,
+            cpl0_stack_top: 0,
+        }
+    }
+
+    pub fn new_user(
+        name: &'static str,
+        entry: extern "sysv64" fn() -> !,
+        stack_base: u64,
+        cpl0_stack_base: u64,
+    ) -> Task {
+        Task {
+            name,
+            frame: TaskFrame::fresh_user(entry, stack_base + TASK_STACK_SIZE),
+            stack_base,
+            cpl0_stack_top: cpl0_stack_base + TASK_STACK_SIZE,
         }
     }
 }
@@ -221,15 +276,46 @@ pub unsafe fn spawn(
     entry: extern "sysv64" fn() -> !,
     stack_base: u64,
 ) -> Option<usize> {
+    spawn_impl(name, entry, stack_base, 0)
+}
+
+/// Register a RING-3 task. In addition to `spawn`'s requirements,
+/// `cpl0_stack_base` must point at a second 16 KiB region owned by the
+/// kernel; it becomes the task's dedicated CPL0 stack (TSS.RSP0 target)
+/// for every interrupt/syscall that enters the kernel from ring 3.
+///
+/// # Safety
+/// See `spawn`; additionally both stacks must be regions the kernel
+/// retains for the task's lifetime.
+pub unsafe fn spawn_user(
+    name: &'static str,
+    entry: extern "sysv64" fn() -> !,
+    stack_base: u64,
+    cpl0_stack_base: u64,
+) -> Option<usize> {
+    spawn_impl(name, entry, stack_base, cpl0_stack_base)
+}
+
+unsafe fn spawn_impl(
+    name: &'static str,
+    entry: extern "sysv64" fn() -> !,
+    stack_base: u64,
+    cpl0_stack_base: u64,
+) -> Option<usize> {
     let spawned = core::ptr::read(core::ptr::addr_of_mut!(SPAWNED));
     if spawned >= MAX_TASKS {
         return None;
     }
+    let task = if cpl0_stack_base != 0 {
+        Task::new_user(name, entry, stack_base, cpl0_stack_base)
+    } else {
+        Task::new(name, entry, stack_base)
+    };
     core::ptr::write(
         core::ptr::addr_of_mut!(TASKS)
             .cast::<core::mem::MaybeUninit<Task>>()
             .add(spawned),
-        core::mem::MaybeUninit::new(Task::new(name, entry, stack_base)),
+        core::mem::MaybeUninit::new(task),
     );
     core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), spawned + 1);
     Some(spawned)
@@ -266,6 +352,28 @@ fn context_frame(idx: usize) -> *mut TaskFrame {
     }
 }
 
+/// TSS.RSP0 value for a context: its dedicated CPL0 stack for ring-3
+/// tasks, or the kernel stack top for kernel/idle contexts (which never
+/// transition into the kernel, so the value is only a safe default).
+fn context_cpl0_top(idx: usize) -> u64 {
+    if idx == usize::MAX {
+        return crate::cpu::stack_top();
+    }
+    unsafe {
+        let top = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(
+                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, cpl0_stack_top),
+            )
+            .cast::<u64>()
+            .read();
+        if top != 0 {
+            top
+        } else {
+            crate::cpu::stack_top()
+        }
+    }
+}
+
 /// Preemptive round-robin tick hook, called from the timer stub on every
 /// timer interrupt, with the interrupt frame on the current context's
 /// stack. Saves the interrupted context (including this call's own stub
@@ -288,6 +396,10 @@ pub unsafe fn timer_preempt() {
         return;
     }
     core::ptr::write(core::ptr::addr_of_mut!(CURRENT), next);
+    // Point TSS.RSP0 at the next context's CPL0 stack so ITS ring-3
+    // transitions (and only theirs) use it, never the stack another
+    // task's kernel frame is parked on.
+    crate::cpu::set_tss_rsp0(context_cpl0_top(next));
     let from = context_frame(cur);
     let to = context_frame(next);
     switch_frame(from, to)
@@ -349,6 +461,17 @@ mod tests {
     }
 
     #[test]
+    fn fresh_user_frame_uses_ring3_selectors() {
+        let f = TaskFrame::fresh_user(dummy, 0x4000);
+        assert_eq!(f.rip, dummy_addr());
+        assert_eq!(f.cs, crate::gdt::USER_CODE_SELECTOR as u64); // 0x1B
+        assert_eq!(f.ss, crate::gdt::USER_DATA_SELECTOR as u64); // 0x23
+        assert_eq!(f.rflags, 0x202); // IF set, IOPL 0
+        assert_eq!(f.rsp, 0x4000 - 40);
+        assert_eq!(f.rsp % 16, 8);
+    }
+
+    #[test]
     fn fresh_rsp_sits_inside_stack_region() {
         let stack_base = 0x4000;
         let f = TaskFrame::fresh(dummy, stack_base + TASK_STACK_SIZE);
@@ -362,7 +485,18 @@ mod tests {
         let t = Task::new("t", dummy, 0x8000);
         assert_eq!(t.name, "t");
         assert_eq!(t.stack_base, 0x8000);
+        assert_eq!(t.cpl0_stack_top, 0);
         assert_eq!(t.frame.rip, dummy_addr());
+        assert_eq!(t.frame.rsp, 0x8000 + TASK_STACK_SIZE - 40);
+    }
+
+    #[test]
+    fn task_new_user_places_both_stack_tops_correctly() {
+        let t = Task::new_user("u", dummy, 0x8000, 0xC000);
+        assert_eq!(t.stack_base, 0x8000);
+        assert_eq!(t.cpl0_stack_top, 0xC000 + TASK_STACK_SIZE);
+        assert_eq!(t.frame.cs, crate::gdt::USER_CODE_SELECTOR as u64);
+        assert_eq!(t.frame.ss, crate::gdt::USER_DATA_SELECTOR as u64);
         assert_eq!(t.frame.rsp, 0x8000 + TASK_STACK_SIZE - 40);
     }
 

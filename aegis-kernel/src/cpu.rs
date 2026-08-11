@@ -42,6 +42,26 @@ pub fn stack_top() -> u64 {
     top & !15
 }
 
+/// Disable SMEP (bit 20) and SMAP (bit 21) in CR4. The firmware (OVMF)
+/// leaves these on under `-cpu max`; with SMEP set, a supervisor-mode
+/// fetch of a user-accessible page #PFs — which would kill our `iretq`
+/// into ring-3 the instant it tried to fetch the first user instruction.
+///
+/// # Safety
+///
+/// Must be called once at boot, before any ring-3 transition. Reads and
+/// writes CR4; the caller must guarantee no concurrent uses of CR4.
+pub unsafe fn disable_smep_smap() {
+    let mut cr4: u64;
+    asm!("mov {}, cr4", out(reg) cr4, options(nomem, preserves_flags));
+    crate::sprintln!("Aegis: CR4 before = 0x{:016X}", cr4);
+    cr4 &= !((1u64 << 20) | (1u64 << 21));
+    asm!("mov cr4, {}", in(reg) cr4, options(nomem, preserves_flags));
+    let after: u64;
+    asm!("mov {}, cr4", out(reg) after, options(nomem, preserves_flags));
+    crate::sprintln!("Aegis: CR4 after  = 0x{:016X} (SMEP/SMAP cleared)", after);
+}
+
 /// Switch the CPU onto the kernel's own stack.
 ///
 /// # Safety
@@ -77,13 +97,45 @@ static mut KERNEL_GDT: crate::gdt::Gdt = crate::gdt::Gdt::new();
 ///
 /// Single-threaded boot only; the static GDT must never move while loaded.
 pub unsafe fn init_gdt() {
-    (&raw mut KERNEL_GDT).as_mut().unwrap().install();
+    let gdt = (&raw mut KERNEL_GDT).as_mut().unwrap();
+    gdt.install();
+    // Ring-3 -> ring-0 transitions (interrupts/syscalls from user tasks) use
+    // TSS.RSP0 as the initial kernel stack. Point it at the kernel stack
+    // top until the first preemptive switch installs the scheduled task's
+    // own CPL0 stack.
+    gdt.tss_mut().rsp0 = stack_top();
+}
+
+/// Point TSS.RSP0 at the CPL0 stack of the task about to run. Called by the
+/// scheduler on every preemptive switch; the CPU reads RSP0 only when a
+/// ring-3 context enters the kernel, so the value must track the running
+/// task.
+///
+/// # Safety
+///
+/// Must run in interrupt context (switches happen with IF cleared); the
+/// static GDT must be loaded and never moved.
+pub unsafe fn set_tss_rsp0(top: u64) {
+    (&raw mut KERNEL_GDT).as_mut().unwrap().tss_mut().rsp0 = top;
+}
+
+/// Diagnostic: the current TSS.RSP0 value (used by the exception printer
+/// to report the kernel stack pointer in force when a fault fired).
+/// Layout: `Gdt` = 8 GDT entries (64 bytes) then the packed `TssStruct`,
+/// whose `rsp0` sits at offset 4 (reserved u32 first).
+pub fn get_tss_rsp0() -> u64 {
+    unsafe {
+        (&raw const KERNEL_GDT)
+            .byte_add(64 + 4)
+            .cast::<u64>()
+            .read()
+    }
 }
 
 static mut KERNEL_IDT: crate::idt::Idt = crate::idt::Idt::new();
 
-/// Load the kernel IDT: exception handlers for vectors 0-31 plus the LAPIC
-/// timer gate at `TIMER_VECTOR`.
+/// Load the kernel IDT: exception handlers for vectors 0-31, the LAPIC
+/// timer gate at `TIMER_VECTOR`, and the DPL-3 syscall gate at `SYS_VECTOR`.
 ///
 /// # Safety
 ///
@@ -92,6 +144,12 @@ pub unsafe fn init_idt() {
     let idt = (&raw mut KERNEL_IDT).as_mut().unwrap();
     crate::idt::install_exception_handlers(idt);
     idt.set_irq_handler(TIMER_VECTOR as usize, timer_stub as *const () as u64);
+    idt.set_handler(
+        crate::syscall::SYS_VECTOR as usize,
+        crate::syscall::syscall_stub as *const () as u64,
+        crate::gdt::KERNEL_CODE_SELECTOR,
+        3,
+    );
     idt.install();
 }
 
@@ -135,38 +193,96 @@ pub unsafe fn init_lapic_timer() -> u64 {
 }
 
 /// Index of the interrupted RIP within an exception frame, given whether
-/// the vector pushes an architectural error code.
+/// the vector pushes an architectural error code. Stub layout: `push 0`,
+/// then `rax rbx rcx rdx rsi rdi r8 r9 r10 r11`, then `sub rsp,8`; the
+/// 12 qwords below `rdi` (the frame base) are: gap, r11..rax, error-slot.
+/// The CPU-pushed interrupt frame begins at index 12.
 pub const fn frame_rip_index(has_err: bool) -> usize {
-    10 + has_err as usize
+    12 + has_err as usize
 }
 
 /// Index of the interrupted RSP within an exception frame.
 pub const fn frame_rsp_index(has_err: bool) -> usize {
-    13 + has_err as usize
+    15 + has_err as usize
 }
 
 /// Rust side of the exception stubs: print vector/err/RIP/RSP/CR2, then
 /// halt. Never returns.
 #[no_mangle]
 pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, frame: *const u64) {
+    let raw = [
+        unsafe { *frame.add(0) },
+        unsafe { *frame.add(1) },
+        unsafe { *frame.add(2) },
+        unsafe { *frame.add(3) },
+        unsafe { *frame.add(4) },
+        unsafe { *frame.add(5) },
+        unsafe { *frame.add(6) },
+        unsafe { *frame.add(7) },
+        unsafe { *frame.add(8) },
+        unsafe { *frame.add(9) },
+        unsafe { *frame.add(10) },
+        unsafe { *frame.add(11) },
+        unsafe { *frame.add(12) },
+        unsafe { *frame.add(13) },
+        unsafe { *frame.add(14) },
+        unsafe { *frame.add(15) },
+    ];
     let err = if has_err != 0 {
-        unsafe { *frame.add(10) }
+        unsafe { *frame.add(12) }
     } else {
         0
     };
     let rip = unsafe { *frame.add(frame_rip_index(has_err != 0)) };
     let rsp = unsafe { *frame.add(frame_rsp_index(has_err != 0)) };
     let mut cr2: u64 = 0;
+    let mut cr3: u64 = 0;
     unsafe {
         asm!("mov {}, cr2", out(reg) cr2, options(nomem, preserves_flags));
+        asm!("mov {}, cr3", out(reg) cr3, options(nomem, preserves_flags));
     }
     crate::sprintln!(
-        "KERNEL EXCEPTION vector=0x{:02X} err=0x{:X} RIP=0x{:016X} RSP=0x{:016X} CR2=0x{:016X}",
+        "KERNEL EXCEPTION vector=0x{:02X} err=0x{:X} RIP=0x{:016X} RSP=0x{:016X} CR2=0x{:016X} CR3=0x{:016X}",
         vector,
         err,
         rip,
         rsp,
-        cr2
+        cr2,
+        cr3
+    );
+    crate::sprintln!(
+        "frame ptr=0x{:016X} rsp0=0x{:016X} ticks={}",
+        frame as u64,
+        crate::cpu::get_tss_rsp0(),
+        crate::cpu::timer_ticks()
+    );
+    crate::sprintln!(
+        "frame: 0x{:016X} 0x{:016X} 0x{:016X} 0x{:016X}",
+        raw[0],
+        raw[1],
+        raw[2],
+        raw[3]
+    );
+    crate::sprintln!(
+        "frame: 0x{:016X} 0x{:016X} 0x{:016X} 0x{:016X}",
+        raw[4],
+        raw[5],
+        raw[6],
+        raw[7]
+    );
+    crate::sprintln!(
+        "frame: 0x{:016X} 0x{:016X} 0x{:016X} 0x{:016X}",
+        raw[8],
+        raw[9],
+        raw[10],
+        raw[11]
+    );
+    crate::sprintln!(
+        "frame: 0x{:016X} 0x{:016X} 0x{:016X} 0x{:016X}",
+        raw[12],
+        raw[13],
+        raw[14],
+        raw[15]
     );
     loop {
         unsafe { asm!("hlt", options(nomem, preserves_flags)) }
