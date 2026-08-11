@@ -24,9 +24,30 @@ pub enum TaskState {
     Blocked,
 }
 
-/// Full register context of a running task, in the same order as the
-/// timer-stub saves: 15 GP registers, error slot, then the iretq frame
-/// (RIP, CS, RFLAGS, RSP, SS).
+/// Full register context of a running task. The `#[repr(C)]` layout
+/// defines the memory offsets that `switch_frame` uses to save/restore:
+///
+/// ```text
+/// offset  register    offset  register
+/// 0       r15         112     rax
+/// 8       r14         120     error slot
+/// 16      r13         128     rip
+/// 24      r12         136     cs
+/// 32      rbx         144     rflags
+/// 40      r11         152     rsp (pre-call rbp-based)
+/// 48      r10         160     ss
+/// 56      r9          168     saved_to (unused by switch_frame)
+/// 64      r8
+/// 72      rbp
+/// 80      rdi
+/// 88      rsi
+/// 96      rdx
+/// 104     rcx
+/// ```
+///
+/// Note: the struct field names (rax, rcx, ...) define `#[repr(C)]` offsets,
+/// but `switch_frame` maps them to different registers via explicit offsets.
+/// Only the offsets matter; the field names are for debugger readability.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TaskFrame {
@@ -196,6 +217,10 @@ pub(crate) extern "sysv64" fn switch_frame(from: *mut TaskFrame, to: *const Task
         // load path then pops them straight back out of the slots. Flags
         // are captured BEFORE `cli` so the saved RFLAGS keeps IF set and
         // the later iretq re-enables interrupts.
+        //
+        // Frame layout (offsets): r15=0, r14=8, ..., rax=112, error=120,
+        // rip=128, cs=136, rflags=144, rsp=152, ss=160, saved_to=168.
+        // The save path stores each register at its struct field offset.
         "mov [rdi+112], rax", // rax slot first (rax is clobbered below)
         "pushfq",             // flags with IF still set
         "cli",
@@ -272,6 +297,21 @@ static mut SWITCH_SCRATCH: u64 = 0;
 
 /// The idle loop's own frame (the "scheduler" context).
 static mut IDLE_FRAME: core::mem::MaybeUninit<TaskFrame> = core::mem::MaybeUninit::uninit();
+
+/// Initialise `IDLE_FRAME` with a self-contained idle-loop context so the
+/// scheduler can switch to idle before the first timer preemption has saved
+/// one. The idle loop runs on its own stack (`idle_stack_top`), so this
+/// frame's `rsp` points at private, never-clobbered memory.
+///
+/// # Safety
+/// Call once at boot, before interrupts are enabled / any task runs.
+pub unsafe fn init_idle_frame(idle_entry: extern "sysv64" fn() -> !) {
+    let f = TaskFrame::fresh(idle_entry, crate::cpu::idle_stack_top());
+    core::ptr::write(
+        core::ptr::addr_of_mut!(IDLE_FRAME).cast::<TaskFrame>(),
+        f,
+    );
+}
 
 /// Task table; slots filled by `spawn`.
 static mut TASKS: [core::mem::MaybeUninit<Task>; MAX_TASKS] =
@@ -381,19 +421,14 @@ pub fn schedule_next(cur: usize) -> Option<usize> {
     loop {
         i = match i {
             usize::MAX => 0,
-            c if c + 1 >= spawned => usize::MAX,
+            c if c + 1 >= spawned => 0,
             c => c + 1,
         };
         checked += 1;
-        match i {
-            usize::MAX => return Some(usize::MAX), // idle always runnable
-            idx => {
-                if task_state(idx) == TaskState::Ready {
-                    return Some(idx);
-                }
-            }
+        if task_state(i) == TaskState::Ready {
+            return Some(i);
         }
-        if checked >= spawned + 1 {
+        if checked >= spawned {
             return Some(usize::MAX);
         }
     }
@@ -498,8 +533,10 @@ pub unsafe fn switch_away_from(cur: usize) {
     if next == cur {
         return; // nothing else runnable (idle is the only option)
     }
+    crate::sprintln!("Aegis: switch {} -> {}", cur, next);
     core::ptr::write(core::ptr::addr_of_mut!(CURRENT), next);
     crate::cpu::set_tss_rsp0(context_cpl0_top(next));
+    crate::sprintln!("Aegis: switch_frame from={} to={} rsp0=0x{:X}", cur, next, crate::cpu::get_tss_rsp0());
     switch_frame(context_frame(cur), context_frame(next));
 }
 
@@ -518,7 +555,7 @@ pub fn context_frame(idx: usize) -> *mut TaskFrame {
 /// transition into the kernel, so the value is only a safe default).
 fn context_cpl0_top(idx: usize) -> u64 {
     if idx == usize::MAX {
-        return crate::cpu::stack_top();
+        return crate::cpu::idle_stack_top();
     }
     unsafe {
         let top = core::ptr::addr_of_mut!(TASKS)
@@ -556,6 +593,7 @@ pub unsafe fn timer_preempt() {
     if next == cur {
         return;
     }
+    crate::sprintln!("Aegis: preempt {} -> {} tick={}", cur, next, crate::cpu::timer_ticks());
     core::ptr::write(core::ptr::addr_of_mut!(CURRENT), next);
     // Point TSS.RSP0 at the next context's CPL0 stack so ITS ring-3
     // transitions (and only theirs) use it, never the stack another

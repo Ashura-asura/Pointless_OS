@@ -59,9 +59,11 @@ impl Endpoint {
 static mut ENDPOINTS: [Endpoint; MAX_ENDPOINTS] = [Endpoint::new(); MAX_ENDPOINTS];
 
 /// Set the return value (rax) of a task's saved frame, so it resumes with it.
+/// Offset 112 is the rax slot in the switch_frame save/restore layout
+/// (switch_frame saves rax to offset 112, restore pops rax from offset 112).
 unsafe fn set_ret(idx: usize, val: u64) {
     let f = context_frame(idx) as *mut u64;
-    *f = val;
+    *f.add(112 / 8) = val;
 }
 
 unsafe fn copy_in(va: u64, dst: &mut [u8]) {
@@ -128,6 +130,7 @@ pub unsafe fn ipc_cap_grant(dst: u64, src_slot: u64, dst_slot: u64) -> i64 {
 /// frame rax when it is resumed).
 pub unsafe fn ipc_call(ep_slot: u64, msg_va: u64, len: u64, reply_va: u64) -> i64 {
     let cur = current_idx();
+    crate::sprintln!("Aegis: ipc_call cur={} ep_slot={}", cur, ep_slot);
     let ep = match cap_to_ep(cur, ep_slot) {
         Some(e) => e,
         None => return -1,
@@ -167,16 +170,17 @@ pub unsafe fn ipc_call(ep_slot: u64, msg_va: u64, len: u64, reply_va: u64) -> i6
 /// saved `rax` slot. After `switch_away_from` resumes a blocked task the
 /// live `rax` register may have been clobbered by intervening code, so we
 /// read the value straight out of the saved frame (memory), which is exactly
-/// what `set_ret` modified.
+/// what `set_ret` modified. Offset 112 = rax slot in switch_frame layout.
 unsafe fn resume_ret(cur: usize) -> i64 {
     let f = context_frame(cur) as *const u64;
-    *f as i64
+    *f.add(112 / 8) as i64
 }
 
 /// Syscall: `int 0x80` with rax=6. Blocks the server until a call arrives,
 /// delivering the request into `recvbuf_va`. Returns `(caller_id << 32) | len`.
 pub unsafe fn ipc_serve(ep_slot: u64, recvbuf_va: u64) -> i64 {
     let cur = current_idx();
+    crate::sprintln!("Aegis: ipc_serve cur={} ep_slot={}", cur, ep_slot);
     let ep = match cap_to_ep(cur, ep_slot) {
         Some(e) => e,
         None => return -1,

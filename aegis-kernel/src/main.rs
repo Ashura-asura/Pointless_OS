@@ -39,6 +39,29 @@ pub extern "sysv64" fn _start() -> ! {
             unsafe {
                 aegis_kernel::frame::init_global(info);
             }
+            // Dedicated idle stack: its saved scheduler frame must point at
+            // private, never-clobbered memory. If idle shared KERNEL_STACK,
+            // other tasks' timer/syscall entries would overwrite that region
+            // and restoring idle would pop garbage (QEMU/TCG tolerated it;
+            // VMware faulted). Allocate it like the task stacks.
+            let idle_stack = unsafe {
+                aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+            };
+            match idle_stack {
+                Some(is) => {
+                    unsafe {
+                        aegis_kernel::cpu::set_idle_stack_top(is + aegis_kernel::tasks::TASK_STACK_SIZE);
+                    }
+                    sprintln!(
+                        "Aegis: idle stack @ 0x{:X} ({} KiB, private)",
+                        is,
+                        aegis_kernel::tasks::TASK_STACK_SIZE / 1024
+                    );
+                }
+                None => {
+                    sprintln!("Aegis: WARNING could not allocate idle stack");
+                }
+            }
             let (total, free) = unsafe { aegis_kernel::frame::stats_global() };
             sprintln!(
                 "Aegis: frame allocator: {} usable frames ({} MiB), {} free",
@@ -161,6 +184,21 @@ pub extern "sysv64" fn _start() -> ! {
     }
     sprintln!("Aegis: interrupts enabled - entering idle loop");
 
+    // Seed the idle scheduler frame with a self-contained context on the
+    // dedicated idle stack, then move the idle loop onto that stack so its
+    // saved frame can never be clobbered by other tasks' kernel-stack use.
+    unsafe {
+        aegis_kernel::tasks::init_idle_frame(run_idle);
+        aegis_kernel::cpu::switch_to_idle_stack(run_idle);
+    }
+    // unreachable
+}
+
+/// Ring-0 idle loop: halts until the next timer tick. Entered on a private
+/// idle stack (see `switch_to_idle_stack`); the scheduler switches back to
+/// it whenever no task is runnable.
+#[no_mangle]
+pub extern "sysv64" fn run_idle() -> ! {
     let mut next_print: u64 = 512;
     loop {
         let t = aegis_kernel::cpu::timer_ticks();

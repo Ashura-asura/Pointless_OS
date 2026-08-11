@@ -27,6 +27,14 @@ static mut KERNEL_STACK: [u8; KERNEL_STACK_SIZE] = [0u8; KERNEL_STACK_SIZE];
 
 const KERNEL_STACK_SIZE: usize = 16384;
 
+/// Top of the dedicated idle stack, allocated from the frame allocator at
+/// boot (see `set_idle_stack_top`). The idle loop runs here so its saved
+/// scheduler frame's `rsp` points at private, never-clobbered memory; if
+/// idle shared `KERNEL_STACK`, later timer/syscall entries for other tasks
+/// would overwrite that region and restoring idle would pop garbage — which
+/// QEMU/TCG tolerated but real hardware (VMware) faults on. Zero until set.
+static mut IDLE_STACK_TOP: u64 = 0;
+
 /// Top (highest address) of the kernel stack, 16-aligned downwards.
 pub fn stack_top() -> u64 {
     let mut top: u64;
@@ -40,6 +48,40 @@ pub fn stack_top() -> u64 {
         );
     }
     top & !15
+}
+
+/// Top (highest address) of the idle stack, 16-aligned downwards. Returns 0
+/// before the idle stack has been allocated.
+pub fn idle_stack_top() -> u64 {
+    unsafe { core::ptr::addr_of!(IDLE_STACK_TOP).read() }
+}
+
+/// Record the idle stack top (allocated from the frame allocator at boot).
+///
+/// # Safety
+/// Must be called exactly once, before `idle_stack_top` / `switch_to_idle_stack`.
+pub unsafe fn set_idle_stack_top(top: u64) {
+    core::ptr::addr_of_mut!(IDLE_STACK_TOP).write(top);
+}
+
+/// Switch the CPU onto the idle stack and jump into the idle loop. Used
+/// once, after boot init, to take the idle loop off the shared kernel
+/// stack. `entry` is the idle-loop function; it never returns.
+///
+/// # Safety
+///
+/// Call only once, after interrupts are enabled and all init is done, and
+/// after `set_idle_stack_top`. `entry` must be a valid, never-returning fn.
+pub unsafe fn switch_to_idle_stack(entry: extern "sysv64" fn() -> !) -> ! {
+    asm!(
+        "mov rsp, {top}",
+        "and rsp, -16",
+        "mov rax, {entry}",
+        "jmp rax",
+        top = in(reg) idle_stack_top(),
+        entry = in(reg) entry,
+        options(noreturn),
+    );
 }
 
 /// Disable SMEP (bit 20) and SMAP (bit 21) in CR4. The firmware (OVMF)
