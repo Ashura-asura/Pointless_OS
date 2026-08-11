@@ -123,7 +123,7 @@ We seriously considered five distinct OS architectures. Here's why we rejected f
 - ❌ Development difficulty extremely high
 - ❌ No compatibility layer for legacy apps
 
-**Verdict**: This is our **kernel foundation** (we use seL4), but not sufficient alone.
+**Verdict**: This is our **kernel architecture** (seL4-lineage design), but not sufficient alone.
 
 ---
 
@@ -185,13 +185,13 @@ We seriously considered five distinct OS architectures. Here's why we rejected f
 ### E. Adaptive Capability Substrate with AI-native Orchestration
 
 **Architecture** (Ours): 
-- Thin, verified capability kernel (seL4-based)
+- Thin capability kernel (seL4-lineage design, custom Rust implementation)
 - Separate orchestration layer (not in TCB)
 - Graph as query index (not ground truth)
 - Distributed as opt-in, not default
 
 **This wins because**:
-- ✅ Smallest TCB (keeps seL4's verified kernel)
+- ✅ Smallest TCB (follows seL4's minimal kernel philosophy)
 - ✅ AI agents are first-class, bounded principals
 - ✅ Self-healing via supervision trees (proven in Erlang)
 - ✅ Adaptability without the WinFS trap
@@ -218,9 +218,9 @@ We seriously considered five distinct OS architectures. Here's why we rejected f
 
 ---
 
-## The Kernel: seL4 Foundation
+## The Kernel: seL4-Lineage Architecture
 
-### Why seL4?
+### Why seL4-Lineage?
 
 **seL4** is a formally verified capability microkernel:
 - ~10-15k LOC (vs. 30M+ for Linux)
@@ -228,12 +228,12 @@ We seriously considered five distinct OS architectures. Here's why we rejected f
 - Already open source & shipping in real products
 - Proven on real hardware (ARM, x86, RISC-V)
 
-**We don't write a new kernel from scratch because**:
-- The single hardest part of capability OS design is the verified kernel
-- seL4 already solved this problem
-- We inherit 20 years of research & real-world validation
+**Our implementation** follows seL4's architecture but is a custom Rust kernel (`aegis-kernel`):
+- We **do not** use seL4's verified C code directly
+- We follow the same design principles: minimal TCB, capability-based authority, IPC-driven
+- **Honest limit**: No formal (inductive) proof exists for `aegis-kernel`. TLA+ model-checking covers 331k states (2 tasks, 3 slots) — evidence, not proof. Contract tests prove the model, not production behavior.
 
-### What the seL4 Kernel Provides
+### What the Kernel Provides
 
 ```rust
 // Kernel Primitives (What's Formally Verified)
@@ -714,7 +714,7 @@ Windows compatibility is harder because:
 
 | Layer | Tech | Purpose |
 |-------|------|---------|
-| **Kernel** | seL4 (formally verified) | Memory isolation, capability enforcement, IPC |
+| **Kernel** | Custom Rust (`aegis-kernel`), seL4-lineage design | Memory isolation, capability enforcement, IPC |
 | **Orchestration** | Rust + supervision trees | AI-aware scheduling, self-healing, anomaly detection |
 | **Storage** | Capability-addressed object store | Immutable, content-addressed, with POSIX view |
 | **Network** | Userspace stack (DPDK-style) | Isolated, capability-scoped, efficient |
@@ -723,5 +723,14 @@ Windows compatibility is harder because:
 | **UX** | Object/relationship view + file tree | Both CLI and semantic interfaces |
 
 ---
+
+## Honest Limits
+
+- **No seL4-class formal proof.** `aegis-kernel` follows seL4-lineage architecture but does not inherit seL4's verification. TLA+ model-checking is finite-instance (2 tasks, 3 slots).
+- **Contract tests prove the model, not production behavior.** All 364 tests are deterministic model logic.
+- **Real hardware is UNTESTED.** Page tables, GDT/IDT, IOMMU, NVMe, VirtIO drivers exist but need VMware/QEMU on real firmware.
+- **AI behavior is monitored, not verified.** The adaptive ceiling is property-tested, not formally proven.
+- **Full Windows/Linux compatibility is explicitly unsolved** by translation alone (design doc).
+- **Single-threaded kernel.** No concurrency testing; all tests are sequential.
 
 **Next Steps**: See [ROADMAP.md](../ROADMAP.md) for the 12-phase development plan.

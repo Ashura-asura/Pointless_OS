@@ -4,7 +4,7 @@ An executable reference implementation of a capability-based operating system de
 
 ## Status
 
-355 tests passing, 0 failures (113 model, 229 aegis-kernel, 13 uefi-boot ELF parser). The reachable-authority auditor runs clean. The kernel boots under QEMU/OVMF: UEFI loader → page tables → bare-metal kernel (GDT/TSS/IDT, LAPIC timer, frame allocator) → **cooperative scheduler running two tasks (alpha/beta) that interleave every 512 timer ticks** — live-run verified, 0 exceptions.
+364 tests passing, 0 failures (113 model, 238 aegis-kernel, 13 uefi-boot ELF parser). The reachable-authority auditor runs clean. The kernel boots under QEMU/OVMF: UEFI loader → page tables → bare-metal kernel (GDT/TSS/IDT, LAPIC timer, frame allocator) → **cooperative scheduler running two tasks (alpha/beta) that interleave every 512 timer ticks** — live-run verified, 0 exceptions. IPC (endpoints, call/serve/reply, capabilities) verified under both QEMU and VMware Workstation 26 with 0 exceptions.
 
 ## What Is Implemented
 
@@ -65,7 +65,9 @@ PCIe/VT-d/NVMe drivers, VirtIO-net/Ethernet/ARP/IPv4, Linux syscall ABI + ELF lo
 ## Running
 
 ```
-cargo test --workspace          # Run all 355 tests
+cargo test --workspace          # Run all model tests (113)
+cargo test -p aegis-kernel     # Run kernel tests (238)
+cargo test -p uefi-boot        # Run ELF parser tests (13)
 cargo run -p capability-audit   # Reachable-authority audit
 cargo run -p capability-audit -- --graph  # Capability graph visualization
 cargo run -p aegis-shell        # Interactive demo

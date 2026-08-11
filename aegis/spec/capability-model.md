@@ -244,6 +244,24 @@ boot scene — the agent cannot talk to the services even knowing the exact slot
 numbers, and its refusals appear in the reachable-authority audit alongside the
 endpoint state.
 
+### Machine-checked verification (executable): aegis-kernel IPC (real hardware)
+
+`aegis-kernel/src/ipc.rs` implements a synchronous call/serve/reply IPC system
+for the bare-metal kernel. This is a **separate, real-hardware IPC** from the
+model-level `capability-core` IPC above.
+
+**What exists**: Endpoints, `ipc_call`, `ipc_serve`, `ipc_reply`,
+`ipc_endpoint_create`, `ipc_cap_grant`. Ring-3 echo server/client demo
+verified under QEMU and VMware Workstation 26 with 0 exceptions.
+
+**Honest limits**:
+- No contract tests — requires real/virtual hardware for ring-3 transitions.
+  Its proof is the live QEMU/VMware boot, not `cargo test`.
+- Single-threaded; no concurrency testing.
+- The IPC is synchronous only (no async notification variant).
+- Not formally verified; follows seL4-lineage design but does not inherit
+  seL4's proof.
+
 ### Machine-checked verification (executable): supervision (§5)
 
 `capability-core/tests/supervision.rs` (3 tests) checks the kernel side of the

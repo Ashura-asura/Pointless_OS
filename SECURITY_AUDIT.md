@@ -11,7 +11,7 @@ No claim below outruns its test evidence; nothing here certifies production beha
 | Reachable-authority vs compiled manifests | `aegis/crates/capability-audit` + `security-audit` | `cargo run -p capability-audit` (CI); 10 aggregate contract tests (clean reference world, kernel-equivalent rejection, undeclared-holdings rejection, overhang-warns-not-fails, self-cap exclusion) |
 | Adaptive/AI ceiling (monotonic non-expansion) | `aegis-kernel/src/ceiling.rs` | 14 property tests; caught+fixed a real scope-expansion bug |
 | Parser/syscall total functions (no panic on garbage) | `aegis-kernel/src/hardening.rs` | 13 boundary tests over ELF/PE loaders, IPv4/Ethernet/ARP parsers, both syscall ABIs, compat layers, shell/window/graph/input |
-| Per-phase contracts | all crates | 299 total tests, 0 failures (101 workspace + 188 kernel + 10 bootloader) |
+| Per-phase contracts | all crates | 364 total tests, 0 failures (113 workspace + 238 kernel + 13 bootloader) |
 
 ## Certification status by claim
 

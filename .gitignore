@@ -5,3 +5,6 @@ aegis/spec/AegisCapabilities_TTrace_*
 # Rust
 Cargo.lock
 target/
+
+# Debug artifacts
+Debug Files/

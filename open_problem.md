@@ -3,7 +3,16 @@
 *Last updated: 2026-08-11. Session state at commit `0b8d002` (pushed to origin/main).*
 
 ## Current Status
-All critical issues have been resolved. The kernel boots and runs in both QEMU and VMware Workstation 26 with 0 exceptions. The IPC system (endpoints, call/serve/reply, capabilities) is fully functional.
+All critical issues have been resolved. The kernel boots and runs in both QEMU and VMware Workstation 26 with 0 exceptions. The IPC system (endpoints, call/serve/reply, capabilities) is functional at the model level.
+
+### Honest Limits
+- The kernel is a **single-threaded in-process model** — all contract tests are deterministic model logic, not real hardware isolation.
+- QEMU/VMware verification proves the boot flow and IPC logic work under virtualization; it does **not** prove correctness on physical hardware.
+- The IPC system has **no contract tests** (it requires real/virtual hardware for ring-3 transitions). Its proof is the live QEMU/VMware boot.
+- TLA+ model-checking is finite-instance (2 tasks, 3 slots) — evidence, not inductive proof.
+- No seL4-class formal proof exists for `aegis-kernel`. The design follows seL4-lineage architecture but does not inherit seL4's verification.
+- AI behavior is monitored, not verified. The adaptive ceiling is property-tested, not formally proven.
+- Full Windows/Linux compatibility is explicitly unsolved by translation alone (design doc).
 
 ### Resolved
 - ✅ **VMware triple-fault crash** — Root cause identified: idle loop ran on shared `KERNEL_STACK`, its saved `rsp` got clobbered by other tasks. Fixed by allocating a dedicated idle stack (`cpu::IDLE_STACK_TOP`) and using `switch_to_idle_stack(entry)`.
