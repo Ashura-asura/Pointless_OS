@@ -648,6 +648,26 @@ real firmware.
 cycling, zombie reaping. Honest limits: GDT/TSS, IDT stubs, and per-process page tables
 are code-only; the actual lgdt/lidt/cr3 switching is UNTESTED on real hardware.
 
+### Machine-checked verification (live): cooperative task switching on bare metal (§5, Phase 2)
+
+`aegis-kernel/src/tasks.rs`: `TaskFrame` (15 GPRs + error slot + iretq words), naked
+`switch_frame` — registers saved into the frame's slots, restored via pops, resume via
+`iretq`; the same path serves fresh targets (all-zero slots) and saved targets (their
+last switch spilled real registers). `yield_now` (task → idle) and `run_idle` (one
+round: idle → each spawned task in order) form a cooperative scheduler over tasks on
+16 KiB stacks (`alloc_contiguous_global`; fixed 4-slot table). VERIFIED live under
+QEMU/OVMF on the current commit: two tasks interleave every 512 timer ticks at stable
+stack addresses (0x37F70 / 0x3BF70), 6665/6665 consecutive interrupt RSP deltas = 0, 0
+exceptions across a 12 s+ boot. The live verification caught a real bug: the saved RSP
+included the `call`-pushed return address, so every resume ran 8 bytes deeper (2
+switches per hlt-gated round = −16 bytes/tick); after ~500 ticks the kernel stack had
+walked into the task table, `run_idle` switched to a never-spawned slot (RSP=0) and the
+machine triple-faulted. The save path now stores the pre-call RSP (`rsp+8`).
+
+Honest limits: cooperative only (`yield_now`) — the LAPIC timer counts ticks but does
+not preempt, so a task that never yields starves the rest; verified under QEMU/TCG
+only, not on physical hardware; no dynamic spawn after boot, no task removal.
+
 ### Machine-checked verification (executable): driver framework (§8, Phase 3)
 
 `pci.rs` (6), `iommu.rs` (5), `nvme.rs` (5): config-space address construction, BAR
