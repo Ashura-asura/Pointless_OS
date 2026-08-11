@@ -2,9 +2,9 @@
 
 *Generated: 2026-08-11. Every claim below is verified by `cargo test` on the current commit.*
 
-## What exists (344 tests, 0 failures)
+## What exists (355 tests, 0 failures)
 
-Breakdown: 113 model-crate tests (aegis workspace, incl. fleet + security-audit), 218 aegis-kernel tests (Phases 1-12 + boot-info + frame allocator), 13 uefi-boot ELF parser tests. Verified from clean lockfiles on commit `6fc8d49`.
+Breakdown: 113 model-crate tests (aegis workspace, incl. fleet + security-audit), 229 aegis-kernel tests (Phases 1-12 + boot-info + frame allocator + scheduler), 13 uefi-boot ELF parser tests. Verified from clean lockfiles on commit `2e35c90`.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -45,6 +45,7 @@ A single-threaded, in-process capability kernel with:
 |-----------|-------|----------------|
 | GDT/TSS | — | Ring 0/3 transitions, kernel/user segment selectors. **VERIFIED under QEMU/TCG**: `lgdt` installs the kernel's 8-entry GDT (0x08 kcode/0x10 kdata/0x18 ucode/0x20 udata/0x28 TSS/0x30 TSS-upper-half/0x38 kcode mirror), `ltr` needs the 64-bit TSS as a full 16-byte descriptor (QEMU quirk — upper half must be zeroed, else #GP(0x28)); still UNTESTED on real hardware |
 | IDT | — | Exception handler stubs for vectors 0-31 (naked, save GPRs + error code, print vector/RIP/RSP via CPU and halt), install via `lidt` with DPL-0 interrupt/trap gates. **VERIFIED under QEMU/TCG**: gates at selector 0x08/attr 0x8E deliver (timer vector dispatched continuously); still UNTESTED on real hardware |
+| Cooperative task switching | — | `switch_frame`: 15-GPR save into frame slots, restore via pop, `iretq` resume (registers uniform for fresh/saved targets); `yield_now` / `run_idle` round-robin over spawned tasks on 16 KiB stacks (`alloc_contiguous`). **VERIFIED under QEMU/TCG**: alpha/beta interleave every 512 ticks at stable rsp (0x37F70/0x3BF70), 6665/6665 consecutive interrupt RSP deltas = 0, 12 s+ live run with 0 exceptions. Fixed a real bug: the saved rsp included the `call`-pushed return address, so every resume ran 8 bytes deeper (2 switches per hlt-gated round = −16/tick leak → stack walked into the task table ~1 s in → switch to a never-spawned slot → #PF triple-fault reboot); the save path now stores the pre-call rsp (`rsp+8`). Still cooperative — the LAPIC timer counts ticks but does not preempt; UNTESTED on real hardware |
 | Per-process page tables | — | 4-level paging with kernel/user split (upper half shared, lower half per-process). UNTESTED: requires mov cr3 on real hardware |
 | Process abstraction | — | State machine (Ready/Running/Blocked/Zombie), CpuState for context switch |
 | Round-robin scheduler | 10 | Spawn, schedule_next, tick/preempt, block/wake, round-robin cycling, zombie reaping |
@@ -133,7 +134,7 @@ Honest limits: two-node in-process model (no sockets, no real network); no conse
 | Claim | Status | Why it's missing |
 |-------|--------|-----------------|
 | Real hardware isolation (verified on actual hardware) | Model-level code only | Page tables, IOMMU, NVMe, VirtIO drivers exist but are UNTESTED on real hardware (need VMware) |
-| Real process isolation on hardware (page faults, cr3 switching) | Code + 10 contract tests | Scheduler/page-table code tested in-process; lgdt/lidt/mov-cr3 ops UNTESTED on real hardware |
+| Real process isolation on hardware (page faults, cr3 switching) | Code + 10 contract tests + scheduler live under QEMU | Cooperative task switching verified live (alpha/beta interleave); preemptive scheduling, user mode, and page-fault-driven isolation still UNTESTED on real hardware |
 | seL4-class formal proof | Not built | TLA+ model-checking (finite instance), not inductive proof |
 | Real network I/O on a NIC | Driver code + 22 tests | VirtIO-net driver exists; no real NIC traffic, no TCP/UDP yet |
 | Linux/Windows compat layers | Partially built (Phase 8+9 model-level) | Linux (32 tests) + Windows (31 tests) translation/loader/personality; no hypervisor VM vehicles; full Windows fidelity explicitly not solved by translation alone |
@@ -161,7 +162,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 |-------|-------------|--------|
 | 0 | Architecture research + capability model | ✅ Done |
 | 1 | Boot + minimal kernel | ✅ Done (real + model): UEFI boot, page tables, ELF loader + relocations (13 parser tests), bare-metal kernel printing via COM1 serial under QEMU/OVMF (0 exceptions across 24576 ticks in a 40 s timer run). Honest limits: not run on physical hardware (VMware needed); per-process isolation added in Phase 2 |
-| 2 | Userspace resource managers + supervision tree | ✅ Done (real + model): GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework. **LAPIC timer verified under QEMU/TCG**: 8-entry GDT installed + TSS loaded (16-byte descriptor quirk), IDT gates deliver, periodic timer (~570 ticks/s) drives the idle loop; honest limits: still not run on physical hardware |
+| 2 | Userspace resource managers + supervision tree | ✅ Done (real + model): GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework. **LAPIC timer verified under QEMU/TCG**: 8-entry GDT installed + TSS loaded (16-byte descriptor quirk), IDT gates deliver, periodic timer (~570 ticks/s) drives the idle loop. **Cooperative task switching verified under QEMU/TCG**: alpha/beta tasks interleave every 512 ticks at stable rsp, 6665/6665 interrupt rsp deltas = 0 (after fixing the resume-rsp drift — saved rsp had included the call's return address); still cooperative, still not run on physical hardware |
 | 3 | Driver framework (IOMMU) | ✅ Done (real + model): PCIe enumeration (6 tests), VT-d IOMMU domain isolation (5 tests), NVMe command queues (5 tests). Model: typed Block/Net/Gpu interfaces, crash containment, GPU isolation, compositor (4 tests). Honest limits: all hardware ops UNTESTED (need real PCIe/IOMMU/NVMe) |
 | 4 | Storage service + POSIX view | ✅ Done (model: FlatView is a flat, single-level namespace projection — create/read/write/delete/list by name. Not a hierarchical POSIX filesystem — no nested dirs, no path resolution, no permission bits, no symlinks. 8 contract tests) |
 | 5 | Networking stack | ✅ Done (real + model): VirtIO-net driver (9 tests), Ethernet frames (5), ARP (6), IPv4 (6). Model: loopback stack (4 tests). Honest limits: no real NIC hardware, no TCP/UDP yet |
@@ -220,3 +221,4 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `602c1a2` | LAPIC timer delivers under QEMU/TCG: call init_gdt (never called — all IDT deliveries #GP'd on loader's GDT), 16-byte TSS descriptor slot for QEMU `ltr`, periodic LVT 0x20030 (bit 16 was the timer mask); naked exception stubs save GPRs + error code; idle loop prints ticks — verified 24576 ticks, 0 exceptions |
 | `ff835fb` | Boot-info handoff: loader writes final EBS memory map to 0x10000 (20-byte flat entries, magic-validated); kernel parses + prints it — verified live: 116 descriptors, 485 MB conventional (8 parser tests) |
 | `6fc8d49` | Frame allocator: bitmap over boot-info map (4 GiB/1M frames, 128 KiB BSS); handoff v2 carries loader-computed image_end — verified live: 157876 frames free, probe frames land exactly above image end (10 tests) |
+| `2e35c90` | Cooperative scheduler: iretq-based `switch_frame` (GPR save into frame slots, pop + iretq resume, `yield_now`/`run_idle`, 16 KiB task stacks), fixed resume-rsp drift (stored pre-call rsp — the call-pushed return address was making every resume 8 bytes deeper; −16/tick → ~1 s triple-fault) — verified live: alpha/beta interleave every 512 ticks, stable rsp, 6665/6665 int deltas = 0 (229 tests) |
