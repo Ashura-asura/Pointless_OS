@@ -37,7 +37,7 @@ Proves six authority invariants (I1-I6) via TLA+ model checking (331k states, 0 
 - **Bare-metal kernel**: COM1 serial, 4 GiB identity paging, frame allocator (bitmap over boot-info map; 157876 frames verified free live)
 - **GDT/TSS/IDT**: kernel + user selectors, TSS, exception stubs for vectors 0-31
 - **LAPIC timer**: periodic, vector 0x30, drives the tick counter (~570 ticks/s)
-- **Cooperative scheduler**: iretq-based `switch_frame` (full GPR save/restore), `yield_now` / `run_idle`, tasks on 16 KiB stacks — verified live: alpha/beta interleave every 512 ticks at stable stack addresses, 6665/6665 consecutive interrupt RSP deltas = 0, 0 exceptions
+- **Preemptive scheduler**: iretq-based `switch_frame`, the timer stub preempts round-robin every tick — tasks never yield, yet alpha/beta interleave every 2048 ticks at stable stack addresses, 0 exceptions
 
 ### Drivers, compat layers, orchestration (contract-tested model code)
 
@@ -46,7 +46,7 @@ PCIe/VT-d/NVMe drivers, VirtIO-net/Ethernet/ARP/IPv4, Linux syscall ABI + ELF lo
 ## What Is Not Done
 
 - Physical hardware verification (needs VMware) — everything runs under QEMU/TCG
-- Preemptive scheduling — tasks are cooperative (`yield_now`); a task that never yields starves the rest
+- Priority/blocking scheduling — single fixed-priority round-robin; no wait queues
 - User-mode isolation — no ring-3 processes, no page-fault-driven isolation yet
 - Hypervisor-based Linux/Windows execution vehicles (WSL2-lineage design paths)
 - Real NIC traffic (no TCP/UDP), real GPU/display output, real input devices
