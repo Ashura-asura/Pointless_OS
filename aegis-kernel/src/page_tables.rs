@@ -4,6 +4,7 @@ const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const HUGE_PAGE: u64 = 1 << 7;
+const NX: u64 = 1 << 63;
 
 #[repr(C, align(4096))]
 pub struct PageTable {
@@ -49,6 +50,11 @@ const LAPIC_PHYS: u64 = 0xFEE0_0000;
 /// APIC page (0xFEE00000) which is mapped through a 4 KB page table so MMIO
 /// writes reach the device.
 ///
+/// **Memory isolation**: The kernel PML4 has NO USER flags. Ring-3 tasks
+/// cannot access kernel memory through this page table. Per-user-task PML4s
+/// (created by `create_user_pml4`) share the kernel upper-half and only
+/// map the specific task's stack as USER-accessible.
+///
 /// # Safety
 ///
 /// Must be called exactly once at boot, before any address-space switch. The
@@ -64,18 +70,10 @@ pub unsafe fn init_kernel_tables() {
     pd.clear();
     pt.clear();
 
-    // Map first 3 entries as 1GB each = 3GB identity. The first 1 GB gets
-    // the USER flag so ring-3 code (the demo user task + its stacks, and
-    // the whole kernel image below 1 MB) is executable/readable at CPL3.
-    // HONEST LIMIT: with a 1 GB huge page the whole window becomes
-    // user-accessible — this demo enforces privilege TRANSITIONS, not
-    // memory isolation (per-process page tables with ring-3-only regions
-    // are a separate phase).
+    // Map first 3 entries as 1GB each = 3GB identity.
+    // NO USER flag on any entry — kernel-only access through this PML4.
     for i in 0..3 {
-        let mut flags = PRESENT | WRITABLE | HUGE_PAGE;
-        if i == 0 {
-            flags |= USER;
-        }
+        let flags = PRESENT | WRITABLE | HUGE_PAGE;
         pdpt.entries[i] = (i as u64 * 0x4000_0000) | flags;
     }
 
@@ -92,44 +90,55 @@ pub unsafe fn init_kernel_tables() {
         pt.entries[i as usize] = (lapic_window + i * 0x1000) | PRESENT | WRITABLE;
     }
 
-    // Link PDPT into PML4. The first 1 GB is reachable by ring-3, so the
-    // PML4 entry itself must carry USER too — user-mode access requires the
-    // U/S bit at EVERY paging level, not just the leaf.
-    pml4.entries[0] = core::ptr::addr_of!(KERNEL_PDPT) as u64 | PRESENT | WRITABLE | USER;
+    // Link PDPT into PML4. NO USER flag — ring-3 cannot access any memory
+    // through the kernel PML4. Per-user PML4s share the upper-half entries.
+    pml4.entries[0] = core::ptr::addr_of!(KERNEL_PDPT) as u64 | PRESENT | WRITABLE;
 }
 
-/// Create new user page tables.
-/// Upper half (entries 256-511) points to kernel's PDPT (kernel space shared).
-/// Lower half (entries 0-255) are zeroed (user space unique).
-/// Returns the physical address of the new PML4.
+/// Create a per-user-task PML4 with memory isolation.
+///
+/// The new PML4 has:
+/// - Upper half (entries 256-511): shared kernel space (copied from kernel PML4)
+/// - Lower half: ONLY the task's stack region mapped as USER (2MB granularity)
+///   Everything else in the lower half is unmapped — ring-3 access faults.
+///
+/// Returns the physical address of the new PML4, or 0 on allocation failure.
 ///
 /// # Safety
 ///
-/// The returned address references a single static scratch PML4; callers must
-/// copy it into per-process memory before creating another table.
-pub unsafe fn create_user_tables() -> u64 {
-    static mut USER_PML4: PageTable = PageTable::new();
-    let user_pml4 = (&raw mut USER_PML4).as_mut().unwrap();
-    let kernel_pml4 = (&raw const KERNEL_PML4).as_ref().unwrap();
+/// `stack_phys` must be a valid physical address of a 16 KiB stack region.
+/// The caller must store the returned PML4 address in the task and switch CR3
+/// when scheduling this task.
+pub unsafe fn create_user_pml4(stack_phys: u64) -> u64 {
+    use crate::frame::alloc_global;
 
+    // Allocate a fresh PML4 page
+    let pml4_frame = match alloc_global() {
+        Some(f) => f,
+        None => return 0,
+    };
+    let user_pml4 = &mut *(pml4_frame as *mut PageTable);
     user_pml4.clear();
 
-    // Copy kernel's upper-half entries
+    // Copy kernel's upper-half entries (shared kernel space)
+    let kernel_pml4 = (&raw const KERNEL_PML4).as_ref().unwrap();
     for i in 256..512 {
         user_pml4.entries[i] = kernel_pml4.entries[i];
     }
 
-    // Lower half is zeroed (already cleared)
-    core::ptr::addr_of!(USER_PML4) as u64
+    // Lower half: map ONLY the task's stack region as USER.
+    // The stack is 16 KiB = 4 pages. We map the 2MB region containing
+    // the stack with the USER flag. Everything else in the lower half
+    // remains unmapped (zeroed entries → page fault on access).
+    let stack_2mb = stack_phys & !0x1F_FFFF; // 2MB-align the stack base
+    map_2mb_user(pml4_frame, stack_2mb, stack_2mb);
+
+    pml4_frame
 }
 
-/// Map one 2MB page in the given PML4.
-///
-/// # Safety
-///
-/// `pml4_phys` must be a valid physical address of a present PML4 page table.
-/// Scratch page-table pages are reused; only one mapping walk may be in flight.
-pub unsafe fn map_page(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
+/// Map a single 2MB page in a PML4 with USER access.
+/// Used by `create_user_pml4` to map task stacks.
+unsafe fn map_2mb_user(pml4_phys: u64, vaddr: u64, paddr: u64) {
     let pml4 = &mut *(pml4_phys as *mut PageTable);
 
     let pml4_index = ((vaddr >> 39) & 0x1FF) as usize;
@@ -154,8 +163,8 @@ pub unsafe fn map_page(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
     }
     let pd = &mut *((pdpt.entries[pdpt_index] & !0xFFF) as *mut PageTable);
 
-    // Map the 2MB page
-    pd.entries[pd_index] = (paddr & !0x1FFFFF) | PRESENT | WRITABLE | USER | HUGE_PAGE | flags;
+    // Map the 2MB page with USER access
+    pd.entries[pd_index] = (paddr & !0x1FFFFF) | PRESENT | WRITABLE | USER | HUGE_PAGE;
 }
 
 /// Switch to a different address space by writing CR3.

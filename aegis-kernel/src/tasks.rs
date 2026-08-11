@@ -162,6 +162,10 @@ pub struct Task {
     /// at transition time, and the single shared kernel stack would be
     /// overwritten by interleaved transitions of other tasks.
     pub cpl0_stack_top: u64,
+    /// Physical address of this task's per-user PML4 (0 for kernel tasks
+    /// that use the shared kernel PML4). On context switch to a user task,
+    /// CR3 is loaded with this value to enforce memory isolation.
+    pub pml4_phys: u64,
     /// Capability table (the only authority token the task holds).
     pub caps: CapTable,
     /// Scheduling state.
@@ -177,6 +181,7 @@ impl Task {
             frame: TaskFrame::fresh(entry, stack_base + TASK_STACK_SIZE),
             stack_base,
             cpl0_stack_top: 0,
+            pml4_phys: 0,
             caps: crate::cap::new_cap_table(),
             state: TaskState::Ready,
             blocked_ep: usize::MAX,
@@ -189,11 +194,17 @@ impl Task {
         stack_base: u64,
         cpl0_stack_base: u64,
     ) -> Task {
+        // Create per-user-task page tables with memory isolation:
+        // only this task's stack region is USER-accessible.
+        let user_pml4 = unsafe {
+            crate::page_tables::create_user_pml4(stack_base)
+        };
         Task {
             name,
             frame: TaskFrame::fresh_user(entry, stack_base + TASK_STACK_SIZE),
             stack_base,
             cpl0_stack_top: cpl0_stack_base + TASK_STACK_SIZE,
+            pml4_phys: user_pml4,
             caps: crate::cap::new_cap_table(),
             state: TaskState::Ready,
             blocked_ep: usize::MAX,
@@ -512,6 +523,9 @@ pub fn unblock_task(idx: usize) {
 /// `cur` (the caller is resumed later by a future switch). Used by both the
 /// timer preemption path and the blocking IPC syscalls.
 ///
+/// Swaps CR3 when switching between kernel and user tasks to enforce
+/// per-task memory isolation.
+///
 /// # Safety
 /// `cur` must be the currently executing task index. Interrupts must be
 /// disabled. The caller will not return until rescheduled.
@@ -525,6 +539,13 @@ pub unsafe fn switch_away_from(cur: usize) {
     crate::sprintln!("Aegis: switch {} -> {}", cur, next);
     core::ptr::write(core::ptr::addr_of_mut!(CURRENT), next);
     crate::cpu::set_tss_rsp0(context_cpl0_top(next));
+    // Swap CR3 for memory isolation between kernel and user tasks
+    let next_pml4 = context_pml4(next);
+    if next_pml4 != crate::page_tables::kernel_pml4_phys() {
+        crate::page_tables::switch_to(next_pml4);
+    } else {
+        crate::page_tables::switch_to(crate::page_tables::kernel_pml4_phys());
+    }
     crate::sprintln!(
         "Aegis: switch_frame from={} to={} rsp0=0x{:X}",
         cur,
@@ -566,6 +587,27 @@ fn context_cpl0_top(idx: usize) -> u64 {
     }
 }
 
+/// Physical address of a context's page table: the per-user PML4 for
+/// ring-3 tasks, or the kernel PML4 for kernel/idle contexts.
+fn context_pml4(idx: usize) -> u64 {
+    if idx == usize::MAX {
+        return crate::page_tables::kernel_pml4_phys();
+    }
+    unsafe {
+        let pml4 = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(
+                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, pml4_phys),
+            )
+            .cast::<u64>()
+            .read();
+        if pml4 != 0 {
+            pml4
+        } else {
+            crate::page_tables::kernel_pml4_phys()
+        }
+    }
+}
+
 /// Preemptive round-robin tick hook, called from the timer stub on every
 /// timer interrupt, with the interrupt frame on the current context's
 /// stack. Saves the interrupted context (including this call's own stub
@@ -598,6 +640,13 @@ pub unsafe fn timer_preempt() {
     // transitions (and only theirs) use it, never the stack another
     // task's kernel frame is parked on.
     crate::cpu::set_tss_rsp0(context_cpl0_top(next));
+    // Swap CR3 for memory isolation between kernel and user tasks
+    let next_pml4 = context_pml4(next);
+    if next_pml4 != crate::page_tables::kernel_pml4_phys() {
+        crate::page_tables::switch_to(next_pml4);
+    } else {
+        crate::page_tables::switch_to(crate::page_tables::kernel_pml4_phys());
+    }
     let from = context_frame(cur);
     let to = context_frame(next);
     switch_frame(from, to)
