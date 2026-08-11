@@ -1,4 +1,4 @@
-# Pointless OS
+# Pointless OS ---> Still Prototype
 
 An executable reference implementation of a capability-based operating system design. Built on Rust, modeled against TLA+, verified by contract tests on every `cargo test`, and booted bare-metal under QEMU/OVMF.
 
