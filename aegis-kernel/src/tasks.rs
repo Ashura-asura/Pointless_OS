@@ -307,10 +307,7 @@ static mut IDLE_FRAME: core::mem::MaybeUninit<TaskFrame> = core::mem::MaybeUnini
 /// Call once at boot, before interrupts are enabled / any task runs.
 pub unsafe fn init_idle_frame(idle_entry: extern "sysv64" fn() -> !) {
     let f = TaskFrame::fresh(idle_entry, crate::cpu::idle_stack_top());
-    core::ptr::write(
-        core::ptr::addr_of_mut!(IDLE_FRAME).cast::<TaskFrame>(),
-        f,
-    );
+    core::ptr::write(core::ptr::addr_of_mut!(IDLE_FRAME).cast::<TaskFrame>(), f);
 }
 
 /// Task table; slots filled by `spawn`.
@@ -437,9 +434,7 @@ pub fn schedule_next(cur: usize) -> Option<usize> {
 fn task_state(idx: usize) -> TaskState {
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
-            .byte_add(
-                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, state),
-            )
+            .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, state))
             .cast::<TaskState>();
         *p
     }
@@ -448,9 +443,7 @@ fn task_state(idx: usize) -> TaskState {
 fn set_task_state(idx: usize, s: TaskState) {
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
-            .byte_add(
-                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, state),
-            )
+            .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, state))
             .cast::<TaskState>();
         *p = s;
     }
@@ -460,9 +453,7 @@ fn set_task_state(idx: usize, s: TaskState) {
 pub fn task_cap(idx: usize, slot: usize) -> Cap {
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
-            .byte_add(
-                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, caps),
-            )
+            .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, caps))
             .cast::<CapTable>();
         (*p)[slot]
     }
@@ -471,9 +462,7 @@ pub fn task_cap(idx: usize, slot: usize) -> Cap {
 pub fn set_task_cap(idx: usize, slot: usize, cap: Cap) {
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
-            .byte_add(
-                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, caps),
-            )
+            .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, caps))
             .cast::<CapTable>();
         (*p)[slot] = cap;
     }
@@ -502,9 +491,7 @@ pub fn block_current(ep: usize) {
     set_task_state(cur, TaskState::Blocked);
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
-            .byte_add(
-                cur * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, blocked_ep),
-            )
+            .byte_add(cur * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, blocked_ep))
             .cast::<usize>();
         *p = ep;
     }
@@ -515,9 +502,7 @@ pub fn unblock_task(idx: usize) {
     set_task_state(idx, TaskState::Ready);
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
-            .byte_add(
-                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, blocked_ep),
-            )
+            .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, blocked_ep))
             .cast::<usize>();
         *p = usize::MAX;
     }
@@ -526,6 +511,10 @@ pub fn unblock_task(idx: usize) {
 /// Switch away from `cur` to the next runnable context. Does not return to
 /// `cur` (the caller is resumed later by a future switch). Used by both the
 /// timer preemption path and the blocking IPC syscalls.
+///
+/// # Safety
+/// `cur` must be the currently executing task index. Interrupts must be
+/// disabled. The caller will not return until rescheduled.
 pub unsafe fn switch_away_from(cur: usize) {
     let Some(next) = schedule_next(cur) else {
         return;
@@ -536,7 +525,12 @@ pub unsafe fn switch_away_from(cur: usize) {
     crate::sprintln!("Aegis: switch {} -> {}", cur, next);
     core::ptr::write(core::ptr::addr_of_mut!(CURRENT), next);
     crate::cpu::set_tss_rsp0(context_cpl0_top(next));
-    crate::sprintln!("Aegis: switch_frame from={} to={} rsp0=0x{:X}", cur, next, crate::cpu::get_tss_rsp0());
+    crate::sprintln!(
+        "Aegis: switch_frame from={} to={} rsp0=0x{:X}",
+        cur,
+        next,
+        crate::cpu::get_tss_rsp0()
+    );
     switch_frame(context_frame(cur), context_frame(next));
 }
 
@@ -593,7 +587,12 @@ pub unsafe fn timer_preempt() {
     if next == cur {
         return;
     }
-    crate::sprintln!("Aegis: preempt {} -> {} tick={}", cur, next, crate::cpu::timer_ticks());
+    crate::sprintln!(
+        "Aegis: preempt {} -> {} tick={}",
+        cur,
+        next,
+        crate::cpu::timer_ticks()
+    );
     core::ptr::write(core::ptr::addr_of_mut!(CURRENT), next);
     // Point TSS.RSP0 at the next context's CPL0 stack so ITS ring-3
     // transitions (and only theirs) use it, never the stack another

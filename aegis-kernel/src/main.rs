@@ -45,12 +45,16 @@ pub extern "sysv64" fn _start() -> ! {
             // and restoring idle would pop garbage (QEMU/TCG tolerated it;
             // VMware faulted). Allocate it like the task stacks.
             let idle_stack = unsafe {
-                aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+                aegis_kernel::frame::alloc_contiguous_global(
+                    aegis_kernel::tasks::TASK_STACK_SIZE / 4096,
+                )
             };
             match idle_stack {
                 Some(is) => {
                     unsafe {
-                        aegis_kernel::cpu::set_idle_stack_top(is + aegis_kernel::tasks::TASK_STACK_SIZE);
+                        aegis_kernel::cpu::set_idle_stack_top(
+                            is + aegis_kernel::tasks::TASK_STACK_SIZE,
+                        );
                     }
                     sprintln!(
                         "Aegis: idle stack @ 0x{:X} ({} KiB, private)",
@@ -282,7 +286,9 @@ extern "sysv64" fn task_server() -> ! {
     let ep_slot = user_syscall5(8, 0, 0, 0, 0) as i64;
     if ep_slot < 0 {
         user_print(b"Aegis: [server] EndpointCreate failed\r\n");
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     }
     let ep_slot = ep_slot as u64;
     user_print(b"Aegis: [server] endpoint created\r\n");
@@ -315,7 +321,13 @@ extern "sysv64" fn task_client() -> ! {
         let msg = b"ping from client";
         let mut reply = [0u8; 256];
         // Call: ep_slot=0, msg_va, len, reply_va
-        let rlen = user_syscall5(5, 0, msg.as_ptr() as u64, msg.len() as u64, reply.as_mut_ptr() as u64);
+        let rlen = user_syscall5(
+            5,
+            0,
+            msg.as_ptr() as u64,
+            msg.len() as u64,
+            reply.as_mut_ptr() as u64,
+        );
         if rlen != u64::MAX {
             user_print(b"Aegis: [client] echo reply: ");
             user_print(&reply[..rlen as usize]);
@@ -333,7 +345,9 @@ extern "sysv64" fn task_client() -> ! {
         // Yield briefly to let the server run.
         user_syscall5(3, 0, 0, 0, 0);
     }
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 #[panic_handler]

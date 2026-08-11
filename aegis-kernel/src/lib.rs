@@ -1,15 +1,15 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod boot_info;
+pub mod cap;
 pub mod cpu;
 pub mod frame;
 pub mod gdt;
 pub mod idt;
+pub mod ipc;
 pub mod page_tables;
 pub mod process;
 pub mod scheduler;
-pub mod cap;
-pub mod ipc;
 pub mod syscall;
 pub mod tasks;
 

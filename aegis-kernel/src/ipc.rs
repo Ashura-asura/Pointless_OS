@@ -15,7 +15,10 @@
 //! the per-task table; no async/notify variant yet (only synchronous call/reply).
 
 use crate::cap::Cap;
-use crate::tasks::{current_idx, context_frame, task_cap, set_task_cap, unblock_task, block_current, switch_away_from};
+use crate::tasks::{
+    block_current, context_frame, current_idx, set_task_cap, switch_away_from, task_cap,
+    unblock_task,
+};
 
 const IPC_BUF: usize = 256;
 pub const MAX_ENDPOINTS: usize = 16;
@@ -90,6 +93,9 @@ fn cap_to_ep(cur: usize, slot: u64) -> Option<usize> {
 
 /// Syscall: create an endpoint, returning the capability slot in the caller's
 /// table (or -1 on failure).
+///
+/// # Safety
+/// Must be called via syscall from ring-3 with valid task context.
 pub unsafe fn ipc_endpoint_create() -> i64 {
     let cur = current_idx();
     let id = (0..MAX_ENDPOINTS).find(|&i| !ENDPOINTS[i].active);
@@ -114,6 +120,9 @@ pub unsafe fn ipc_endpoint_create() -> i64 {
 /// Syscall: grant the caller's capability `src_slot` to task `dst` at its
 /// slot `dst_slot` (so the destination knows where to find it). Returns
 /// `dst_slot` on success, or -1.
+///
+/// # Safety
+/// Must be called via syscall from ring-3 with valid task context.
 pub unsafe fn ipc_cap_grant(dst: u64, src_slot: u64, dst_slot: u64) -> i64 {
     let cur = current_idx();
     let cap = task_cap(cur, src_slot as usize);
@@ -128,6 +137,10 @@ pub unsafe fn ipc_cap_grant(dst: u64, src_slot: u64, dst_slot: u64) -> i64 {
 /// `ep_slot` = capability slot, `msg_va`/`len` = request, `reply_va` = where
 /// the reply is written. Returns the reply length (delivered via the caller's
 /// frame rax when it is resumed).
+///
+/// # Safety
+/// Must be called via syscall from ring-3 with valid task context and
+/// user-space virtual addresses for msg_va and reply_va.
 pub unsafe fn ipc_call(ep_slot: u64, msg_va: u64, len: u64, reply_va: u64) -> i64 {
     let cur = current_idx();
     crate::sprintln!("Aegis: ipc_call cur={} ep_slot={}", cur, ep_slot);
@@ -178,6 +191,10 @@ unsafe fn resume_ret(cur: usize) -> i64 {
 
 /// Syscall: `int 0x80` with rax=6. Blocks the server until a call arrives,
 /// delivering the request into `recvbuf_va`. Returns `(caller_id << 32) | len`.
+///
+/// # Safety
+/// Must be called via syscall from ring-3 with valid task context and
+/// user-space virtual address for recvbuf_va.
 pub unsafe fn ipc_serve(ep_slot: u64, recvbuf_va: u64) -> i64 {
     let cur = current_idx();
     crate::sprintln!("Aegis: ipc_serve cur={} ep_slot={}", cur, ep_slot);
@@ -210,6 +227,10 @@ pub unsafe fn ipc_serve(ep_slot: u64, recvbuf_va: u64) -> i64 {
 
 /// Syscall: `int 0x80` with rax=7. Server sends `reply_va`/`rlen` back to the
 /// caller identified by `caller_id` (from the `ipc_serve` return).
+///
+/// # Safety
+/// Must be called via syscall from ring-3 with valid task context and
+/// user-space virtual address for reply_va.
 pub unsafe fn ipc_reply(ep_slot: u64, caller_id: u64, reply_va: u64, rlen: u64) -> i64 {
     let cur = current_idx();
     let ep = match cap_to_ep(cur, ep_slot) {
@@ -228,6 +249,9 @@ pub unsafe fn ipc_reply(ep_slot: u64, caller_id: u64, reply_va: u64, rlen: u64) 
 }
 
 /// Force a task runnable (used by diagnostics). Kept for completeness.
+///
+/// # Safety
+/// `idx` must be a valid task index. Only use for debugging/testing.
 #[allow(dead_code)]
 pub unsafe fn force_unblock(idx: usize) {
     unblock_task(idx);
