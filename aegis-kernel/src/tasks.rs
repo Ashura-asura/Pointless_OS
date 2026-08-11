@@ -358,6 +358,7 @@ pub fn current_idx() -> usize {
 /// Next context in round-robin order: idle -> task 0 -> ... -> last task
 /// -> idle. Returns `None` when no tasks are spawned. Pure (ignores blocked
 /// state) — used by unit tests.
+#[cfg(test)]
 fn next_after(cur: usize, spawned: usize) -> Option<usize> {
     match (spawned, cur) {
         (0, _) => None,
