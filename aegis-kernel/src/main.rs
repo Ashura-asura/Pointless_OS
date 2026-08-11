@@ -108,14 +108,6 @@ pub extern "sysv64" fn _start() -> ! {
     let stack_beta = unsafe {
         aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
     };
-    // One ring-3 task: a user stack (16 KiB) + a dedicated CPL0 stack
-    // (16 KiB) for its kernel transitions (TSS.RSP0 target).
-    let stack_user = unsafe {
-        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
-    };
-    let cpl0_user = unsafe {
-        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
-    };
     match (stack_alpha, stack_beta) {
         (Some(sa), Some(sb)) => {
             unsafe {
@@ -133,20 +125,34 @@ pub extern "sysv64" fn _start() -> ! {
             sprintln!("Aegis: WARNING could not allocate task stacks");
         }
     }
-    match (stack_user, cpl0_user) {
-        (Some(su), Some(c0)) => {
+    // Ring-3 IPC demo: echo server (task 2) + client (task 3).
+    let stack_server = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    let cpl0_server = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    let stack_client = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    let cpl0_client = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    match (stack_server, cpl0_server, stack_client, cpl0_client) {
+        (Some(ss), Some(cs), Some(su), Some(cu)) => {
             unsafe {
-                aegis_kernel::tasks::spawn_user("george", task_user, su, c0);
+                aegis_kernel::tasks::spawn_user("server", task_server, ss, cs);
+                aegis_kernel::tasks::spawn_user("client", task_client, su, cu);
             }
             sprintln!(
-                "Aegis: ring-3 task spawned: george user@0x{:X} cpl0@0x{:X} ({} tasks)",
+                "Aegis: IPC demo spawned: server@0x{:X}, client@0x{:X} ({} tasks)",
+                ss,
                 su,
-                c0,
                 aegis_kernel::tasks::spawned_count()
             );
         }
         _ => {
-            sprintln!("Aegis: WARNING could not allocate ring-3 task stacks");
+            sprintln!("Aegis: WARNING could not allocate ring-3 IPC task stacks");
         }
     }
 
@@ -168,7 +174,31 @@ pub extern "sysv64" fn _start() -> ! {
 
 static ALPHA_NEXT: AtomicU64 = AtomicU64::new(2048);
 static BETA_NEXT: AtomicU64 = AtomicU64::new(4096);
-static USER_NEXT: AtomicU64 = AtomicU64::new(2048);
+
+/// Ring-3 syscall invocation (int 0x80): number in rax, args in
+/// rsi/rcx/rdx/r8; the return value comes back in rax.
+#[inline]
+fn user_syscall5(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let mut ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") num,
+            in("rsi") a1,
+            in("rcx") a2,
+            in("rdx") a3,
+            in("r8") a4,
+            lateout("rax") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Ring-3 printf-equivalent: a `Write` syscall that prints `msg` verbatim.
+fn user_print(msg: &[u8]) {
+    user_syscall5(1, msg.as_ptr() as u64, msg.len() as u64, 0, 0);
+}
 
 // The demo tasks NEVER yield: progress only happens because the timer
 // stub preempts them every tick (round-robin). If preemption stops
@@ -206,45 +236,66 @@ extern "sysv64" fn task_beta() -> ! {
     }
 }
 
-/// Ring-3 syscall invocation (int 0x80): number in rax, args in
-/// rsi/rcx/rdx; the return value comes back in rax.
-#[inline]
-fn user_syscall3(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    let mut ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("rax") num,
-            in("rsi") a1,
-            in("rcx") a2,
-            in("rdx") a3,
-            lateout("rax") ret,
-            options(nostack),
-        );
+/// Ring-3 IPC echo server: creates an endpoint, grants it to the client,
+/// then loops calling Serve (blocking) to receive requests and Reply with
+/// the same bytes (echo).
+extern "sysv64" fn task_server() -> ! {
+    // Create an endpoint — returns the capability slot in our table.
+    let ep_slot = user_syscall5(8, 0, 0, 0, 0) as i64;
+    if ep_slot < 0 {
+        user_print(b"Aegis: [server] EndpointCreate failed\r\n");
+        loop { core::hint::spin_loop(); }
     }
-    ret
-}
+    let ep_slot = ep_slot as u64;
+    user_print(b"Aegis: [server] endpoint created\r\n");
 
-/// Ring-3 printf-equivalent: a `Write` syscall that prints `msg` verbatim.
-fn user_print(msg: &[u8]) {
-    user_syscall3(1, msg.as_ptr() as u64, msg.len() as u64, 0);
-}
+    // Grant the endpoint capability to the client (task index 3, slot 0).
+    let client_idx: u64 = 3;
+    user_syscall5(9, client_idx, ep_slot, 0, 0);
+    user_print(b"Aegis: [server] endpoint granted to client\r\n");
 
-// The ring-3 demo task: runs at CPL3 on its own user stack, reads the
-// global tick counter (first 1 GB is user-accessible in this demo), and
-// prints through the int 0x80 syscall. It never yields — progress proves
-// that timer preemption works in and out of ring 3.
-
-extern "sysv64" fn task_user() -> ! {
+    // Serve loop: block until a call arrives, then reply with the same data.
+    let mut recvbuf = [0u8; 256];
     loop {
-        let t = aegis_kernel::cpu::timer_ticks();
-        let n = USER_NEXT.load(Ordering::Relaxed);
-        if t >= n {
-            USER_NEXT.store(n + 2048, Ordering::Relaxed);
-            user_print(b"Aegis: [user] ring 3 hello via int 0x80\r\n");
-        }
-        core::hint::spin_loop();
+        // Serve: returns (caller_id << 32) | len.
+        let packed = user_syscall5(6, ep_slot, recvbuf.as_mut_ptr() as u64, 0, 0);
+        let caller = (packed >> 32) as u64;
+        let rlen = (packed & 0xFFFF_FFFF) as u64;
+        // Echo: reply with the same data we received.
+        user_syscall5(7, ep_slot, caller, recvbuf.as_ptr() as u64, rlen);
     }
+}
+
+/// Ring-3 IPC echo client: waits for the server to grant the endpoint
+/// capability (slot 0), then sends a few messages and prints the replies.
+extern "sysv64" fn task_client() -> ! {
+    // Wait for the server to grant the capability (slot 0).
+    // The server sets up the endpoint and grants before the client
+    // typically runs, but we retry briefly just in case.
+    let mut retries = 0u64;
+    loop {
+        let msg = b"ping from client";
+        let mut reply = [0u8; 256];
+        // Call: ep_slot=0, msg_va, len, reply_va
+        let rlen = user_syscall5(5, 0, msg.as_ptr() as u64, msg.len() as u64, reply.as_mut_ptr() as u64);
+        if rlen != u64::MAX {
+            user_print(b"Aegis: [client] echo reply: ");
+            user_print(&reply[..rlen as usize]);
+            user_print(b"\r\n");
+            break;
+        }
+        // The server grants the endpoint capability at startup; until it has
+        // run and granted, our call fails. Poll (yielding so the server can
+        // run) until the grant lands. Large cap guards against a real bug.
+        retries += 1;
+        if retries > 1_000_000 {
+            user_print(b"Aegis: [client] gave up waiting for server\r\n");
+            break;
+        }
+        // Yield briefly to let the server run.
+        user_syscall5(3, 0, 0, 0, 0);
+    }
+    loop { core::hint::spin_loop(); }
 }
 
 #[panic_handler]

@@ -9,8 +9,20 @@
 
 use core::arch::naked_asm;
 
+use crate::cap::{Cap, CapTable};
+
 pub const TASK_STACK_SIZE: u64 = 16384;
 pub const MAX_TASKS: usize = 4;
+/// Slots in each task's capability table.
+pub const MAX_CAPS: usize = 16;
+
+/// Scheduling state of a task. `Blocked` tasks are skipped by the scheduler
+/// (e.g. while waiting for an IPC reply).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Ready,
+    Blocked,
+}
 
 /// Full register context of a running task, in the same order as the
 /// timer-stub saves: 15 GP registers, error slot, then the iretq frame
@@ -129,6 +141,12 @@ pub struct Task {
     /// at transition time, and the single shared kernel stack would be
     /// overwritten by interleaved transitions of other tasks.
     pub cpl0_stack_top: u64,
+    /// Capability table (the only authority token the task holds).
+    pub caps: CapTable,
+    /// Scheduling state.
+    pub state: TaskState,
+    /// Endpoint id this task is blocked on (usize::MAX when not blocked).
+    pub blocked_ep: usize,
 }
 
 impl Task {
@@ -138,6 +156,9 @@ impl Task {
             frame: TaskFrame::fresh(entry, stack_base + TASK_STACK_SIZE),
             stack_base,
             cpl0_stack_top: 0,
+            caps: crate::cap::new_cap_table(),
+            state: TaskState::Ready,
+            blocked_ep: usize::MAX,
         }
     }
 
@@ -152,6 +173,9 @@ impl Task {
             frame: TaskFrame::fresh_user(entry, stack_base + TASK_STACK_SIZE),
             stack_base,
             cpl0_stack_top: cpl0_stack_base + TASK_STACK_SIZE,
+            caps: crate::cap::new_cap_table(),
+            state: TaskState::Ready,
+            blocked_ep: usize::MAX,
         }
     }
 }
@@ -327,12 +351,13 @@ pub fn spawned_count() -> usize {
 }
 
 /// Index of the currently running context (`usize::MAX` = the idle loop).
-fn current_idx() -> usize {
+pub fn current_idx() -> usize {
     unsafe { core::ptr::read(core::ptr::addr_of_mut!(CURRENT)) }
 }
 
 /// Next context in round-robin order: idle -> task 0 -> ... -> last task
-/// -> idle. Returns `None` when no tasks are spawned.
+/// -> idle. Returns `None` when no tasks are spawned. Pure (ignores blocked
+/// state) — used by unit tests.
 fn next_after(cur: usize, spawned: usize) -> Option<usize> {
     match (spawned, cur) {
         (0, _) => None,
@@ -342,9 +367,144 @@ fn next_after(cur: usize, spawned: usize) -> Option<usize> {
     }
 }
 
+/// Pick the next *runnable* context (skips `Blocked` tasks). If every task
+/// is blocked, returns the idle loop (`usize::MAX`) so the CPU has something
+/// to run while IPC completes.
+pub fn schedule_next(cur: usize) -> Option<usize> {
+    let spawned = spawned_count();
+    if spawned == 0 {
+        return None;
+    }
+    let mut checked = 0;
+    let mut i = cur;
+    loop {
+        i = match i {
+            usize::MAX => 0,
+            c if c + 1 >= spawned => usize::MAX,
+            c => c + 1,
+        };
+        checked += 1;
+        match i {
+            usize::MAX => return Some(usize::MAX), // idle always runnable
+            idx => {
+                if task_state(idx) == TaskState::Ready {
+                    return Some(idx);
+                }
+            }
+        }
+        if checked >= spawned + 1 {
+            return Some(usize::MAX);
+        }
+    }
+}
+
+fn task_state(idx: usize) -> TaskState {
+    unsafe {
+        let p = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(
+                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, state),
+            )
+            .cast::<TaskState>();
+        *p
+    }
+}
+
+fn set_task_state(idx: usize, s: TaskState) {
+    unsafe {
+        let p = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(
+                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, state),
+            )
+            .cast::<TaskState>();
+        *p = s;
+    }
+}
+
+/// Capability slot `slot` of task `idx`.
+pub fn task_cap(idx: usize, slot: usize) -> Cap {
+    unsafe {
+        let p = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(
+                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, caps),
+            )
+            .cast::<CapTable>();
+        (*p)[slot]
+    }
+}
+
+pub fn set_task_cap(idx: usize, slot: usize, cap: Cap) {
+    unsafe {
+        let p = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(
+                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, caps),
+            )
+            .cast::<CapTable>();
+        (*p)[slot] = cap;
+    }
+}
+
+/// Copy a capability from `src` task's slot into `dst` task's table (first
+/// free slot). Returns the destination slot, or `usize::MAX` if full.
+pub fn grant_cap(dst: usize, src: usize, src_slot: usize) -> usize {
+    let cap = task_cap(src, src_slot);
+    if cap == Cap::None {
+        return usize::MAX;
+    }
+    let free = (0..MAX_CAPS).find(|&s| task_cap(dst, s) == Cap::None);
+    match free {
+        Some(s) => {
+            set_task_cap(dst, s, cap);
+            s
+        }
+        None => usize::MAX,
+    }
+}
+
+/// Mark the current task blocked on endpoint `ep`.
+pub fn block_current(ep: usize) {
+    let cur = current_idx();
+    set_task_state(cur, TaskState::Blocked);
+    unsafe {
+        let p = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(
+                cur * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, blocked_ep),
+            )
+            .cast::<usize>();
+        *p = ep;
+    }
+}
+
+/// Mark task `idx` runnable again.
+pub fn unblock_task(idx: usize) {
+    set_task_state(idx, TaskState::Ready);
+    unsafe {
+        let p = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(
+                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, blocked_ep),
+            )
+            .cast::<usize>();
+        *p = usize::MAX;
+    }
+}
+
+/// Switch away from `cur` to the next runnable context. Does not return to
+/// `cur` (the caller is resumed later by a future switch). Used by both the
+/// timer preemption path and the blocking IPC syscalls.
+pub unsafe fn switch_away_from(cur: usize) {
+    let Some(next) = schedule_next(cur) else {
+        return;
+    };
+    if next == cur {
+        return; // nothing else runnable (idle is the only option)
+    }
+    core::ptr::write(core::ptr::addr_of_mut!(CURRENT), next);
+    crate::cpu::set_tss_rsp0(context_cpl0_top(next));
+    switch_frame(context_frame(cur), context_frame(next));
+}
+
 /// Frame pointer of a context: a numeric task index, or the idle loop for
 /// `usize::MAX`.
-fn context_frame(idx: usize) -> *mut TaskFrame {
+pub fn context_frame(idx: usize) -> *mut TaskFrame {
     if idx == usize::MAX {
         core::ptr::addr_of_mut!(IDLE_FRAME).cast::<TaskFrame>()
     } else {
@@ -389,7 +549,7 @@ pub unsafe fn timer_preempt() {
         return;
     }
     let cur = current_idx();
-    let Some(next) = next_after(cur, spawned) else {
+    let Some(next) = schedule_next(cur) else {
         return;
     };
     if next == cur {

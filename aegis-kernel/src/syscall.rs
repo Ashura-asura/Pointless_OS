@@ -28,6 +28,20 @@ pub enum SyscallNum {
     Read = 2,
     Yield = 3,
     Fork = 4,
+    /// IPC: blocking call to an endpoint (rax=5, rsi=ep_slot, rdx=msg_va,
+    /// rcx=len, r8=reply_va). Returns reply length.
+    Call = 5,
+    /// IPC: server blocks until a call arrives (rax=6, rsi=ep_slot,
+    /// rdx=recvbuf_va). Returns (caller_id<<32)|len.
+    Serve = 6,
+    /// IPC: server sends the reply (rax=7, rsi=ep_slot, rdx=caller_id,
+    /// rcx=reply_va, r8=rlen).
+    Reply = 7,
+    /// IPC: create an endpoint, returns the capability slot. (rax=8)
+    EndpointCreate = 8,
+    /// IPC: grant a capability to another task (rax=9, rsi=dst_task,
+    /// rcx=src_slot, rdx=dst_slot). Returns 0 or -1.
+    CapGrant = 9,
 }
 
 /// Maximum bytes a user `Write` may ask to print per call (defensive cap
@@ -46,9 +60,10 @@ pub const fn clamp_write_len(raw: u64) -> usize {
 /// Dispatch a system call.
 /// Returns -1 for unimplemented syscalls, 0 for Yield and Write success.
 ///
-/// `arg1`/`arg2`/`arg3` are the raw user-supplied arguments (pointers are
+/// `arg1`..`arg4` are the raw user-supplied arguments (pointers are
 /// NOT validated — the demo kernel maps the whole first 1 GB with U/S).
-pub fn dispatch(num: u64, arg1: u64, arg2: u64, _arg3: u64) -> i64 {
+/// Register layout: arg1=rsi, arg2=rcx, arg3=rdx, arg4=r8.
+pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
     match num {
         0 => -1, // Exit — not implemented
         1 => {
@@ -62,6 +77,16 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, _arg3: u64) -> i64 {
         2 => -1, // Read — not implemented
         3 => 0,  // Yield — returns success
         4 => -1, // Fork — not implemented
+        // IPC: Call(ep_slot, msg_va, len, reply_va)
+        5 => unsafe { crate::ipc::ipc_call(arg1, arg2, arg3, arg4) },
+        // IPC: Serve(ep_slot, recvbuf_va)
+        6 => unsafe { crate::ipc::ipc_serve(arg1, arg2) },
+        // IPC: Reply(ep_slot, caller_id, reply_va, rlen)
+        7 => unsafe { crate::ipc::ipc_reply(arg1, arg2, arg3, arg4) },
+        // IPC: EndpointCreate()
+        8 => unsafe { crate::ipc::ipc_endpoint_create() },
+        // IPC: CapGrant(dst_task, src_slot, dst_slot)
+        9 => unsafe { crate::ipc::ipc_cap_grant(arg1, arg2, arg3) },
         _ => -1, // Unknown syscall
     }
 }
@@ -86,7 +111,8 @@ pub unsafe extern "sysv64" fn syscall_trap_rust(frame: *mut u64) {
     let arg1 = unsafe { *frame.add(6) }; // rsi
     let arg2 = unsafe { *frame.add(8) }; // rcx
     let arg3 = unsafe { *frame.add(7) }; // rdx
-    let ret = dispatch(num, arg1, arg2, arg3);
+    let arg4 = unsafe { *frame.add(4) }; // r8
+    let ret = dispatch(num, arg1, arg2, arg3, arg4);
     unsafe { *frame.add(10) = ret as u64 }; // rax
 }
 
@@ -134,15 +160,15 @@ mod tests {
 
     #[test]
     fn unknown_syscalls_return_minus_one() {
-        assert_eq!(dispatch(99, 0, 0, 0), -1);
-        assert_eq!(dispatch(SyscallNum::Read as u64, 0, 0, 0), -1);
-        assert_eq!(dispatch(SyscallNum::Exit as u64, 0, 0, 0), -1);
-        assert_eq!(dispatch(SyscallNum::Fork as u64, 0, 0, 0), -1);
+        assert_eq!(dispatch(99, 0, 0, 0, 0), -1);
+        assert_eq!(dispatch(SyscallNum::Read as u64, 0, 0, 0, 0), -1);
+        assert_eq!(dispatch(SyscallNum::Exit as u64, 0, 0, 0, 0), -1);
+        assert_eq!(dispatch(SyscallNum::Fork as u64, 0, 0, 0, 0), -1);
     }
 
     #[test]
     fn yield_returns_zero() {
-        assert_eq!(dispatch(SyscallNum::Yield as u64, 0, 0, 0), 0);
+        assert_eq!(dispatch(SyscallNum::Yield as u64, 0, 0, 0, 0), 0);
     }
 
     #[test]
@@ -156,6 +182,6 @@ mod tests {
     #[test]
     fn write_with_zero_length_returns_zero() {
         // No bytes requested: the buffer pointer is never dereferenced.
-        assert_eq!(dispatch(SyscallNum::Write as u64, 0x1000, 0, 0), 0);
+        assert_eq!(dispatch(SyscallNum::Write as u64, 0x1000, 0, 0, 0), 0);
     }
 }
