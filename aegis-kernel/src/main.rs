@@ -183,6 +183,33 @@ pub extern "sysv64" fn _start() -> ! {
         }
     }
 
+    // Memory isolation test: a ring-3 task that tries to read kernel memory.
+    // If memory isolation works, this triggers a page fault → task killed.
+    let stack_iso = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    let cpl0_iso = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    match (stack_iso, cpl0_iso) {
+        (Some(si), Some(ci)) => {
+            unsafe {
+                aegis_kernel::tasks::spawn_user("iso-test", task_isolation_test, si, ci);
+            }
+            sprintln!(
+                "Aegis: isolation test spawned @ 0x{:X} ({} tasks total)",
+                si,
+                aegis_kernel::tasks::spawned_count()
+            );
+            // Hold the isolation test until the IPC demo (server/client
+            // echo) has finished, so the two demos don't race for slices.
+            aegis_kernel::tasks::arm_isolation_test(4, 15);
+        }
+        _ => {
+            sprintln!("Aegis: WARNING could not allocate isolation test stack");
+        }
+    }
+
     unsafe {
         core::arch::asm!("sti");
     }
@@ -345,6 +372,27 @@ extern "sysv64" fn task_client() -> ! {
         // Yield briefly to let the server run.
         user_syscall5(3, 0, 0, 0, 0);
     }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Ring-3 memory isolation test: attempts to read a kernel-only address
+/// (0x1000000 = 16 MiB) that is NOT within the task's USER regions (low
+/// 2 MB identity map + its stack). If memory isolation works, this triggers
+/// a page fault → the exception handler reports it and halts.
+extern "sysv64" fn task_isolation_test() -> ! {
+    user_print(b"Aegis: [isolation-test] attempting illegal kernel read at 0x1000000...\r\n");
+    // This address is in the identity map (so it is present) but NOT marked
+    // USER. The task's own PML4 has no USER flag on it → page fault.
+    unsafe {
+        let ptr = 0x1000000 as *const u64;
+        let _val = core::ptr::read_volatile(ptr);
+        // If we get here, isolation FAILED — this should never happen.
+        user_print(b"Aegis: [isolation-test] ISOLATION FAILED - read succeeded!\r\n");
+    }
+    // Should never reach here — the page fault handler kills us first.
+    user_print(b"Aegis: [isolation-test] UNREACHABLE\r\n");
     loop {
         core::hint::spin_loop();
     }

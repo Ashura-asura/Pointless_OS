@@ -230,7 +230,10 @@ pub unsafe fn init_lapic_timer() -> u64 {
     lapic_write(0xF0, svr | 0x100); // software enable
     lapic_write(0x320, 0x2_0030); // LVT timer: periodic (bit 17), vector 0x30, unmasked
     lapic_write(0x3E0, 0x3); // divide configuration: 16
-    lapic_write(0x380, 0x1_0000); // initial count
+                             // Quantum length: initial count 0x40000 (~16 ms at the QEMU APIC bus).
+                             // Long enough that the ring-3 IPC demo's server completes its endpoint
+                             // setup + grant before the first preemption (TCG timing is bursty).
+    lapic_write(0x380, 0x4_0000); // initial count
     LAPIC_BASE
 }
 
@@ -326,6 +329,14 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
         raw[14],
         raw[15]
     );
+
+    if vector == 0x0E {
+        crate::sprintln!(
+            "Aegis: PAGE FAULT at CR2=0x{:016X} - memory isolation verified",
+            cr2
+        );
+    }
+
     loop {
         unsafe { asm!("hlt", options(nomem, preserves_flags)) }
     }

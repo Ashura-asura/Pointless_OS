@@ -2,17 +2,18 @@
 //! stack, and control moves between tasks (and the idle loop) by swapping
 //! full interrupt-style frames with `iretq`.
 //!
-//! Honest limits: scheduling is cooperative (`yield_now` only) — the LAPIC
-//! timer drives the wall-clock tick counter but does not preempt tasks yet.
-//! The `switch_frame` assembler primitive is verified under QEMU/TCG only,
+//! Honest limits: scheduling is cooperative (`yield_now` only) plus
+//! preemption by the LAPIC timer, which round-robins on every tick. The
+//! `switch_frame` assembler primitive is verified under QEMU/TCG only,
 //! not on physical hardware.
 
 use core::arch::naked_asm;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::cap::{Cap, CapTable};
 
 pub const TASK_STACK_SIZE: u64 = 16384;
-pub const MAX_TASKS: usize = 4;
+pub const MAX_TASKS: usize = 8;
 /// Slots in each task's capability table.
 pub const MAX_CAPS: usize = 16;
 
@@ -196,9 +197,7 @@ impl Task {
     ) -> Task {
         // Create per-user-task page tables with memory isolation:
         // only this task's stack region is USER-accessible.
-        let user_pml4 = unsafe {
-            crate::page_tables::create_user_pml4(stack_base)
-        };
+        let user_pml4 = unsafe { crate::page_tables::create_user_pml4(stack_base) };
         Task {
             name,
             frame: TaskFrame::fresh_user(entry, stack_base + TASK_STACK_SIZE),
@@ -519,6 +518,20 @@ pub fn unblock_task(idx: usize) {
     }
 }
 
+/// One-shot demo hook: hold task `idx` blocked until the LAPIC tick counter
+/// reaches `tick`, then unblock it. Lets the IPC demo (server/client) finish
+/// before the isolation test runs, so the two demos don't race for the
+/// first slice. `tick = u64::MAX` disarms the hook.
+pub static ISO_ARM_TICK: AtomicU64 = AtomicU64::new(u64::MAX);
+static ISO_ARM_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Arm the one-shot unblock hook for the isolation-test demo task.
+pub fn arm_isolation_test(idx: usize, tick: u64) {
+    set_task_state(idx, TaskState::Blocked);
+    ISO_ARM_IDX.store(idx, Ordering::Relaxed);
+    ISO_ARM_TICK.store(tick, Ordering::Relaxed);
+}
+
 /// Switch away from `cur` to the next runnable context. Does not return to
 /// `cur` (the caller is resumed later by a future switch). Used by both the
 /// timer preemption path and the blocking IPC syscalls.
@@ -539,13 +552,10 @@ pub unsafe fn switch_away_from(cur: usize) {
     crate::sprintln!("Aegis: switch {} -> {}", cur, next);
     core::ptr::write(core::ptr::addr_of_mut!(CURRENT), next);
     crate::cpu::set_tss_rsp0(context_cpl0_top(next));
-    // Swap CR3 for memory isolation between kernel and user tasks
+    // Swap CR3 to enforce per-task memory isolation before loading the
+    // target context (the target's iretq words use the new address space).
     let next_pml4 = context_pml4(next);
-    if next_pml4 != crate::page_tables::kernel_pml4_phys() {
-        crate::page_tables::switch_to(next_pml4);
-    } else {
-        crate::page_tables::switch_to(crate::page_tables::kernel_pml4_phys());
-    }
+    crate::page_tables::switch_to(next_pml4);
     crate::sprintln!(
         "Aegis: switch_frame from={} to={} rsp0=0x{:X}",
         cur,
@@ -568,7 +578,7 @@ pub fn context_frame(idx: usize) -> *mut TaskFrame {
 /// TSS.RSP0 value for a context: its dedicated CPL0 stack for ring-3
 /// tasks, or the kernel stack top for kernel/idle contexts (which never
 /// transition into the kernel, so the value is only a safe default).
-fn context_cpl0_top(idx: usize) -> u64 {
+pub(crate) fn context_cpl0_top(idx: usize) -> u64 {
     if idx == usize::MAX {
         return crate::cpu::idle_stack_top();
     }
@@ -589,15 +599,13 @@ fn context_cpl0_top(idx: usize) -> u64 {
 
 /// Physical address of a context's page table: the per-user PML4 for
 /// ring-3 tasks, or the kernel PML4 for kernel/idle contexts.
-fn context_pml4(idx: usize) -> u64 {
+pub(crate) fn context_pml4(idx: usize) -> u64 {
     if idx == usize::MAX {
         return crate::page_tables::kernel_pml4_phys();
     }
     unsafe {
         let pml4 = core::ptr::addr_of_mut!(TASKS)
-            .byte_add(
-                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, pml4_phys),
-            )
+            .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, pml4_phys))
             .cast::<u64>()
             .read();
         if pml4 != 0 {
@@ -622,6 +630,11 @@ pub unsafe fn timer_preempt() {
     if spawned == 0 {
         return;
     }
+    // Release the isolation-test task once the IPC demo has finished.
+    if crate::cpu::timer_ticks() >= ISO_ARM_TICK.load(Ordering::Relaxed) {
+        ISO_ARM_TICK.store(u64::MAX, Ordering::Relaxed);
+        unblock_task(ISO_ARM_IDX.load(Ordering::Relaxed));
+    }
     let cur = current_idx();
     let Some(next) = schedule_next(cur) else {
         return;
@@ -640,13 +653,8 @@ pub unsafe fn timer_preempt() {
     // transitions (and only theirs) use it, never the stack another
     // task's kernel frame is parked on.
     crate::cpu::set_tss_rsp0(context_cpl0_top(next));
-    // Swap CR3 for memory isolation between kernel and user tasks
-    let next_pml4 = context_pml4(next);
-    if next_pml4 != crate::page_tables::kernel_pml4_phys() {
-        crate::page_tables::switch_to(next_pml4);
-    } else {
-        crate::page_tables::switch_to(crate::page_tables::kernel_pml4_phys());
-    }
+    // Swap CR3 to the next context's address space for memory isolation.
+    crate::page_tables::switch_to(context_pml4(next));
     let from = context_frame(cur);
     let to = context_frame(next);
     switch_frame(from, to)
