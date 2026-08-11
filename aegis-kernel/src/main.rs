@@ -135,6 +135,21 @@ pub extern "sysv64" fn _start() -> ! {
         }
     }
 
+    // Live PCI enumeration over the legacy 0xCF8/0xCFC config ports.
+    let mut pci = aegis_kernel::pci::PciDeviceList::new();
+    unsafe {
+        aegis_kernel::pci::scan_live(&mut pci);
+    }
+    let found_nvme = pci.find_nvme().is_some();
+    sprintln!(
+        "Aegis: PCI scan complete: {} device(s) found on bus 0",
+        pci.len()
+    );
+    aegis_kernel::pci::print_report(&pci);
+    if found_nvme {
+        sprintln!("Aegis: PCI: NVMe controller present");
+    }
+
     unsafe {
         aegis_kernel::cpu::init_lapic_timer();
     }

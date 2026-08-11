@@ -8,3 +8,4 @@ target/
 
 # Debug artifacts
 Debug Files/
+qerr*.txt

@@ -1,6 +1,6 @@
 # Open Problems — Pointless OS / Aegis Boot
 
-*Last updated: 2026-08-12. Session state at commit `88f4e3c`.*
+*Last updated: 2026-08-12. Session state at commit `bf78794` (PCI live enumeration follows).*
 
 ## Current Status
 All critical issues have been resolved. The kernel boots and runs in both QEMU and VMware Workstation 26 with 0 exceptions. The IPC system (endpoints, call/serve/reply, capabilities) is functional at the model level. The boot demo is now **visible on the VM display** — a VGA text console mirrors the COM1 log white-on-black (verified via screendump glyph decoding).
@@ -29,6 +29,7 @@ All critical issues have been resolved. The kernel boots and runs in both QEMU a
 - ✅ **QEMU display**: white-on-black boot log visible (VGA text console, screendump-verified glyph-for-glyph)
 - ✅ **QEMU**: per-task memory isolation — `iso-test` task's kernel-only read #PFs, task killed, kernel keeps running
 - ✅ **QEMU**: NX enforcement — only kernel text executable; `nx-test` instruction fetch from 0xB8000 #PFs (NX bit set in error code), task killed, kernel keeps running (0 exceptions, 13k ticks)
+- ✅ **QEMU**: live PCI enumeration (q35) — 6 devices found on bus 0 via legacy 0xCF8/0xCFC ports: host bridge 8086:29C0, stdvga 1234:1111 (2 MMIO BARs), e1000e 8086:10D3, ICH9 ISA bridge, AHCI SATA 8086:2922 (5 BARs: 4 MMIO + 2 IO), SMBus; VID/DID/class/prog-if/rev/BARs decode correctly in the boot log
 - ✅ **VMware**: idle stack at `0x34000`, full IPC flow (`ipc_serve`→`ipc_call`→`ipc_serve`→`echo reply`), 0 exceptions, runs past tick 4200
 
 ## What Was Built
