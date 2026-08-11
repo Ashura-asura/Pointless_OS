@@ -67,11 +67,13 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
     match num {
         0 => -1, // Exit — not implemented
         1 => {
-            // Write: print arg2 bytes from the buffer at arg1 to COM1.
+            // Write: print arg2 bytes from the buffer at arg1 to COM1
+            // (and mirror them to the VGA text console).
             let buf =
                 unsafe { core::slice::from_raw_parts(arg1 as *const u8, clamp_write_len(arg2)) };
             let mut w = crate::serial::SerialWriter;
             w.write_bytes(buf);
+            crate::vga::vga_write_bytes(buf);
             0
         }
         2 => -1, // Read — not implemented

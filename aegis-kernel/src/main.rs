@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[no_mangle]
 pub extern "sysv64" fn _start() -> ! {
     aegis_kernel::serial::SerialWriter::init();
+    aegis_kernel::vga::vga_init();
 
     sprintln!("=== Aegis Phase 2: Bare-Metal Kernel ===");
     sprintln!("Aegis: kernel started (loader handed off at entry)");

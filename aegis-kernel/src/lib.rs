@@ -12,6 +12,8 @@ pub mod process;
 pub mod scheduler;
 pub mod syscall;
 pub mod tasks;
+pub mod vga;
+pub mod font;
 
 pub mod iommu;
 pub mod nvme;
