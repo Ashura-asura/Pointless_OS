@@ -1,9 +1,9 @@
 # Open Problems — Pointless OS / Aegis Boot
 
-*Last updated: 2026-08-11. Session state at commit `0b8d002` (pushed to origin/main).*
+*Last updated: 2026-08-12. Session state at commit `d81ea68` (pending push).*
 
 ## Current Status
-All critical issues have been resolved. The kernel boots and runs in both QEMU and VMware Workstation 26 with 0 exceptions. The IPC system (endpoints, call/serve/reply, capabilities) is functional at the model level.
+All critical issues have been resolved. The kernel boots and runs in both QEMU and VMware Workstation 26 with 0 exceptions. The IPC system (endpoints, call/serve/reply, capabilities) is functional at the model level. The boot demo is now **visible on the VM display** — a VGA text console mirrors the COM1 log white-on-black (verified via screendump glyph decoding).
 
 ### Honest Limits
 - The kernel is a **single-threaded in-process model** — all contract tests are deterministic model logic, not real hardware isolation.
@@ -20,10 +20,13 @@ All critical issues have been resolved. The kernel boots and runs in both QEMU a
 - ✅ **GPT/FAT16 layout** — All partition type GUIDs, bounds, BPB geometry, and backup GPT header corrected per spec. `verify()` in `build_image.py` now independently validates all fields.
 - ✅ **VMware VM config** — `guestOS` changed from invalid `"uefi"` to `"other-64"` (kept `firmware = "efi"`).
 - ✅ **STARTUP.NSH** — Added `add_startup.py` to patch `FS0:\EFI\BOOT\BOOTX64.EFI` into FAT16 ESP root so EFI shell auto-boots kernel.
-- ✅ **CI workflows** — `.github/workflows/ci.yml` (kernel+UEFI builds, clippy) and `.github/workflows/test.yml` (fmt, clippy, test for `aegis` workspace + `aegis-kernel`). 238 tests pass.
+- ✅ **CI workflows** — `.github/workflows/ci.yml` (kernel+UEFI builds, clippy) and `.github/workflows/test.yml` (fmt, clippy, test for `aegis` workspace + `aegis-kernel`). 242 tests pass.
+- ✅ **Blank/garbled VM display** — the GTK window showed no text or wrong glyphs. Root causes (all fixed in `aegis-kernel/src/vga.rs`): SR4 chain4 bit made QEMU scatter text writes by `addr&3`; SR2=0x0F let the odd/even parity rule stamp plane 2 (the font area) with screen characters (SR2=0x03 keeps chars on plane 0 / attrs on plane 1); a 0x3C0 readback during the flip-flop data phase corrupted `ar[0]` (green background); cursor + light-gray attr cleaned up. Verified: plane-2 glyph probe returns the embedded font, DAC readback matches the palette, screendump decodes to the exact Aegis log lines, pixels = black `000000` bg + white `ffffff` fg.
 
 ### Verified
 - ✅ **QEMU**: `echo reply: ping from client`, 0 exceptions, 11k+ lines of output
+- ✅ **QEMU display**: white-on-black boot log visible (VGA text console, screendump-verified glyph-for-glyph)
+- ✅ **QEMU**: per-task memory isolation — `iso-test` task's kernel-only read #PFs, isolated task killed
 - ✅ **VMware**: idle stack at `0x34000`, full IPC flow (`ipc_serve`→`ipc_call`→`ipc_serve`→`echo reply`), 0 exceptions, runs past tick 4200
 
 ## What Was Built
@@ -35,6 +38,11 @@ All critical issues have been resolved. The kernel boots and runs in both QEMU a
 
 ### Ring-3 Demo
 - Echo server/client demo in `main.rs` using IPC endpoints
+
+### VGA Text Console
+- `aegis-kernel/src/vga.rs` — `vga_enter_text_mode` (Bochs VBE disable, CRTC/GC/AC programming, 16-color DAC palette, cursor off), `vga_upload_font` (8x16 font into plane 2 via map A), `vga_fmt_line`/`vga_write_bytes` (screen mirror)
+- `aegis-kernel/src/font.rs` — canonical 8x16 font, 0x00..=0x7F
+- `sprintln!` mirrors every line to COM1 + screen; the ring-3 `Write` syscall mirrors too
 
 ## Useful Commands
 - **Rebuild image**: `python build_image.py` (from `uefi-boot/`) — must print `VERIFY OK`

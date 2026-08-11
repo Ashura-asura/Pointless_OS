@@ -1,16 +1,16 @@
 # Honest Status — Pointless OS / Aegis
 
-*Generated: 2026-08-11. Every claim below is verified by `cargo test` on the current commit.*
+*Generated: 2026-08-12. Every claim below is verified by `cargo test` on the current commit.*
 
 ## What exists (verified clean)
 
 Test counts are kept separate on purpose: `aegis-kernel` is a **standalone bare-metal crate that is NOT a member of the `aegis` workspace**, so its tests are never covered by `cargo test --workspace`.
 
 - **aegis workspace (model crates):** 113 contract tests, 0 failures — `cargo test --workspace` from a clean lockfile (Rule 1/10).
-- **aegis-kernel (bare-metal, separate crate):** 238 contract tests, 0 failures — `cargo test` on the host target; the ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
+- **aegis-kernel (bare-metal, separate crate):** 242 contract tests, 0 failures — `cargo test` on the host target; the ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
 - **uefi-boot:** 13 ELF parser contract tests.
 
-Combined contract-test count across all crates: **364**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
+Combined contract-test count across all crates: **368**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -56,8 +56,14 @@ A single-threaded, in-process capability kernel with:
 | Process abstraction | — | State machine (Ready/Running/Blocked/Zombie), CpuState for context switch |
 | Round-robin scheduler | 10 | Spawn, schedule_next, tick/preempt, block/wake, round-robin cycling, zombie reaping |
 | Ring-3 user task | — | A demo task dropped to CPL3 via `iretq` (fresh frame carries user CS=0x1B/SS=0x23), serviced by a DPL-3 `int 0x80` interrupt-gate (`syscall_stub` + `syscall_trap_rust` dispatch: Exit/Write/Read/Yield/Fork). **VERIFIED under QEMU/TCG**: a CPL3 task (`george`) runs on its own user stack, prints `Aegis: [user] ring 3 hello via int 0x80` through the syscall gate, and is preempted by the LAPIC timer every tick alongside two CPL0 tasks (`alpha`/`beta`) and the idle loop — privilege transitions both ways work, 0 exceptions across an 18 s boot (5 user prints interleaved with kernel prints). Two real bugs were found and fixed live: (1) `PML4[0]` lacked the `USER` bit, so the user page table walk faulted at the very first fetch — every level needs `USER`; (2) the syscall stub saves `rax…r11` such that `rax` lands at frame slot 10, not slot 1, so the handler was reading the wrong registers and syscalls silently returned -1 — indices corrected. CR4 SMEP/SMAP are also cleared at boot (defensive; firmware had them off here, but correct for real hardware). Still UNTESTED on real hardware |
-| Syscall framework | — | SyscallNum enum, dispatch stub. Returns -1 for unimplemented syscalls. The ring-3 `Write` path (untrusted buffer pointer + capped length) prints to COM1 |
+| Syscall framework | — | SyscallNum enum, dispatch stub. Returns -1 for unimplemented syscalls. The ring-3 `Write` path (untrusted buffer pointer + capped length) prints to COM1 and mirrors to the VGA console |
 | IPC (endpoints, call/serve/reply) | — | Synchronous IPC: `ipc_call`, `ipc_serve`, `ipc_reply`, `ipc_endpoint_create`, `ipc_cap_grant`. **VERIFIED under QEMU and VMware Workstation 26**: echo server/client demo, 0 exceptions, idle stack dedicated to avoid clobber. No contract tests — proof is live boot. Dedicated idle stack (`cpu::IDLE_STACK_TOP`) allocated from frame allocator to prevent triple-fault (idle's saved rsp was clobbered by other tasks' timer/syscall entries on shared KERNEL_STACK). `schedule_next` wrap-around fix: `c+1 >= spawned` maps to 0, checks all tasks before returning idle. UNTESTED on real hardware |
+| Memory isolation (per-task U/S) | — | A ring-3 `iso-test` task attempts to read a kernel-only address (0x1000000, present but not USER in its PML4). **VERIFIED under QEMU**: the read #PFs, the exception handler prints `PAGE FAULT at CR2=0x1000000 - memory isolation verified`, task killed. Fixed live: exception-stub argument order so the Rust handler read the right vector/error/RIP. UNTESTED on real hardware |
+
+### Real display output (aegis-kernel)
+| Component | Tests | What it proves |
+|-----------|-------|----------------|
+| VGA text console | 4 | 80x25 white-on-black mirror of the COM1 stream (`vga.rs`: Bochs VBE disable, CRTC/GC/AC programming, 16-color DAC palette, 8x16 font uploaded into plane 2 via map A; `sprintln!` and the ring-3 `Write` syscall print to 0xB8000). **VERIFIED under QEMU**: screendump decodes glyph-for-glyph to the exact Aegis log lines ("Aegis: [client] echo reply..."), plane-2 glyph probe matches the embedded font, DAC readback matches the programmed palette, pixels = black `000000` bg + white `ffffff` fg. Three real bugs fixed live: (1) SR4 chain4 bit made QEMU scatter text writes by `addr&3`; (2) SR2=0x0F let the odd/even parity rule stamp plane 2 (the font area) with screen characters — SR2=0x03 keeps chars on plane 0 / attrs on plane 1; (3) a 0x3C0 readback during the flip-flop data phase corrupted `ar[0]` (green background). Honest limits: text mode only — no framebuffer graphics, no GPU accel, no mouse/keyboard input; font covers 0x00..=0x7F (higher chars render blank); the low 2 MB is USER-flagged in per-task PML4s, so a ring-3 task could scribble the screen (cosmetic, accepted for the demo); UNTESTED on real hardware |
 
 ### Real driver framework (aegis-kernel)
 | Component | Tests | What it proves |
@@ -142,12 +148,12 @@ Honest limits: two-node in-process model (no sockets, no real network); no conse
 | Claim | Status | Why it's missing |
 |-------|--------|-----------------|
 | Real hardware isolation (verified on actual hardware) | Model-level code only | Page tables, IOMMU, NVMe, VirtIO drivers exist but are UNTESTED on real hardware (need VMware) |
-| Real process isolation on hardware (page faults, cr3 switching) | Code + 10 contract tests + scheduler + ring-3 task live under QEMU | Cooperative task switching and a ring-3 user task (CPL3 `iretq` + `int 0x80` syscall) verified live under QEMU/TCG; page-fault-driven *per-process* isolation (separate user page tables) still UNTESTED on real hardware |
+| Real process isolation on hardware (page faults, cr3 switching) | Code + 10 contract tests + scheduler + ring-3 task live under QEMU | Cooperative task switching and a ring-3 user task (CPL3 `iretq` + `int 0x80` syscall) verified live under QEMU/TCG; per-task isolation via page-table U/S bits verified under QEMU (isolation-test task faults on a kernel-only address and is killed); still UNTESTED on real hardware |
 | seL4-class formal proof | Not built | TLA+ model-checking (finite instance), not inductive proof |
 | Real network I/O on a NIC | Driver code + 22 tests | VirtIO-net driver exists; no real NIC traffic, no TCP/UDP yet |
 | Linux/Windows compat layers | Partially built (Phase 8+9 model-level) | Linux (32 tests) + Windows (31 tests) translation/loader/personality; no hypervisor VM vehicles; full Windows fidelity explicitly not solved by translation alone |
 | AI orchestration on real hardware | Model-level code only | Agent/profiler/adaptive/policy tested in-process (23 tests); no real-time integration |
-| Graphical shell on a real display | Model-level code only | Shell/window/graph/input tested in-process (24 tests); no GPU, no framebuffer, no real input |
+| Graphical shell on a real display | Model-level code only | Shell/window/graph/input tested in-process (24 tests); a VGA text console mirrors kernel output on the QEMU display (verified live), but no framebuffer graphics, no GPU accel, no real input |
 | Cross-machine transport for macaroon tokens | Partially built (Phase 11 model-level) | fleet crate: transport/envelope/locality/verification (13 tests) in-process; no real network, no consensus |
 | File metadata (timestamps, permissions beyond capability rights) | Not started | Currently no metadata beyond capability rights |
 | Delivery overhang as hard gate | Deliberately warning | Kernel enforces at delivery time (I2/I6); auditor is build-time cross-check, not enforcement |
@@ -170,7 +176,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 |-------|-------------|--------|
 | 0 | Architecture research + capability model | ✅ Done |
 | 1 | Boot + minimal kernel | ✅ Done (real + model): UEFI boot, page tables, ELF loader + relocations (13 parser tests), bare-metal kernel printing via COM1 serial under QEMU/OVMF (0 exceptions across 24576 ticks in a 40 s timer run). Honest limits: not run on physical hardware (VMware needed); per-process isolation added in Phase 2 |
-| 2 | Userspace resource managers + supervision tree | ✅ Done (real + model): GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework. **LAPIC timer verified under QEMU/TCG**: 8-entry GDT installed + TSS loaded (16-byte descriptor quirk), IDT gates deliver, periodic timer (~570 ticks/s) drives the idle loop. **Cooperative task switching verified under QEMU/TCG**: alpha/beta tasks interleave every 512 ticks at stable rsp, 6665/6665 interrupt rsp deltas = 0 (after fixing the resume-rsp drift — saved rsp had included the call's return address); still cooperative, still not run on physical hardware |
+| 2 | Userspace resource managers + supervision tree | ✅ Done (real + model): GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework. **LAPIC timer verified under QEMU/TCG**: 8-entry GDT installed + TSS loaded (16-byte descriptor quirk), IDT gates deliver, periodic timer (~570 ticks/s) drives the idle loop. **Cooperative task switching verified under QEMU/TCG**: alpha/beta tasks interleave every 512 ticks at stable rsp, 6665/6665 interrupt rsp deltas = 0 (after fixing the resume-rsp drift — saved rsp had included the call's return address); still cooperative, still not run on physical hardware. **Per-task memory isolation verified under QEMU**: iso-test task's kernel-only read #PFs and is killed (page-fault-driven isolation, fixed exception-stub arg order); still not run on physical hardware |
 | 3 | Driver framework (IOMMU) | ✅ Done (real + model): PCIe enumeration (6 tests), VT-d IOMMU domain isolation (5 tests), NVMe command queues (5 tests). Model: typed Block/Net/Gpu interfaces, crash containment, GPU isolation, compositor (4 tests). Honest limits: all hardware ops UNTESTED (need real PCIe/IOMMU/NVMe) |
 | 4 | Storage service + POSIX view | ✅ Done (model: FlatView is a flat, single-level namespace projection — create/read/write/delete/list by name. Not a hierarchical POSIX filesystem — no nested dirs, no path resolution, no permission bits, no symlinks. 8 contract tests) |
 | 5 | Networking stack | ✅ Done (real + model): VirtIO-net driver (9 tests), Ethernet frames (5), ARP (6), IPv4 (6). Model: loopback stack (4 tests). Honest limits: no real NIC hardware, no TCP/UDP yet |
@@ -235,3 +241,6 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `32fa2a0` | IPC: synchronous call/serve/reply + capabilities (`ipc_call`, `ipc_serve`, `ipc_reply`, `ipc_endpoint_create`, `ipc_cap_grant`); Ring-3 echo server/client demo; `set_ret` fix (writes to offset 112 = rax slot); `resume_ret` reads from same offset |
 | `cef6559` | Fix VMware triple-fault crash: idle loop shared KERNEL_STACK → dedicated idle stack (`cpu::IDLE_STACK_TOP`); `switch_to_idle_stack(entry)`; `IDLE_FRAME` initialized at boot; `context_cpl0_top(idle)` returns `idle_stack_top()`; `schedule_next` wrap-around fix (c+1 >= spawned maps to 0); verified QEMU + VMware, 0 exceptions |
 | `4c010de` | Fix CI: cargo fmt + clippy safety docs (7 `# Safety` doc comments added) |
+| `8a29c1b` | Per-task memory isolation via page-table U/S bits (verified under QEMU) |
+| `eacd5c4` | Fix exception stub arg order; verify per-task memory isolation under QEMU |
+| `d81ea68` | VGA text console: visible demo on QEMU/VMware display (vga.rs + font.rs, route SR2/SR4, palette + font upload verified; 4 new tests, 242 kernel tests total) |

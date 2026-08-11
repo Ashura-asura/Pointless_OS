@@ -3,6 +3,7 @@
 pub mod boot_info;
 pub mod cap;
 pub mod cpu;
+pub mod font;
 pub mod frame;
 pub mod gdt;
 pub mod idt;
@@ -13,7 +14,6 @@ pub mod scheduler;
 pub mod syscall;
 pub mod tasks;
 pub mod vga;
-pub mod font;
 
 pub mod iommu;
 pub mod nvme;

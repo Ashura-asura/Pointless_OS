@@ -4,7 +4,7 @@ An executable reference implementation of a capability-based operating system de
 
 ## Status
 
-364 tests passing, 0 failures (113 model, 238 aegis-kernel, 13 uefi-boot ELF parser). The reachable-authority auditor runs clean. The kernel boots under QEMU/OVMF: UEFI loader → page tables → bare-metal kernel (GDT/TSS/IDT, LAPIC timer, frame allocator) → **cooperative scheduler running two tasks (alpha/beta) that interleave every 512 timer ticks** — live-run verified, 0 exceptions. IPC (endpoints, call/serve/reply, capabilities) verified under both QEMU and VMware Workstation 26 with 0 exceptions.
+368 tests passing, 0 failures (113 model, 242 aegis-kernel, 13 uefi-boot ELF parser). The reachable-authority auditor runs clean. The kernel boots under QEMU/OVMF: UEFI loader → page tables → bare-metal kernel (GDT/TSS/IDT, LAPIC timer, frame allocator) → **cooperative scheduler running two tasks (alpha/beta) that interleave every 512 timer ticks** — live-run verified, 0 exceptions. IPC (endpoints, call/serve/reply, capabilities) verified under both QEMU and VMware Workstation 26 with 0 exceptions. Per-task memory isolation verified under QEMU (isolation-test task faults on a kernel-only read and is killed). The demo is now **visible on the VM display**: a VGA text console mirrors the whole boot log white-on-black (verified via screendump decoding).
 
 ## What Is Implemented
 
@@ -36,9 +36,10 @@ Proves six authority invariants (I1-I6) via TLA+ model checking (331k states, 0 
 - **ELF64 loader**: header validation, PT_LOAD parsing, R_X86_64_RELATIVE relocation application (13 tests)
 - **Bare-metal kernel**: COM1 serial, 4 GiB identity paging, frame allocator (bitmap over boot-info map; 157876 frames verified free live)
 - **GDT/TSS/IDT**: kernel + user selectors, TSS, exception stubs for vectors 0-31, DPL-3 `int 0x80` syscall gate
-- **Ring-3 user task**: a demo task dropped to CPL3 via `iretq` (user CS=0x1B/SS=0x23) and serviced by the `int 0x80` syscall gate (Write prints to COM1) — verified under QEMU/TCG: runs on its own user stack, preempted every tick alongside CPL0 tasks, 0 exceptions
+- **Ring-3 user task**: a demo task dropped to CPL3 via `iretq` (user CS=0x1B/SS=0x23) and serviced by the `int 0x80` syscall gate (Write prints to COM1 and the VGA console) — verified under QEMU/TCG: runs on its own user stack, preempted every tick alongside CPL0 tasks, 0 exceptions
 - **LAPIC timer**: periodic, vector 0x30, drives the tick counter (~570 ticks/s)
 - **Preemptive scheduler**: iretq-based `switch_frame`, the timer stub preempts round-robin every tick — tasks never yield, yet alpha/beta interleave every 2048 ticks at stable stack addresses, 0 exceptions
+- **VGA text console**: 80x25 white-on-black mirror of the COM1 stream (Bochs VBE disable, CRTC/GC/AC programming, 8x16 font uploaded into plane 2, 16-color DAC palette) — verified via screendump: glyphs decode to the exact Aegis log lines, pixels are black `000000` + white `ffffff`; text mode only, no GPU accel (run QEMU with `-display gtk` to watch the demo)
 
 ### Drivers, compat layers, orchestration (contract-tested model code)
 
@@ -48,9 +49,9 @@ PCIe/VT-d/NVMe drivers, VirtIO-net/Ethernet/ARP/IPv4, Linux syscall ABI + ELF lo
 
 - Physical hardware verification (needs VMware) — everything runs under QEMU/TCG
 - Priority/blocking scheduling — single fixed-priority round-robin; no wait queues
-- User-mode isolation — a ring-3 demo task + syscall gate exist and are verified under QEMU/TCG, but per-process *page-fault-driven* isolation (separate user page tables per process) is not built yet
+- User-mode isolation — per-task *page-fault-driven* isolation via U/S bits verified under QEMU (iso-test task faults on a kernel-only read and is killed); not run on physical hardware
 - Hypervisor-based Linux/Windows execution vehicles (WSL2-lineage design paths)
-- Real NIC traffic (no TCP/UDP), real GPU/display output, real input devices
+- Real NIC traffic (no TCP/UDP), real GPU-accelerated display output (a VGA text console works; no framebuffer graphics, no real input devices)
 - Cross-machine macaroon transport (in-process model only, no network)
 - SeL4-class inductive proof (TLA+ model-checking is finite-instance)
 

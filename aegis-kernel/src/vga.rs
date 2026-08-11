@@ -378,13 +378,10 @@ pub fn vga_enter_text_mode() {
         out_index(0x3CE, 0x06, 0x04);
         out_index(0x3CE, 0x05, 0x00);
         out_index(0x3CE, 0x04, 0x02);
+        let cell0 = *(0xA0000usize as *const u8);
         let mut font_a = [0u8; 16];
-        let mut cell0 = 0u8;
-        unsafe {
-            for i in 0..16usize {
-                font_a[i] = *(0xA0000usize as *const u8).add(0x41 * 32 + i);
-            }
-            cell0 = *(0xA0000usize as *const u8);
+        for (i, slot) in font_a.iter_mut().enumerate() {
+            *slot = *(0xA0000usize as *const u8).add(0x41 * 32 + i);
         }
         out_index(0x3CE, 0x05, 0x10);
         out_index(0x3CE, 0x04, 0x00);
@@ -398,8 +395,8 @@ pub fn vga_enter_text_mode() {
         // advances every 3rd byte (entries 0..=7).
         out8(0x3C7, 0);
         let mut dac = [0u8; 32];
-        for i in 0..32 {
-            dac[i] = in8(0x3C9);
+        for slot in dac.iter_mut() {
+            *slot = in8(0x3C9);
         }
         crate::sprintln!(
             "VGA READBACK seq0={:#04x} sr4={:#04x} gcmode={:#04x} gc6={:#04x} gcmap={:#04x} crtc_start={:02x}{:02x} cur={:02x}{:02x} misc={:#04x} vbe_enable={:#06x} dac0={:02x}{:02x}{:02x} dac1={:02x}{:02x}{:02x} dac7={:02x}{:02x}{:02x}",
