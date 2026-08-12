@@ -15,6 +15,7 @@ pub mod syscall;
 pub mod tasks;
 pub mod vga;
 
+pub mod fat;
 pub mod iommu;
 pub mod nvme;
 pub mod pci;

@@ -176,6 +176,73 @@ pub extern "sysv64" fn _start() -> ! {
         let g1 = aegis_kernel::nvme::gpt_signature_ok(ctrl.lba_data());
         sprintln!("Aegis: NVMe: LBA0: read {}, protective MBR {}", l0, g0);
         sprintln!("Aegis: NVMe: LBA1: read {}, GPT header {}", l1, g1);
+
+        // Real FAT16 read from live hardware: mount the ESP (starts at LBA
+        // 2048, matching uefi-boot/build_image.py's PART_START_LBA), walk
+        // EFI/BOOT/BOOTX64.EFI, and read back the kernel's own bootloader
+        // file's first sector. This is not the userspace object-store
+        // model — it's real BPB parsing, real directory-entry scanning,
+        // and real NVMe reads, end to end, from the live kernel.
+        const ESP_START_LBA: u64 = 2048;
+        if let Some(fs) = aegis_kernel::fat::mount(&mut ctrl, ESP_START_LBA) {
+            sprintln!("Aegis: FAT16: ESP mounted at LBA {}", ESP_START_LBA);
+            if let Some(efi_dir) =
+                aegis_kernel::fat::find_in_root(&mut ctrl, &fs, b"EFI     ", b"   ")
+            {
+                sprintln!(
+                    "Aegis: FAT16: found EFI/ (cluster {})",
+                    efi_dir.cluster
+                );
+                if let Some(boot_dir) = aegis_kernel::fat::find_in_subdir(
+                    &mut ctrl,
+                    &fs,
+                    efi_dir.cluster,
+                    b"BOOT    ",
+                    b"   ",
+                ) {
+                    sprintln!(
+                        "Aegis: FAT16: found EFI/BOOT/ (cluster {})",
+                        boot_dir.cluster
+                    );
+                    if let Some(bootx64) = aegis_kernel::fat::find_in_subdir(
+                        &mut ctrl,
+                        &fs,
+                        boot_dir.cluster,
+                        b"BOOTX64 ",
+                        b"EFI",
+                    ) {
+                        sprintln!(
+                            "Aegis: FAT16: found BOOTX64.EFI, {} bytes, cluster {}",
+                            bootx64.size,
+                            bootx64.cluster
+                        );
+                        let mut first_sector = [0u8; 512];
+                        if aegis_kernel::fat::read_first_sector(
+                            &mut ctrl,
+                            &fs,
+                            &bootx64,
+                            &mut first_sector,
+                        ) {
+                            let magic_ok = &first_sector[0..2] == b"MZ";
+                            sprintln!(
+                                "Aegis: FAT16: read BOOTX64.EFI first sector via NVMe — MZ signature: {}",
+                                magic_ok
+                            );
+                        } else {
+                            sprintln!("Aegis: FAT16: read of BOOTX64.EFI data failed");
+                        }
+                    } else {
+                        sprintln!("Aegis: FAT16: BOOTX64.EFI not found in EFI/BOOT/");
+                    }
+                } else {
+                    sprintln!("Aegis: FAT16: BOOT/ not found in EFI/");
+                }
+            } else {
+                sprintln!("Aegis: FAT16: EFI/ not found in root directory");
+            }
+        } else {
+            sprintln!("Aegis: FAT16: mount failed at LBA {}", ESP_START_LBA);
+        }
     } else {
         sprintln!("Aegis: NVMe: no controller with a mapped BAR");
     }
