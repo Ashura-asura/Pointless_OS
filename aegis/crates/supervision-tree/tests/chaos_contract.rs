@@ -38,13 +38,15 @@ fn budget_zero_trips_on_first_crash() {
     let mut w = world();
     let mut sup = Supervisor::new(w.root);
     let (a, a_cap) = spawn(&mut w, "svc-a");
-    let idx = sup.add(
-        &mut w.k,
-        "svc-a",
-        a,
-        a_cap,
-        RestartPolicy { max_restarts: 0 },
-    ).unwrap();
+    let idx = sup
+        .add(
+            &mut w.k,
+            "svc-a",
+            a,
+            a_cap,
+            RestartPolicy { max_restarts: 0 },
+        )
+        .unwrap();
 
     w.k.task_kill(w.root, a_cap).unwrap();
     sup.pump(&mut w.k);
@@ -68,27 +70,33 @@ fn interleaved_crashes_track_independently() {
     let (b, b_cap) = spawn(&mut w, "svc-b");
     let (c, c_cap) = spawn(&mut w, "svc-c");
 
-    let idx_a = sup.add(
-        &mut w.k,
-        "svc-a",
-        a,
-        a_cap,
-        RestartPolicy { max_restarts: 2 },
-    ).unwrap();
-    let idx_b = sup.add(
-        &mut w.k,
-        "svc-b",
-        b,
-        b_cap,
-        RestartPolicy { max_restarts: 1 },
-    ).unwrap();
-    let idx_c = sup.add(
-        &mut w.k,
-        "svc-c",
-        c,
-        c_cap,
-        RestartPolicy { max_restarts: 3 },
-    ).unwrap();
+    let idx_a = sup
+        .add(
+            &mut w.k,
+            "svc-a",
+            a,
+            a_cap,
+            RestartPolicy { max_restarts: 2 },
+        )
+        .unwrap();
+    let idx_b = sup
+        .add(
+            &mut w.k,
+            "svc-b",
+            b,
+            b_cap,
+            RestartPolicy { max_restarts: 1 },
+        )
+        .unwrap();
+    let idx_c = sup
+        .add(
+            &mut w.k,
+            "svc-c",
+            c,
+            c_cap,
+            RestartPolicy { max_restarts: 3 },
+        )
+        .unwrap();
 
     let c_before = census(&w.k, c);
 
@@ -141,13 +149,15 @@ fn rapid_crash_restart_cycle_stays_consistent() {
     let mut sup = Supervisor::new(w.root);
 
     let (a, a_cap) = spawn(&mut w, "svc-a");
-    let idx = sup.add(
-        &mut w.k,
-        "svc-a",
-        a,
-        a_cap,
-        RestartPolicy { max_restarts: 3 },
-    ).unwrap();
+    let idx = sup
+        .add(
+            &mut w.k,
+            "svc-a",
+            a,
+            a_cap,
+            RestartPolicy { max_restarts: 3 },
+        )
+        .unwrap();
 
     // 7 rapid cycles: 3 restarts within budget, then trip. After the trip,
     // pump() skips faulted subsystems — further crashes are not logged.
@@ -187,13 +197,15 @@ fn escalation_clears_budget_for_parent() {
     let mut parent = Supervisor::new(w.root);
 
     let (a, a_cap) = spawn(&mut w, "svc-a");
-    child.add(
-        &mut w.k,
-        "svc-a",
-        a,
-        a_cap,
-        RestartPolicy { max_restarts: 1 },
-    ).unwrap();
+    child
+        .add(
+            &mut w.k,
+            "svc-a",
+            a,
+            a_cap,
+            RestartPolicy { max_restarts: 1 },
+        )
+        .unwrap();
 
     // Trip the child.
     w.k.task_kill(w.root, a_cap).unwrap();
@@ -223,20 +235,24 @@ fn new_crash_during_existing_fault() {
 
     let (a, a_cap) = spawn(&mut w, "svc-a");
     let (b, b_cap) = spawn(&mut w, "svc-b");
-    let idx_a = sup.add(
-        &mut w.k,
-        "svc-a",
-        a,
-        a_cap,
-        RestartPolicy { max_restarts: 0 },
-    ).unwrap();
-    let idx_b = sup.add(
-        &mut w.k,
-        "svc-b",
-        b,
-        b_cap,
-        RestartPolicy { max_restarts: 2 },
-    ).unwrap();
+    let idx_a = sup
+        .add(
+            &mut w.k,
+            "svc-a",
+            a,
+            a_cap,
+            RestartPolicy { max_restarts: 0 },
+        )
+        .unwrap();
+    let idx_b = sup
+        .add(
+            &mut w.k,
+            "svc-b",
+            b,
+            b_cap,
+            RestartPolicy { max_restarts: 2 },
+        )
+        .unwrap();
 
     // Trip A immediately.
     w.k.task_kill(w.root, a_cap).unwrap();
@@ -263,20 +279,24 @@ fn budget_accounting_is_exact_under_interleave() {
 
     let (a, a_cap) = spawn(&mut w, "svc-a");
     let (b, b_cap) = spawn(&mut w, "svc-b");
-    let idx_a = sup.add(
-        &mut w.k,
-        "svc-a",
-        a,
-        a_cap,
-        RestartPolicy { max_restarts: 3 },
-    ).unwrap();
-    let idx_b = sup.add(
-        &mut w.k,
-        "svc-b",
-        b,
-        b_cap,
-        RestartPolicy { max_restarts: 3 },
-    ).unwrap();
+    let idx_a = sup
+        .add(
+            &mut w.k,
+            "svc-a",
+            a,
+            a_cap,
+            RestartPolicy { max_restarts: 3 },
+        )
+        .unwrap();
+    let idx_b = sup
+        .add(
+            &mut w.k,
+            "svc-b",
+            b,
+            b_cap,
+            RestartPolicy { max_restarts: 3 },
+        )
+        .unwrap();
 
     // 4 crashes each, alternating. After 3 restarts each, both breakers
     // trip on the 4th crash. Further crashes are skipped by pump().

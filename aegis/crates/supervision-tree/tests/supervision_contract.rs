@@ -54,20 +54,24 @@ fn crashes_are_restarted_within_budget_and_siblings_are_untouched() {
 
     let (a, a_cap) = spawn(&mut w, "svc-a");
     let (b, b_cap) = spawn(&mut w, "svc-b");
-    let idx_a = sup.add(
-        &mut w.k,
-        "svc-a",
-        a,
-        a_cap,
-        RestartPolicy { max_restarts: 3 },
-    ).unwrap();
-    let idx_b = sup.add(
-        &mut w.k,
-        "svc-b",
-        b,
-        b_cap,
-        RestartPolicy { max_restarts: 3 },
-    ).unwrap();
+    let idx_a = sup
+        .add(
+            &mut w.k,
+            "svc-a",
+            a,
+            a_cap,
+            RestartPolicy { max_restarts: 3 },
+        )
+        .unwrap();
+    let idx_b = sup
+        .add(
+            &mut w.k,
+            "svc-b",
+            b,
+            b_cap,
+            RestartPolicy { max_restarts: 3 },
+        )
+        .unwrap();
     let b_before = census(&w.k, b);
 
     // A crash before the first pump (or one detected on the next pulse):
@@ -116,20 +120,24 @@ fn the_circuit_breaker_trips_instead_of_retrying_forever() {
 
     let (a, a_cap) = spawn(&mut w, "svc-a");
     let (b, b_cap) = spawn(&mut w, "svc-b");
-    let idx_a = sup.add(
-        &mut w.k,
-        "svc-a",
-        a,
-        a_cap,
-        RestartPolicy { max_restarts: 3 },
-    ).unwrap();
-    let idx_b = sup.add(
-        &mut w.k,
-        "svc-b",
-        b,
-        b_cap,
-        RestartPolicy { max_restarts: 3 },
-    ).unwrap();
+    let idx_a = sup
+        .add(
+            &mut w.k,
+            "svc-a",
+            a,
+            a_cap,
+            RestartPolicy { max_restarts: 3 },
+        )
+        .unwrap();
+    let idx_b = sup
+        .add(
+            &mut w.k,
+            "svc-b",
+            b,
+            b_cap,
+            RestartPolicy { max_restarts: 3 },
+        )
+        .unwrap();
     let b_before = census(&w.k, b);
 
     // Four crashes against a budget of three restarts.
@@ -197,13 +205,15 @@ fn escalation_to_a_parent_renews_the_budget_for_the_whole_subsystem() {
 
     // A subsystem under a tight child budget.
     let (a, a_cap) = spawn(&mut w, "svc-a");
-    let idx_a = child.add(
-        &mut w.k,
-        "svc-a",
-        a,
-        a_cap,
-        RestartPolicy { max_restarts: 1 },
-    ).unwrap();
+    let idx_a = child
+        .add(
+            &mut w.k,
+            "svc-a",
+            a,
+            a_cap,
+            RestartPolicy { max_restarts: 1 },
+        )
+        .unwrap();
 
     // Crash; restart; crash again: the child's breaker trips after one.
     w.k.task_kill(w.root, a_cap).unwrap();
@@ -246,20 +256,24 @@ fn the_policy_decision_log_crosschecks_the_kernel_audit() {
 
     let (a, a_cap) = spawn(&mut w, "svc-a");
     let (b, b_cap) = spawn(&mut w, "svc-b");
-    let _ia = sup.add(
-        &mut w.k,
-        "svc-a",
-        a,
-        a_cap,
-        RestartPolicy { max_restarts: 2 },
-    ).unwrap();
-    let _ib = sup.add(
-        &mut w.k,
-        "svc-b",
-        b,
-        b_cap,
-        RestartPolicy { max_restarts: 1 },
-    ).unwrap();
+    let _ia = sup
+        .add(
+            &mut w.k,
+            "svc-a",
+            a,
+            a_cap,
+            RestartPolicy { max_restarts: 2 },
+        )
+        .unwrap();
+    let _ib = sup
+        .add(
+            &mut w.k,
+            "svc-b",
+            b,
+            b_cap,
+            RestartPolicy { max_restarts: 1 },
+        )
+        .unwrap();
 
     let log = |s: &Supervisor| {
         s.log()

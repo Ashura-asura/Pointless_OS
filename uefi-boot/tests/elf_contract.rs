@@ -177,7 +177,7 @@ fn parse_relocations(data: &[u8]) -> Result<Vec<Relocation>, ElfError> {
         if name != b".rela.dyn" && name != b".rela.plt" {
             continue;
         }
-        if sec_offset + sec_size > data.len() || !sec_size.is_multiple_of(24) {
+        if sec_offset + sec_size > data.len() || sec_size % 24 != 0 {
             return Err(ElfError);
         }
 
