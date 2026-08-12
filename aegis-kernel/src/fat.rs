@@ -33,7 +33,7 @@ impl Fat16Info {
 
     fn root_dir_sectors(&self) -> usize {
         // 32-byte entries, rounded up to a whole sector.
-        ((self.root_entries as usize * 32) + BYTES_PER_SECTOR - 1) / BYTES_PER_SECTOR
+        (self.root_entries as usize * 32).div_ceil(BYTES_PER_SECTOR)
     }
 
     fn data_area_start_lba(&self) -> Option<u64> {
@@ -54,7 +54,8 @@ impl Fat16Info {
 }
 
 fn u16_at(b: &[u8], off: usize) -> Option<u16> {
-    b.get(off..off + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+    b.get(off..off + 2)
+        .map(|s| u16::from_le_bytes([s[0], s[1]]))
 }
 
 fn u32_at(b: &[u8], off: usize) -> Option<u32> {

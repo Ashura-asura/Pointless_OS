@@ -189,10 +189,7 @@ pub extern "sysv64" fn _start() -> ! {
             if let Some(efi_dir) =
                 aegis_kernel::fat::find_in_root(&mut ctrl, &fs, b"EFI     ", b"   ")
             {
-                sprintln!(
-                    "Aegis: FAT16: found EFI/ (cluster {})",
-                    efi_dir.cluster
-                );
+                sprintln!("Aegis: FAT16: found EFI/ (cluster {})", efi_dir.cluster);
                 if let Some(boot_dir) = aegis_kernel::fat::find_in_subdir(
                     &mut ctrl,
                     &fs,

@@ -414,7 +414,7 @@ mod tests {
         // A device lying about a 64-bit BAR at the final slot (index 5) has
         // no room for the high half. Must not index bar[6] (panic); treat the
         // high half as absent and return the low part only.
-        let mut dev = PciDevice {
+        let dev = PciDevice {
             address: PciAddress::new(0, 0, 0),
             vendor_id: 0,
             device_id: 0,
