@@ -150,6 +150,36 @@ pub extern "sysv64" fn _start() -> ! {
         sprintln!("Aegis: PCI: NVMe controller present");
     }
 
+    // Live NVMe demo: probe BAR0, reset, admin + IO queues, identify, read
+    // LBA 0/1 and check the GPT signature (disk image is GPT-partitioned).
+    if let Some(mut ctrl) = aegis_kernel::nvme::NvmeController::probe(&pci) {
+        sprintln!(
+            "Aegis: NVMe: BAR {:x} CAP=0x{:08X} VS=0x{:08X}",
+            ctrl.bar_addr,
+            ctrl.cap(),
+            ctrl.vs()
+        );
+        let ok = ctrl.reset_and_ready();
+        sprintln!("Aegis: NVMe: admin queues ready: {}", ok);
+        let ok = ok && ctrl.create_io_queues();
+        sprintln!("Aegis: NVMe: IO queues created: {}", ok);
+        let ok = ok && ctrl.identify();
+        sprintln!("Aegis: NVMe: identify: {}", ok);
+        if ok {
+            sprintln!("Aegis: NVMe: model {}", ctrl.identify_model());
+            sprintln!("Aegis: NVMe: firmware {}", ctrl.identify_firmware());
+            sprintln!("Aegis: NVMe: ns 1 x {} B", ctrl.ns_size());
+        }
+        let l0 = ctrl.read_lba(0);
+        let g0 = aegis_kernel::nvme::mbr_protective_ok(ctrl.lba_data());
+        let l1 = ctrl.read_lba(1);
+        let g1 = aegis_kernel::nvme::gpt_signature_ok(ctrl.lba_data());
+        sprintln!("Aegis: NVMe: LBA0: read {}, protective MBR {}", l0, g0);
+        sprintln!("Aegis: NVMe: LBA1: read {}, GPT header {}", l1, g1);
+    } else {
+        sprintln!("Aegis: NVMe: no controller with a mapped BAR");
+    }
+
     unsafe {
         aegis_kernel::cpu::init_lapic_timer();
     }

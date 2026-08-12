@@ -7,10 +7,10 @@
 Test counts are kept separate on purpose: `aegis-kernel` is a **standalone bare-metal crate that is NOT a member of the `aegis` workspace**, so its tests are never covered by `cargo test --workspace`.
 
 - **aegis workspace (model crates):** 113 contract tests, 0 failures — `cargo test --workspace` from a clean lockfile (Rule 1/10).
-- **aegis-kernel (bare-metal, separate crate):** 250 contract tests, 0 failures — `cargo test` on the host target; the ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
+- **aegis-kernel (bare-metal, separate crate):** 251 contract tests, 0 failures — `cargo test` on the host target; the ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
 - **uefi-boot:** 13 ELF parser contract tests.
 
-Combined contract-test count across all crates: **376**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
+Combined contract-test count across all crates: **377**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -45,6 +45,7 @@ A single-threaded, in-process capability kernel with:
 | ELF64 parser | 13 | Validates ELF headers (magic, class, endianness, type, machine), parses PT_LOAD segments, parses `.rela.dyn`/`.rela.plt` relocation entries, applies R_X86_64_RELATIVE, rejects symbolic relocation types, rejects invalid binaries |
 | Bare-metal kernel | — | `#![no_std]` entry point, 4GB identity paging, COM1 serial output, **frame allocator** (bitmap, 4 GiB/1 MiB frames; fed by the boot-info map; reserves `[0, image_end)` + the handoff page). **VERIFIED under QEMU/OVMF**: prints banner, kernel-started, page tables up, CR3, own GDT + TSS, IDT + PIC masked, APIC timer armed, boot-info consumed (120 descriptors, 485 MB conventional), allocator stats + live alloc/free probe (157876 frames free; first frame exactly one page above the 0x30000 image end) and idle-loops printing `Aegis: tick = ... (timer alive)` — 24576 ticks over a 40 s run, zero exceptions |
 | Disk image builder | — | Creates 16MB GPT+FAT16 image with `/EFI/BOOT/BOOTX64.EFI` |
+| NVMe storage driver | — | QEMU q35 NVMe controller (BAR0 `0xC000000000`, 768 GiB, above the 4 GiB identity map). **VERIFIED under QEMU/TCG**: probe → reset (admin SQES 64 B / CQES 16 B) → create IO SQ+CQ (qid 1) → identify (model `QEMU NVMe Ctrl`, firmware `11.0.50`, namespace 1 = 16 MiB) → polled LBA0/LBA1 reads; LBA0 protective-MBR signature and LBA1 GPT `EFI PART` header both verify, **0 exceptions**. 64-bit MMIO mapped via kernel PML4[1]/PDPT[256]/PD[0]/PT[0] (4 KiB NX pages). Completion phase tag is bit 16 of D3 (status field = bits 17+); initial phase = 1. UNTESTED on real hardware |
 
 ### Real process isolation (aegis-kernel)
 | Component | Tests | What it proves |

@@ -75,6 +75,16 @@ static mut KERNEL_PT_LOW0: PageTable = PageTable::new();
 static mut SCRATCH_PD: PageTable = PageTable::new();
 static mut SCRATCH_PT: PageTable = PageTable::new();
 
+// 64-bit device BAR window: QEMU's q35 machine assigns the NVMe controller's
+// BAR0 above 4 GiB (0xC000000000 = 768 GiB). PML4[1] -> DEV_HI_PDPT (slot 256
+// = GB 768) -> DEV_HI_PD (2 MB pages, NX) -> DEV_HI_PT (first 2 MB split into
+// 4 KB NX pages so TCG can take MMIO through them, same pattern as the LAPIC).
+static mut DEV_HI_PDPT: PageTable = PageTable::new();
+static mut DEV_HI_PD: PageTable = PageTable::new();
+static mut DEV_HI_PT: PageTable = PageTable::new();
+
+pub const DEVICE_BAR_WINDOW: u64 = 0xC000000000;
+
 const LAPIC_PHYS: u64 = 0xFEE0_0000;
 
 /// Page index (4 KB) of a virtual address.
@@ -218,6 +228,9 @@ pub unsafe fn init_kernel_tables() {
     pt_low0.clear();
     pd.clear();
     pt.clear();
+    (&raw mut DEV_HI_PDPT).as_mut().unwrap().clear();
+    (&raw mut DEV_HI_PD).as_mut().unwrap().clear();
+    (&raw mut DEV_HI_PT).as_mut().unwrap().clear();
 
     // Executable window of the kernel image. Everything outside it is NX.
     let window = kernel_text_window();
@@ -262,6 +275,35 @@ pub unsafe fn init_kernel_tables() {
     // Link PDPT into PML4. NO USER flag — ring-3 cannot access any memory
     // through the kernel PML4. Per-user PML4s share the upper-half entries.
     pml4.entries[0] = core::ptr::addr_of!(KERNEL_PDPT) as u64 | PRESENT | WRITABLE;
+
+    // 64-bit device BAR window at 0xC000000000 (PML4[1] -> PDPT[256] -> PD[0]).
+    // 2 MB NX pages by default; the first 2 MB is split into DEV_HI_PT 4 KB
+    // pages so TCG can take MMIO (same reason as the LAPIC breakout).
+    let dev_pdpt = (&raw mut DEV_HI_PDPT).as_mut().unwrap();
+    let dev_pd = (&raw mut DEV_HI_PD).as_mut().unwrap();
+    let dev_pt = (&raw mut DEV_HI_PT).as_mut().unwrap();
+    let dev_pdpt_idx = ((DEVICE_BAR_WINDOW >> 30) & 0x1FF) as usize; // 256
+    dev_pdpt.entries[dev_pdpt_idx] = core::ptr::addr_of!(DEV_HI_PD) as u64 | PRESENT | WRITABLE;
+    for i in 0..512u64 {
+        dev_pd.entries[i as usize] =
+            (DEVICE_BAR_WINDOW + i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX;
+    }
+    dev_pd.entries[0] = core::ptr::addr_of!(DEV_HI_PT) as u64 | PRESENT | WRITABLE;
+    for i in 0..512u64 {
+        dev_pt.entries[i as usize] = (DEVICE_BAR_WINDOW + i * 0x1000) | PRESENT | WRITABLE | NX;
+    }
+    pml4.entries[1] = core::ptr::addr_of!(DEV_HI_PDPT) as u64 | PRESENT | WRITABLE;
+
+    // DIAG for the NVMe open problem: dump the four page-walk qwords the CPU
+    // will read when translating 0xC000000000.
+    crate::sprintln!(
+        "Aegis: DIAG walk CR3=0x{:X} pml4[1]=0x{:X} pdpt[256]=0x{:X} pd[0]=0x{:X} pt[0]=0x{:X}",
+        core::ptr::addr_of!(KERNEL_PML4) as u64,
+        pml4.entries[1],
+        dev_pdpt.entries[dev_pdpt_idx],
+        dev_pd.entries[0],
+        dev_pt.entries[0]
+    );
 }
 
 /// Create a per-user-task PML4 with memory isolation.
@@ -461,6 +503,12 @@ mod tests {
         assert_eq!(pdpt_index(0x40000000), 1);
         assert_eq!(pdpt_index(0xFEE00000), pdpt_index(0xFEE0_0000));
         assert_eq!(pt_index(0), 0);
+        // 0xC000000000 = 768 GiB: PML4 index 1 (bits 47:39), PDPT slot 256
+        // (bits 38:30), PD slot 0, PT slot 0.
+        assert_eq!((0xC000000000u64 >> 39) & 0x1FF, 1);
+        assert_eq!(pdpt_index(0xC000000000), 256);
+        assert_eq!(pd_index(0xC000000000), 0);
+        assert_eq!(pt_index(0xC000000000), 0);
     }
 
     #[test]

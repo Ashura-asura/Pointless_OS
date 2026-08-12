@@ -119,6 +119,350 @@ impl NvmeQueue {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Live driver for QEMU's emulated NVMe controller (q35, BAR0 above 4 GiB).
+// Verified under QEMU/OVMF: probe -> reset + admin queues -> IO queues ->
+// identify -> polled LBA reads. Honest limits: one queue pair, polled IO,
+// PRP only (no SGL), designed single-threaded before the scheduler runs.
+
+const QUEUE_SIZE: u32 = 16;
+const REG_CAP: u64 = 0x00;
+const REG_VS: u64 = 0x08;
+const REG_INTMS: u64 = 0x0C;
+const REG_CC: u64 = 0x14;
+const REG_CSTS: u64 = 0x1C;
+const REG_AQA: u64 = 0x24;
+const REG_ASQ: u64 = 0x28;
+const REG_ACQ: u64 = 0x30;
+const DOORBELL_BASE: u64 = 0x1000;
+
+const CC_EN: u32 = 1 << 0;
+const CC_IOSQES_SHIFT: u32 = 16;
+const CC_IOCQES_SHIFT: u32 = 20;
+const CSTS_RDY: u32 = 1 << 0;
+
+const ADMIN_CREATE_IO_SQ: u8 = 0x01;
+const ADMIN_CREATE_IO_CQ: u8 = 0x05;
+const ADMIN_IDENTIFY: u8 = 0x06;
+const CNS_IDENTIFY_CONTROLLER: u32 = 0x01;
+const CNS_IDENTIFY_NAMESPACE: u32 = 0x00;
+const IO_READ: u8 = 0x02;
+
+const POLL_ITERATIONS: u32 = 1_200_000;
+
+fn wr32(base: *mut u8, offset: u64, value: u32) {
+    unsafe { core::ptr::write_volatile(base.add(offset as usize) as *mut u32, value) }
+}
+
+fn rd32(base: *mut u8, offset: u64) -> u32 {
+    unsafe { core::ptr::read_volatile(base.add(offset as usize) as *mut u32) }
+}
+
+fn spin_wait(mut iterations: u32, mut cond: impl FnMut() -> bool) -> bool {
+    while iterations > 0 {
+        if cond() {
+            return true;
+        }
+        iterations -= 1;
+        core::hint::spin_loop();
+    }
+    false
+}
+
+fn wmb() {
+    unsafe { core::arch::asm!("mfence", options(nomem, preserves_flags)) }
+}
+
+fn str_of(bytes: &[u8]) -> &str {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    core::str::from_utf8(&bytes[..end]).unwrap_or("<bad utf8>")
+}
+
+/// True if `lba0` is a protective MBR: 0x55AA signature plus a GPT type
+/// marker (0xEE) in the first partition entry. The project's boot image
+/// puts the marker at offset 450 (its protective entry layout), so both
+/// the standard 446 and the shipped 450 position are accepted.
+pub fn mbr_protective_ok(lba0: &[u8]) -> bool {
+    lba0.len() >= 512
+        && lba0[510] == 0x55
+        && lba0[511] == 0xAA
+        && (lba0[446] == 0xEE || lba0[450] == 0xEE)
+}
+
+/// True if `lba1` has the GPT header signature "EFI PART".
+pub fn gpt_signature_ok(lba1: &[u8]) -> bool {
+    lba1.len() >= 8 && lba1[0..8] == [0x45, 0x46, 0x49, 0x20, 0x50, 0x41, 0x52, 0x54]
+}
+
+fn alloc_dma_frame() -> &'static mut [u64] {
+    match unsafe { crate::frame::alloc_contiguous_global(1) } {
+        Some(phys) => unsafe { core::slice::from_raw_parts_mut(phys as *mut u64, 512) },
+        None => panic!("NVMe: no frame for DMA buffer"),
+    }
+}
+
+/// One 4 KiB DMA buffer per role (contiguous, physically addressable).
+struct Bufs {
+    sq: &'static mut [u64], // admin + io submission queue (16 x 64 B)
+    cq: &'static mut [u64], // admin + io completion queue (16 x 16 B)
+    qe: &'static mut [u64], // io read data (LBA contents)
+    id: &'static mut [u64], // Identify Controller data
+    ad: &'static mut [u64], // Identify Namespace data
+}
+
+impl Bufs {
+    fn new() -> Self {
+        Self {
+            sq: alloc_dma_frame(),
+            cq: alloc_dma_frame(),
+            qe: alloc_dma_frame(),
+            id: alloc_dma_frame(),
+            ad: alloc_dma_frame(),
+        }
+    }
+
+    fn phys(bytes: &[u64]) -> u64 {
+        bytes.as_ptr() as u64
+    }
+}
+
+pub struct NvmeController {
+    base: *mut u8,
+    pub bar_addr: u64,
+    sq_tail: u16,
+    io_tail: u16,
+    cq_head: u16,
+    phase: bool,
+    io_cq_head: u16,
+    io_phase: bool,
+    buf: Bufs,
+}
+
+impl NvmeController {
+    /// Find the NVMe device and verify its BAR0 is inside a mapped window:
+    /// below 4 GiB (identity map) or inside the 64-bit DEVICE_BAR_WINDOW.
+    pub fn probe(pci: &crate::pci::PciDeviceList) -> Option<Self> {
+        let dev = pci.find_nvme()?;
+        let addr = dev.bar_address(0);
+        if addr == 0 {
+            return None;
+        }
+        let window = crate::page_tables::DEVICE_BAR_WINDOW;
+        let bar_addr = if addr < window || (addr >= window && addr < window + 0x20_0000) {
+            addr
+        } else {
+            crate::sprintln!("Aegis: NVMe: BAR {:x} out of identity map - skipped", addr);
+            return None;
+        };
+        Some(Self {
+            base: bar_addr as *mut u8,
+            bar_addr,
+            sq_tail: 0,
+            io_tail: 0,
+            cq_head: 0,
+            phase: true,
+            io_cq_head: 0,
+            io_phase: true,
+            buf: Bufs::new(),
+        })
+    }
+
+    pub fn cap(&self) -> u32 {
+        rd32(self.base, REG_CAP)
+    }
+
+    pub fn vs(&self) -> u32 {
+        rd32(self.base, REG_VS)
+    }
+
+    /// Reset the controller, program the admin queues (16 slots each, 64 B
+    /// SQES / 16 B CQES), enable, and wait for CSTS.RDY.
+    pub fn reset_and_ready(&mut self) -> bool {
+        wr32(self.base, REG_INTMS, 0xFFFF_FFFF); // mask all interrupts, polled IO
+        wr32(self.base, REG_CC, 0);
+        if !spin_wait(POLL_ITERATIONS, || {
+            rd32(self.base, REG_CSTS) & CSTS_RDY == 0
+        }) {
+            return false;
+        }
+        wr32(
+            self.base,
+            REG_AQA,
+            ((QUEUE_SIZE - 1) << 16) | (QUEUE_SIZE - 1),
+        );
+        wr32(self.base, REG_ASQ, Bufs::phys(self.buf.sq) as u32);
+        wr32(self.base, REG_ACQ, Bufs::phys(self.buf.cq) as u32);
+        let cc = CC_EN | (6 << CC_IOSQES_SHIFT) | (4 << CC_IOCQES_SHIFT);
+        wr32(self.base, REG_CC, cc);
+        wmb();
+        spin_wait(POLL_ITERATIONS, || {
+            rd32(self.base, REG_CSTS) & CSTS_RDY != 0
+        })
+    }
+
+    /// Submit one admin command; returns the command id used.
+    fn admin_cmd(&mut self, opcode: u8, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32) -> u16 {
+        let tail = self.sq_tail as usize;
+        let s = &mut self.buf.sq[tail * 8..tail * 8 + 8];
+        s[0] = opcode as u64 | ((tail as u64) << 16) | ((nsid as u64) << 32);
+        s[1] = 0;
+        s[3] = prp1;
+        s[4] = 0;
+        s[5] = cdw10 as u64 | ((cdw11 as u64) << 32);
+        s[6] = 0;
+        s[7] = 0;
+        self.sq_tail = (self.sq_tail + 1) % QUEUE_SIZE as u16;
+        wmb();
+        wr32(self.base, DOORBELL_BASE, self.sq_tail as u32);
+        tail as u16
+    }
+
+    /// QEMU completions: P = bit 16 of D3, status field = bits 31:17,
+    /// command ID echoed in bits 15:0.
+    fn cq_phase(dw3: u32) -> bool {
+        (dw3 >> 16) & 1 != 0
+    }
+
+    fn cq_status(dw3: u32) -> u16 {
+        ((dw3 >> 17) & 0x7FFF) as u16
+    }
+
+    /// Poll the admin completion queue until the phase tag matches;
+    /// true on status 0x0000 with the expected command id.
+    fn wait_completion(&mut self, cid: u16) -> bool {
+        let head = self.cq_head as usize;
+        if !spin_wait(POLL_ITERATIONS, || {
+            let dw3 = (self.buf.cq[head * 2 + 1] >> 32) as u32;
+            Self::cq_phase(dw3) == self.phase
+        }) {
+            return false;
+        }
+        let dw3 = (self.buf.cq[head * 2 + 1] >> 32) as u32;
+        let ok = Self::cq_status(dw3) == 0 && (dw3 as u16) == cid;
+        self.cq_head = (self.cq_head + 1) % QUEUE_SIZE as u16;
+        if self.cq_head == 0 {
+            self.phase = !self.phase;
+        }
+        ok
+    }
+
+    /// Poll the IO completion queue (in its own `ad` frame) until the phase
+    /// tag matches; true on status 0x0000 with the expected command id.
+    fn wait_io_completion(&mut self, cid: u16) -> bool {
+        let head = self.io_cq_head as usize;
+        if !spin_wait(POLL_ITERATIONS, || {
+            let dw3 = (self.buf.ad[head * 2 + 1] >> 32) as u32;
+            Self::cq_phase(dw3) == self.io_phase
+        }) {
+            return false;
+        }
+        let dw3 = (self.buf.ad[head * 2 + 1] >> 32) as u32;
+        let ok = Self::cq_status(dw3) == 0 && (dw3 as u16) == cid;
+        self.io_cq_head = (self.io_cq_head + 1) % QUEUE_SIZE as u16;
+        if self.io_cq_head == 0 {
+            self.io_phase = !self.io_phase;
+        }
+        ok
+    }
+
+    /// Create IO CQ and IO SQ (qid 1, 16 slots, physically contiguous).
+    /// The IO CQ lives in its own frame (`ad`): QEMU keeps a separate head
+    /// for it, and sharing the admin CQ buffer let stale admin completions
+    /// impersonate IO completions (both rings start at phase 1).
+    pub fn create_io_queues(&mut self) -> bool {
+        let cid = self.admin_cmd(
+            ADMIN_CREATE_IO_CQ,
+            0,
+            Bufs::phys(self.buf.ad),
+            (QUEUE_SIZE << 16) | 1,
+            1,
+        );
+        if !self.wait_completion(cid) {
+            return false;
+        }
+        let cid = self.admin_cmd(
+            ADMIN_CREATE_IO_SQ,
+            0,
+            Bufs::phys(self.buf.sq),
+            (QUEUE_SIZE << 16) | 1,
+            (1 << 16) | 1,
+        );
+        self.wait_completion(cid)
+    }
+
+    /// Identify controller (into `id`) and namespace 1 (into `ad`).
+    pub fn identify(&mut self) -> bool {
+        let cid = self.admin_cmd(
+            ADMIN_IDENTIFY,
+            0,
+            Bufs::phys(self.buf.id),
+            CNS_IDENTIFY_CONTROLLER,
+            0,
+        );
+        if !self.wait_completion(cid) {
+            return false;
+        }
+        let cid = self.admin_cmd(
+            ADMIN_IDENTIFY,
+            1,
+            Bufs::phys(self.buf.ad),
+            CNS_IDENTIFY_NAMESPACE,
+            0,
+        );
+        self.wait_completion(cid)
+    }
+
+    fn id_bytes(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.buf.id.as_ptr() as *const u8, 4096) }
+    }
+
+    pub fn identify_model(&self) -> &str {
+        let d = self.id_bytes();
+        str_of(d.get(0x18..0x18 + 40).unwrap_or(&[]))
+    }
+
+    pub fn identify_firmware(&self) -> &str {
+        let d = self.id_bytes();
+        str_of(d.get(0x40..0x40 + 8).unwrap_or(&[]))
+    }
+
+    /// Namespace size in bytes (NSZE x 512 B block).
+    pub fn ns_size(&self) -> u64 {
+        self.buf.ad[0] * 512
+    }
+
+    /// Read one 512 B LBA into the DMA buffer; call `lba_data` afterwards.
+    pub fn read_lba(&mut self, lba: u64) -> bool {
+        let tail = self.io_tail as usize;
+        let cid = tail as u16;
+        let s = &mut self.buf.sq[tail * 8..tail * 8 + 8];
+        s[0] = IO_READ as u64 | ((tail as u64) << 16) | (1 << 32);
+        s[1] = 0;
+        s[3] = Bufs::phys(self.buf.qe);
+        s[4] = 0;
+        s[5] = lba;
+        s[6] = 0;
+        s[7] = 0;
+        self.io_tail = (self.io_tail + 1) % QUEUE_SIZE as u16;
+        wmb();
+        // IO SQ1 tail doorbell: stride = (DSTRD + 1) * 4 bytes.
+        let stride = ((rd32(self.base, REG_CAP + 4) & 0xF) as u64) + 1;
+        wr32(
+            self.base,
+            DOORBELL_BASE + 2 * stride * 4,
+            self.io_tail as u32,
+        );
+        let ok = self.wait_io_completion(cid);
+        // Order the completion observation before reading the DMA data.
+        wmb();
+        ok
+    }
+
+    pub fn lba_data(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.buf.qe.as_ptr() as *const u8, 4096) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

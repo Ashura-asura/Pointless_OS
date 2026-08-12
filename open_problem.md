@@ -1,9 +1,9 @@
 # Open Problems — Pointless OS / Aegis Boot
 
-*Last updated: 2026-08-12. Session state at commit `bf78794` (PCI live enumeration follows).*
+*Last updated: 2026-08-12. Session state at commit `8338a97` (PCI live enumeration) + uncommitted NVMe live-I/O work on top.*
 
 ## Current Status
-All critical issues have been resolved. The kernel boots and runs in both QEMU and VMware Workstation 26 with 0 exceptions. The IPC system (endpoints, call/serve/reply, capabilities) is functional at the model level. The boot demo is now **visible on the VM display** — a VGA text console mirrors the COM1 log white-on-black (verified via screendump glyph decoding).
+All critical issues have been resolved. The kernel boots and runs in both QEMU and VMware Workstation 26 with 0 exceptions. Live **NVMe block I/O** is now verified under QEMU/OVMF (probe → admin+IO queues → identify → LBA0/LBA1 reads, 0 exceptions). The IPC system (endpoints, call/serve/reply, capabilities) is functional at the model level. The boot demo is now **visible on the VM display** — a VGA text console mirrors the COM1 log white-on-black (verified via screendump glyph decoding).
 
 ### Honest Limits
 - The kernel is a **single-threaded in-process model** — all contract tests are deterministic model logic, not real hardware isolation.
@@ -23,6 +23,7 @@ All critical issues have been resolved. The kernel boots and runs in both QEMU a
 - ✅ **CI workflows** — `.github/workflows/ci.yml` (kernel+UEFI builds, clippy) and `.github/workflows/test.yml` (fmt, clippy, test for `aegis` workspace + `aegis-kernel`). 242 tests pass.
 - ✅ **Blank/garbled VM display** — the GTK window showed no text or wrong glyphs. Root causes (all fixed in `aegis-kernel/src/vga.rs`): SR4 chain4 bit made QEMU scatter text writes by `addr&3`; SR2=0x0F let the odd/even parity rule stamp plane 2 (the font area) with screen characters (SR2=0x03 keeps chars on plane 0 / attrs on plane 1); a 0x3C0 readback during the flip-flop data phase corrupted `ar[0]` (green background); cursor + light-gray attr cleaned up. Verified: plane-2 glyph probe returns the embedded font, DAC readback matches the palette, screendump decodes to the exact Aegis log lines, pixels = black `000000` bg + white `ffffff` fg.
 - ✅ **NX bit enforcement** — every non-code mapping (kernel stacks/BSS, VGA framebuffer, LAPIC MMIO, ring-3 stacks) is now NX; the executable window is the kernel image's R+X PT_LOAD parsed from the ELF at runtime; per-user PML4s clone the low tables (USER bits never leak into shared kernel tables); IA32_EFER.NXE set explicitly. Ring-3 page faults now KILL the faulting task and resume the scheduler instead of halting the whole kernel. Verified: boot banner prints the parsed text window, `nx-test` fetching from 0xB8000 faults with the NX instruction-fetch bit, isolation-test + nx-test + IPC demo all complete in one boot, 0 exceptions.
+- ✅. **NVMe live I/O (64-bit BAR MMIO)** — QEMU q35 places the NVMe BAR0 at `0xC000000000` (768 GiB), above the 4 GiB identity map. The boot hang / `#PF` (not-present) at the BAR was two bugs: (a) `DEVICE_BAR_WINDOW` was `0xC000_0000_0000` (192 TiB), so the page-table mapping targeted the wrong address and the CPU faulted at the real 768 GiB BAR; (b) the IO completion queue shared the admin CQ DMA buffer, so stale admin completions impersonated IO completions. Fixed: window constant = `0xC000000000` (kernel PML4[1]/PDPT[256]/PD[0]/PT[0], 4 KiB NX pages), IO CQ moved to its own DMA frame, NSID placed in SQE dword 1 (bits 32-63 of slot 0) and the completion phase tag decoded from bit 16 of D3 (status field = bits 17+, initial phase = 1). Verified under QEMU/TCG: admin+IO queues, identify (model `QEMU NVMe Ctrl`, firmware `11.0.50`, namespace 1 = 16 MiB), LBA0 protective-MBR + LBA1 GPT-header reads, **0 exceptions**.
 
 ### Verified
 - ✅ **QEMU**: `echo reply: ping from client`, 0 exceptions, 11k+ lines of output
@@ -30,6 +31,7 @@ All critical issues have been resolved. The kernel boots and runs in both QEMU a
 - ✅ **QEMU**: per-task memory isolation — `iso-test` task's kernel-only read #PFs, task killed, kernel keeps running
 - ✅ **QEMU**: NX enforcement — only kernel text executable; `nx-test` instruction fetch from 0xB8000 #PFs (NX bit set in error code), task killed, kernel keeps running (0 exceptions, 13k ticks)
 - ✅ **QEMU**: live PCI enumeration (q35) — 6 devices found on bus 0 via legacy 0xCF8/0xCFC ports: host bridge 8086:29C0, stdvga 1234:1111 (2 MMIO BARs), e1000e 8086:10D3, ICH9 ISA bridge, AHCI SATA 8086:2922 (5 BARs: 4 MMIO + 2 IO), SMBus; VID/DID/class/prog-if/rev/BARs decode correctly in the boot log
+- ✅. **QEMU**: NVMe live block I/O — `nvme=deadbeef` device on q35; kernel probes BAR0 `0xC000000000` (768 GiB), resets + programs 64 B admin SQ / 16 B CQ, creates IO SQ+CQ (qid 1), identifies (model `QEMU NVMe Ctrl`, firmware `11.0.50`, ns 1 = 16 MiB), and reads LBA0/LBA1 with polled completions; LBA0 protective-MBR and LBA1 GPT `EFI PART` signatures verify, **0 exceptions** across the boot
 - ✅ **VMware**: idle stack at `0x34000`, full IPC flow (`ipc_serve`→`ipc_call`→`ipc_serve`→`echo reply`), 0 exceptions, runs past tick 4200
 
 ## What Was Built

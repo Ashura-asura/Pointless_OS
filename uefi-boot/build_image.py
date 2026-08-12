@@ -114,6 +114,10 @@ def build_gpt(fs):
     last_lba = TOTAL_SECTORS - 1
 
     # --- protective MBR ---
+    # NOTE: kept byte-compatible with the original working image (the 0xEE
+    # type marker sits at offset 450 rather than the strictly standard 446);
+    # OVMF's partition driver accepts it either way, and the kernel's GPT
+    # probe accepts both marker positions.
     mbr = bytearray(BYTES_PER_SECTOR)
     mbr[450] = 0xEE  # partition type GPT
     struct.pack_into("<I", mbr, 454, 1)  # first LBA
@@ -199,6 +203,8 @@ def verify(disk, efi_data):
     struct.pack_into("<I", bgpt_copy, 16, 0)
     if struct.unpack_from("<I", bgpt, 16)[0] != (zlib.crc32(bytes(bgpt_copy[:hdr_len])) & 0xFFFFFFFF):
         errors.append("backup GPT header CRC mismatch")
+    if disk[450] != 0xEE:
+        errors.append("protective MBR partition type missing")
     if struct.unpack_from("<I", disk, 458)[0] != last_lba:
         errors.append("protective MBR size mismatch")
     if struct.unpack_from("<Q", bgpt, 72)[0] != last_lba - 32:
