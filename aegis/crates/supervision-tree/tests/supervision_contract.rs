@@ -1,4 +1,4 @@
-//! Supervision-runtime contract (design doc §5): self-healing is circuit
+//! Supervision-runtime contract (design doc §5): supervision is circuit
 //! breaker + supervision tree — restarts within budget, a real breaker that
 //! trips instead of retrying forever, escalation to a parent supervisor that
 //! renews the whole subsystem, and a decision log that cross-checks the

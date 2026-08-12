@@ -119,15 +119,33 @@ fn undeclared_holdings_fail() {
 
 #[test]
 fn delivery_overhang_warns_but_stays_clean() {
-    // Root holds a GRANT-carrying naming cap into the assistant and holds
-    // strictly more than the assistant declares: overhang is a *warning*,
+    // A *userspace* grantor holding a GRANT-carrying naming cap into the assistant
+    // and holding strictly more than the assistant declares: overhang is a *warning*,
     // never a build-breaking violation (design decision in capability-model.md).
-    let (k, root, agent, _, _, _) = build_reference_world();
-    let report = reference_report(&k, root, agent);
+    // The kernel/boot session's own bootstrap edge is exempt (trusted bootstrap).
+    let (mut k, root, agent, agent_cap, _, root_creator) = build_reference_world();
+    let (ops, ops_cap) = k.create_task(root, root_creator, "ops").unwrap();
+    k.grant(
+        root,
+        agent_cap,
+        ops_cap,
+        Rights::GRANT.union(Rights::RECEIVE),
+        None,
+    )
+    .unwrap();
+
+    let session_m = session();
+    let assistant_m = assistant();
+    let ops_m = Manifest::new("ops", Repo::Service)
+        .allow(ObjectKind::Task, Rights::GRANT.union(Rights::RECEIVE));
+    let report = audit(
+        &k,
+        &[(root, &session_m), (agent, &assistant_m), (ops, &ops_m)],
+    );
     assert!(report.is_clean(), "overhang must not break the build");
     assert!(
         report.warning_count() > 0,
-        "root's authority overhang onto the assistant must be surfaced"
+        "userspace grantor's authority overhang onto the assistant must be surfaced"
     );
     assert!(report.warnings.contains_key("assistant"));
 }

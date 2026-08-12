@@ -110,7 +110,7 @@ impl Monitor {
     /// activity, and if it deviates from the trained shape, suspend the
     /// agent's grants with the grant service (never revoke them). Suspension
     /// stays until a human resumes the agent — the monitor does not
-    /// auto-heal; it contains and surfaces.
+    /// auto-restart; it contains and surfaces.
     pub fn observe(&mut self, kernel: &Kernel, service: &mut crate::GrantService) -> bool {
         match self.deviation(kernel) {
             None => false,

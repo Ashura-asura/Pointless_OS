@@ -1,4 +1,4 @@
-//! The supervision-tree runtime (design doc §5: self-healing is *circuit
+//! The supervision-tree runtime (design doc §5: supervision is *circuit
 //! breaker + supervision tree*, not silent retry — "contain the fault so it
 //! doesn't cascade, preserve full forensic state, escalate with an auditable
 //! trail, never silently retry the same failure indefinitely").

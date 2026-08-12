@@ -17,6 +17,12 @@
 9. [Compatibility Strategy](#compatibility-strategy)
 10. [Performance Tradeoffs](#performance-tradeoffs)
 
+> **Design only, not implemented — see design/future-work.md.** This document
+> describes the *target* architecture. Orchestration, compatibility, distributed
+> transparency and graphics sections are design intent; the implemented-and-verified
+> surface (boot, kernel, isolation, IPC, drivers, storage) is in README.md and
+> HONEST_STATUS.md.
+
 ---
 
 ## Core Design Principles
@@ -193,7 +199,7 @@ We seriously considered five distinct OS architectures. Here's why we rejected f
 **This wins because**:
 - ✅ Smallest TCB (follows seL4's minimal kernel philosophy)
 - ✅ AI agents are first-class, bounded principals
-- ✅ Self-healing via supervision trees (proven in Erlang)
+- ✅ Circuit-breaker / supervision trees (proven in Erlang)
 - ✅ Adaptability without the WinFS trap
 - ✅ Can layer distribution on top later
 - ✅ Remains single-machine fast
@@ -715,22 +721,25 @@ Windows compatibility is harder because:
 | Layer | Tech | Purpose |
 |-------|------|---------|
 | **Kernel** | Custom Rust (`aegis-kernel`), seL4-lineage design | Memory isolation, capability enforcement, IPC |
-| **Orchestration** | Rust + supervision trees | AI-aware scheduling, self-healing, anomaly detection |
+| **Orchestration** | Rust + supervision trees | AI-aware scheduling, circuit breaking, anomaly detection |
 | **Storage** | Capability-addressed object store | Immutable, content-addressed, with POSIX view |
 | **Network** | Userspace stack (DPDK-style) | Isolated, capability-scoped, efficient |
 | **Drivers** | IOMMU-fenced userspace processes | Safe, isolated, updatable without reboot |
 | **Compatibility** | Translation layers (Linux) + VM (Windows) | Legacy app support without trusting their code |
 | **UX** | Object/relationship view + file tree | Both CLI and semantic interfaces |
 
+> Design only, not implemented — see design/future-work.md for the deferred
+> rows above (compatibility, distributed/fleet, GPU compositor, broader orchestration).
+> What is actually implemented and verified today is in README.md and HONEST_STATUS.md.
+
 ---
 
 ## Honest Limits
 
-- **No seL4-class formal proof.** `aegis-kernel` follows seL4-lineage architecture but does not inherit seL4's verification. TLA+ model-checking is finite-instance (2 tasks, 3 slots).
-- **Contract tests prove the model, not production behavior.** All 364 tests are deterministic model logic.
-- **Real hardware is UNTESTED.** Page tables, GDT/IDT, IOMMU, NVMe, VirtIO drivers exist but need VMware/QEMU on real firmware.
-- **AI behavior is monitored, not verified.** The adaptive ceiling is property-tested, not formally proven.
-- **Full Windows/Linux compatibility is explicitly unsolved** by translation alone (design doc).
-- **Single-threaded kernel.** No concurrency testing; all tests are sequential.
+See **[Known Limits](HONEST_STATUS.md#known-limits)** — the single consolidated
+section (closed / reduced / inherent split). Headline facts: no seL4-class
+inductive proof (TLA+ is finite-instance); contract tests prove the model, not
+production behavior; real hardware is UNTESTED; AI behavior is monitored, not
+verified.
 
-**Next Steps**: See [ROADMAP.md](../ROADMAP.md) for the 12-phase development plan.
+**Next Steps**: See [os-from-first-principles.md](os-from-first-principles.md) for the master design and [design/future-work.md](design/future-work.md) for deferred items.

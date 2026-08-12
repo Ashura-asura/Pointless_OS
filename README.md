@@ -4,7 +4,7 @@ An executable reference implementation of a capability-based operating system de
 
 ## Status
 
-400 tests passing, 0 failures (113 model, 274 aegis-kernel, 13 uefi-boot ELF parser). The reachable-authority auditor runs clean. The kernel boots under QEMU/OVMF: UEFI loader → page tables → bare-metal kernel (GDT/TSS/IDT, LAPIC timer, frame allocator) → **cooperative scheduler running two tasks (alpha/beta) that interleave every 512 timer ticks** — live-run verified, 0 exceptions. IPC (endpoints, call/serve/reply, capabilities) verified under both QEMU and VMware Workstation 26 with 0 exceptions. Per-task memory isolation and NX enforcement (only the kernel text window executable) verified under QEMU: the iso-test and nx-test tasks fault and are killed while the kernel keeps running. **Live PCI enumeration** at boot decodes all 6 q35 devices (host/display/network/ISA/SATA/SMBus incl. BARs) over the legacy config ports. The demo is **visible on the VM display**: a VGA text console mirrors the whole boot log white-on-black (verified via screendump decoding).
+401 tests passing, 0 failures (113 model, 275 aegis-kernel, 13 uefi-boot ELF parser). The reachable-authority auditor runs clean. The kernel boots under QEMU/OVMF: UEFI loader → page tables → bare-metal kernel (GDT/TSS/IDT, LAPIC timer, frame allocator) → **cooperative scheduler running two tasks (alpha/beta) that interleave every 512 timer ticks** — live-run verified, 0 exceptions. IPC (endpoints, call/serve/reply, capabilities) verified under both QEMU and VMware Workstation 26 with 0 exceptions. Per-task memory isolation and NX enforcement (only the kernel text window executable) verified under QEMU: the iso-test and nx-test tasks fault and are killed while the kernel keeps running. **Live PCI enumeration** at boot decodes all 6 q35 devices (host/display/network/ISA/SATA/SMBus incl. BARs) over the legacy config ports. The demo is **visible on the VM display**: a VGA text console mirrors the whole boot log white-on-black (verified via screendump decoding).
 
 ## What Is Implemented
 
@@ -44,7 +44,11 @@ Proves six authority invariants (I1-I6) via TLA+ model checking (331k states, 0 
 
 ### Drivers, compat layers, orchestration (contract-tested model code)
 
-PCIe/VT-d/NVMe drivers, VirtIO-net/Ethernet/ARP/IPv4, Linux syscall ABI + ELF loader, Windows NT ABI + PE32+ loader, adaptive-ceiling verification, agent runtime + usage profiler + adaptive grants + policy engine, shell + window manager + object graph + input dispatcher, self-healing hardening + security audit.
+> Design only, not implemented — see design/future-work.md: Linux/Windows
+> compatibility, distributed/fleet transparency, GPU compositor, broader AI
+> orchestration.
+
+PCIe/VT-d/NVMe drivers, VirtIO-net/Ethernet/ARP/IPv4, adaptive-ceiling verification, circuit-breaker (supervision) hardening + security audit.
 
 ## What Is Not Done
 
@@ -58,17 +62,18 @@ PCIe/VT-d/NVMe drivers, VirtIO-net/Ethernet/ARP/IPv4, Linux syscall ABI + ELF lo
 
 ## Honest Limits
 
-- Task switching is verified under QEMU/TCG only, not on physical hardware.
-- The kernel is single-threaded; all contract tests are deterministic model logic.
-- The TLA+ proof is finite-instance (2 tasks, 3 slots) — evidence, not induction.
-- The "kernel crossing" in io_uring is an audit record, not a real syscall boundary.
-- Full Windows compatibility is explicitly unsolved by translation alone (design doc).
+See **[Known Limits](HONEST_STATUS.md#known-limits)** — the single consolidated
+section (closed / reduced / inherent split). Headline facts: contract tests prove
+the model, not production behavior; the kernel is single-threaded; TLA+
+model-checking is finite-instance (evidence, not induction); real hardware ops are
+UNTESTED (need VMware); the io_uring "kernel crossing" is an audit record, not a
+real syscall boundary.
 
 ## Running
 
 ```
 cargo test --workspace          # Run all model tests (113)
-cargo test -p aegis-kernel     # Run kernel tests (274)
+cargo test -p aegis-kernel     # Run kernel tests (275)
 cargo test -p uefi-boot        # Run ELF parser tests (13)
 cargo run -p capability-audit   # Reachable-authority audit
 cargo run -p capability-audit -- --graph  # Capability graph visualization

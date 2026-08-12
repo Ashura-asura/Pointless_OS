@@ -265,7 +265,7 @@ verified under QEMU and VMware Workstation 26 with 0 exceptions.
 ### Machine-checked verification (executable): supervision (§5)
 
 `capability-core/tests/supervision.rs` (3 tests) checks the kernel side of the
-supervision-tree contract — the part that must hold before any "self-healing"
+supervision-tree contract — the part that must hold before any automatic-recovery
 claim is worth making:
 
 - Containment is a full-subtree revoke (I4), not a flag flip: killing smtp only
@@ -278,7 +278,7 @@ claim is worth making:
   no grants, no revokes — the role bought restart only).
 - Escalation stops the retry loop and logs it: after revocation the agent cannot
   keep restarting, and the refusal is a logged failed TaskSpawn — never a silent
-  swallow (the anti-"self-healing hides bugs" property of §5).
+  swallow (the anti-"auto-recovery hides bugs" property of §5).
 
 Scheduling and retry policy remain userspace (the kernel's close contract): the
 kernel decides *whether* an op may run and records it; the supervision tree
@@ -485,7 +485,7 @@ registry itself is trusted userspace, not a kernel mechanism.
 
 The kernel's side of the supervision contract is already checked by
 `capability-core/tests/supervision.rs`. This crate is the *runtime* on top of
-it — the policy layer the doc calls for: self-healing is circuit breaker +
+it — the policy layer the doc calls for: supervision is circuit breaker +
 supervision tree, not silent retry; "contain the fault so it doesn't cascade,
 preserve full forensic state, escalate with an auditable trail, never silently
 retry the same failure indefinitely."
@@ -572,7 +572,7 @@ full audit history — there is no sliding window, no rate smoothing, and no
 time-decay, so "what the role normally does" is a snapshot, not a model; the
 "significant" threshold is a flat 2x rule, not a statistical measure; the
 baseline is what the agent *does*, never what it *should* do — an agent whose
-history already contains the anomaly is immune; and the monitor's suspension
+history already contains the anomaly is never flagged; and the monitor's suspension
 touches only grant confirmations — the already-minted caps live until their
 own expiry, the same trade-off the design doc declares (suspension is
 reversible, revocation is not, so the breaker errs on the side of not
@@ -632,9 +632,15 @@ as an `AuditViolation`.
    enforcement mechanism.
 3. Making it a violation would produce false positives for legitimate patterns: a
    session granting an assistant more than the assistant declared is the *intended*
-   use case for the session-as-orchestrator model (§9).
+   use case for the session-as-orchestrator model (§9). Corollary: the warning
+   skips edges whose grantor is the kernel/boot repository (`Repo::Kernel`) — the
+   session is the trusted bootstrap authority, and its power to deposit capabilities
+   into the tasks it created is by design, not the userspace-TCB-creep the check
+   exists to catch (design doc §10). Userspace grantors that could over-deliver
+   still warn.
 4. The existing test `delivery_overhang_tracks_the_declared_ceiling` verifies the
-   warning fires correctly and disappears when the target's manifest is wide enough.
+   warning fires correctly (via a userspace grantor) and disappears when the
+   target's manifest is wide enough.
 
 This is a deliberate design choice, not an open gap. If a future threat model
 requires delivery overhang to be a hard gate, the path is: promote

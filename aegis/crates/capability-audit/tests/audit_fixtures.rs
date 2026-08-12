@@ -78,11 +78,14 @@ fn honest_system_audits_clean() {
         ],
     );
     assert!(report.is_clean(), "honest system flagged: {report:?}");
-    // The session holds GRANT-carrying naming caps into the assistant, so the
-    // overhang of what it *could* push beyond the assistant's manifest is surfaced.
+    // The session->assistant edge is the trusted bootstrap: the kernel/boot session
+    // may deposit anything into the tasks it created by design, so its overhang is
+    // exempt from the warning (design doc §10 — the check targets userspace TCB
+    // creep, not the bootstrap authority). A userspace grantor still warns, see
+    // delivery_overhang_tracks_the_declared_ceiling.
     assert!(
-        report.warnings.contains_key("assistant"),
-        "expected the session->assistant delivery overhang to be surfaced: {report:?}"
+        report.warnings.is_empty(),
+        "kernel-bootstrap edge must not warn: {report:?}"
     );
 }
 
@@ -145,18 +148,34 @@ fn structural_self_cap_is_exempt() {
     assert!(report.is_clean(), "self-cap-only task flagged: {report:?}");
 }
 
-/// The delivery-overhang warning fires only when the target itself is narrower
-/// than what a GRANT-holding grantor could push into it.
+/// The delivery-overhang warning fires (for a userspace grantor) only when the
+/// target itself is narrower than what a GRANT-holding grantor could push into it.
+/// The kernel/boot session's own edges are exempt (trusted bootstrap, design doc §10).
 #[test]
 fn delivery_overhang_tracks_the_declared_ceiling() {
     let mut w = world();
-    grant_restart(&mut w);
+    let (ops, ops_cap) = w.kernel.create_task(w.root, w.creator, "ops").unwrap();
+    // The session hands the ops service a GRANT-carrying naming cap into the
+    // assistant, so ops is a *userspace* grantor that could push into the
+    // assistant's table — the overhang the checker exists to surface.
+    w.kernel
+        .grant(
+            w.root,
+            w.agent_cap,
+            ops_cap,
+            Rights::GRANT.union(Rights::RECEIVE),
+            None,
+        )
+        .unwrap();
+    let ops_manifest = Manifest::new("ops", Repo::Service)
+        .allow(ObjectKind::Task, Rights::GRANT.union(Rights::RECEIVE));
 
     let report = audit(
         &w.kernel,
         &[
             (w.root, &session_manifest()),
             (w.agent, &assistant_manifest()),
+            (ops, &ops_manifest),
         ],
     );
     let has_overhang = report.warnings.get("assistant").is_some_and(|ws| {
@@ -165,13 +184,15 @@ fn delivery_overhang_tracks_the_declared_ceiling() {
     });
     assert!(has_overhang, "narrow target not warned: {report:?}");
 
-    let wide_pet = assistant_manifest()
-        .allow(ObjectKind::Creator, Rights::ALL)
-        .allow(ObjectKind::GrantRoot, Rights::GRANT)
-        .allow(ObjectKind::Task, Rights::ALL);
+    let wide_pet =
+        assistant_manifest().allow(ObjectKind::Task, Rights::GRANT.union(Rights::RECEIVE));
     let report2 = audit(
         &w.kernel,
-        &[(w.root, &session_manifest()), (w.agent, &wide_pet)],
+        &[
+            (w.root, &session_manifest()),
+            (w.agent, &wide_pet),
+            (ops, &ops_manifest),
+        ],
     );
     assert!(
         !report2.warnings.contains_key("assistant"),

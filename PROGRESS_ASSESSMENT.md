@@ -18,7 +18,7 @@
 | **Phase 7** (Native app model + shell) | ~5% | Model-level only |
 | **Phase 8** (Linux compat) | ~5% | Translation logic only |
 | **Phase 9** (Windows compat) | ~5% | Translation logic only |
-| **Phase 10** (Self-healing) | ~5% | Model-level only |
+| **Phase 10** (Supervision/circuit breaker) | ~5% | Model-level only |
 | **Phase 11** (Distributed) | ~0% | Not started |
 | **Phase 12** (Production hardening) | ~5% | Partial |
 

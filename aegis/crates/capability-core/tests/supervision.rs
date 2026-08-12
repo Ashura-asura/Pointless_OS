@@ -1,4 +1,4 @@
-//! Executable checks for the supervision claims of the design doc (§5: self-healing
+//! Executable checks for the supervision claims of the design doc (§5: supervision
 //! is circuit breaker + supervision tree, not silent retry). The kernel's side of
 //! the contract is capability-shaped: a crash is a TaskKill event, a restart is a
 //! TaskSpawn through a granted CONTROL cap, containment is the supervisor's

@@ -2,15 +2,65 @@
 
 *Generated: 2026-08-13. Every claim below is verified by `cargo test` on the current commit.*
 
+## Known Limits
+
+This is the **single consolidated Known Limits section** (`README.md` and
+`ARCHITECTURE.md` point here). Limits use the three-way split: **closed**
+(fixed, tested), **reduced** (better than before, not solved), **inherent**
+(cannot be closed by better engineering — state plainly, never imply progress).
+
+### Closed (fixed, tested)
+
+- Per-task memory isolation via page-table U/S bits — faulting task kicked out by
+  the page-fault handler, kernel keeps running (verified under QEMU).
+- NX enforcement — only the kernel text window (parsed from the running ELF) is
+  executable; ring-3 fetch from 0xB8000 faults with the NX bit in the error code,
+  only the faulting task is killed (verified under QEMU).
+- Live hardware-path I/O — PCI enumeration, NVMe block I/O, FAT16 reads all
+  verified under QEMU/OVMF with 0 exceptions.
+- IPC echo call/serve/reply under QEMU and VMware Workstation 26, 0 exceptions.
+- Adaptive-ceiling verification caught and fixed a real scope-expansion bug
+  (`tighten_scope` budget `/2 .max(1)` raised a restrictive 0-budget to 1).
+
+### Reduced (better than before, not solved)
+
+- **Formal verification** is TLA+ model-checking (331k states, finite instance:
+  2 tasks, 3 slots), not an inductive seL4-class proof.
+- **Real hardware** is UNTESTED — everything runs under QEMU/TCG or VMware; many
+  driver paths need a real device.
+- **Compatibility** is model-level translation only (Linux 32 + Windows 31 tests).
+  No hypervisor VM vehicle; full Win32/NT fidelity remains unsolved.
+- **Distributed / fleet** is a two-node in-process model (15 tests); no real
+  network, no consensus, partition behavior deliberately not modeled.
+- **AI orchestration** is model-level in-process code (23 tests) plus a
+  contract-tested ceiling (14 tests); no real-time integration, no real AI.
+- **Graphical shell** is contract-tested model code (24 tests); the only live
+  display is the VGA text console.
+- **IPC overhead** vs a monolithic syscall path is reduced (batched submission,
+  shared-memory capability grants), not eliminated.
+
+### Inherent (cannot be closed by better engineering)
+
+- **Distributed transparency under partition** — CAP theorem. The design makes
+  locality and partition failure visible and fail-safe by default, not hidden.
+- **Proving AI agent behavior, not just its ceiling** — a capability check is a
+  decidable check; a model's behavior under adversarial input is not.
+- **The compatibility moat** — full native Win32/NT fidelity without a real
+  Windows kernel, and instant parity with Linux's syscall-path tuning, are
+  ecosystem network effects, not engineering gaps.
+- **A human granting too much authority** — bounded by role-shaped ephemeral
+  grants + audit, never eliminated; anyone claiming otherwise is not being
+  straight with you.
+
 ## What exists (verified clean)
 
 Test counts are kept separate on purpose: `aegis-kernel` is a **standalone bare-metal crate that is NOT a member of the `aegis` workspace**, so its tests are never covered by `cargo test --workspace`.
 
 - **aegis workspace (model crates):** 113 contract tests, 0 failures — `cargo test --workspace` from a clean lockfile (Rule 1/10).
-- **aegis-kernel (bare-metal, separate crate):** 274 contract tests, 0 failures — `cargo test` on the pinned 1.97.1 toolchain (verified this session: includes the UDP/TCP header parsers in `udp.rs`/`tcp.rs` — RFC 768/793 parse/serialize with pseudo-header checksum verification — and the full Phase-12 `hardening.rs` adversarial boundary suite — ELF/PE/IPv4/Ethernet/ARP/UDP/TCP parse-and-never-panic, syscall/ABI translation totality, compat-layer/shell/window/graph/input bad-ID rejection). The ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
+- **aegis-kernel (bare-metal, separate crate):** 275 contract tests, 0 failures — `cargo test` on the pinned 1.97.1 toolchain (verified this session: includes the UDP/TCP header parsers in `udp.rs`/`tcp.rs` — RFC 768/793 parse/serialize with pseudo-header checksum verification — and the full Phase-12 `hardening.rs` adversarial boundary suite — ELF/PE/IPv4/Ethernet/ARP/UDP/TCP parse-and-never-panic, syscall/ABI translation totality, compat-layer/shell/window/graph/input bad-ID rejection). The ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
 - **uefi-boot:** 13 ELF parser contract tests.
 
-Combined contract-test count across all crates: **400**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
+Combined contract-test count across all crates: **401**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -190,7 +240,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | 7 | Native app model + shell | ✅ Done (real): Shell runtime (6 tests), window manager (7), object-relationship graph (6), input dispatcher (5). Honest limits: no GPU rendering, no real display output, no real keyboard/mouse hardware |
 | 8 | Linux compat | ✅ Done (real, model-level): syscall ABI translation (12 tests), ELF loader + initial stack (12 tests), compat personality with capability gating (8 tests). Honest limits: no hypervisor lightweight-VM vehicle (needs hypervisor); translation proven against buffers, not a live Linux userspace |
 | 9 | Windows compat | ✅ Done (real, model-level): NT syscall ABI translation (12 tests), PE32+ loader (12 tests), Windows compat personality with capability gating (7 tests). Honest limits: narrow well-behaved-subset translator only; full-fidelity VM path (needs hypervisor + Windows) not built; design doc says full Windows compat is unsolved by translation alone |
-| 10 | Self-healing hardening + chaos testing | ✅ Done: supervision-tree (4) + chaos (6) model tests; adaptive-ceiling verification (14) in aegis-kernel — caught+fixed real scope-expansion bug in tighten_scope |
+| 10 | Supervision/circuit-breaker hardening + chaos testing | ✅ Done: supervision-tree (4) + chaos (6) model tests; adaptive-ceiling verification (14) in aegis-kernel — caught+fixed real scope-expansion bug in tighten_scope |
 | 11 | Distributed extension (macaroons) | ✅ Done (model-level): fleet crate — cross-machine capability transport with explicit locality, wire envelope, peer trust, chain/expiry verification, remote attenuation (13 tests). Honest limits: two-node in-process model; no real network/consensus; partition behavior deliberately not modeled (design doc CAP warning) |
 | 12 | Production hardening | ✅ Done (model-level): security-audit aggregate gate (10 tests), kernel boundary/panic-safety tests (13), SECURITY_AUDIT.md certification matrix. Honest limits: NO real-hardware certification of any kind — all hardware ops UNTESTED; no inductive proof; no fuzzing; secure boot/attestation not built |
 
