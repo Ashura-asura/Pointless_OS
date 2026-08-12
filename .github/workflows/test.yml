@@ -50,6 +50,9 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Reachable-authority audit (build-breaking gate, design doc §10 [CLOSED] TCB creep)
+        run: cargo run -p capability-audit
+
   kernel:
     name: Kernel + Bootloader
     runs-on: ubuntu-latest

@@ -142,6 +142,14 @@ pub fn audit(
         let (Some(mf), Some(mi)) = (bind.get(&from), bind.get(&into)) else {
             continue;
         };
+        // The kernel/boot session is the trusted bootstrap authority; its power to
+        // deposit any capability into the tasks it created is by design, not the
+        // userspace-TCB-creep the delivery-overhang check exists to catch (design
+        // doc §10: the rule is about repositories *outside* the kernel/bootloader
+        // repo). Skip it so the warning stays meaningful for real userspace grantors.
+        if mf.repo.is_kernel() {
+            continue;
+        }
         let deliverable = holding.get(&from).cloned().unwrap_or_default();
         let mut ws: Vec<AuditWarning> = deliverable
             .iter()
