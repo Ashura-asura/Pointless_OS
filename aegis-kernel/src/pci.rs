@@ -301,7 +301,7 @@ impl PciDevice {
         if bar_is_io(bar) {
             return (bar & 0xFFFF_FFF0) as u64;
         }
-        if bar_is_64bit(bar) {
+        if bar_is_64bit(bar) && index + 1 < self.bar.len() {
             let low = (bar & 0xFFFF_FFF0) as u64;
             let high = self.bar[index + 1] as u64;
             (high << 32) | low
@@ -407,6 +407,28 @@ mod tests {
             interrupt_pin: 0,
         };
         assert_eq!(dev.bar_address(0), 0x1000_0000);
+    }
+
+    #[test]
+    fn bar_address_rejects_64bit_bar_at_last_index() {
+        // A device lying about a 64-bit BAR at the final slot (index 5) has
+        // no room for the high half. Must not index bar[6] (panic); treat the
+        // high half as absent and return the low part only.
+        let mut dev = PciDevice {
+            address: PciAddress::new(0, 0, 0),
+            vendor_id: 0,
+            device_id: 0,
+            class: 0,
+            subclass: 0,
+            prog_if: 0,
+            revision: 0,
+            header_type: 0,
+            bar: [0, 0, 0, 0, 0, 0x1000_0004],
+            interrupt_line: 0,
+            interrupt_pin: 0,
+        };
+        // index 5 is a 64-bit BAR with no high half: must not panic.
+        assert_eq!(dev.bar_address(5), 0x1000_0000);
     }
 
     #[test]
