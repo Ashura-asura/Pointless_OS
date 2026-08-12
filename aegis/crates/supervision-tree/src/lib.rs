@@ -25,7 +25,7 @@
 //! creates a fresh child supervisor on restart); and the restart budget is
 //! per-subsystem-lifetime, not a sliding window.
 
-use capability_core::{CapHandle, Kernel, ObjectId, TaskHandle};
+use capability_core::{CapHandle, Kernel, KernelResult, ObjectId, TaskHandle};
 
 /// The restart budget one subsystem may burn before its breaker opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,8 +120,8 @@ impl Supervisor {
         task: TaskHandle,
         task_cap: CapHandle,
         policy: RestartPolicy,
-    ) -> usize {
-        k.task_spawn(self.service, task_cap).unwrap();
+    ) -> KernelResult<usize> {
+        k.task_spawn(self.service, task_cap)?;
         let idx = self.subsystems.len();
         self.subsystems.push(Subsystem {
             name: name.to_string(),
@@ -131,7 +131,7 @@ impl Supervisor {
             restarts: 0,
             state: NodeState::Running,
         });
-        idx
+        Ok(idx)
     }
 
     pub fn log(&self) -> &[RuntimeEvent] {

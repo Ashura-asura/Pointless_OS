@@ -2,6 +2,7 @@
 name = "grants"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 capability-core = { path = "../capability-core" }

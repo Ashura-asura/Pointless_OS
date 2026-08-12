@@ -144,17 +144,31 @@ fn encode_entries(entries: &[(String, u64)]) -> Vec<u8> {
 fn decode_entries(bytes: &[u8]) -> Vec<(String, u64)> {
     let mut out = Vec::new();
     if bytes.len() < 4 {
-        return out; // an empty node (no block yet): the empty namespace
+        return out;
     }
     let mut at = 0usize;
-    let count = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let Some(count_bytes) = bytes.get(at..at + 4) else {
+        return out;
+    };
+    let count = u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
     at += 4;
     for _ in 0..count {
-        let nlen = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let Some(nlen_bytes) = bytes.get(at..at + 4) else {
+            break;
+        };
+        let nlen = u32::from_le_bytes(nlen_bytes.try_into().unwrap()) as usize;
         at += 4;
-        let name = String::from_utf8(bytes[at..at + nlen].to_vec()).unwrap();
+        let Some(name_bytes) = bytes.get(at..at + nlen) else {
+            break;
+        };
+        let Ok(name) = String::from_utf8(name_bytes.to_vec()) else {
+            break;
+        };
         at += nlen;
-        let node = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let Some(node_bytes) = bytes.get(at..at + 8) else {
+            break;
+        };
+        let node = u64::from_le_bytes(node_bytes.try_into().unwrap());
         at += 8;
         out.push((name, node));
     }

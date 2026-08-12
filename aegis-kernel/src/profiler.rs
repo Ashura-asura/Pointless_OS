@@ -209,24 +209,37 @@ impl Profiler {
     }
 
     fn get_or_create_profile(&mut self, agent_id: AgentId) -> &mut UsageProfile {
-        let mut found = None;
-        for slot in self.profiles.iter_mut() {
+        let mut existing = None;
+        let mut free = None;
+        let mut victim = 0usize;
+        let mut oldest = u64::MAX;
+        for (i, slot) in self.profiles.iter().enumerate() {
             if slot.used && slot.agent_id == agent_id {
-                found = Some(slot as *mut ProfileSlot);
+                existing = Some(i);
                 break;
             }
-        }
-        if let Some(ptr) = found {
-            return unsafe { &mut (*ptr).profile };
-        }
-        for slot in self.profiles.iter_mut() {
-            if !slot.used {
-                slot.agent_id = agent_id;
-                slot.used = true;
-                return &mut slot.profile;
+            if !slot.used && free.is_none() {
+                free = Some(i);
+            }
+            if slot.profile.last_seen < oldest {
+                oldest = slot.profile.last_seen;
+                victim = i;
             }
         }
-        panic!("profiler: too many agents");
+
+        let idx = if let Some(i) = existing {
+            i
+        } else if let Some(i) = free {
+            self.profiles[i].agent_id = agent_id;
+            self.profiles[i].used = true;
+            i
+        } else {
+            self.profiles[victim].agent_id = agent_id;
+            self.profiles[victim].used = true;
+            self.profiles[victim].profile = UsageProfile::new(agent_id);
+            victim
+        };
+        &mut self.profiles[idx].profile
     }
 }
 
@@ -243,6 +256,35 @@ mod tests {
             arg2: 0,
             success: true,
         }
+    }
+
+    #[test]
+    fn full_table_evicts_lru_instead_of_panicking() {
+        let mut prof = Profiler::new(1000);
+        for agent in 0..32u32 {
+            prof.record(SyscallRecord {
+                agent_id: agent,
+                syscall_num: 0,
+                timestamp: agent as u64,
+                arg1: 0,
+                arg2: 0,
+                success: true,
+            });
+        }
+        assert!(prof.get_profile(0).is_some());
+
+        prof.record(SyscallRecord {
+            agent_id: 999,
+            syscall_num: 0,
+            timestamp: 1000,
+            arg1: 0,
+            arg2: 0,
+            success: true,
+        });
+
+        assert!(prof.get_profile(999).is_some());
+        assert!(prof.get_profile(0).is_none());
+        assert!(prof.get_profile(31).is_some());
     }
 
     #[test]
