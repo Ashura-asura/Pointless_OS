@@ -199,6 +199,60 @@ fn ipv4_parse_rejects_short_and_bad_version() {
 }
 
 #[test]
+fn udp_parse_survives_truncated_and_garbage_inputs() {
+    for len in [0usize, 1, 4, 7, 8, 9, 100] {
+        let data = vec![0xEEu8; len];
+        let r = no_panic(|| crate::udp::UdpDatagram::parse(&data, None, None));
+        assert!(
+            r.is_some(),
+            "udp parse panicked on {} bytes of garbage",
+            len
+        );
+    }
+    // Length field claiming more than the buffer holds must error, not panic.
+    let mut buf = [0xFFu8; 8];
+    buf[4..6].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    let r = no_panic(|| crate::udp::UdpDatagram::parse(&buf, None, None)).unwrap();
+    assert!(r.is_err());
+}
+
+#[test]
+fn udp_checksum_is_total_on_garbage() {
+    let ip = crate::ipv4::IPv4Address::LOOPBACK;
+    for len in [0usize, 1, 7, 8, 9, 100] {
+        let segment = vec![0xABu8; len];
+        assert!(no_panic(|| crate::udp::UdpDatagram::compute_checksum(ip, ip, &segment)).is_some());
+    }
+}
+
+#[test]
+fn tcp_parse_survives_truncated_and_garbage_inputs() {
+    for len in [0usize, 1, 12, 19, 20, 21, 100] {
+        let data = vec![0xEEu8; len];
+        let r = no_panic(|| crate::tcp::TcpSegment::parse(&data, None, None));
+        assert!(
+            r.is_some(),
+            "tcp parse panicked on {} bytes of garbage",
+            len
+        );
+    }
+    // data_offset claiming a header far past the buffer must error, not panic.
+    let mut buf = [0xFFu8; 20];
+    buf[12] = 0x0F << 4; // 60-byte header claimed, buffer is 20 bytes
+    let r = no_panic(|| crate::tcp::TcpSegment::parse(&buf, None, None)).unwrap();
+    assert!(r.is_err());
+}
+
+#[test]
+fn tcp_checksum_is_total_on_garbage() {
+    let ip = crate::ipv4::IPv4Address::LOOPBACK;
+    for len in [0usize, 1, 19, 20, 21, 100] {
+        let segment = vec![0xABu8; len];
+        assert!(no_panic(|| crate::tcp::TcpSegment::compute_checksum(ip, ip, &segment)).is_some());
+    }
+}
+
+#[test]
 fn arp_parse_rejects_short_packets() {
     for len in 0..28 {
         let data = vec![0u8; len];

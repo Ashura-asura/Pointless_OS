@@ -24,6 +24,8 @@ pub mod arp;
 pub mod ethernet;
 pub mod ipv4;
 pub mod net;
+pub mod tcp;
+pub mod udp;
 
 pub mod adaptive;
 pub mod agent;

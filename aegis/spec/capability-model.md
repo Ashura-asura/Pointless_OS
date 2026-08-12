@@ -734,10 +734,13 @@ MMIO operations are UNTESTED on real hardware.
 
 ### Machine-checked verification (executable): networking stack (§8, Phase 5)
 
-`net.rs` (9), `ethernet.rs` (5), `arp.rs` (6), `ipv4.rs` (6): device init, frame
-parse/serialize, ethertype validation, ARP table ops and packet construction, IPv4
-checksums, loopback/broadcast detection. Honest limits: no real NIC traffic; drivers
-UNTESTED on real hardware.
+`net.rs` (9), `ethernet.rs` (5), `arp.rs` (6), `ipv4.rs` (6), `udp.rs` (8), `tcp.rs` (9):
+device init, frame parse/serialize, ethertype validation, ARP table ops and packet
+construction, IPv4 checksums, loopback/broadcast detection, UDP (RFC 768) and TCP
+(RFC 793) header parse/serialize with pseudo-header checksum verification and
+length/data-offset validation. Honest limits: UDP/TCP are header models only — no
+connection state machine, no socket layer, not wired into the boot path; no real NIC
+traffic; drivers UNTESTED on real hardware.
 
 ### Machine-checked verification (executable): AI orchestration (§5, Phase 6)
 

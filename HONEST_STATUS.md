@@ -1,16 +1,16 @@
 # Honest Status — Pointless OS / Aegis
 
-*Generated: 2026-08-12. Every claim below is verified by `cargo test` on the current commit.*
+*Generated: 2026-08-13. Every claim below is verified by `cargo test` on the current commit.*
 
 ## What exists (verified clean)
 
 Test counts are kept separate on purpose: `aegis-kernel` is a **standalone bare-metal crate that is NOT a member of the `aegis` workspace**, so its tests are never covered by `cargo test --workspace`.
 
 - **aegis workspace (model crates):** 113 contract tests, 0 failures — `cargo test --workspace` from a clean lockfile (Rule 1/10).
-- **aegis-kernel (bare-metal, separate crate):** 253 contract tests, 0 failures — `cargo test` on the pinned 1.97.1 toolchain (verified this session: includes the UDP/TCP header parsers and the full Phase-12 `hardening.rs` adversarial boundary suite — ELF/PE/IPv4/Ethernet/ARP/UDP/TCP parse-and-never-panic, syscall/ABI translation totality, compat-layer/shell/window/graph/input bad-ID rejection). The ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
+- **aegis-kernel (bare-metal, separate crate):** 274 contract tests, 0 failures — `cargo test` on the pinned 1.97.1 toolchain (verified this session: includes the UDP/TCP header parsers in `udp.rs`/`tcp.rs` — RFC 768/793 parse/serialize with pseudo-header checksum verification — and the full Phase-12 `hardening.rs` adversarial boundary suite — ELF/PE/IPv4/Ethernet/ARP/UDP/TCP parse-and-never-panic, syscall/ABI translation totality, compat-layer/shell/window/graph/input bad-ID rejection). The ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
 - **uefi-boot:** 13 ELF parser contract tests.
 
-Combined contract-test count across all crates: **379**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
+Combined contract-test count across all crates: **400**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -83,6 +83,8 @@ A single-threaded, in-process capability kernel with:
 | Ethernet frames | 5 | Frame parsing/serialization, ethertype validation, minimum size enforcement, broadcast |
 | ARP | 6 | Table lookup/insert/remove, request/reply construction, packet parsing. UNTESTED: no real network |
 | IPv4 | 6 | Packet parsing/serialization, checksum computation, address formatting, loopback/broadcast detection |
+| UDP | 8 | RFC 768 datagram parse/serialize, pseudo-header checksum verification, length-field validation, zero-checksum (not-computed) handling |
+| TCP | 9 | RFC 793 segment parse/serialize, data-offset validation, mandatory pseudo-header checksum verification; options exposed raw (not decoded), no connection state machine (honest limit — future socket layer) |
 
 ### Real AI orchestration (aegis-kernel)
 | Component | Tests | What it proves |
@@ -138,7 +140,7 @@ Honest limits: two-node in-process model (no sockets, no real network); no conse
 | Component | Tests | What it proves |
 |-----------|-------|----------------|
 | Aggregate security audit | 10 | Reference world is clean (0 violations); kernel-equivalent demand from userspace repo is a violation; undeclared holdings are violations; delivery overhang warns but never breaks the build; self caps excluded from reachable authority; unbound tasks skipped |
-| Kernel boundary/panic-safety | 20 | All parsers (ELF/PE/IPv4/Ethernet/ARP/UDP/TCP) and both syscall ABIs return errors on garbage/truncated/overflowing inputs and never panic; ELF/PE loaders reject attacker-controlled offsets that would overflow (checked_add/checked_mul — 4 regression tests); compat layers reject garbage; shell/window/graph/input reject bad IDs without panicking |
+| Kernel boundary/panic-safety | 21 | All parsers (ELF/PE/IPv4/Ethernet/ARP/UDP/TCP) and both syscall ABIs return errors on garbage/truncated/overflowing inputs and never panic; ELF/PE loaders reject attacker-controlled offsets that would overflow (checked_add/checked_mul — 4 regression tests); compat layers reject garbage; shell/window/graph/input reject bad IDs without panicking |
 | Certification matrix | — | `SECURITY_AUDIT.md`: what is certified (model-level only), what is NOT (all real-hardware ops UNTESTED, no inductive proof, no fuzzing, no distributed guarantees) |
 
 ### Tooling
@@ -154,7 +156,7 @@ Honest limits: two-node in-process model (no sockets, no real network); no conse
 | Real hardware isolation (verified on actual hardware) | Model-level code only | Page tables, IOMMU, NVMe, VirtIO drivers exist but are UNTESTED on real hardware (need VMware) |
 | Real process isolation on hardware (page faults, cr3 switching) | Code + 10 contract tests + scheduler + ring-3 task live under QEMU | Cooperative task switching and a ring-3 user task (CPL3 `iretq` + `int 0x80` syscall) verified live under QEMU/TCG; per-task isolation via page-table U/S bits verified under QEMU (isolation-test task faults on a kernel-only address and is killed); still UNTESTED on real hardware |
 | seL4-class formal proof | Not built | TLA+ model-checking (finite instance), not inductive proof |
-| Real network I/O on a NIC | Driver code + 22 tests | VirtIO-net driver exists; no real NIC traffic, no TCP/UDP yet |
+| Real network I/O on a NIC | Driver code + 43 tests | VirtIO-net driver exists; no real NIC traffic, no socket layer; UDP/TCP are header parse/serialize models only (17 unit tests + 4 boundary tests), not wired into the boot path |
 | Linux/Windows compat layers | Partially built (Phase 8+9 model-level) | Linux (32 tests) + Windows (31 tests) translation/loader/personality; no hypervisor VM vehicles; full Windows fidelity explicitly not solved by translation alone |
 | AI orchestration on real hardware | Model-level code only | Agent/profiler/adaptive/policy tested in-process (23 tests); no real-time integration |
 | Graphical shell on a real display | Model-level code only | Shell/window/graph/input tested in-process (24 tests); a VGA text console mirrors kernel output on the QEMU display (verified live), but no framebuffer graphics, no GPU accel, no real input |
@@ -183,7 +185,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | 2 | Userspace resource managers + supervision tree | ✅ Done (real + model): GDT/TSS, IDT, per-process page tables, process abstraction, round-robin scheduler (10 tests), syscall framework. **LAPIC timer verified under QEMU/TCG**: 8-entry GDT installed + TSS loaded (16-byte descriptor quirk), IDT gates deliver, periodic timer (~570 ticks/s) drives the idle loop. **Cooperative task switching verified under QEMU/TCG**: alpha/beta tasks interleave every 512 ticks at stable rsp, 6665/6665 interrupt rsp deltas = 0 (after fixing the resume-rsp drift — saved rsp had included the call's return address); still cooperative, still not run on physical hardware. **Per-task memory isolation verified under QEMU**: iso-test task's kernel-only read #PFs and is killed (page-fault-driven isolation, fixed exception-stub arg order); still not run on physical hardware. **NX enforcement verified under QEMU**: only the kernel text window (parsed from the ELF) is executable; ring-3 fetch from the NX VGA page #PFs, only the faulting task is killed and the kernel survives |
 | 3 | Driver framework (IOMMU) | ✅ Done (real + model): PCIe enumeration (6 tests), VT-d IOMMU domain isolation (5 tests), NVMe command queues (5 tests). Model: typed Block/Net/Gpu interfaces, crash containment, GPU isolation, compositor (4 tests). **Live PCI enumeration verified under QEMU/OVMF (q35)**: legacy 0xCF8/0xCFC config-port scan finds all 6 q35 default devices on bus 0 — host bridge (8086:29C0), stdvga (1234:1111, 2 MMIO BARs), e1000e (8086:10D3), ICH9 ISA bridge, AHCI SATA (5 BARs incl. 2 IO), SMBus — VID/DID/class/prog-if/rev/BARs decoded and reported at boot. Honest limits: bus 0 only (no PCI-PCI bridge traversal yet); no real hardware test |
 | 4 | Storage service + POSIX view | ✅ Done (model: FlatView is a flat, single-level namespace projection — create/read/write/delete/list by name. Not a hierarchical POSIX filesystem — no nested dirs, no path resolution, no permission bits, no symlinks. 8 contract tests) |
-| 5 | Networking stack | ✅ Done (real + model): VirtIO-net driver (9 tests), Ethernet frames (5), ARP (6), IPv4 (6). Model: loopback stack (4 tests). Honest limits: no real NIC hardware, no TCP/UDP yet |
+| 5 | Networking stack | ✅ Done (real + model): VirtIO-net driver (9 tests), Ethernet frames (5), ARP (6), IPv4 (6), UDP/TCP header models (17 tests). Model: loopback stack (4 tests). Honest limits: no real NIC hardware, no socket layer — UDP/TCP exist as header parse/serialize only, not wired into the boot path |
 | 6 | AI orchestration layer | ✅ Done (real + model): Agent runtime (8 tests), usage profiler (5), adaptive grants (5), policy engine (5). Model: anomaly monitor (3 tests). Honest limits: no real AI model, profiler is histogram-based not ML, no real-time learning |
 | 7 | Native app model + shell | ✅ Done (real): Shell runtime (6 tests), window manager (7), object-relationship graph (6), input dispatcher (5). Honest limits: no GPU rendering, no real display output, no real keyboard/mouse hardware |
 | 8 | Linux compat | ✅ Done (real, model-level): syscall ABI translation (12 tests), ELF loader + initial stack (12 tests), compat personality with capability gating (8 tests). Honest limits: no hypervisor lightweight-VM vehicle (needs hypervisor); translation proven against buffers, not a live Linux userspace |

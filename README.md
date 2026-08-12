@@ -4,7 +4,7 @@ An executable reference implementation of a capability-based operating system de
 
 ## Status
 
-377 tests passing, 0 failures (113 model, 251 aegis-kernel, 13 uefi-boot ELF parser). The reachable-authority auditor runs clean. The kernel boots under QEMU/OVMF: UEFI loader → page tables → bare-metal kernel (GDT/TSS/IDT, LAPIC timer, frame allocator) → **cooperative scheduler running two tasks (alpha/beta) that interleave every 512 timer ticks** — live-run verified, 0 exceptions. IPC (endpoints, call/serve/reply, capabilities) verified under both QEMU and VMware Workstation 26 with 0 exceptions. Per-task memory isolation and NX enforcement (only the kernel text window executable) verified under QEMU: the iso-test and nx-test tasks fault and are killed while the kernel keeps running. **Live PCI enumeration** at boot decodes all 6 q35 devices (host/display/network/ISA/SATA/SMBus incl. BARs) over the legacy config ports. The demo is **visible on the VM display**: a VGA text console mirrors the whole boot log white-on-black (verified via screendump decoding).
+400 tests passing, 0 failures (113 model, 274 aegis-kernel, 13 uefi-boot ELF parser). The reachable-authority auditor runs clean. The kernel boots under QEMU/OVMF: UEFI loader → page tables → bare-metal kernel (GDT/TSS/IDT, LAPIC timer, frame allocator) → **cooperative scheduler running two tasks (alpha/beta) that interleave every 512 timer ticks** — live-run verified, 0 exceptions. IPC (endpoints, call/serve/reply, capabilities) verified under both QEMU and VMware Workstation 26 with 0 exceptions. Per-task memory isolation and NX enforcement (only the kernel text window executable) verified under QEMU: the iso-test and nx-test tasks fault and are killed while the kernel keeps running. **Live PCI enumeration** at boot decodes all 6 q35 devices (host/display/network/ISA/SATA/SMBus incl. BARs) over the legacy config ports. The demo is **visible on the VM display**: a VGA text console mirrors the whole boot log white-on-black (verified via screendump decoding).
 
 ## What Is Implemented
 
@@ -52,7 +52,7 @@ PCIe/VT-d/NVMe drivers, VirtIO-net/Ethernet/ARP/IPv4, Linux syscall ABI + ELF lo
 - Priority/blocking scheduling — single fixed-priority round-robin; no wait queues
 - User-mode isolation — per-task *page-fault-driven* isolation via U/S bits verified under QEMU (iso-test task faults on a kernel-only read and is killed); not run on physical hardware
 - Hypervisor-based Linux/Windows execution vehicles (WSL2-lineage design paths)
-- Real NIC traffic (no TCP/UDP), real GPU-accelerated display output (a VGA text console works; no framebuffer graphics, no real input devices)
+- Real NIC traffic, real socket layer (UDP/TCP are header parse/serialize models only, not wired into the boot path), real GPU-accelerated display output (a VGA text console works; no framebuffer graphics, no real input devices)
 - Cross-machine macaroon transport (in-process model only, no network)
 - SeL4-class inductive proof (TLA+ model-checking is finite-instance)
 
@@ -68,7 +68,7 @@ PCIe/VT-d/NVMe drivers, VirtIO-net/Ethernet/ARP/IPv4, Linux syscall ABI + ELF lo
 
 ```
 cargo test --workspace          # Run all model tests (113)
-cargo test -p aegis-kernel     # Run kernel tests (251)
+cargo test -p aegis-kernel     # Run kernel tests (274)
 cargo test -p uefi-boot        # Run ELF parser tests (13)
 cargo run -p capability-audit   # Reachable-authority audit
 cargo run -p capability-audit -- --graph  # Capability graph visualization
