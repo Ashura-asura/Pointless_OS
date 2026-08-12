@@ -254,9 +254,21 @@ model-level `capability-core` IPC above.
 `ipc_endpoint_create`, `ipc_cap_grant`. Ring-3 echo server/client demo
 verified under QEMU and VMware Workstation 26 with 0 exceptions.
 
+**Capability-aware delivery (Phase 1)**: a slot is now a `(Cap, Rights)` pair
+(`aegis-kernel/src/cap.rs`): `Rights` is a bitfield (READ/WRITE/CONTROL/
+SEND/RECV/GRANT), `Cap` names an `Endpoint`, `Task`, or `MemRegion`, and the
+syscall entries are rights-gated — `ipc_call` requires SEND, `ipc_serve` and
+`ipc_reply` require RECV, `ipc_cap_grant` requires GRANT, and `CapGrant`
+copies the slot verbatim (rights never widened, I2). `ipc_endpoint_create`
+installs SEND|RECV|GRANT. The kernel enforces at delivery time and never
+trusts the caller to state its own authority. `#[cfg(test)]` contract tests
+(`ipc.rs` and `cap.rs` test modules, 14 tests) pin all seven gates: wrong
+rights, wrong object kind, and out-of-range slots all deny cleanly.
+
 **Honest limits**:
-- No contract tests — requires real/virtual hardware for ring-3 transitions.
-  Its proof is the live QEMU/VMware boot, not `cargo test`.
+- The ring-3 path through `int 0x80` still needs real/virtual hardware; its
+  proof is the live QEMU/VMware boot, not `cargo test`. The contract tests
+  cover the capability-gate logic, not the privilege transition.
 - Single-threaded; no concurrency testing.
 - The IPC is synchronous only (no async notification variant).
 - Not formally verified; follows seL4-lineage design but does not inherit
@@ -654,10 +666,11 @@ workflow (`cargo test --workspace`) will enforce it.
 The Phase 0 formal model above governs the capability-crate workspace (`aegis/crates`).
 Phases 1-7 in `aegis-kernel` implement the real-hardware-facing substrate: boot, process
 isolation, drivers, networking, AI orchestration, and shell. Every claim below is
-machine-checked by `#[cfg(test)]` contract tests in the same crate (99 total), run by
-`cargo test` from `aegis-kernel/`. Honest limits: tests run as host-target unit tests
-proving the *model logic*; every hardware-touching operation (lgdt/lidt/cr3, PCIe config
-I/O, IOMMU tables, NVMe queues, VirtIO MMIO, VGA writes) is UNTESTED on real hardware.
+machine-checked by `#[cfg(test)]` contract tests in the same crate (289 total as of
+Phase 1), run by `cargo test` from `aegis-kernel/`. Honest limits: tests run as
+host-target unit tests proving the *model logic*; every hardware-touching operation
+(lgdt/lidt/cr3, PCIe config I/O, IOMMU tables, NVMe queues, VirtIO MMIO, VGA writes) is
+UNTESTED on real hardware.
 
 ### Machine-checked verification (executable): boot and ELF64 loading (§5, Phase 1)
 

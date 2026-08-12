@@ -10,7 +10,7 @@
 use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::cap::{Cap, CapTable};
+use crate::cap::{Cap, CapSlot, CapTable};
 
 pub const TASK_STACK_SIZE: u64 = 16384;
 pub const MAX_TASKS: usize = 8;
@@ -404,6 +404,13 @@ pub fn current_idx() -> usize {
     unsafe { core::ptr::read(core::ptr::addr_of_mut!(CURRENT)) }
 }
 
+/// Test-only: pin `CURRENT` to a task index so ipc capability-gate tests can
+/// exercise the syscall entries without a live scheduler context.
+#[cfg(test)]
+pub fn set_current_for_test(idx: usize) {
+    unsafe { core::ptr::write(core::ptr::addr_of_mut!(CURRENT), idx) }
+}
+
 /// Next context in round-robin order: idle -> task 0 -> ... -> last task
 /// -> idle. Returns `None` when no tasks are spawned. Pure (ignores blocked
 /// state) — used by unit tests.
@@ -462,7 +469,7 @@ fn set_task_state(idx: usize, s: TaskState) {
 }
 
 /// Capability slot `slot` of task `idx`.
-pub fn task_cap(idx: usize, slot: usize) -> Cap {
+pub fn task_cap(idx: usize, slot: usize) -> CapSlot {
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
             .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, caps))
@@ -471,7 +478,7 @@ pub fn task_cap(idx: usize, slot: usize) -> Cap {
     }
 }
 
-pub fn set_task_cap(idx: usize, slot: usize, cap: Cap) {
+pub fn set_task_cap(idx: usize, slot: usize, cap: CapSlot) {
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
             .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, caps))
@@ -483,14 +490,14 @@ pub fn set_task_cap(idx: usize, slot: usize, cap: Cap) {
 /// Copy a capability from `src` task's slot into `dst` task's table (first
 /// free slot). Returns the destination slot, or `usize::MAX` if full.
 pub fn grant_cap(dst: usize, src: usize, src_slot: usize) -> usize {
-    let cap = task_cap(src, src_slot);
-    if cap == Cap::None {
+    let slot = task_cap(src, src_slot);
+    if slot.cap == Cap::None {
         return usize::MAX;
     }
-    let free = (0..MAX_CAPS).find(|&s| task_cap(dst, s) == Cap::None);
+    let free = (0..MAX_CAPS).find(|&s| task_cap(dst, s).cap == Cap::None);
     match free {
         Some(s) => {
-            set_task_cap(dst, s, cap);
+            set_task_cap(dst, s, slot);
             s
         }
         None => usize::MAX,

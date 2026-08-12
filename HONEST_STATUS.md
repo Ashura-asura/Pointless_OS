@@ -38,6 +38,20 @@ This is the **single consolidated Known Limits section** (`README.md` and
   display is the VGA text console.
 - **IPC overhead** vs a monolithic syscall path is reduced (batched submission,
   shared-memory capability grants), not eliminated.
+- **Pre-existing boot fault on this host (Phase 1 note)** — with the current
+  committed boot image the ring-3 IPC demo faults at `tick=3` with a
+  `KERNEL EXCEPTION vector=0x0D err=0x402 RIP=0x4425` (a #GP pointing at IDT
+  index 0x80, the DPL-3 `int 0x80` syscall gate) the first time `task_server`
+  enters the gate. This is **not** introduced by Phase 1: unmodified committed
+  HEAD reproduces the identical fault, and runtime evidence (boot config is
+  IDE-only, so the storage path prints `NVMe: no controller with a mapped BAR`
+  and the FAT16 reader never runs) shows the trigger is a *code-layout shift*
+  from the `cb48a90` FAT16 commit changing the behavior of a latent
+  ring-3/syscall-gate race. Bisect: `c9f57dd` (pre-FAT16) boots clean every run
+  (echo reply works, 0 exceptions); `cb48a90` and every later commit fault
+  every run. Contract-test proof of the capability gates is unaffected (14
+  Phase-1 tests, green); the fault lives in the pre-existing task/preempt path
+  and is tracked for a later phase, not bundled into Phase 1.
 
 ### Inherent (cannot be closed by better engineering)
 
@@ -57,10 +71,10 @@ This is the **single consolidated Known Limits section** (`README.md` and
 Test counts are kept separate on purpose: `aegis-kernel` is a **standalone bare-metal crate that is NOT a member of the `aegis` workspace**, so its tests are never covered by `cargo test --workspace`.
 
 - **aegis workspace (model crates):** 113 contract tests, 0 failures — `cargo test --workspace` from a clean lockfile (Rule 1/10).
-- **aegis-kernel (bare-metal, separate crate):** 275 contract tests, 0 failures — `cargo test` on the pinned 1.97.1 toolchain (verified this session: includes the UDP/TCP header parsers in `udp.rs`/`tcp.rs` — RFC 768/793 parse/serialize with pseudo-header checksum verification — and the full Phase-12 `hardening.rs` adversarial boundary suite — ELF/PE/IPv4/Ethernet/ARP/UDP/TCP parse-and-never-panic, syscall/ABI translation totality, compat-layer/shell/window/graph/input bad-ID rejection). The ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
+- **aegis-kernel (bare-metal, separate crate):** 289 contract tests, 0 failures — `cargo test` on the pinned 1.97.1 toolchain (verified this session: includes the UDP/TCP header parsers in `udp.rs`/`tcp.rs` — RFC 768/793 parse/serialize with pseudo-header checksum verification — and the full Phase-12 `hardening.rs` adversarial boundary suite — ELF/PE/IPv4/Ethernet/ARP/UDP/TCP parse-and-never-panic, syscall/ABI translation totality, compat-layer/shell/window/graph/input bad-ID rejection — plus the Phase-1 `cap.rs`/`ipc.rs` capability-rights model: SEND/RECV/GRANT gates on call/serve/reply/grant and the Task/MemRegion object kinds). The ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
 - **uefi-boot:** 13 ELF parser contract tests.
 
-Combined contract-test count across all crates: **401**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
+Combined contract-test count across all crates: **415**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:

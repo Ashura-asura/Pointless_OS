@@ -14,7 +14,7 @@
 //! once isolation lands. There is no capability sealing/revocation yet beyond
 //! the per-task table; no async/notify variant yet (only synchronous call/reply).
 
-use crate::cap::Cap;
+use crate::cap::{Cap, CapSlot, Rights};
 use crate::tasks::{
     block_current, context_frame, current_idx, set_task_cap, switch_away_from, task_cap,
     unblock_task,
@@ -81,13 +81,21 @@ unsafe fn copy_user(src_va: u64, dst_va: u64, len: usize) {
     core::ptr::copy_nonoverlapping(src_va as *const u8, dst_va as *mut u8, len);
 }
 
-fn cap_to_ep(cur: usize, slot: u64) -> Option<usize> {
+/// Resolve a capability slot to an endpoint, requiring the caller to hold the
+/// given rights on it. `None` both when the slot is empty or names a non-endpoint
+/// object, and when the held rights are insufficient (Phase 1: capability-aware
+/// IPC — a cap is a (object, rights) pair, and the kernel enforces the rights at
+/// delivery time, never trusting the caller to state its own authority).
+fn caps_endpoint(cur: usize, slot: u64, need: Rights) -> Option<usize> {
     if slot as usize >= crate::tasks::MAX_CAPS {
         return None;
     }
     match task_cap(cur, slot as usize) {
-        Cap::Endpoint(id) => Some(id as usize),
-        Cap::None => None,
+        CapSlot {
+            cap: Cap::Endpoint(id),
+            rights,
+        } if rights.contains(need) => Some(id as usize),
+        _ => None,
     }
 }
 
@@ -105,7 +113,7 @@ pub unsafe fn ipc_endpoint_create() -> i64 {
     };
     ENDPOINTS[id] = Endpoint::new();
     ENDPOINTS[id].active = true;
-    let slot = (0..crate::tasks::MAX_CAPS).find(|&s| task_cap(cur, s) == Cap::None);
+    let slot = (0..crate::tasks::MAX_CAPS).find(|&s| task_cap(cur, s).cap == Cap::None);
     let slot = match slot {
         Some(s) => s,
         None => {
@@ -113,23 +121,32 @@ pub unsafe fn ipc_endpoint_create() -> i64 {
             return -1;
         }
     };
-    set_task_cap(cur, slot, Cap::Endpoint(id as u32));
+    set_task_cap(
+        cur,
+        slot,
+        CapSlot {
+            cap: Cap::Endpoint(id as u32),
+            rights: crate::cap::ENDPOINT_RIGHTS,
+        },
+    );
     slot as i64
 }
 
 /// Syscall: grant the caller's capability `src_slot` to task `dst` at its
-/// slot `dst_slot` (so the destination knows where to find it). Returns
-/// `dst_slot` on success, or -1.
+/// slot `dst_slot` (so the destination knows where to find it). Requires the
+/// caller to hold GRANT on the source slot (Phase 1: delegation is gated on the
+/// GRANT right — a caller can only copy authority it is entitled to delegate).
+/// Returns `dst_slot` on success, or -1.
 ///
 /// # Safety
 /// Must be called via syscall from ring-3 with valid task context.
 pub unsafe fn ipc_cap_grant(dst: u64, src_slot: u64, dst_slot: u64) -> i64 {
     let cur = current_idx();
-    let cap = task_cap(cur, src_slot as usize);
-    if cap == Cap::None {
+    let slot = task_cap(cur, src_slot as usize);
+    if slot.cap == Cap::None || !slot.rights.contains(Rights::GRANT) {
         return -1;
     }
-    set_task_cap(dst as usize, dst_slot as usize, cap);
+    set_task_cap(dst as usize, dst_slot as usize, slot);
     0
 }
 
@@ -144,7 +161,7 @@ pub unsafe fn ipc_cap_grant(dst: u64, src_slot: u64, dst_slot: u64) -> i64 {
 pub unsafe fn ipc_call(ep_slot: u64, msg_va: u64, len: u64, reply_va: u64) -> i64 {
     let cur = current_idx();
     crate::sprintln!("Aegis: ipc_call cur={} ep_slot={}", cur, ep_slot);
-    let ep = match cap_to_ep(cur, ep_slot) {
+    let ep = match caps_endpoint(cur, ep_slot, Rights::SEND) {
         Some(e) => e,
         None => return -1,
     };
@@ -198,7 +215,7 @@ unsafe fn resume_ret(cur: usize) -> i64 {
 pub unsafe fn ipc_serve(ep_slot: u64, recvbuf_va: u64) -> i64 {
     let cur = current_idx();
     crate::sprintln!("Aegis: ipc_serve cur={} ep_slot={}", cur, ep_slot);
-    let ep = match cap_to_ep(cur, ep_slot) {
+    let ep = match caps_endpoint(cur, ep_slot, Rights::RECV) {
         Some(e) => e,
         None => return -1,
     };
@@ -233,7 +250,7 @@ pub unsafe fn ipc_serve(ep_slot: u64, recvbuf_va: u64) -> i64 {
 /// user-space virtual address for reply_va.
 pub unsafe fn ipc_reply(ep_slot: u64, caller_id: u64, reply_va: u64, rlen: u64) -> i64 {
     let cur = current_idx();
-    let ep = match cap_to_ep(cur, ep_slot) {
+    let ep = match caps_endpoint(cur, ep_slot, Rights::RECV) {
         Some(e) => e,
         None => return -1,
     };
@@ -255,4 +272,129 @@ pub unsafe fn ipc_reply(ep_slot: u64, caller_id: u64, reply_va: u64, rlen: u64) 
 #[allow(dead_code)]
 pub unsafe fn force_unblock(idx: usize) {
     unblock_task(idx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cap::new_cap_table;
+    use crate::tasks::MAX_CAPS;
+
+    // Global-state tests each pin a task index so they never collide with the
+    // other tests sharing CURRENT/TASKS: 0 = grants+call, 1 = endpoint create,
+    // 2 = serve/reply, 3 = non-endpoint, 4 = out-of-range.
+
+    fn seed_endpoint(idx: usize, rights: Rights) {
+        set_task_cap(
+            idx,
+            0,
+            CapSlot {
+                cap: Cap::Endpoint(7),
+                rights,
+            },
+        );
+    }
+
+    #[test]
+    fn blank_table_has_only_empty_slots() {
+        let caps = new_cap_table();
+        assert!(caps
+            .iter()
+            .all(|s| s.cap == Cap::None && s.rights == Rights::NONE));
+    }
+
+    #[test]
+    fn endpoint_create_installs_send_recv_grant_rights() {
+        // Task 1 owns slot 0 here; no other test touches task 1.
+        crate::tasks::set_current_for_test(1);
+        let slot = unsafe { ipc_endpoint_create() };
+        assert!(slot >= 0, "endpoint create must succeed");
+        let s = task_cap(1, slot as usize);
+        assert!(s.rights.contains(Rights::SEND));
+        assert!(s.rights.contains(Rights::RECV));
+        assert!(s.rights.contains(Rights::GRANT));
+        assert!(!s.rights.contains(Rights::CONTROL));
+    }
+
+    #[test]
+    fn grants_require_grant_right_on_source() {
+        // Task 0 slot 0 is seeded with RECV only; slot 3 stays empty.
+        crate::tasks::set_current_for_test(0);
+        seed_endpoint(0, Rights::RECV);
+        // Empty slot must fail.
+        assert_eq!(unsafe { ipc_cap_grant(1, 3, 0) }, -1);
+        // Slot without GRANT right must fail.
+        assert_eq!(unsafe { ipc_cap_grant(1, 0, 0) }, -1);
+    }
+
+    #[test]
+    fn grant_copies_slot_verbatim() {
+        // Task 1 owns slot 2 here (endpoint create writes task 1 slot 0 only).
+        crate::tasks::set_current_for_test(1);
+        let mut caps = new_cap_table();
+        caps[2] = CapSlot {
+            cap: Cap::Endpoint(3),
+            rights: Rights::RECV.union(Rights::GRANT),
+        };
+        set_task_cap(1, 2, caps[2]);
+        assert_eq!(unsafe { ipc_cap_grant(0, 2, 0) }, 0);
+        let got = task_cap(0, 0);
+        assert_eq!(got, caps[2]);
+    }
+
+    #[test]
+    fn call_requires_send_right_on_endpoint() {
+        // Task 0 slot 0 RECV-only (same seed value as grants test, so the two
+        // stay consistent even if they interleave).
+        crate::tasks::set_current_for_test(0);
+        seed_endpoint(0, Rights::RECV);
+        assert_eq!(
+            caps_endpoint(0, 0, Rights::SEND),
+            None,
+            "call with RECV-only must be denied"
+        );
+    }
+
+    #[test]
+    fn serve_and_reply_require_recv_right_on_endpoint() {
+        // Task 2 slot 0 SEND-only.
+        crate::tasks::set_current_for_test(2);
+        seed_endpoint(2, Rights::SEND);
+        assert_eq!(
+            caps_endpoint(2, 0, Rights::RECV),
+            None,
+            "serve/reply with SEND-only must be denied"
+        );
+    }
+
+    #[test]
+    fn non_endpoint_caps_are_not_deliverable() {
+        // Task 3 slots 1,2 hold Task/MemRegion caps.
+        crate::tasks::set_current_for_test(3);
+        set_task_cap(
+            3,
+            1,
+            CapSlot {
+                cap: Cap::Task(1),
+                rights: Rights::ALL,
+            },
+        );
+        set_task_cap(
+            3,
+            2,
+            CapSlot {
+                cap: Cap::MemRegion(4),
+                rights: Rights::ALL,
+            },
+        );
+        assert_eq!(caps_endpoint(3, 1, Rights::SEND), None);
+        assert_eq!(caps_endpoint(3, 2, Rights::RECV), None);
+    }
+
+    #[test]
+    fn out_of_range_slot_is_denied_not_panic() {
+        // Task 4 pins CURRENT; nothing else touches it.
+        crate::tasks::set_current_for_test(4);
+        assert_eq!(caps_endpoint(4, MAX_CAPS as u64 + 100, Rights::SEND), None);
+    }
 }
