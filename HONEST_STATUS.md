@@ -7,10 +7,10 @@
 Test counts are kept separate on purpose: `aegis-kernel` is a **standalone bare-metal crate that is NOT a member of the `aegis` workspace**, so its tests are never covered by `cargo test --workspace`.
 
 - **aegis workspace (model crates):** 113 contract tests, 0 failures — `cargo test --workspace` from a clean lockfile (Rule 1/10).
-- **aegis-kernel (bare-metal, separate crate):** 251 contract tests, 0 failures — `cargo test` on the host target; the ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
+- **aegis-kernel (bare-metal, separate crate):** 253 contract tests, 0 failures — `cargo test` on the pinned 1.97.1 toolchain (verified this session: includes the UDP/TCP header parsers and the full Phase-12 `hardening.rs` adversarial boundary suite — ELF/PE/IPv4/Ethernet/ARP/UDP/TCP parse-and-never-panic, syscall/ABI translation totality, compat-layer/shell/window/graph/input bad-ID rejection). The ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
 - **uefi-boot:** 13 ELF parser contract tests.
 
-Combined contract-test count across all crates: **377**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
+Combined contract-test count across all crates: **379**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:
@@ -138,7 +138,7 @@ Honest limits: two-node in-process model (no sockets, no real network); no conse
 | Component | Tests | What it proves |
 |-----------|-------|----------------|
 | Aggregate security audit | 10 | Reference world is clean (0 violations); kernel-equivalent demand from userspace repo is a violation; undeclared holdings are violations; delivery overhang warns but never breaks the build; self caps excluded from reachable authority; unbound tasks skipped |
-| Kernel boundary/panic-safety | 17 | All parsers (ELF/PE/IPv4/Ethernet/ARP) and both syscall ABIs return errors on garbage/truncated/overflowing inputs and never panic; ELF/PE loaders reject attacker-controlled offsets that would overflow (checked_add/checked_mul — 4 regression tests); compat layers reject garbage; shell/window/graph/input reject bad IDs without panicking |
+| Kernel boundary/panic-safety | 20 | All parsers (ELF/PE/IPv4/Ethernet/ARP/UDP/TCP) and both syscall ABIs return errors on garbage/truncated/overflowing inputs and never panic; ELF/PE loaders reject attacker-controlled offsets that would overflow (checked_add/checked_mul — 4 regression tests); compat layers reject garbage; shell/window/graph/input reject bad IDs without panicking |
 | Certification matrix | — | `SECURITY_AUDIT.md`: what is certified (model-level only), what is NOT (all real-hardware ops UNTESTED, no inductive proof, no fuzzing, no distributed guarantees) |
 
 ### Tooling
