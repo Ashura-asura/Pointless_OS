@@ -334,6 +334,32 @@ on-disk block (bit-flipped, truncated), confirming no panic.
 **Definition of Done:** left open deliberately — scope this for real once
 you reach it, not from here.
 
+### P7 landed (see commit "master roadmap P7")
+
+`aegis-kernel/src/nvme_store.rs` writes the Phase 4 object-store semantics
+through the kernel's real QEMU NVMe device: hash-named immutable blocks
+plus a COW mutable dir layer over flat on-disk LBAs (header + index +
+data region at LBA 8192+), SHA-256 content addressing, cross-checked
+digest verify on reads, and a deliberate bit-flip corruption test proving
+the store detects a bad block and keeps running without panicking. Two
+real driver bugs surfaced and were fixed on the live device:
+
+- **Queue size is 0s-based.** QEMU builds queues of `qsize + 1` entries
+  (NVMe spec), so advertising `QUEUE_SIZE` (16) created 17-entry rings;
+  on the wrap the controller fetched one slot past the never-written end
+  of the SQ buffer (all zeroes -> FLUSH, nsid 0) and replied
+  `INVALID_NSID`. Fixed by advertising `QUEUE_SIZE - 1`, exactly as the
+  admin AQA already did.
+- **The CQ head doorbell was never rung.** Polled completion queues still
+  must ring the CQ head doorbell to release consumed slots; without it
+  QEMU reports the ring full once `qsize` completions are outstanding and
+  every later completion stalls. Added CQ head doorbell writes to both
+  `wait_completion` and `wait_io_completion`.
+
+Verified live under QEMU/OVMF: single `put` round-trip proves
+insert-dedup, digest-verified readback, COW dir versioning, and
+corruption recovery — all against the kernel's real NVMe driver.
+
 ---
 
 ## 10. What happens to the deferred items (Windows/Linux compat, distributed transparency, GPU shell, broader AI orchestration)

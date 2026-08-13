@@ -135,7 +135,7 @@ pub fn role_grant(role_id: u64, grantee: u64, target: u64, dst_slot: u64) -> i64
 mod tests {
     use super::*;
     use crate::supervisor::{task_restart, task_state};
-    use crate::tasks::{kill_task, reset_table_for_test, set_current_for_test, spawn};
+    use crate::tasks::{set_current_for_test, spawn};
 
     extern "sysv64" fn dummy() -> ! {
         loop {
@@ -144,13 +144,11 @@ mod tests {
     }
 
     fn clean_world() {
-        unsafe {
-            crate::audit::reset_for_test();
-            crate::tasks::reset_table_for_test();
-            for i in 0..MAX_TASKS {
-                for s in 0..MAX_CAPS {
-                    set_task_cap(i, s, CapSlot::empty());
-                }
+        crate::audit::reset_for_test();
+        crate::tasks::reset_table_for_test();
+        for i in 0..MAX_TASKS {
+            for s in 0..MAX_CAPS {
+                set_task_cap(i, s, CapSlot::empty());
             }
         }
     }

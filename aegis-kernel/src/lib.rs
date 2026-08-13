@@ -24,6 +24,7 @@ pub mod monitor;
 pub mod fat;
 pub mod iommu;
 pub mod nvme;
+pub mod nvme_store;
 pub mod pci;
 
 pub mod arp;
@@ -67,9 +68,12 @@ pub mod role;
 /// region / supervisor state. The kernel has one `static mut CURRENT` and one
 /// capability table per task, so tests that pin `CURRENT` and seed caps must
 /// not run concurrently with each other even though they use distinct task
-/// indices (the global cursor itself is shared).
+/// indices (the global cursor itself is shared). Poison-tolerant: a test that
+/// panics while holding the lock must not cascade into every other guarded
+/// test via `PoisonError` -- mutual exclusion (the actual invariant) still
+/// holds after a panic, only the "no panic happened" invariant is lost.
 #[cfg(test)]
 pub(crate) fn kernel_state_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap()
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }

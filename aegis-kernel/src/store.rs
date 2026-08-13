@@ -360,7 +360,7 @@ pub struct FileEntry {
     pub node: u64,
 }
 
-fn encode_entries(entries: &[FileEntry]) -> Option<([u8; ENTRY_BUF], usize)> {
+pub(crate) fn encode_entries(entries: &[FileEntry]) -> Option<([u8; ENTRY_BUF], usize)> {
     let mut out = [0u8; ENTRY_BUF];
     let mut at = 0usize;
     out[at..at + 4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
@@ -381,7 +381,7 @@ fn encode_entries(entries: &[FileEntry]) -> Option<([u8; ENTRY_BUF], usize)> {
 }
 
 /// Decode at most `MAX_FILES` entries; returns how many were decoded.
-fn decode_entries(bytes: &[u8], out: &mut [FileEntry; MAX_FILES]) -> usize {
+pub(crate) fn decode_entries(bytes: &[u8], out: &mut [FileEntry; MAX_FILES]) -> usize {
     let mut written = 0usize;
     if bytes.len() < 4 {
         return 0;

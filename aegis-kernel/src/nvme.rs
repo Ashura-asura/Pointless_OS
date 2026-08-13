@@ -147,8 +147,9 @@ const ADMIN_IDENTIFY: u8 = 0x06;
 const CNS_IDENTIFY_CONTROLLER: u32 = 0x01;
 const CNS_IDENTIFY_NAMESPACE: u32 = 0x00;
 const IO_READ: u8 = 0x02;
+const IO_WRITE: u8 = 0x01;
 
-const POLL_ITERATIONS: u32 = 1_200_000;
+const POLL_ITERATIONS: u32 = 50_000_000;
 
 fn wr32(base: *mut u8, offset: u64, value: u32) {
     unsafe { core::ptr::write_volatile(base.add(offset as usize) as *mut u32, value) }
@@ -212,13 +213,22 @@ struct Bufs {
 
 impl Bufs {
     fn new() -> Self {
-        Self {
+        let mut b = Self {
             sq: alloc_dma_frame(),
             cq: alloc_dma_frame(),
             qe: alloc_dma_frame(),
             id: alloc_dma_frame(),
             ad: alloc_dma_frame(),
+        };
+        // Deterministic init: polled completions match on the phase bit, so a
+        // stale non-zero completion ring must never be mistaken for a real
+        // entry (see the identify-clobbering note in `identify`).
+        for f in [&mut b.sq, &mut b.cq, &mut b.qe, &mut b.id, &mut b.ad] {
+            for w in f.iter_mut() {
+                *w = 0;
+            }
         }
+        b
     }
 
     fn phys(bytes: &[u64]) -> u64 {
@@ -235,6 +245,7 @@ pub struct NvmeController {
     phase: bool,
     io_cq_head: u16,
     io_phase: bool,
+    ns_size_bytes: u64,
     buf: Bufs,
 }
 
@@ -263,6 +274,7 @@ impl NvmeController {
             phase: true,
             io_cq_head: 0,
             io_phase: true,
+            ns_size_bytes: 0,
             buf: Bufs::new(),
         })
     }
@@ -328,7 +340,10 @@ impl NvmeController {
     }
 
     /// Poll the admin completion queue until the phase tag matches;
-    /// true on status 0x0000 with the expected command id.
+    /// true on status 0x0000 with the expected command id. Rings the
+    /// admin CQ head doorbell so the controller can reuse the consumed
+    /// slots: without it QEMU's ring reads full once `qsize` completions
+    /// are outstanding and stalls every later completion.
     fn wait_completion(&mut self, cid: u16) -> bool {
         let head = self.cq_head as usize;
         if !spin_wait(POLL_ITERATIONS, || {
@@ -343,6 +358,9 @@ impl NvmeController {
         if self.cq_head == 0 {
             self.phase = !self.phase;
         }
+        let stride = ((rd32(self.base, REG_CAP + 4) & 0xF) as u64) + 1;
+        wr32(self.base, DOORBELL_BASE + stride * 4, self.cq_head as u32);
+        wmb();
         ok
     }
 
@@ -354,14 +372,49 @@ impl NvmeController {
             let dw3 = (self.buf.ad[head * 2 + 1] >> 32) as u32;
             Self::cq_phase(dw3) == self.io_phase
         }) {
+            #[cfg(not(test))]
+            {
+                let dw3 = (self.buf.ad[head * 2 + 1] >> 32) as u32;
+                crate::sprintln!(
+                    "Aegis: NVMe: io timeout cid={} head={} phase={} dw3={:08X} P={} S={:04X}",
+                    cid,
+                    head,
+                    self.io_phase,
+                    dw3,
+                    Self::cq_phase(dw3),
+                    Self::cq_status(dw3)
+                );
+            }
             return false;
         }
         let dw3 = (self.buf.ad[head * 2 + 1] >> 32) as u32;
         let ok = Self::cq_status(dw3) == 0 && (dw3 as u16) == cid;
+        #[cfg(not(test))]
+        if !ok {
+            crate::sprintln!(
+                "Aegis: NVMe: io done-bad cid={} head={} dw3={:08X} P={} S={:04X} gotcid={}",
+                cid,
+                head,
+                dw3,
+                Self::cq_phase(dw3),
+                Self::cq_status(dw3),
+                dw3 as u16
+            );
+        }
         self.io_cq_head = (self.io_cq_head + 1) % QUEUE_SIZE as u16;
         if self.io_cq_head == 0 {
             self.io_phase = !self.io_phase;
         }
+        // IO CQ head doorbell (qid 1): free the consumed slot so QEMU can
+        // keep posting. Without it the ring saturates at `qsize` outstanding
+        // completions and the next completion never lands.
+        let stride = ((rd32(self.base, REG_CAP + 4) & 0xF) as u64) + 1;
+        wr32(
+            self.base,
+            DOORBELL_BASE + 3 * stride * 4,
+            self.io_cq_head as u32,
+        );
+        wmb();
         ok
     }
 
@@ -369,12 +422,18 @@ impl NvmeController {
     /// The IO CQ lives in its own frame (`ad`): QEMU keeps a separate head
     /// for it, and sharing the admin CQ buffer let stale admin completions
     /// impersonate IO completions (both rings start at phase 1).
+    /// QSize is 0s-based (NVMe spec): QEMU builds queues of `qsize + 1`
+    /// entries, so advertise `QUEUE_SIZE - 1` to keep the controller's ring
+    /// exactly 16 entries like the driver's. Passing `QUEUE_SIZE` made QEMU
+    /// create 17-entry rings; on the wrap it fetched one slot past the
+    /// never-written end of `buf.sq` (all zeroes -> FLUSH, nsid 0) and the
+    /// driver replied INVALID_NSID for a command it never issued.
     pub fn create_io_queues(&mut self) -> bool {
         let cid = self.admin_cmd(
             ADMIN_CREATE_IO_CQ,
             0,
             Bufs::phys(self.buf.ad),
-            (QUEUE_SIZE << 16) | 1,
+            ((QUEUE_SIZE - 1) << 16) | 1,
             1,
         );
         if !self.wait_completion(cid) {
@@ -384,13 +443,17 @@ impl NvmeController {
             ADMIN_CREATE_IO_SQ,
             0,
             Bufs::phys(self.buf.sq),
-            (QUEUE_SIZE << 16) | 1,
+            ((QUEUE_SIZE - 1) << 16) | 1,
             (1 << 16) | 1,
         );
         self.wait_completion(cid)
     }
 
     /// Identify controller (into `id`) and namespace 1 (into `ad`).
+    /// `ad` doubles as the IO completion ring, so after the namespace
+    /// identify lands we cache NSZE and clear the ring: leftover identify
+    /// bytes must never be mistaken for completion entries (their phase bit
+    /// would make the polled `wait_io_completion` return garbage).
     pub fn identify(&mut self) -> bool {
         let cid = self.admin_cmd(
             ADMIN_IDENTIFY,
@@ -409,7 +472,14 @@ impl NvmeController {
             CNS_IDENTIFY_NAMESPACE,
             0,
         );
-        self.wait_completion(cid)
+        if !self.wait_completion(cid) {
+            return false;
+        }
+        self.ns_size_bytes = self.buf.ad[0] * 512;
+        for w in self.buf.ad.iter_mut() {
+            *w = 0;
+        }
+        true
     }
 
     fn id_bytes(&self) -> &[u8] {
@@ -426,9 +496,9 @@ impl NvmeController {
         str_of(d.get(0x40..0x40 + 8).unwrap_or(&[]))
     }
 
-    /// Namespace size in bytes (NSZE x 512 B block).
+    /// Namespace size in bytes (NSZE x 512 B block), cached during identify.
     pub fn ns_size(&self) -> u64 {
-        self.buf.ad[0] * 512
+        self.ns_size_bytes
     }
 
     /// Read one 512 B LBA into the DMA buffer; call `lba_data` afterwards.
@@ -460,6 +530,43 @@ impl NvmeController {
 
     pub fn lba_data(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.buf.qe.as_ptr() as *const u8, 4096) }
+    }
+
+    /// Write one 512 B LBA from `data` (the first 512 bytes; anything beyond is
+    /// ignored) via IO_WRITE (opcode 0x01), the exact mirror of `read_lba`:
+    /// PRP1 points at the shared DMA frame, cdw10 = LBA, same polled
+    /// completion. The payload is staged into the DMA buffer and an `mfence`
+    /// runs before the doorbell so the controller's DMA read cannot observe a
+    /// partially-written sector.
+    pub fn write_lba(&mut self, lba: u64, data: &[u8]) -> bool {
+        let qe = &mut self.buf.qe;
+        unsafe {
+            core::ptr::write_bytes(qe.as_mut_ptr() as *mut u8, 0, 4096);
+            core::ptr::copy_nonoverlapping(data.as_ptr(), qe.as_mut_ptr() as *mut u8, data.len().min(512));
+        }
+        wmb();
+        let tail = self.io_tail as usize;
+        let cid = tail as u16;
+        let s = &mut self.buf.sq[tail * 8..tail * 8 + 8];
+        s[0] = IO_WRITE as u64 | ((tail as u64) << 16) | (1 << 32);
+        s[1] = 0;
+        s[3] = Bufs::phys(self.buf.qe);
+        s[4] = 0;
+        s[5] = lba;
+        s[6] = 0;
+        s[7] = 0;
+        self.io_tail = (self.io_tail + 1) % QUEUE_SIZE as u16;
+        wmb();
+        // IO SQ1 tail doorbell: stride = (DSTRD + 1) * 4 bytes.
+        let stride = ((rd32(self.base, REG_CAP + 4) & 0xF) as u64) + 1;
+        wr32(
+            self.base,
+            DOORBELL_BASE + 2 * stride * 4,
+            self.io_tail as u32,
+        );
+        let ok = self.wait_io_completion(cid);
+        wmb();
+        ok
     }
 }
 

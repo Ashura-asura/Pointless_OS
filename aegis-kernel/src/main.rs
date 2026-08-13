@@ -248,6 +248,95 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         } else {
             sprintln!("Aegis: FAT16: mount failed at LBA {}", ESP_START_LBA);
         }
+
+        // Phase 7: the object store graduates from an in-memory model to a
+        // write-through, content-addressed store over THIS live NVMe device.
+        // Identical bytes are the same block (dedup against the on-disk index),
+        // reads are digest-verified against the content hash, a flat directory
+        // is a COW store object (each mutation writes a NEW dir block; an id
+        // you already hold reads that version forever), and a deliberately
+        // corrupted on-disk block is detected by hash mismatch — no panic.
+        match aegis_kernel::nvme_store::Store::open(&mut ctrl) {
+            Some(mut st) => {
+                use aegis_kernel::nvme_store::{DATA_BASE_LBA, STORE_START_LBA};
+                use aegis_kernel::store::{FileEntry, Name};
+                sprintln!(
+                    "Aegis: NVMe-store: region @ LBA {} (data @ LBA {}), {} block(s) on disk",
+                    STORE_START_LBA,
+                    DATA_BASE_LBA,
+                    st.count()
+                );
+
+                // 1) Content addressing + dedup: identical bytes, one block.
+                let hello = b"hello content-addressed NVMe block";
+                let h1 = st.put(&mut ctrl, hello).expect("put hello");
+                let h1_dup = st.put(&mut ctrl, hello).expect("put hello again");
+                sprintln!(
+                    "Aegis: NVMe-store: put block h1={:02X}{:02X}{:02X}{:02X}.. ({} bytes), dedup = {}",
+                    h1[0], h1[1], h1[2], h1[3], hello.len(), h1_dup == h1
+                );
+
+                // 2) Read back + digest verification.
+                let mut buf = [0u8; 512];
+                let n = st.get(&mut ctrl, &h1, &mut buf);
+                let read_ok = n.map(|l| &buf[..l] == hello).unwrap_or(false);
+                sprintln!("Aegis: NVMe-store: read back {}, digest verified {}", n.is_some(), read_ok);
+
+                // 3) COW flat directory: two versions of memo.txt are two blocks.
+                let memo7 = FileEntry {
+                    name: Name::from_slice(b"memo.txt").unwrap(),
+                    node: 7,
+                };
+                let memo8 = FileEntry {
+                    name: Name::from_slice(b"memo.txt").unwrap(),
+                    node: 8,
+                };
+                let d1 = st.put_dir(&mut ctrl, &[memo7]).expect("put dir v1");
+                let d2 = st.put_dir(&mut ctrl, &[memo8]).expect("put dir v2");
+                sprintln!(
+                    "Aegis: NVMe-store: COW dir: v1={:02X}{:02X}.. v2={:02X}{:02X}.. distinct = {} ({} blocks)",
+                    d1[0], d1[1], d2[0], d2[1], d1 != d2, st.count()
+                );
+                let mut ents = [FileEntry {
+                    name: Name::from_slice(b"x").unwrap(),
+                    node: 0,
+                }; aegis_kernel::store::MAX_FILES];
+                let n1 = st.load_dir(&mut ctrl, &d1, &mut ents).unwrap_or(0);
+                let v1_stable = n1 == 1 && ents[0].node == 7;
+                let n2 = st.load_dir(&mut ctrl, &d2, &mut ents).unwrap_or(0);
+                let v2_ok = n2 == 1 && ents[0].node == 8;
+                sprintln!(
+                    "Aegis: NVMe-store: COW read: v1 {} entry (memo.txt -> {}), v2 {} entry (memo.txt -> {})",
+                    n1, ents[0].node, n2, ents[0].node
+                );
+                sprintln!(
+                    "Aegis: NVMe-store: version-stable (old id still reads old version): {}; v2 visible: {}",
+                    v1_stable, v2_ok
+                );
+
+                // 4) Corrupted-block detection on live hardware: flip one bit of
+                //    the first content block (h1) on the disk, then ask for it.
+                let mut sec = [0u8; 512];
+                let _ = ctrl.read_lba(DATA_BASE_LBA);
+                sec[..512].copy_from_slice(&ctrl.lba_data()[..512]);
+                sec[0] = 0xAA; // idempotent corruption: deterministic across reboots
+                let wr = ctrl.write_lba(DATA_BASE_LBA, &sec);
+                let detected = !st.verify(&mut ctrl, &h1) && st.get(&mut ctrl, &h1, &mut buf).is_none();
+                sprintln!(
+                    "Aegis: NVMe-store: flipped a bit of h1 on disk (write-back {}), verify -> {}, get -> absent: {}",
+                    wr, st.verify(&mut ctrl, &h1), detected
+                );
+                // The store is still usable after the corrupted read.
+                let id3 = st.put(&mut ctrl, b"post-corruption write still works");
+                sprintln!(
+                    "Aegis: NVMe-store: store usable after corruption: {} ({} blocks)",
+                    id3.is_some(), st.count()
+                );
+            }
+            None => {
+                sprintln!("Aegis: NVMe-store: corrupt or unreadable store region");
+            }
+        }
     } else {
         sprintln!("Aegis: NVMe: no controller with a mapped BAR");
     }

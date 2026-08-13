@@ -439,12 +439,17 @@ pub fn set_current_for_test(idx: usize) {
 }
 
 /// Test-only: reset the task table so supervisor/reap contract tests can spawn
-/// fresh tasks in an otherwise empty, deterministic table.
+/// fresh tasks in an otherwise empty, deterministic table. Also clears the
+/// monitor's global grant ledger: `ipc_cap_grant` is gated on
+/// `ledger.is_suspended(current)`, and a monitor contract test that leaves a
+/// task suspended must not leak that state into a later grant test (it made
+/// the revocation contract flaky depending on test order).
 #[cfg(test)]
 pub fn reset_table_for_test() {
     unsafe {
         core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
         core::ptr::write(core::ptr::addr_of_mut!(CURRENT), usize::MAX);
+        crate::monitor::ledger().clear_for_test();
         for i in 0..MAX_TASKS {
             let slot = core::ptr::addr_of_mut!(TASKS)
                 .cast::<core::mem::MaybeUninit<Task>>()

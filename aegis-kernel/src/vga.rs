@@ -414,7 +414,10 @@ mod tests {
     use super::*;
 
     /// RAM-backed stand-in for the VGA framebuffer (the real 0xB8000 is not
-    /// mapped in the host test process).
+    /// mapped in the host test process). VGA_BUF/ROW/COL are process-global
+    /// mutable statics, so the tests must not run concurrently with each
+    /// other: each test redirects the buffer to `RAM_BUF` and mutates the
+    /// shared cursor.
     static mut RAM_BUF: [u16; COLS * ROWS] = [0x0720; COLS * ROWS];
 
     fn with_ram_buffer(f: impl FnOnce()) {
@@ -428,58 +431,72 @@ mod tests {
         unsafe { &*core::ptr::addr_of_mut!(RAM_BUF) }
     }
 
+    fn with_vga_guard(f: impl FnOnce()) {
+        static VGA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = VGA_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        f();
+    }
+
     #[test]
     fn plain_text_fills_cells() {
-        with_ram_buffer(|| {
-            vga_clear_screen();
-            vga_write_str("hi");
-            assert_eq!(ram()[0], ATTR | b'h' as u16);
-            assert_eq!(ram()[1], ATTR | b'i' as u16);
-            unsafe {
-                assert_eq!(ROW, 0);
-                assert_eq!(COL, 2);
-            }
+        with_vga_guard(|| {
+            with_ram_buffer(|| {
+                vga_clear_screen();
+                vga_write_str("hi");
+                assert_eq!(ram()[0], ATTR | b'h' as u16);
+                assert_eq!(ram()[1], ATTR | b'i' as u16);
+                unsafe {
+                    assert_eq!(ROW, 0);
+                    assert_eq!(COL, 2);
+                }
+            });
         });
     }
 
     #[test]
     fn crlf_handling() {
-        with_ram_buffer(|| {
-            vga_clear_screen();
-            vga_write_str("a\r\nb");
-            assert_eq!(ram()[0], ATTR | b'a' as u16);
-            assert_eq!(ram()[COLS], ATTR | b'b' as u16);
-            unsafe {
-                assert_eq!(ROW, 1);
-                assert_eq!(COL, 1);
-            }
+        with_vga_guard(|| {
+            with_ram_buffer(|| {
+                vga_clear_screen();
+                vga_write_str("a\r\nb");
+                assert_eq!(ram()[0], ATTR | b'a' as u16);
+                assert_eq!(ram()[COLS], ATTR | b'b' as u16);
+                unsafe {
+                    assert_eq!(ROW, 1);
+                    assert_eq!(COL, 1);
+                }
+            });
         });
     }
 
     #[test]
     fn long_line_wraps() {
-        with_ram_buffer(|| {
-            vga_clear_screen();
-            let s: String = "x".repeat(COLS + 3);
-            vga_write_str(&s);
-            unsafe {
-                assert_eq!(ROW, 1);
-                assert_eq!(COL, 3);
-            }
+        with_vga_guard(|| {
+            with_ram_buffer(|| {
+                vga_clear_screen();
+                let s: String = "x".repeat(COLS + 3);
+                vga_write_str(&s);
+                unsafe {
+                    assert_eq!(ROW, 1);
+                    assert_eq!(COL, 3);
+                }
+            });
         });
     }
 
     #[test]
     fn scroll_keeps_bottom_row_clear() {
-        with_ram_buffer(|| {
-            vga_clear_screen();
-            let s: String = "x\n".repeat(ROWS);
-            vga_write_str(&s);
-            unsafe {
-                assert_eq!(ROW, ROWS - 1);
-                assert_eq!(COL, 0);
-            }
-            assert_eq!(ram()[COLS * (ROWS - 1)], ATTR | b' ' as u16);
+        with_vga_guard(|| {
+            with_ram_buffer(|| {
+                vga_clear_screen();
+                let s: String = "x\n".repeat(ROWS);
+                vga_write_str(&s);
+                unsafe {
+                    assert_eq!(ROW, ROWS - 1);
+                    assert_eq!(COL, 0);
+                }
+                assert_eq!(ram()[COLS * (ROWS - 1)], ATTR | b' ' as u16);
+            });
         });
     }
 }
