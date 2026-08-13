@@ -336,12 +336,24 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
                 );
             }
             // Phase 2 supervision hook: a supervised, budgeted task is
-            // restarted by the supervisor instead of left dead; unsupervised
-            // tasks keep the existing kill-and-continue behavior.
+            // restarted by the kernel-resident supervisor instead of left
+            // dead; unsupervised tasks keep the existing kill-and-continue
+            // behavior.
             let cur = crate::tasks::current_idx();
-            if !crate::supervisor::handle_fault(cur) {
-                crate::tasks::kill_current();
+            if crate::supervisor::handle_fault(cur) {
+                return;
             }
+            crate::tasks::kill_current();
+            // Phase 5 supervision tree: the fault-kill also parks the death
+            // on the reserved notification endpoint, so a ring-3 supervisor
+            // task (policy out of the kernel) can observe the TaskKill and
+            // apply its own bounded-restart / escalation policy.
+            let reason = if err & (1 << 4) != 0 {
+                crate::ipc::REASON_NX
+            } else {
+                crate::ipc::REASON_PF_ISOLATION
+            };
+            crate::ipc::notify_task_kill(cur, reason);
             return;
         }
     }

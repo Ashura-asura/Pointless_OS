@@ -309,6 +309,56 @@ extern "sysv64" fn boot_kernel() -> ! {
         }
     }
 
+    // Phase 5 supervision tree: a ring-3 Supervisor task (policy out of the
+    // kernel). It holds two kernel-installed caps and nothing else: the
+    // reserved kill-notification endpoint (RECV) at slot 0, and a Task cap on
+    // its child (CONTROL|READ) at slot 1. The fault path parks every ring-3
+    // death on the notification channel; the supervisor observes, applies its
+    // bounded-restart policy, and escalates once the budget is spent.
+    aegis_kernel::ipc::init_notify_endpoint();
+    let stack_sup = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    let cpl0_sup = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    match (stack_sup, cpl0_sup) {
+        (Some(su), Some(cu)) => {
+            let sup = unsafe {
+                aegis_kernel::tasks::spawn_user("supervisor", task_supervisor, su, cu)
+            }
+            .expect("supervisor task slot");
+            // Slot 0: reserved notification endpoint, RECV only (serve).
+            aegis_kernel::tasks::set_task_cap(
+                sup,
+                0,
+                aegis_kernel::cap::CapSlot {
+                    cap: aegis_kernel::cap::Cap::Endpoint(aegis_kernel::ipc::NOTIFY_EP as u32),
+                    rights: aegis_kernel::cap::Rights::RECV,
+                },
+            );
+            // Slot 1: Task cap on the supervised child (the isolation test at
+            // task index 5), CONTROL to restart/kill it, READ to query state.
+            aegis_kernel::tasks::set_task_cap(
+                sup,
+                1,
+                aegis_kernel::cap::CapSlot {
+                    cap: aegis_kernel::cap::Cap::Task(5),
+                    rights: aegis_kernel::cap::Rights::CONTROL
+                        .union(aegis_kernel::cap::Rights::READ),
+                },
+            );
+            sprintln!(
+                "Aegis: supervisor spawned @ 0x{:X} ({} tasks total)",
+                su,
+                aegis_kernel::tasks::spawned_count()
+            );
+        }
+        _ => {
+            sprintln!("Aegis: WARNING could not allocate supervisor task stacks");
+        }
+    }
+
     // Memory isolation test: a ring-3 task that tries to read kernel memory.
     // If memory isolation works, this triggers a page fault → task killed.
     let stack_iso = unsafe {
@@ -329,7 +379,9 @@ extern "sysv64" fn boot_kernel() -> ! {
             );
             // Hold the isolation test until the IPC demo (server/client
             // echo) has finished, so the two demos don't race for slices.
-            aegis_kernel::tasks::arm_isolation_test(4, 15);
+            // This task (index 5) is the supervisor's supervised child: it
+            // crashes, the supervisor restarts it twice, then escalates.
+            aegis_kernel::tasks::arm_isolation_test(5, 15);
         }
         _ => {
             sprintln!("Aegis: WARNING could not allocate isolation test stack");
@@ -358,7 +410,7 @@ extern "sysv64" fn boot_kernel() -> ! {
             );
             // After the isolation test faults (tick 15), let the NX test run
             // and fault too (tick 22).
-            aegis_kernel::tasks::arm_nx_test(5, 22);
+            aegis_kernel::tasks::arm_nx_test(6, 22);
         }
         _ => {
             sprintln!("Aegis: WARNING could not allocate NX test stack");
@@ -557,6 +609,74 @@ extern "sysv64" fn task_client() -> ! {
     }
     loop {
         core::hint::spin_loop();
+    }
+}
+
+/// Ring-3 decimal print via the Write syscall (no std `format!` in ring 3).
+fn print_dec(v: u64) {
+    let mut buf = [0u8; 20];
+    if v == 0 {
+        user_print(b"0");
+        return;
+    }
+    let mut x = v;
+    let mut pos = buf.len();
+    while x > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (x % 10) as u8;
+        x /= 10;
+    }
+    user_print(&buf[pos..]);
+}
+
+/// Ring-3 supervisor (Phase 5 supervision tree): the live policy, entirely
+/// outside the kernel and the trusted compute base. It observes TaskKill
+/// notifications on the reserved endpoint (slot 0, RECV), and for its one
+/// adopted child (task 5 via the CONTROL cap at slot 1) applies a bounded
+/// restart policy: respawn after each crash while budget remains, then a
+/// distinct ESCALATION message once the budget is spent (the child is left
+/// dead — never retried forever). The kernel only provides the notification
+/// and the capability-gated `task_restart`; the decision logic is ring 3.
+extern "sysv64" fn task_supervisor() -> ! {
+    user_print(b"Aegis: [supervisor] online; observing kill notifications\r\n");
+    let notify_slot: u64 = 0;
+    let child_slot: u64 = 1;
+    let child_idx: u64 = 5;
+    let budget_limit: u64 = 2;
+    let mut budget = budget_limit;
+    let mut recvbuf = [0u8; 64];
+    loop {
+        // Serve the notification channel: blocks until the kernel parks a
+        // TaskKill record. Returns (child_index << 32) | len.
+        let packed = user_syscall5(6, notify_slot, recvbuf.as_mut_ptr() as u64, 0, 0);
+        let child = packed >> 32;
+        user_print(b"Aegis: [supervisor] child ");
+        print_dec(child);
+        user_print(b" DIED (TaskKill notification)\r\n");
+        if child != child_idx {
+            // Not our adopted child (e.g. the NX-test task): observe and
+            // ignore. Least authority: we hold no cap over it anyway.
+            user_print(b"Aegis: [supervisor] not my child, ignoring\r\n");
+            continue;
+        }
+        if budget > 0 {
+            budget -= 1;
+            let r = user_syscall5(16, child_slot, 0, 0, 0); // task_restart
+            user_print(b"Aegis: [supervisor] restarting child, budget left ");
+            print_dec(budget);
+            user_print(if r == u64::MAX {
+                b" -> DENIED\r\n"
+            } else {
+                b" -> OK\r\n"
+            });
+        } else {
+            user_print(b"Aegis: [supervisor] ESCALATION: child restart budget exhausted, \
+leaving child dead\r\n");
+            user_print(b"Aegis: [supervisor] escalated; kernel and peers continue\r\n");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
     }
 }
 

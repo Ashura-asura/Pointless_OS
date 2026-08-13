@@ -462,4 +462,50 @@ mod tests {
             -1
         );
     }
+
+    /// Phase 5 least-authority contract for the ring-3 supervision path: the
+    /// capability gate the ring-3 supervisor rides on. With only READ on a
+    /// task cap, kill and restart are both refused (-1); once the supervisor
+    /// holds CONTROL it can respawn a dead child. Mirrors the model's
+    /// `task_kill`/`task_spawn` CONTROL gate.
+    #[test]
+    fn ring3_restart_gate_requires_control() {
+        let _g = crate::kernel_state_guard();
+        unsafe {
+            reset_table_for_test();
+            spawn("target", dummy, 0x100000).unwrap();
+            spawn("grantor", dummy, 0x200000).unwrap();
+        }
+        let (target, grantor) = (0usize, 1usize);
+        // Read-only task cap: no CONTROL, so the kill and restart syscalls are
+        // denied even while the target sits dead.
+        set_task_cap(
+            grantor,
+            0,
+            CapSlot {
+                cap: Cap::Task(target as u32),
+                rights: Rights::READ,
+            },
+        );
+        crate::tasks::set_current_for_test(grantor);
+        assert_eq!(task_kill(0), -1, "kill needs CONTROL");
+        assert_eq!(task_restart(0), -1, "restart needs CONTROL");
+        // Simulate the fault-kill: the target is really dead now.
+        crate::tasks::kill_task(target);
+        assert_eq!(task_restart(0), -1, "restart still denied without CONTROL");
+        // With CONTROL the supervisor can respawn the dead child.
+        set_task_cap(
+            grantor,
+            1,
+            CapSlot {
+                cap: Cap::Task(target as u32),
+                rights: Rights::CONTROL,
+            },
+        );
+        assert_eq!(task_restart(1), 0);
+        assert!(
+            is_task_alive(target),
+            "CONTROL-gated restart makes the child runnable again"
+        );
+    }
 }

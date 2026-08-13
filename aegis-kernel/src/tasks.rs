@@ -20,7 +20,7 @@ pub const MAX_CAPS: usize = 16;
 /// Scheduling state of a task. `Blocked` tasks are skipped by the scheduler
 /// (e.g. while waiting for an IPC reply). `Zombie` tasks are killed (they
 /// faulted as ring-3 isolation/NX victims) and never scheduled again.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskState {
     Ready,
     Blocked,
@@ -449,6 +449,21 @@ pub fn reset_table_for_test() {
             core::ptr::write(slot, core::mem::MaybeUninit::uninit());
         }
     }
+}
+
+/// Test-only: an entry function other modules can spawn in unit tests
+/// (mirrors the private `dummy` in this module's own test suite).
+#[cfg(test)]
+pub extern "sysv64" fn tests_dummy() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Current scheduling state of task `idx` (public read for tests and the
+/// notification-delivery contract).
+pub fn task_state_of(idx: usize) -> TaskState {
+    task_state(idx)
 }
 
 /// Next context in round-robin order: idle -> task 0 -> ... -> last task
@@ -986,6 +1001,21 @@ mod tests {
                     "spawn must never implicitly grant authority (least authority)"
                 );
             }
+            core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
+        }
+    }
+
+    /// Phase 5 least-authority contract: the respawn primitive only rebuilds a
+    /// task that is already a `Zombie` — restarting a live task is refused, so
+    /// a supervisor can never mint a reset on a running child.
+    #[test]
+    fn restart_refuses_live_tasks() {
+        let _g = crate::kernel_state_guard();
+        unsafe {
+            core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
+            let t = spawn("live", dummy, 0x8000).unwrap();
+            assert_eq!(restart_task(t), false, "Ready tasks are never resettable");
+            assert!(is_task_alive(t));
             core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
         }
     }

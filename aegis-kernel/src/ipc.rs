@@ -14,8 +14,10 @@
 //! once isolation lands. Capability revocation is slot clearing only: the
 //! GRANT-gated `ipc_cap_revoke` takes back a named granted instance, but the
 //! flat per-task CSpace tracks no grant-root derivation tree (model I4), so it
-//! cannot reach copies in CSpaces the grantor cannot name. No async/notify
-//! variant yet (only synchronous call/reply).
+//! cannot reach copies in CSpaces the grantor cannot name. The only async
+//! variant is the kernel → task kill notification on the reserved endpoint
+//! (`notify_task_kill`), a single-slot mailbox: two deaths before the
+//! supervisor serves keep the last record.
 
 use crate::cap::{Cap, CapSlot, Rights};
 use crate::tasks::{
@@ -26,7 +28,7 @@ use crate::tasks::{
 const IPC_BUF: usize = 256;
 pub const MAX_ENDPOINTS: usize = 16;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EpState {
     Idle,
     /// A caller is waiting; its message sits in `buf`, awaiting a server.
@@ -63,6 +65,75 @@ impl Endpoint {
 }
 
 static mut ENDPOINTS: [Endpoint; MAX_ENDPOINTS] = [Endpoint::new(); MAX_ENDPOINTS];
+
+/// Reserved kill-notification endpoint (Phase 5 supervision tree). The kernel
+/// parks the death of a ring-3 task here instead of only killing it, so a
+/// ring-3 supervisor task can observe TaskKill events via `ipc_serve`. The
+/// last endpoint slot is never handed to user `ipc_endpoint_create` because it
+/// stays active from boot.
+pub const NOTIFY_EP: usize = MAX_ENDPOINTS - 1;
+/// Notification record length in bytes: [0..4] = child task index (LE),
+/// [4..8] = kill reason code.
+pub const NOTIFY_REC_LEN: usize = 8;
+/// Kill-reason code: a ring-3 page fault from a U/S violation (isolation).
+pub const REASON_PF_ISOLATION: u32 = 0;
+/// Kill-reason code: a ring-3 instruction fetch from a non-executable page.
+pub const REASON_NX: u32 = 1;
+
+/// Activate the reserved kill-notification endpoint. Idempotent. Called at
+/// boot, before the ring-3 supervisor task is spawned, so the supervisor's
+/// first `ipc_serve` can observe deaths from the first crash onward.
+pub fn init_notify_endpoint() {
+    unsafe {
+        ENDPOINTS[NOTIFY_EP] = Endpoint::new();
+        ENDPOINTS[NOTIFY_EP].active = true;
+    }
+}
+
+/// Park a TaskKill notification record for `child` into the reserved endpoint:
+/// the kernel-side half of the supervision tree's death signal. If a server
+/// (the ring-3 supervisor) is already blocked in `ipc_serve` on the reserved
+/// endpoint, the record is delivered immediately and the server is unblocked
+/// (mirrors `ipc_call`'s RecvWaiting delivery); otherwise the record sits in
+/// the mailbox until the next `ipc_serve` picks it up.
+///
+/// Returns true when a waiting server received the record, false when it was
+/// parked (single-slot mailbox, honest limit).
+///
+/// # Safety
+/// Single-threaded kernel; callers must be kernel-mode (this is the
+/// kernel → task direction, never a ring-3 syscall).
+pub fn notify_task_kill(child: usize, reason: u32) -> bool {
+    let rec: [[u8; 4]; 2] = [(child as u32).to_le_bytes(), reason.to_le_bytes()];
+    let len = NOTIFY_REC_LEN;
+    unsafe {
+        if NOTIFY_EP >= MAX_ENDPOINTS || !ENDPOINTS[NOTIFY_EP].active {
+            return false;
+        }
+        for (i, b) in rec.iter().flatten().copied().enumerate() {
+            ENDPOINTS[NOTIFY_EP].buf[i] = b;
+        }
+        ENDPOINTS[NOTIFY_EP].msg_len = len;
+        if ENDPOINTS[NOTIFY_EP].state == EpState::RecvWaiting {
+            let srv = ENDPOINTS[NOTIFY_EP].server;
+            copy_out(
+                &ENDPOINTS[NOTIFY_EP].buf[..len],
+                ENDPOINTS[NOTIFY_EP].server_recvbuf_va,
+            );
+            ENDPOINTS[NOTIFY_EP].server = usize::MAX;
+            ENDPOINTS[NOTIFY_EP].server_recvbuf_va = 0;
+            ENDPOINTS[NOTIFY_EP].state = EpState::Idle;
+            ENDPOINTS[NOTIFY_EP].caller = child;
+            set_ret(srv, ((child as u64) << 32) | (len as u64));
+            unblock_task(srv);
+            true
+        } else {
+            ENDPOINTS[NOTIFY_EP].state = EpState::SendWaiting;
+            ENDPOINTS[NOTIFY_EP].caller = child;
+            false
+        }
+    }
+}
 
 /// Set the return value (rax) of a task's saved frame, so it resumes with it.
 /// Offset 112 is the rax slot in the switch_frame save/restore layout
@@ -466,5 +537,79 @@ mod tests {
         // Task 4 pins CURRENT; nothing else touches it.
         crate::tasks::set_current_for_test(4);
         assert_eq!(caps_endpoint(4, MAX_CAPS as u64 + 100, Rights::SEND), None);
+    }
+
+    // ---- Phase 5: reserved TaskKill notification endpoint ----
+
+    #[test]
+    fn reserved_notify_endpoint_init_activates_last_slot() {
+        let _g = crate::kernel_state_guard();
+        super::init_notify_endpoint();
+        assert_eq!(NOTIFY_EP, MAX_ENDPOINTS - 1);
+        assert!(unsafe { ENDPOINTS[NOTIFY_EP].active });
+        // Ordinary endpoint create never steals the reserved slot.
+        crate::tasks::set_current_for_test(0);
+        let slot = unsafe { ipc_endpoint_create() };
+        assert!(slot >= 0);
+        let cap = task_cap(0, slot as usize);
+        match cap.cap {
+            Cap::Endpoint(id) => assert_ne!(id as usize, NOTIFY_EP, "reserved slot leaks"),
+            _ => unreachable!("endpoint create installs an Endpoint cap"),
+        }
+    }
+
+    #[test]
+    fn notify_task_kill_mailboxes_without_a_waiting_server() {
+        let _g = crate::kernel_state_guard();
+        unsafe {
+            super::init_notify_endpoint();
+            // No server is waiting: the record must park in the mailbox.
+            assert!(!super::notify_task_kill(5, REASON_PF_ISOLATION));
+            assert_eq!(ENDPOINTS[NOTIFY_EP].state, EpState::SendWaiting);
+            assert_eq!(ENDPOINTS[NOTIFY_EP].msg_len, NOTIFY_REC_LEN);
+            assert_eq!(ENDPOINTS[NOTIFY_EP].caller, 5);
+            assert_eq!(u32::from_le_bytes(ENDPOINTS[NOTIFY_EP].buf[0..4].try_into().unwrap()), 5);
+            assert_eq!(
+                u32::from_le_bytes(ENDPOINTS[NOTIFY_EP].buf[4..8].try_into().unwrap()),
+                REASON_PF_ISOLATION
+            );
+        }
+    }
+
+    #[test]
+    fn notify_task_kill_delivers_to_a_waiting_server() {
+        let _g = crate::kernel_state_guard();
+        unsafe {
+            // A host-side scratch buffer stands in for the ring-3 server's
+            // recv buffer; copy_out must land the record there.
+            static mut SCRATCH: [u8; 16] = [0u8; 16];
+            crate::tasks::reset_table_for_test();
+            crate::tasks::spawn("srv", crate::tasks::tests_dummy, 0x100000).unwrap();
+            super::init_notify_endpoint();
+            // Pin task 0 as the waiting server, blocked on the notify ep.
+            crate::tasks::set_current_for_test(0);
+            block_current(NOTIFY_EP);
+            ENDPOINTS[NOTIFY_EP].state = EpState::RecvWaiting;
+            ENDPOINTS[NOTIFY_EP].server = 0;
+            ENDPOINTS[NOTIFY_EP].server_recvbuf_va = (&raw mut SCRATCH) as u64;
+            // The kill is parked and delivered to the waiting server.
+            assert!(super::notify_task_kill(5, REASON_NX));
+            assert_eq!(
+                u32::from_le_bytes(SCRATCH[0..4].try_into().unwrap()),
+                5,
+                "record child index must reach the server buffer"
+            );
+            assert_eq!(
+                u32::from_le_bytes(SCRATCH[4..8].try_into().unwrap()),
+                REASON_NX
+            );
+            // The server is runnable again with (child << 32) | len in rax.
+            assert!(crate::tasks::is_task_alive(0));
+            assert_eq!(crate::tasks::task_state_of(0), crate::tasks::TaskState::Ready);
+            let f = crate::tasks::context_frame(0) as *const u64;
+            assert_eq!(*f.add(112 / 8), (5u64 << 32) | NOTIFY_REC_LEN as u64);
+            // Endpoint is idle again (single-slot box consumed).
+            assert_eq!(ENDPOINTS[NOTIFY_EP].state, EpState::Idle);
+        }
     }
 }
