@@ -598,6 +598,7 @@ mod tests {
 
     #[test]
     fn staging_a_candidate_does_not_disturb_the_boot_target() {
+        let _g = crate::kernel_state_guard();
         let (mut disk, mut store, mut um) = world();
         let s1 = um
             .stage(
@@ -624,6 +625,7 @@ mod tests {
 
     #[test]
     fn activation_is_health_gated() {
+        let _g = crate::kernel_state_guard();
         let (mut disk, mut store, mut um) = world();
         let staged = um
             .stage(
@@ -643,6 +645,7 @@ mod tests {
 
     #[test]
     fn activation_is_a_content_flip_and_version_stable() {
+        let _g = crate::kernel_state_guard();
         let (mut disk, mut store, mut um) = world();
         let staged = um
             .stage(
@@ -669,6 +672,7 @@ mod tests {
 
     #[test]
     fn rollback_restores_last_known_good_and_drop_dethroned() {
+        let _g = crate::kernel_state_guard();
         let (mut disk, mut store, mut um) = world();
         let g1 = um
             .stage(
@@ -699,6 +703,7 @@ mod tests {
 
     #[test]
     fn rollback_preserves_generations_up_to_the_target() {
+        let _g = crate::kernel_state_guard();
         let (mut disk, mut store, mut um) = world();
         let g1 = um
             .stage(&mut store, &mut disk, man(b"editor"), &[])
@@ -721,6 +726,7 @@ mod tests {
 
     #[test]
     fn identical_payloads_dedup_to_one_block() {
+        let _g = crate::kernel_state_guard();
         let (mut disk, mut store, mut um) = world();
         let base = store.count();
         let g1 = um
@@ -753,6 +759,7 @@ mod tests {
 
     #[test]
     fn reopen_dedups_payloads_and_continues_numbering() {
+        let _g = crate::kernel_state_guard();
         let (mut disk, mut store, mut um) = world();
         let g1 = um
             .stage(
