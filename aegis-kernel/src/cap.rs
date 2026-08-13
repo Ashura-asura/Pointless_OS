@@ -109,6 +109,20 @@ impl CapSlot {
     }
 }
 
+impl Cap {
+    /// The object id a non-`None` cap names, if any. Used by the audit log to
+    /// attribute the target of an operation.
+    pub fn id(self) -> Option<u32> {
+        match self {
+            Cap::None => None,
+            Cap::Endpoint(id) => Some(id),
+            Cap::Task(id) => Some(id),
+            Cap::MemRegion(id) => Some(id),
+            Cap::Channel(id) => Some(id),
+        }
+    }
+}
+
 /// A task's capability table: a fixed slot array.
 pub type CapTable = [CapSlot; MAX_CAPS];
 

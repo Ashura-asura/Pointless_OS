@@ -873,8 +873,21 @@ traffic; drivers UNTESTED on real hardware.
 
 `agent.rs` (8), `profiler.rs` (5), `adaptive.rs` (5), `policy_engine.rs` (5): agent
 lifecycle and capability scoping, syscall histograms and deviation, auto-tighten/
-suspend/terminate, rule evaluation and audit trail. Honest limits: profiler is
-histogram-based, not ML; no real AI model; no real-time integration.
+suspend/terminate, rule evaluation and audit trail. In the kernel (`aegis-kernel`),
+Phase 6 is closed by the **real attributed audit log** — `audit.rs` (3 tests), a
+512-record ring where every gated op (`task_state`/`task_kill`/`task_restart`,
+`ch_send_as`/`ch_recv_as`, `mem_len`/`mem_read`/`mem_write`, `ipc_cap_grant`, and the
+GRANT-gated `revoke_slot`) lands attributed `(tick, caller, op, target, ok)` on
+success and refusal alike — and the **§9 anomaly circuit breaker** — `monitor.rs`
+(3 tests): a capability-less `AnomalyMonitor` trains on the agent's real op-shape
+from the audit log and, on significant deviation (an op's rate more than doubled, or
+an op never in the shape), suspends — never revokes — via the `GrantLedger`, which
+freezes `ipc_cap_grant` for a suspended agent while minted caps keep working, is
+reversible and logged on human review, and is itself refused any authority (a
+cap-less monitor task cannot kill, revoke, or read an object). Honest limits:
+profiler is histogram-based, not ML; no real AI model; no real-time integration; the
+audit log is a bounded in-memory ring (no durability), and the ledger gates only
+delegation — the supervisor/channel/mem gates do not consult it.
 
 ### Machine-checked verification (executable): native app model and shell (§8, Phase 7)
 

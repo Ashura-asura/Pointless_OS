@@ -12,6 +12,7 @@
 //! no revocation beyond slot clearing, no ownership transfer. Contract tests
 //! exercise the gate + bounds logic in-process.
 
+use crate::audit::OpKind as AuditedOp;
 use crate::cap::{Cap, CapSlot, Rights};
 use crate::tasks::{current_idx, set_task_cap, task_cap, MAX_CAPS};
 
@@ -174,12 +175,19 @@ pub unsafe fn mem_len(slot: u64) -> i64 {
     let cur = current_idx();
     let id = match caps_region(cur, slot, Rights::READ) {
         Some(i) => i,
-        None => return -1,
+        None => {
+            crate::audit::record(cur, AuditedOp::MemRead, None, false);
+            return -1;
+        }
     };
     let r = match region(id) {
         Some(r) if r.active => r,
-        _ => return -1,
+        _ => {
+            crate::audit::record(cur, AuditedOp::MemRead, Some(id as u32), false);
+            return -1;
+        }
     };
+    crate::audit::record(cur, AuditedOp::MemRead, Some(id as u32), true);
     r.len as i64
 }
 
@@ -193,18 +201,28 @@ pub unsafe fn mem_read(slot: u64, offset: u64, len: u64, dst_va: u64) -> i64 {
     let cur = current_idx();
     let id = match caps_region(cur, slot, Rights::READ) {
         Some(i) => i,
-        None => return -1,
+        None => {
+            crate::audit::record(cur, AuditedOp::MemRead, None, false);
+            return -1;
+        }
     };
     let r = match region(id) {
         Some(r) if r.active => r,
-        _ => return -1,
+        _ => {
+            crate::audit::record(cur, AuditedOp::MemRead, Some(id as u32), false);
+            return -1;
+        }
     };
     let end = offset.checked_add(len);
     let end = match end {
         Some(e) => e as usize,
-        None => return -1,
+        None => {
+            crate::audit::record(cur, AuditedOp::MemRead, Some(id as u32), false);
+            return -1;
+        }
     };
     if end > r.len {
+        crate::audit::record(cur, AuditedOp::MemRead, Some(id as u32), false);
         return -1;
     }
     core::ptr::copy_nonoverlapping(
@@ -212,6 +230,7 @@ pub unsafe fn mem_read(slot: u64, offset: u64, len: u64, dst_va: u64) -> i64 {
         dst_va as *mut u8,
         len as usize,
     );
+    crate::audit::record(cur, AuditedOp::MemRead, Some(id as u32), true);
     len as i64
 }
 
@@ -225,23 +244,34 @@ pub unsafe fn mem_write(slot: u64, offset: u64, len: u64, src_va: u64) -> i64 {
     let cur = current_idx();
     let id = match caps_region(cur, slot, Rights::WRITE) {
         Some(i) => i,
-        None => return -1,
+        None => {
+            crate::audit::record(cur, AuditedOp::MemWrite, None, false);
+            return -1;
+        }
     };
     let r = match region(id) {
         Some(r) if r.active => r,
-        _ => return -1,
+        _ => {
+            crate::audit::record(cur, AuditedOp::MemWrite, Some(id as u32), false);
+            return -1;
+        }
     };
     let end = offset.checked_add(len);
     let end = match end {
         Some(e) => e as usize,
-        None => return -1,
+        None => {
+            crate::audit::record(cur, AuditedOp::MemWrite, Some(id as u32), false);
+            return -1;
+        }
     };
     if end > r.len {
+        crate::audit::record(cur, AuditedOp::MemWrite, Some(id as u32), false);
         return -1;
     }
     let dst = (r.base + offset) as *mut u8;
     let src = src_va as *const u8;
     core::ptr::copy_nonoverlapping(src, dst, len as usize);
+    crate::audit::record(cur, AuditedOp::MemWrite, Some(id as u32), true);
     0
 }
 
@@ -291,8 +321,8 @@ mod tests {
 
     #[test]
     fn read_requires_read_right_out_of_bounds_denied() {
-        set_current_for_test(2);
         let _g = crate::kernel_state_guard();
+        set_current_for_test(2);
         let mut backing = [0u8; 4096];
         seed_region(2, 0, 2, backing.as_mut_ptr() as u64, 16, Rights::READ);
         let mut buf = [0u8; 4];
@@ -317,8 +347,8 @@ mod tests {
 
     #[test]
     fn read_from_region_without_read_right_denied() {
-        set_current_for_test(3);
         let _g = crate::kernel_state_guard();
+        set_current_for_test(3);
         let mut backing = [0u8; 4096];
         seed_region(3, 0, 3, backing.as_mut_ptr() as u64, 16, Rights::WRITE);
         let mut buf = [0u8; 4];
@@ -327,8 +357,8 @@ mod tests {
 
     #[test]
     fn write_requires_write_right() {
-        set_current_for_test(4);
         let _g = crate::kernel_state_guard();
+        set_current_for_test(4);
         // Same region id; slot 0 WRITE-only this time.
         let mut backing = [0u8; 4096];
         seed_region(4, 0, 4, backing.as_mut_ptr() as u64, 16, Rights::WRITE);
@@ -352,8 +382,8 @@ mod tests {
 
     #[test]
     fn len_requires_read_right() {
-        set_current_for_test(5);
         let _g = crate::kernel_state_guard();
+        set_current_for_test(5);
         let mut backing = [0u8; 4096];
         seed_region(5, 0, 6, backing.as_mut_ptr() as u64, 4096, Rights::READ);
         assert_eq!(unsafe { mem_len(0) }, 4096);
@@ -396,8 +426,8 @@ mod tests {
 
     #[test]
     fn non_region_caps_are_not_addressable() {
-        set_current_for_test(1);
         let _g = crate::kernel_state_guard();
+        set_current_for_test(1);
         set_task_cap(
             1,
             0,
@@ -422,8 +452,8 @@ mod tests {
 
     #[test]
     fn out_of_range_slot_is_denied() {
-        set_current_for_test(2);
         let _g = crate::kernel_state_guard();
+        set_current_for_test(2);
         assert_eq!(caps_region(2, MAX_CAPS as u64 + 100, Rights::READ), None);
         assert_eq!(unsafe { mem_len(MAX_CAPS as u64 + 100) }, -1);
     }

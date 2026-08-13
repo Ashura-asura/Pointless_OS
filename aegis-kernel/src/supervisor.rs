@@ -16,9 +16,12 @@
 //! is an in-memory ring, not a durable log; restart re-enters the same entry
 //! point rather than re-spawning fresh user state.
 
+use crate::audit::OpKind as AuditedOp;
 use crate::cap::{Cap, CapSlot, Rights};
 use crate::tasks::MAX_TASKS as MAX_TASKS_TABLE;
-use crate::tasks::{current_idx, is_task_alive, kill_task, restart_task, task_cap, MAX_CAPS};
+use crate::tasks::{
+    current_idx, is_task_alive, kill_task, restart_task, set_task_cap, task_cap, MAX_CAPS,
+};
 
 pub const MAX_CHILDREN: usize = 8;
 pub const MAX_AUDIT: usize = 16;
@@ -46,9 +49,14 @@ pub fn task_state(slot: u64) -> i64 {
     let cur = current_idx();
     let idx = match caps_task(cur, slot, Rights::READ) {
         Some(i) => i,
-        None => return -1,
+        None => {
+            crate::audit::record(cur, AuditedOp::TaskState, None, false);
+            return -1;
+        }
     };
-    if is_task_alive(idx) {
+    let alive = is_task_alive(idx);
+    crate::audit::record(cur, AuditedOp::TaskState, Some(idx as u32), alive);
+    if alive {
         1
     } else {
         0
@@ -61,9 +69,13 @@ pub fn task_kill(slot: u64) -> i64 {
     let cur = current_idx();
     let idx = match caps_task(cur, slot, Rights::CONTROL) {
         Some(i) => i,
-        None => return -1,
+        None => {
+            crate::audit::record(cur, AuditedOp::TaskKill, None, false);
+            return -1;
+        }
     };
     kill_task(idx);
+    crate::audit::record(cur, AuditedOp::TaskKill, Some(idx as u32), true);
     0
 }
 
@@ -74,13 +86,40 @@ pub fn task_restart(slot: u64) -> i64 {
     let cur = current_idx();
     let idx = match caps_task(cur, slot, Rights::CONTROL) {
         Some(i) => i,
-        None => return -1,
+        None => {
+            crate::audit::record(cur, AuditedOp::TaskSpawn, None, false);
+            return -1;
+        }
     };
     if restart_task(idx) {
+        crate::audit::record(cur, AuditedOp::TaskSpawn, Some(idx as u32), true);
         0
     } else {
+        crate::audit::record(cur, AuditedOp::TaskSpawn, Some(idx as u32), false);
         -1
     }
+}
+
+/// Syscall: clear the caller's own capability slot `slot`, revoking its
+/// authority to that object. Requires GRANT on the source slot (the model's
+/// `revoke`). Revocation is permanent and is the one thing the anomaly monitor
+/// (a cap-less observer) never does — the ledger suspends instead. Returns 0 on
+/// success, -1 otherwise.
+pub fn revoke_slot(slot: u64) -> i64 {
+    let cur = current_idx();
+    if slot as usize >= MAX_CAPS {
+        crate::audit::record(cur, AuditedOp::Revoke, None, false);
+        return -1;
+    }
+    let cs = task_cap(cur, slot as usize);
+    if cs.cap == Cap::None || !cs.rights.contains(Rights::GRANT) {
+        crate::audit::record(cur, AuditedOp::Revoke, cs.cap.id(), false);
+        return -1;
+    }
+    let target = cs.cap.id();
+    set_task_cap(cur, slot as usize, CapSlot::empty());
+    crate::audit::record(cur, AuditedOp::Revoke, target, true);
+    0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

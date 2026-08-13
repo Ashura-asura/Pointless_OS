@@ -14,6 +14,7 @@
 //! and deliberately absent (matching the kernel's single-threaded model and
 //! the model crate's non-blocking `ep_recv`).
 
+use crate::audit::OpKind as AuditedOp;
 use crate::cap::{Cap, CapSlot, Rights};
 use crate::tasks::{set_task_cap, task_cap};
 
@@ -48,9 +49,12 @@ unsafe fn channel_mut(id: usize) -> *mut Channel {
 }
 
 /// Resolve `slot` in task `cur`'s CSpace to a channel id, requiring `need`.
-/// `None` when the slot is empty, names a non-channel object, holds
-/// insufficient rights, or references an inactive (destroyed) channel.
+/// `None` when the slot is out of range, empty, names a non-channel object,
+/// holds insufficient rights, or references an inactive (destroyed) channel.
 fn caps_channel(cur: usize, slot: u64, need: Rights) -> Option<usize> {
+    if slot as usize >= crate::tasks::MAX_CAPS {
+        return None;
+    }
     let cs = task_cap(cur, slot as usize);
     match cs.cap {
         Cap::Channel(id) if cs.rights.contains(need) => {
@@ -68,8 +72,11 @@ fn caps_channel(cur: usize, slot: u64, need: Rights) -> Option<usize> {
 }
 
 /// Resolve `slot` in task `cur`'s CSpace to a live channel id regardless of
-/// rights. `None` for a missing/non-channel/inactive object.
+/// rights. `None` for an out-of-range, missing, non-channel/inactive object.
 fn caps_channel_any(cur: usize, slot: u64) -> Option<usize> {
+    if slot as usize >= crate::tasks::MAX_CAPS {
+        return None;
+    }
     let cs = task_cap(cur, slot as usize);
     match cs.cap {
         Cap::Channel(id) => {
@@ -129,22 +136,29 @@ pub unsafe fn ch_create() -> i64 {
 /// Kernel-internal (explicit identity): push `data` onto the channel `slot`
 /// resolves to in `caller`'s CSpace, requiring the caller hold SEND. Bounded:
 /// a message larger than `CHANNEL_BUF` or a full queue leaves no message.
+/// Every attempt — granted or refused — is one attributed `Send` record.
 pub(crate) unsafe fn ch_send_as(caller: usize, slot: u64, data: &[u8]) -> bool {
     let id = match caps_channel(caller, slot, Rights::SEND) {
         Some(i) => i,
-        None => return false,
+        None => {
+            crate::audit::record(caller, AuditedOp::Send, None, false);
+            return false;
+        }
     };
     if data.len() > CHANNEL_BUF {
+        crate::audit::record(caller, AuditedOp::Send, Some(id as u32), false);
         return false;
     }
     let c = &mut *channel_mut(id);
     if c.count >= CHANNEL_DEPTH {
+        crate::audit::record(caller, AuditedOp::Send, Some(id as u32), false);
         return false;
     }
     let tail = (c.head + c.count) % CHANNEL_DEPTH;
     c.msgs[tail][..data.len()].copy_from_slice(data);
     c.lens[tail] = data.len() as u16;
     c.count += 1;
+    crate::audit::record(caller, AuditedOp::Send, Some(id as u32), true);
     true
 }
 
@@ -155,10 +169,14 @@ pub(crate) unsafe fn ch_send_as(caller: usize, slot: u64, data: &[u8]) -> bool {
 pub(crate) unsafe fn ch_recv_as(caller: usize, slot: u64, out: &mut [u8]) -> i64 {
     let id = match caps_channel(caller, slot, Rights::RECV) {
         Some(i) => i,
-        None => return -1,
+        None => {
+            crate::audit::record(caller, AuditedOp::Recv, None, false);
+            return -1;
+        }
     };
     let c = &mut *channel_mut(id);
     if c.count == 0 {
+        crate::audit::record(caller, AuditedOp::Recv, Some(id as u32), true);
         return 0;
     }
     let len = c.lens[c.head] as usize;
@@ -166,6 +184,7 @@ pub(crate) unsafe fn ch_recv_as(caller: usize, slot: u64, out: &mut [u8]) -> i64
     out[..n].copy_from_slice(&c.msgs[c.head][..n]);
     c.head = (c.head + 1) % CHANNEL_DEPTH;
     c.count -= 1;
+    crate::audit::record(caller, AuditedOp::Recv, Some(id as u32), true);
     n as i64
 }
 

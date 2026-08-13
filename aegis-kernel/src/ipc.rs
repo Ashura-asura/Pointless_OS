@@ -136,17 +136,29 @@ pub unsafe fn ipc_endpoint_create() -> i64 {
 /// slot `dst_slot` (so the destination knows where to find it). Requires the
 /// caller to hold GRANT on the source slot (Phase 1: delegation is gated on the
 /// GRANT right — a caller can only copy authority it is entitled to delegate).
-/// Returns `dst_slot` on success, or -1.
+/// Returns `dst_slot` on success, or -1. A suspended agent's grant flow is
+/// frozen by the anomaly monitor's ledger (§9): it cannot delegate new
+/// authority until a human resumes it.
 ///
 /// # Safety
 /// Must be called via syscall from ring-3 with valid task context.
 pub unsafe fn ipc_cap_grant(dst: u64, src_slot: u64, dst_slot: u64) -> i64 {
     let cur = current_idx();
-    let slot = task_cap(cur, src_slot as usize);
-    if slot.cap == Cap::None || !slot.rights.contains(Rights::GRANT) {
+    let slot = if (src_slot as usize) < crate::tasks::MAX_CAPS {
+        task_cap(cur, src_slot as usize)
+    } else {
+        CapSlot::empty()
+    };
+    let target = slot.cap.id();
+    if crate::monitor::ledger().is_suspended(cur)
+        || slot.cap == Cap::None
+        || !slot.rights.contains(Rights::GRANT)
+    {
+        crate::audit::record(cur, crate::audit::OpKind::Grant, target, false);
         return -1;
     }
     set_task_cap(dst as usize, dst_slot as usize, slot);
+    crate::audit::record(cur, crate::audit::OpKind::Grant, target, true);
     0
 }
 

@@ -14,9 +14,7 @@
 //! Honest limits: loopback only (the "interface" is the channel fabric, ports
 //! are per-socket addresses rather than per-host numbers); single stack
 //! instance; bounded message size/depth and a bounded port table; every hop
-//! still goes through the ordinary capability gates, but the kernel keeps no
-//! audit log — the model's "every hop is an attributed op in the audit log"
-//! claim stays proven by `capability-audit`, not here.
+//! still goes through the ordinary capability gates.
 
 use crate::cap::{Cap, CapSlot};
 use crate::channel::CHANNEL_BUF;
