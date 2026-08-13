@@ -104,19 +104,32 @@ pub unsafe fn disable_smep_smap() {
     crate::sprintln!("Aegis: CR4 after  = 0x{:016X} (SMEP/SMAP cleared)", after);
 }
 
-/// Switch the CPU onto the kernel's own stack.
+/// Switch the CPU onto the kernel's own stack and jump to a never-returning
+/// `entry`.
+///
+/// This *jumps* (never returns) so the compiler's frame-pointer-relative
+/// addressing in everything that runs from the kernel stack stays below the
+/// stack top. A plain in-function `mov rsp, ...` leaves the C prologue's
+/// `%rsp`-relative slots pointing ABOVE the new stack top, spilling into
+/// whatever BSS statics the linker happened to place just above the stack —
+/// which is exactly how the syscall gate disappeared (whole-IDT-zeroed +
+/// #GP/double-fault on the first ring-3 `int 0x80`) whenever code-size
+/// shifts placed KERNEL_IDT / vga state directly above KERNEL_STACK.
 ///
 /// # Safety
 ///
-/// The old (loader-provided) stack is abandoned; callers must not rely on
-/// it afterwards. Intended to be called once, very early in boot.
-pub unsafe fn switch_to_kernel_stack() {
+/// Must be the very first thing `_start` does. The old (loader-provided)
+/// stack is abandoned; `entry` must never return.
+pub unsafe fn switch_to_kernel_stack_and_jump(entry: extern "sysv64" fn() -> !) -> ! {
     asm!(
         "lea rsp, [rip + {stack} + {size}]",
         "and rsp, -16",
+        "mov rax, {entry}",
+        "jmp rax",
         stack = sym KERNEL_STACK,
         size = const KERNEL_STACK_SIZE,
-        options(nostack),
+        entry = in(reg) entry,
+        options(noreturn),
     );
 }
 
@@ -174,16 +187,34 @@ pub fn get_tss_rsp0() -> u64 {
     }
 }
 
-static mut KERNEL_IDT: crate::idt::Idt = crate::idt::Idt::new();
+/// Physical address of the loaded IDT. The IDT is NOT a linker-placed BSS
+/// static: the linker freely reorders BSS symbols when code size changes, and
+/// in some layouts the IDT landed immediately above the kernel stack top,
+/// where a boot-time writer zeroed it and the first ring-3 `int 0x80`
+/// faulted. Allocating a dedicated frame instead pins the IDT to allocator
+/// memory that no other structure touches. Zero until `init_idt` runs.
+static mut IDT_FRAME: u64 = 0;
 
 /// Load the kernel IDT: exception handlers for vectors 0-31, the LAPIC
 /// timer gate at `TIMER_VECTOR`, and the DPL-3 syscall gate at `SYS_VECTOR`.
 ///
+/// The IDT lives in a frame allocated from the kernel's frame allocator
+/// (never in BSS), so its address is page-aligned and stable across builds.
+///
 /// # Safety
 ///
-/// Single-threaded boot only; the static IDT must never move while loaded.
+/// Single-threaded boot only, after `frame::init_global`; the allocated
+/// frame must never be freed while the IDT is loaded.
 pub unsafe fn init_idt() {
-    let idt = (&raw mut KERNEL_IDT).as_mut().unwrap();
+    let Some(frame) = crate::frame::alloc_global() else {
+        crate::sprintln!("Aegis: FATAL could not allocate IDT frame");
+        loop {
+            core::arch::asm!("hlt", options(nomem, nostack));
+        }
+    };
+    IDT_FRAME = frame;
+    let idt = &mut *(frame as *mut crate::idt::Idt);
+    core::ptr::write(idt, crate::idt::Idt::new());
     crate::idt::install_exception_handlers(idt);
     idt.set_irq_handler(TIMER_VECTOR as usize, timer_stub as *const () as u64);
     idt.set_handler(

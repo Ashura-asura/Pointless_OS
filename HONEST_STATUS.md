@@ -21,6 +21,18 @@ This is the **single consolidated Known Limits section** (`README.md` and
 - IPC echo call/serve/reply under QEMU and VMware Workstation 26, 0 exceptions.
 - Adaptive-ceiling verification caught and fixed a real scope-expansion bug
   (`tighten_scope` budget `/2 .max(1)` raised a restrictive 0-budget to 1).
+- **Layout-dependent syscall-gate corruption (the old "pre-existing boot fault")**
+  — root-caused and fixed. `switch_to_kernel_stack` did an in-function `mov rsp`
+  to a fresh kernel-stack top, but the compiler's frame-relative slots (`%rsp`+off)
+  then pointed *above* the stack top, spilling into whatever BSS statics the
+  linker had placed there. When code-size shifts put `KERNEL_IDT` (or VGA
+  cursor state / the memory-region table) directly above `KERNEL_STACK`, the
+  first ring-3 `int 0x80` hit an all-zero gate → `#GP(0x402)` → double fault,
+  reproducibly on some layouts and not others. Fix: `_start` now switches stacks
+  via a never-returning asm `jmp` trampoline (`switch_to_kernel_stack_and_jump`)
+  *before* any C prologue runs, so the boot kernel's entire frame lives inside
+  the 16 KiB stack. Verified: full denial/IPC/isolation/NX demo passes, 0
+  exceptions, across two rebuilds with different codegen layouts.
 
 ### Reduced (better than before, not solved)
 
@@ -39,20 +51,6 @@ This is the **single consolidated Known Limits section** (`README.md` and
   display is the VGA text console.
 - **IPC overhead** vs a monolithic syscall path is reduced (batched submission,
   shared-memory capability grants), not eliminated.
-- **Pre-existing boot fault on this host (Phase 1 note)** — with the current
-  committed boot image the ring-3 IPC demo faults at `tick=3` with a
-  `KERNEL EXCEPTION vector=0x0D err=0x402 RIP=0x4425` (a #GP pointing at IDT
-  index 0x80, the DPL-3 `int 0x80` syscall gate) the first time `task_server`
-  enters the gate. This is **not** introduced by Phase 1: unmodified committed
-  HEAD reproduces the identical fault, and runtime evidence (boot config is
-  IDE-only, so the storage path prints `NVMe: no controller with a mapped BAR`
-  and the FAT16 reader never runs) shows the trigger is a *code-layout shift*
-  from the `cb48a90` FAT16 commit changing the behavior of a latent
-  ring-3/syscall-gate race. Bisect: `c9f57dd` (pre-FAT16) boots clean every run
-  (echo reply works, 0 exceptions); `cb48a90` and every later commit fault
-  every run. Contract-test proof of the capability gates is unaffected (14
-  Phase-1 tests, green); the fault lives in the pre-existing task/preempt path
-  and is tracked for a later phase, not bundled into Phase 1.
 
 ### Inherent (cannot be closed by better engineering)
 
@@ -322,4 +320,5 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | `ea7988f` | Phase 4 in the kernel: capability-addressed object store + POSIX FlatView in `aegis-kernel/src/store.rs` (9 contract tests) — SHA-256 (FIPS 180-4 vectors), content-address dedup, capability-gated reads through the real `mem` gates with a narrowed READ-only grant (write refused, I2), COW version-stable snapshots, WAL-consumer relationship index that rebuilds identically, index-free `commit`/`write_version` signatures (§10 [CLOSED]); `mem.rs` gains `region_base_len`/`claim_region`/`reset_regions_for_test` + `MAX_REGIONS` 16→32. 313 kernel + 113 model + 13 uefi-boot tests pass clean (439 total), clippy + fmt clean |
 | `2c6412d` | Phase 5 in the kernel: capability-scoped sockets + loopback netstack in `aegis-kernel/src/netstack.rs` (4 tests) over the design §8 async FIFO channel box in `channel.rs` (2 tests) — sockets are `Cap::Channel` objects minted as narrowed SEND|RECV copies into subscriber CSpaces (no GRANT, I2), ports are not ambient authority (a cap-less task is refused by the stack and by the raw `ch_send` gate), a two-hop capability-gated router preserves FIFO order with an exact drain, unsubscribe destroys the channel and hangs the subscriber's cap while peers keep working, and the stack's CSpace census is router-not-a-root. 319 kernel + 113 model + 13 uefi-boot tests pass clean (445 total), clippy + fmt clean |
 | `c887fd4` | Phase 6 in the kernel: the attributed audit log + §9 anomaly circuit breaker. `audit.rs` (3 tests): a 512-record ring where every gated op — `task_state`/`task_kill`/`task_restart`, `ch_send_as`/`ch_recv_as`, `mem_len`/`mem_read`/`mem_write`, `ipc_cap_grant`, and the new GRANT-gated `revoke_slot` — lands attributed `(tick, caller, op, target, ok)` on success and refusal, with per-caller op histograms, exact-target success queries, and a revoke counter. `monitor.rs` (3 tests): a capability-less `AnomalyMonitor` trains on the agent's real op-shape from the audit log and on significant deviation (an op's rate >2x its baseline, or an op never in the shape) suspends — never revokes — via the `GrantLedger`, which freezes the `ipc_cap_grant` gate for a suspended agent while minted caps keep working, is reversible + logged on human review, and is refused any authority (a cap-less monitor task cannot kill, revoke, or read an object). Closes the Phase-5 honest limit ("the kernel keeps no audit log"); also added the missing slot bounds guard to `caps_channel` and moved the `mem.rs` tests' `set_current_for_test` under the state guard (deterministic serialization). 325 kernel + 113 model + 13 uefi-boot tests pass clean (451 total), clippy + fmt clean |
-| (master roadmap P2) | Cross-grantee revocation + least-authority closure in the kernel (master-roadmap Phase 2): new GRANT-gated `ipc_cap_revoke(dst, dst_slot, src_slot)` in `ipc.rs` (syscall 17 `CapRevoke`, dispatched in `syscall.rs`) invalidates a capability the caller previously granted — the recipient's slot is cleared so every subsequent gated op returns -1 (never a panic, never a silent success), a second revoke of the same slot is refused, and revoking without GRANT on the source is denied. Mirrors the model's `revoke` (GRANT-gated); honest limit: the flat per-task CSpace tracks no grant-root derivation tree (model I4), so it revokes a *named* instance only. Two named master-roadmap contract tests: `revocation_grantor_takes_back_a_granted_cap` (grant → grantee uses the cap → grantor revokes → grantee's op now returns -1 → double-revoke and GRANT-less revoke denied) and `least_authority_new_task_starts_with_an_empty_cspace` (spawn grants no implicit authority). 327 kernel + 113 model + 13 uefi-boot tests pass clean (453 total), clippy + fmt clean |
+| (master roadmap P3) | Capability denial demo + the boot-fault fix: a `task_denied` ring-3 task is spawned with an *empty* CSpace and every gated syscall it attempts is refused — `[denied] ipc_call(slot 0) -> DENIED (-1)`, `mem_len(slot 0) -> DENIED (-1)`, `task_state(slot 0) -> DENIED (-1)` — while the kernel, IPC server/client (echo reply), isolation test (PAGE FAULT at CR2=0x1000000, task killed, kernel survives) and NX test (fetch at 0xB8000) all complete in one boot, **0 exceptions**, verified under QEMU twice across different codegen layouts. Also **root-caused and fixed the old layout-dependent syscall-gate corruption** (`switch_to_kernel_stack`'s in-function `mov rsp` made the compiler's frame-relative slots point above the stack top, spilling into BSS statics — KERNEL_IDT / vga cursor / memory regions — whenever the linker placed them adjacent to the stack; hence the intermittent all-zero 0x80 gate / #GP(0x402) / double fault): `_start` now jumps onto the kernel stack before any C prologue (`switch_to_kernel_stack_and_jump`). 327 kernel + 113 model + 13 uefi-boot tests pass clean (453 total), clippy + fmt clean |
+

@@ -7,6 +7,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 #[no_mangle]
 pub extern "sysv64" fn _start() -> ! {
+    // Enter on a freshly-established kernel stack: jump (never return) so
+    // boot_kernel's prologue and all its %rsp-relative slots live below the
+    // stack top, instead of spilling into BSS statics placed just above it.
+    unsafe { aegis_kernel::cpu::switch_to_kernel_stack_and_jump(boot_kernel) }
+}
+
+extern "sysv64" fn boot_kernel() -> ! {
     aegis_kernel::serial::SerialWriter::init();
     aegis_kernel::vga::vga_init();
 
@@ -14,13 +21,10 @@ pub extern "sysv64" fn _start() -> ! {
     sprintln!("Aegis: kernel started (loader handed off at entry)");
 
     unsafe {
-        aegis_kernel::cpu::switch_to_kernel_stack();
-    }
-    unsafe {
         aegis_kernel::cpu::disable_smep_smap();
     }
     sprintln!(
-        "Aegis: kernel stack 0x{:016X} (16 KiB, tail of BSS)",
+        "Aegis: kernel stack 0x{:016X} (16 KiB, dedicated BSS region)",
         aegis_kernel::cpu::stack_top()
     );
 
@@ -361,6 +365,34 @@ pub extern "sysv64" fn _start() -> ! {
         }
     }
 
+    // Ring-3 capability-denial demo (master roadmap Phase 3): a task that was
+    // granted nothing attempts gated ops on slots it does not hold. Least
+    // authority means its CSpace is empty from birth, so every op returns -1
+    // — denied, never a panic, never a silent success — while the kernel and
+    // its peers keep running. The client's slot 0 was granted by the server;
+    // this task's slot 0 never was.
+    let stack_denied = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    let cpl0_denied = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    match (stack_denied, cpl0_denied) {
+        (Some(sd), Some(cd)) => {
+            unsafe {
+                aegis_kernel::tasks::spawn_user("denied", task_denied, sd, cd);
+            }
+            sprintln!(
+                "Aegis: denial demo spawned @ 0x{:X} ({} tasks total)",
+                sd,
+                aegis_kernel::tasks::spawned_count()
+            );
+        }
+        _ => {
+            sprintln!("Aegis: WARNING could not allocate denial demo stack");
+        }
+    }
+
     unsafe {
         core::arch::asm!("sti");
     }
@@ -481,8 +513,8 @@ extern "sysv64" fn task_server() -> ! {
     loop {
         // Serve: returns (caller_id << 32) | len.
         let packed = user_syscall5(6, ep_slot, recvbuf.as_mut_ptr() as u64, 0, 0);
-        let caller = (packed >> 32) as u64;
-        let rlen = (packed & 0xFFFF_FFFF) as u64;
+        let caller = packed >> 32;
+        let rlen = packed & 0xFFFF_FFFF;
         // Echo: reply with the same data we received.
         user_syscall5(7, ep_slot, caller, recvbuf.as_ptr() as u64, rlen);
     }
@@ -559,6 +591,53 @@ extern "sysv64" fn task_nx_test() -> ! {
         core::arch::asm!("call rax", in("rax") 0xB8000usize);
     }
     user_print(b"Aegis: [nx-test] NX FAILED - instruction fetch succeeded\r\n");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Ring-3 capability-denial demo (master roadmap Phase 3): this task was
+/// granted no capabilities — its CSpace is empty from birth (least
+/// authority). It attempts the gated ops the client and server use (ipc_call
+/// on the endpoint slot, mem_len on a memory-region slot, task_state on a
+/// task slot). Every one must be refused with -1 while the kernel and its
+/// peers keep running.
+extern "sysv64" fn task_denied() -> ! {
+    user_print(b"Aegis: [denied] I was granted no capabilities (empty CSpace)\r\n");
+    // IPC: attempt to call an endpoint at slot 0 — the client's slot 0 is
+    // granted by the server, but this task never received a grant.
+    let mut reply = [0u8; 64];
+    let msg = b"attempt to reach the echo endpoint";
+    let rlen = user_syscall5(
+        5,
+        0,
+        msg.as_ptr() as u64,
+        msg.len() as u64,
+        reply.as_mut_ptr() as u64,
+    );
+    user_print(b"Aegis: [denied] ipc_call(slot 0) -> ");
+    user_print(if rlen == u64::MAX {
+        b"DENIED (-1)\r\n"
+    } else {
+        b"UNEXPECTED SUCCESS\r\n"
+    });
+    // Memory: attempt to read a region at slot 0.
+    let r = user_syscall5(11, 0, 0, 0, 0);
+    user_print(b"Aegis: [denied] mem_len(slot 0) -> ");
+    user_print(if r == u64::MAX {
+        b"DENIED (-1)\r\n"
+    } else {
+        b"UNEXPECTED SUCCESS\r\n"
+    });
+    // Supervision: attempt to query a task at slot 0.
+    let s = user_syscall5(14, 0, 0, 0, 0);
+    user_print(b"Aegis: [denied] task_state(slot 0) -> ");
+    user_print(if s == u64::MAX {
+        b"DENIED (-1)\r\n"
+    } else {
+        b"UNEXPECTED SUCCESS\r\n"
+    });
+    user_print(b"Aegis: [denied] all denied ops refused; kernel and peers continue\r\n");
     loop {
         core::hint::spin_loop();
     }
