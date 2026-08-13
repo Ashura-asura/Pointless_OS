@@ -580,6 +580,7 @@ mod tests {
 
     #[test]
     fn submit_increments_tail_pointer() {
+        let _g = crate::kernel_state_guard();
         let mut q = NvmeQueue::new(64);
         assert_eq!(q.tail, 0);
         let cmd = NvmeSubmissionEntry {
@@ -606,6 +607,7 @@ mod tests {
 
     #[test]
     fn submit_returns_sequential_command_ids() {
+        let _g = crate::kernel_state_guard();
         let mut q = NvmeQueue::new(64);
         let cmd = NvmeSubmissionEntry {
             opcode: 0,
@@ -633,12 +635,14 @@ mod tests {
 
     #[test]
     fn poll_completion_returns_none_when_empty() {
+        let _g = crate::kernel_state_guard();
         let mut q = NvmeQueue::new(64);
         assert!(q.poll_completion().is_none());
     }
 
     #[test]
     fn poll_completion_returns_entry_after_submit() {
+        let _g = crate::kernel_state_guard();
         let mut q = NvmeQueue::new(64);
         q.completions[0] = NvmeCompletionEntry {
             command_specific: 42,
@@ -655,6 +659,7 @@ mod tests {
 
     #[test]
     fn phase_bit_toggles_on_completion() {
+        let _g = crate::kernel_state_guard();
         let mut q = NvmeQueue::new(64);
         assert!(!q.phase);
         for i in 0..64 {
