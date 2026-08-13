@@ -45,6 +45,13 @@ impl Rights {
         Rights(self.0 & other.0)
     }
 
+    /// The raw bitmask. The bit layout matches the model crate's `Rights`, so a
+    /// traced rights value maps directly onto the model (used by the Phase 4
+    /// conformance harness).
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
     /// Set union.
     pub const fn union(self, other: Rights) -> Rights {
         Rights(self.0 | other.0)

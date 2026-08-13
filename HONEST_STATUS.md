@@ -51,6 +51,12 @@ This is the **single consolidated Known Limits section** (`README.md` and
   display is the VGA text console.
 - **IPC overhead** vs a monolithic syscall path is reduced (batched submission,
   shared-memory capability grants), not eliminated.
+- **Capability conformance** is verdict-level, not end-to-end. The harness
+  replays the kernel's `C:` trace against the model and proves *authorized /
+  denied* agreement on every traced op — it does not compare message payloads,
+  timing, or rendezvous ordering, and it adapts the kernel's coarser creation /
+  grant mechanics into the model's Creator-cap and I6-consent ceremony (both
+  documented in `aegis/crates/conformance`).
 
 ### Inherent (cannot be closed by better engineering)
 
@@ -69,11 +75,11 @@ This is the **single consolidated Known Limits section** (`README.md` and
 
 Test counts are kept separate on purpose: `aegis-kernel` is a **standalone bare-metal crate that is NOT a member of the `aegis` workspace**, so its tests are never covered by `cargo test --workspace`.
 
-- **aegis workspace (model crates):** 113 contract tests, 0 failures — `cargo test --workspace` from a clean lockfile (Rule 1/10).
+- **aegis workspace (model crates):** 117 contract tests, 0 failures (incl. the master-roadmap Phase-4 conformance harness `crates/conformance`, 4 tests: trace parsing, the denial-demo replay-agreement proof, a flipped-verdict divergence detector) — `cargo test --workspace` from a clean lockfile (Rule 1/10).
 - **aegis-kernel (bare-metal, separate crate):** 327 contract tests, 0 failures — `cargo test` on the pinned 1.97.1 toolchain (verified this session: includes the Phase-5 loopback netstack in `netstack.rs` — 4 tests over the design §8 async channel box in `channel.rs` — 2 tests: sockets are `Cap::Channel` objects nodded with SEND|RECV into subscriber CSpaces (no GRANT, I2), ports are not ambient authority (a cap-less task is refused by the stack and by the raw gate), a two-hop capability-gated router preserving FIFO order with an exact drain, teardown that destroys the channel and dangles a subscriber's cap while peers keep working, and a router-not-a-root CSpace census — plus the Phase-4 object store in `store.rs` (9 tests): FIPS 180-4 SHA-256 vectors, content-address dedup, capability-addressed blocks served by the real `mem::mem_len`/`mem_read`/`mem_write` gates where a granted READ-only cap reads and writing refuses, COW version-stable snapshots, a relationship index that consumes only the store WAL and rebuilds identically, index-free commit/write signatures, and the POSIX `FlatView` projection — plus the UDP/TCP header parsers in `udp.rs`/`tcp.rs` — RFC 768/793 parse/serialize with pseudo-header checksum verification — and the full Phase-12 `hardening.rs` adversarial boundary suite — ELF/PE/IPv4/Ethernet/ARP/UDP/TCP parse-and-never-panic, syscall/ABI translation totality, compat-layer/shell/window/graph/input bad-ID rejection — plus the Phase-1 `cap.rs`/`ipc.rs` capability-rights model: SEND/RECV/GRANT gates on call/serve/reply/grant and the Task/MemRegion/Channel object kinds — and the Phase 2 additions: `mem.rs` frame-backed MemRegion cap gates + bounds checks (9 tests), `supervisor.rs` budgeted restart/trip/audit runtime (5 tests), `tasks.rs` kill/restart/restore primitives, and `kernel_state_guard` test serialization — plus the Phase-6 kernel audit log in `audit.rs` (3 tests: a 512-entry ring where every gated op — task lifecycle, channel send/recv, memory read/write, delegation, revoke — lands attributed `(tick, caller, op, target, ok)`, success and refusal alike, with per-caller op histograms, target-success queries, and a revoke counter) and the §9 anomaly circuit breaker in `monitor.rs` (3 tests: a capability-less `AnomalyMonitor` trains on the agent's real op-shape and on significant deviation suspends — never revokes — via the `GrantLedger`, which freezes the `ipc_cap_grant` gate while minted caps keep working; suspension is reversible + logged; a cap-less monitor task cannot kill, revoke, or read an object). The ring-3 *integration* is additionally proven by a live QEMU/TCG boot (not a contract test — see Ring-3 row).
 - **uefi-boot:** 13 ELF parser contract tests.
 
-Combined contract-test count across all crates: **453**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
+Combined contract-test count across all crates: **457**. The bare-metal CPL3 transition itself has no contract test (it needs real/virtual hardware); its proof is the live boot.
 
 ### Kernel model (`capability-core`)
 A single-threaded, in-process capability kernel with:

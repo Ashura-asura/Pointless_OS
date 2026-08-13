@@ -85,6 +85,12 @@ pub const fn clamp_write_len(raw: u64) -> usize {
 /// NOT validated — the demo kernel maps the whole first 1 GB with U/S).
 /// Register layout: arg1=rsi, arg2=rcx, arg3=rdx, arg4=r8.
 pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
+    let ret = dispatch_impl(num, arg1, arg2, arg3, arg4);
+    crate::trace::op(num, arg1, arg2, arg3, arg4, ret);
+    ret
+}
+
+fn dispatch_impl(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
     match num {
         0 => -1, // Exit — not implemented
         1 => {

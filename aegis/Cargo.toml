@@ -16,6 +16,7 @@ members = [
     "crates/macaroon",
     "crates/fleet",
     "crates/security-audit",
+    "crates/conformance",
 ]
 
 [workspace.package]

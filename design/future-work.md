@@ -10,6 +10,21 @@ One-line pointer for the main docs:
 
 ---
 
+## Master roadmap (Phases 0–7) — status
+
+- **Phase 0** (honest docs) — done.
+- **Phase 1** (capability rights) — done.
+- **Phase 2** (least authority + revocation) — done.
+- **Phase 3** (live capability-denial demo) — done.
+- **Phase 4** (conformance harness) — done: `aegis/crates/conformance` replays
+  the kernel's live capability trace against the model and proves the model's
+  authorization verdicts agree with the kernel's recorded verdicts at every
+  step (fixture: the ring-3 denial demo, verified under QEMU).
+- **Phases 5–7** (live supervision demo, capability-scoped AI-agent prototype,
+  one real subsystem over NVMe) — next, sequenced below.
+
+---
+
 ## Windows/Linux compatibility
 
 The design doc calls full native fidelity **inherent-cannot-be-closed**. Its

@@ -1,0 +1,10 @@
+[package]
+name = "conformance"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Phase 4: replay the kernel's capability trace against the capability-core model"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+capability-core = { path = "../capability-core" }

@@ -6,6 +6,10 @@ rust-version = "1.82"
 
 [features]
 kernel = []
+# Phase 4 conformance: emit a replayable capability trace (C:lines) to COM1 at
+# the syscall dispatch choke point. Off by default; the shipped image carries
+# no trace state and no extra output.
+trace = []
 
 [dependencies]
 

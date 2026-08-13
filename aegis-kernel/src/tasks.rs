@@ -372,7 +372,11 @@ pub unsafe fn spawn_user(
     stack_base: u64,
     cpl0_stack_base: u64,
 ) -> Option<usize> {
-    spawn_impl(name, entry, stack_base, cpl0_stack_base)
+    let idx = spawn_impl(name, entry, stack_base, cpl0_stack_base);
+    if let Some(i) = idx {
+        crate::trace::spawn(i, name);
+    }
+    idx
 }
 
 unsafe fn spawn_impl(

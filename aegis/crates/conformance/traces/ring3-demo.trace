@@ -1,0 +1,15 @@
+C:spawn idx=2 label=server
+C:spawn idx=3 label=client
+C:spawn idx=4 label=iso-test
+C:spawn idx=5 label=nx-test
+C:spawn idx=6 label=denied
+C:op p=endpoint o=2 s=0 k=e j=0 r=0 rg=56 y=ok
+C:op p=call o=3 s=0 k=- j=0 r=8 rg=0 y=denied
+C:op p=call o=3 s=0 k=- j=0 r=8 rg=0 y=denied
+C:op p=call o=6 s=0 k=- j=0 r=8 rg=0 y=denied
+C:op p=mem_len o=6 s=0 k=- j=0 r=1 rg=0 y=denied
+C:op p=grant o=2 s=0 k=e j=0 r=32 rg=56 d=3 ds=0 y=ok
+C:op p=serve o=2 s=0 k=e j=0 r=16 rg=56 y=ok
+C:op p=reply o=2 s=0 k=e j=0 r=16 rg=56 y=ok
+C:op p=call o=3 s=0 k=e j=0 r=8 rg=56 y=ok
+C:op p=task_state o=6 s=0 k=- j=0 r=1 rg=0 y=denied
