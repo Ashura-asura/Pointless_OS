@@ -451,10 +451,23 @@ pub fn reset_table_for_test() {
         core::ptr::write(core::ptr::addr_of_mut!(CURRENT), usize::MAX);
         crate::monitor::ledger().clear_for_test();
         for i in 0..MAX_TASKS {
-            let slot = core::ptr::addr_of_mut!(TASKS)
-                .cast::<core::mem::MaybeUninit<Task>>()
-                .add(i);
-            core::ptr::write(slot, core::mem::MaybeUninit::uninit());
+            let task = Task {
+                name: "",
+                entry: tests_dummy,
+                frame: TaskFrame::fresh(tests_dummy, TASK_STACK_SIZE),
+                stack_base: 0,
+                cpl0_stack_top: 0,
+                pml4_phys: 0,
+                caps: crate::cap::new_cap_table(),
+                state: TaskState::Ready,
+                blocked_ep: usize::MAX,
+            };
+            core::ptr::write(
+                core::ptr::addr_of_mut!(TASKS)
+                    .cast::<core::mem::MaybeUninit<Task>>()
+                    .add(i),
+                core::mem::MaybeUninit::new(task),
+            );
         }
     }
 }

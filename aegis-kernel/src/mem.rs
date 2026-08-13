@@ -306,6 +306,8 @@ mod tests {
     #[test]
     fn region_gate_requires_held_right_on_region_cap() {
         let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        reset_regions_for_test();
         // Task 0 slot 0 carries a MemRegion with READ only.
         set_current_for_test(0);
         let mut backing = [0u8; 4096];
@@ -322,6 +324,8 @@ mod tests {
     #[test]
     fn read_requires_read_right_out_of_bounds_denied() {
         let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        reset_regions_for_test();
         set_current_for_test(2);
         let mut backing = [0u8; 4096];
         seed_region(2, 0, 2, backing.as_mut_ptr() as u64, 16, Rights::READ);
@@ -348,6 +352,8 @@ mod tests {
     #[test]
     fn read_from_region_without_read_right_denied() {
         let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        reset_regions_for_test();
         set_current_for_test(3);
         let mut backing = [0u8; 4096];
         seed_region(3, 0, 3, backing.as_mut_ptr() as u64, 16, Rights::WRITE);
@@ -358,6 +364,8 @@ mod tests {
     #[test]
     fn write_requires_write_right() {
         let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        reset_regions_for_test();
         set_current_for_test(4);
         // Same region id; slot 0 WRITE-only this time.
         let mut backing = [0u8; 4096];
@@ -383,6 +391,8 @@ mod tests {
     #[test]
     fn len_requires_read_right() {
         let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        reset_regions_for_test();
         set_current_for_test(5);
         let mut backing = [0u8; 4096];
         seed_region(5, 0, 6, backing.as_mut_ptr() as u64, 4096, Rights::READ);
@@ -395,6 +405,8 @@ mod tests {
     fn read_write_roundtrip_through_real_memory() {
         // Bind the region to the backing buffer; write bytes, read them back.
         let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        reset_regions_for_test();
         set_current_for_test(6);
         let mut backing = [0u8; 64];
         for (i, b) in backing.iter_mut().take(16).enumerate() {
@@ -427,6 +439,8 @@ mod tests {
     #[test]
     fn non_region_caps_are_not_addressable() {
         let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        reset_regions_for_test();
         set_current_for_test(1);
         set_task_cap(
             1,
@@ -453,6 +467,8 @@ mod tests {
     #[test]
     fn out_of_range_slot_is_denied() {
         let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        reset_regions_for_test();
         set_current_for_test(2);
         assert_eq!(caps_region(2, MAX_CAPS as u64 + 100, Rights::READ), None);
         assert_eq!(unsafe { mem_len(MAX_CAPS as u64 + 100) }, -1);
@@ -462,6 +478,8 @@ mod tests {
     fn mem_create_installs_read_write_grant() {
         // Task 3 uses mem_create; alloc fails without an initialized frame
         let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        reset_regions_for_test();
         // pool, so this asserts the fail path is clean and non-panicking in
         // the contract-test host (real allocation is proven by live boot).
         set_current_for_test(3);
