@@ -93,36 +93,66 @@ struct IndexEntry {
     len: u16,
 }
 
-fn index_entry_sector(i: usize) -> u64 {
-    STORE_START_LBA + 1 + (i * ENTRY_BYTES / SECTOR) as u64
+/// Absolute byte offset of index entry `i` within the whole index region.
+fn index_entry_byte(i: usize) -> usize {
+    i * ENTRY_BYTES
 }
 
-fn index_entry_offset(i: usize) -> usize {
-    i * ENTRY_BYTES % SECTOR
+/// Serialize one index entry into its on-disk 48-byte form.
+fn pack_entry(e: &IndexEntry, raw: &mut [u8; ENTRY_BYTES]) {
+    raw[..32].copy_from_slice(&e.id);
+    raw[32..40].copy_from_slice(&e.lba.to_le_bytes());
+    raw[40..42].copy_from_slice(&e.len.to_le_bytes());
 }
 
+/// Write the 48-byte entry for slot `i`, splitting it across sector boundaries
+/// if it straddles the end of an index sector (an entry may span two sectors).
 fn write_index_entry(io: &mut impl BlockIo, i: usize, e: &IndexEntry) -> bool {
-    let mut sec = [0u8; SECTOR];
-    if !io.read_sector(index_entry_sector(i), &mut sec) {
-        return false;
+    let mut raw = [0u8; ENTRY_BYTES];
+    pack_entry(e, &mut raw);
+    let mut done = 0usize;
+    let boff = index_entry_byte(i);
+    let mut sector = STORE_START_LBA + 1 + (boff / SECTOR) as u64;
+    let mut in_sec = boff % SECTOR;
+    while done < raw.len() {
+        let mut sec = [0u8; SECTOR];
+        if !io.read_sector(sector, &mut sec) {
+            return false;
+        }
+        let take = (SECTOR - in_sec).min(raw.len() - done);
+        sec[in_sec..in_sec + take].copy_from_slice(&raw[done..done + take]);
+        if !io.write_sector(sector, &sec) {
+            return false;
+        }
+        done += take;
+        sector += 1;
+        in_sec = 0;
     }
-    let off = index_entry_offset(i);
-    sec[off..off + 32].copy_from_slice(&e.id);
-    sec[off + 32..off + 40].copy_from_slice(&e.lba.to_le_bytes());
-    sec[off + 40..off + 42].copy_from_slice(&e.len.to_le_bytes());
-    io.write_sector(index_entry_sector(i), &sec)
+    true
 }
 
+/// Read the 48-byte entry for slot `i` (inverse of [`write_index_entry`]),
+/// reassembling it from one or two index sectors.
 fn read_index_entry(io: &mut impl BlockIo, i: usize) -> Option<IndexEntry> {
+    let mut raw = [0u8; ENTRY_BYTES];
+    let mut done = 0usize;
+    let boff = index_entry_byte(i);
+    let mut sector = STORE_START_LBA + 1 + (boff / SECTOR) as u64;
+    let mut in_sec = boff % SECTOR;
     let mut sec = [0u8; SECTOR];
-    if !io.read_sector(index_entry_sector(i), &mut sec) {
-        return None;
+    while done < raw.len() {
+        if !io.read_sector(sector, &mut sec) {
+            return None;
+        }
+        let take = (SECTOR - in_sec).min(raw.len() - done);
+        raw[done..done + take].copy_from_slice(&sec[in_sec..in_sec + take]);
+        done += take;
+        sector += 1;
+        in_sec = 0;
     }
-    let off = index_entry_offset(i);
-    let mut id = [0u8; 32];
-    id.copy_from_slice(&sec[off..off + 32]);
-    let lba = u64::from_le_bytes(sec[off + 32..off + 40].try_into().ok()?);
-    let len = u16::from_le_bytes(sec[off + 40..off + 42].try_into().ok()?);
+    let id = raw[..32].try_into().ok()?;
+    let lba = u64::from_le_bytes(raw[32..40].try_into().ok()?);
+    let len = u16::from_le_bytes(raw[40..42].try_into().ok()?);
     Some(IndexEntry { id, lba, len })
 }
 
@@ -442,16 +472,39 @@ mod tests {
         let id = s.put(&mut disk, b"short").unwrap();
         assert!(s.verify(&mut disk, &id));
 
-        // Corrupt the index: claim the block is 500 bytes of the padded sector.
+// Corrupt the index: claim the block is 500 bytes of the padded sector.
+        // Slot 0 sits at the very start of the first index sector.
         let mut sec = [0u8; SECTOR];
-        disk.read_sector(index_entry_sector(0), &mut sec);
-        let off = index_entry_offset(0);
-        sec[off + 40..off + 42].copy_from_slice(&500u16.to_le_bytes());
-        disk.write_sector(index_entry_sector(0), &sec);
+        disk.read_sector(STORE_START_LBA + 1, &mut sec);
+        sec[40..42].copy_from_slice(&500u16.to_le_bytes());
+        disk.write_sector(STORE_START_LBA + 1, &sec);
 
         let mut out = [0u8; 512];
         assert!(s.get(&mut disk, &id, &mut out).is_none());
         assert!(!s.verify(&mut disk, &id));
+    }
+
+    /// Index entries are 48 bytes and may straddle the 512-byte index-sector
+    /// boundary (slot 10 begins at byte 480). Pushing well past that proves the
+    /// pack/unpack split survives many crossings: every block must still verify
+    /// and read back byte-for-byte.
+    #[test]
+    fn many_blocks_span_index_sector_boundaries() {
+        let mut disk = MemDisk::new(9000);
+        let mut s = Store::open(&mut disk).unwrap();
+        let mut ids = [[0u8; 32]; 64];
+        for (i, id) in ids.iter_mut().enumerate() {
+            let payload = [i as u8; 511];
+            *id = s.put(&mut disk, &payload).unwrap();
+        }
+        for (i, id) in ids.iter().enumerate() {
+            let payload = [i as u8; 511];
+            let mut out = [0u8; 512];
+            let n = s.get(&mut disk, id, &mut out).unwrap();
+            assert_eq!(&out[..n], &payload[..n]);
+            assert!(s.verify(&mut disk, id));
+        }
+        assert_eq!(s.count(), 64);
     }
 
     /// decode_entries must tolerate any garbage a real disk can serve: a forged

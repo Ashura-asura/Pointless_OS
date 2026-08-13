@@ -353,6 +353,15 @@ impl Name {
     }
 }
 
+impl Default for Name {
+    fn default() -> Name {
+        Name {
+            bytes: [0; NAME_BYTES],
+            len: 0,
+        }
+    }
+}
+
 /// One entry of the flat POSIX projection: a name and the store-node it names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FileEntry {

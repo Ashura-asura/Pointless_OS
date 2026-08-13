@@ -5,6 +5,14 @@ use aegis_kernel::sprintln;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Write the first four bytes of `id` into `out` as xx:xx (for demo printout).
+fn hex_bytes(id: &[u8; 32], out: &mut [u8; 4]) {
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = id[i];
+    }
+    let _ = out;
+}
+
 #[no_mangle]
 pub extern "sysv64" fn _start(handoff_addr: u64) -> ! {
     // Enter on a freshly-established kernel stack: jump (never return) so
@@ -338,6 +346,119 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                     id3.is_some(),
                     st.count()
                 );
+
+                // Phase 8 (roadmap §10 item 2): the package/system-update model
+                // graduated onto THIS object store. A package is a manifest +
+                // named content-addressed payload blocks; the boot view is a COW
+                // directory block (every activate/rollback commits a NEW dir);
+                // a candidate "generation" is staged as gen-N without touching
+                // `current`; activation flips `current` only after a caller
+                // health gate; rollback flips back to the last known good.
+                use aegis_kernel::update::{
+                    payloads_verify, BootView, Manifest, PayloadFile, UpdateManager,
+                };
+                {
+                    let pak = |n: &[u8], bytes: &'static [u8]| PayloadFile {
+                        name: Name::from_slice(n).unwrap(),
+                        bytes,
+                    };
+                    let man = |n: &[u8]| Manifest {
+                        name: Name::from_slice(n).unwrap(),
+                        ceiling: 2,
+                    };
+                    let boot = BootView::create(&mut st, &mut ctrl).expect("boot view");
+                    let mut um = UpdateManager::attach(&mut st, &mut ctrl, boot);
+                    let mut hex = [0u8; 4];
+                    hex_bytes(&um.view_id(), &mut hex);
+                    sprintln!(
+                        "Aegis: system-update: boot view {:02X}{:02X}{:02X}{:02X} created, {} block(s) on disk",
+                        hex[0], hex[1], hex[2], hex[3], st.count()
+                    );
+                    // 1) Stage editor v1 (a candidate generation); the boot
+                    //    target (`current`) is untouched by staging alone.
+                    let g1 = um
+                        .stage(
+                            &mut st,
+                            &mut ctrl,
+                            man(b"editor"),
+                            &[pak(b"main.bin", b"editor v1: hello update")],
+                        )
+                        .expect("stage editor v1");
+                    sprintln!(
+                        "Aegis: system-update: staged gen-1 (editor v1), boot target still empty: {}",
+                        um.boot_target(&mut st, &mut ctrl).is_none()
+                    );
+                    // 2) Activation is health-gated: a health check that refuses
+                    //    leaves `current` untouched.
+                    let refused = um.activate(&mut st, &mut ctrl, &g1, |_, _, _| false);
+                    let still_empty = um.boot_target(&mut st, &mut ctrl).is_none();
+                    sprintln!(
+                        "Aegis: system-update: health-gated activation refused = {}; boot target unchanged = {}",
+                        refused, still_empty
+                    );
+                    // 3) A real gate: every payload block must digest-verify.
+                    let accepted = um.activate(&mut st, &mut ctrl, &g1, payloads_verify);
+                    let target1 = um.boot_target(&mut st, &mut ctrl);
+                    sprintln!(
+                        "Aegis: system-update: payload-verified activate = {}; target = gen-{} package=editor, {} block(s)",
+                        accepted,
+                        target1.as_ref().map(|d| d.n).unwrap_or(0),
+                        st.count()
+                    );
+                    // 4) Stage editor v2 and activate: candidate stays installed,
+                    //    boot flips, and the view is a NEW dir block (COW).
+                    let before = um.view_id();
+                    let g2 = um
+                        .stage(
+                            &mut st,
+                            &mut ctrl,
+                            man(b"editor"),
+                            &[pak(b"main.bin", b"editor v2: the upgrade")],
+                        )
+                        .expect("stage editor v2");
+                    let accepted2 = um.activate(&mut st, &mut ctrl, &g2, payloads_verify);
+                    let target2 = um.boot_target(&mut st, &mut ctrl);
+                    sprintln!(
+                        "Aegis: system-update: v2 activate = {}; target = gen-{}; COW: view flipped to a new dir block = {}",
+                        accepted2,
+                        target2.as_ref().map(|d| d.n).unwrap_or(0),
+                        before != um.view_id()
+                    );
+                    // 5) Rollback: the boot target returns to the last known
+                    //    good (gen-1), and the dethroned gen is dropped so a
+                    //    second rollback has nothing more to restore.
+                    let rolled = um.rollback(&mut st, &mut ctrl);
+                    let second = um.rollback(&mut st, &mut ctrl);
+                    let target_after = um.boot_target(&mut st, &mut ctrl);
+                    sprintln!(
+                        "Aegis: system-update: rollback to gen-{}; boot target now gen-{}; second rollback empty = {}",
+                        rolled.unwrap_or(0),
+                        target_after.as_ref().map(|d| d.n).unwrap_or(0),
+                        second.is_none()
+                    );
+                    // 6) Dedup across packages: installing a SECOND package that
+                    //    ships the same payload bytes costs no new data block.
+                    let base = st.count();
+                    let g3 = um
+                        .stage(
+                            &mut st,
+                            &mut ctrl,
+                            man(b"editor"),
+                            &[pak(b"main.bin", b"editor v1: hello update")],
+                        )
+                        .expect("stage editor v1 again");
+                    let _ = g3;
+                    let mut phex = [0u8; 4];
+                    hex_bytes(&g1.payload[0], &mut phex);
+                    sprintln!(
+                        "Aegis: system-update: reinstall of the same payload dedups: h1={:02X}{:02X}{:02X}{:02X} h2={:02X}{:02X}{:02X}{:02X} equal = {}; {} block(s) added",
+                        phex[0], phex[1], phex[2], phex[3],
+                        g3.payload[0][0], g3.payload[0][1], g3.payload[0][2], g3.payload[0][3],
+                        g3.payload[0] == g1.payload[0],
+                        st.count() - base
+                    );
+                    sprintln!("Aegis: system-update: full install -> stage -> health-gated activate -> rollback cycle persisted to the boot device");
+                }
             }
             None => {
                 sprintln!("Aegis: NVMe-store: corrupt or unreadable store region");

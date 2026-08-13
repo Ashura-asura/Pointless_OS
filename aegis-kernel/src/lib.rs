@@ -59,6 +59,8 @@ pub mod serial;
 
 pub mod store;
 
+pub mod update;
+
 pub mod channel;
 
 pub mod netstack;

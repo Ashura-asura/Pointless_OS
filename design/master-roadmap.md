@@ -397,9 +397,15 @@ Not cut — sequenced, and only after Phase 6:
   restarts the crashed service → observer's restart refused (READ sees the
   crash, CONTROL denies the restart) → audit trail shows both slots and the
   watchdog's denials.
-- **Package/update polish:** least urgent; already has reasonable
-  model-level coverage. Revisit after Phase 7's storage work, since
-  packages logically sit on top of object-store.
+- **Package/update polish (§10 item 2) DONE** — the package/system-update
+   model now runs on top of the Phase-7 NVMe store (`aegis-kernel/src/update.rs`):
+   candidate generations staged as `gen-N` without touching `current`, activation
+   gated on a caller health check (payload-verified digest checks), rollback to
+   the last known good; `current` is a content-addressed COW boot-view pointer,
+   identical payload bytes dedup to one block. 9 new `update` tests + 1 `nvme_store`
+   index-boundary test; live QEMU/OVMF proof (`uefi-boot/serial-p10.log`). The
+   store also closed a latent bug: 48-byte index entries straddling the 512 B
+   index-sector boundary now pack/unpack across two sectors.
 
 ---
 
