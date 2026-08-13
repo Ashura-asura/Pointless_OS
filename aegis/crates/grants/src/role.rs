@@ -19,6 +19,15 @@ const RESTART_SERVICE_REQS: [CapRequest; 1] = [CapRequest {
     note: "read the named service's state and restart it",
 }];
 
+/// §10 "broader AI orchestration" watchdog role: READ only over one named task.
+/// The grantee can query the service's state but has no CONTROL — observation
+/// never becomes control, matching the kernel's `observe-service` role.
+const OBSERVE_SERVICE_REQS: [CapRequest; 1] = [CapRequest {
+    kind: ObjectKind::Task,
+    rights: Rights::READ,
+    note: "watch a named service's state, never restart or kill it",
+}];
+
 const TRIAGE_INBOX_REQS: [CapRequest; 1] = [CapRequest {
     kind: ObjectKind::Endpoint,
     rights: Rights::SEND,
@@ -63,6 +72,13 @@ impl RoleLibrary {
                     requests: &RESTART_SERVICE_REQS,
                 },
                 Role {
+                    id: "observe-service",
+                    name: "Watch a named service's state",
+                    allow_persistent: false,
+                    high_risk: false,
+                    requests: &OBSERVE_SERVICE_REQS,
+                },
+                Role {
                     id: "triage-inbox",
                     name: "Triage my inbox",
                     allow_persistent: true,
@@ -99,5 +115,25 @@ mod tests {
         assert_eq!(req.kind, ObjectKind::Task);
         // Control, not GRANT: the agent can restart, never re-delegate.
         assert!(!req.rights.contains(Rights::GRANT));
+    }
+
+    /// §10: the observe role is READ only — the watchdog can query the service
+    /// but has no CONTROL, no GRANT, and is never persistent.
+    #[test]
+    fn observe_role_is_read_only_and_never_controls() {
+        let lib = RoleLibrary::default_roles();
+        let role = lib.get("observe-service").unwrap();
+        assert!(!role.allow_persistent);
+        assert!(!role.high_risk);
+        assert_eq!(role.requests.len(), 1);
+        let req = &role.requests[0];
+        assert_eq!(req.kind, ObjectKind::Task);
+        assert!(req.rights.contains(Rights::READ));
+        assert!(
+            !req.rights.contains(Rights::CONTROL),
+            "watchdog never controls"
+        );
+        assert!(!req.rights.contains(Rights::GRANT), "role never grants");
+        assert_eq!(req.rights.bits(), Rights::READ.bits());
     }
 }

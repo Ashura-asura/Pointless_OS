@@ -58,8 +58,9 @@ impl<'a> FrameAllocator<'a> {
                 clear_bits(self.bitmap, start, end);
             }
         }
-        let handoff_end =
-            info.image_end.saturating_add(crate::boot_info::HANDOFF_PAGES * PAGE_SIZE);
+        let handoff_end = info
+            .image_end
+            .saturating_add(crate::boot_info::HANDOFF_PAGES * PAGE_SIZE);
         let kernel_end = handoff_end.max(BOOT_INFO_RESERVE_END);
         set_bits(self.bitmap, 0, kernel_end / PAGE_SIZE);
         self.total = self
@@ -343,7 +344,10 @@ mod tests {
         let f = t.alloc.alloc().unwrap();
         // First free frame sits just above the kernel + handoff reservation.
         assert_eq!(f, reserved_frames(TEST_IMAGE_END) * PAGE_SIZE);
-        assert_eq!(t.alloc.stats().1, 160 + 256 - reserved_frames(TEST_IMAGE_END) - 1);
+        assert_eq!(
+            t.alloc.stats().1,
+            160 + 256 - reserved_frames(TEST_IMAGE_END) - 1
+        );
     }
 
     #[test]
@@ -425,7 +429,10 @@ mod tests {
         // Second call wraps to the next 8-frame hole.
         let base2 = t.alloc.alloc_contiguous(8).unwrap();
         assert_eq!(base2, (reserved_frames(TEST_IMAGE_END) + 8) * PAGE_SIZE);
-        assert_eq!(t.alloc.stats().1, 160 + 256 - reserved_frames(TEST_IMAGE_END) - 16);
+        assert_eq!(
+            t.alloc.stats().1,
+            160 + 256 - reserved_frames(TEST_IMAGE_END) - 16
+        );
     }
 
     #[test]

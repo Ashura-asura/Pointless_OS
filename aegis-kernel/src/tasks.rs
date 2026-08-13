@@ -635,10 +635,15 @@ pub fn arm_service_test(idx: usize, tick: u64) {
 /// Phase-6 demo is a kernel-side print, not a ring-3 claim.
 pub static AUDIT_DUMP_TICK: AtomicU64 = AtomicU64::new(u64::MAX);
 static AUDIT_DUMP_AGENT: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// Second agent name for the combined §10 dump (the `observe-service`
+/// watchdog). Armed alongside `AUDIT_DUMP_AGENT`; the one dump prints both.
+static AUDIT_DUMP_AGENT_2: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-/// Arm the one-shot audit-dump hook for the Phase-6 demo.
-pub fn arm_audit_dump(agent: usize, tick: u64) {
+/// Arm the one-shot audit-dump hook for the Phase-6/§10 demo. `agent` and
+/// `agent_2` are both dumped by the single kernel-side print.
+pub fn arm_audit_dump(agent: usize, agent_2: usize, tick: u64) {
     AUDIT_DUMP_AGENT.store(agent, Ordering::Relaxed);
+    AUDIT_DUMP_AGENT_2.store(agent_2, Ordering::Relaxed);
     AUDIT_DUMP_TICK.store(tick, Ordering::Relaxed);
 }
 
@@ -848,12 +853,15 @@ pub unsafe fn timer_preempt() {
         unblock_task(SERVICE_ARM_IDX.load(Ordering::Relaxed));
     }
     // Phase-6 hook: once the role-grant flow has settled, print the kernel's
-    // audit trail for it (the kernel prints audit log, one shot).
+    // audit trail for it (the kernel prints audit log, one shot). §10: dumps
+    // BOTH role flows (the restart agent and the observe watchdog) in one
+    // kernel-side print.
     if crate::cpu::timer_ticks() >= AUDIT_DUMP_TICK.load(Ordering::Relaxed) {
         AUDIT_DUMP_TICK.store(u64::MAX, Ordering::Relaxed);
-        let agent = AUDIT_DUMP_AGENT.load(Ordering::Relaxed);
-        if agent != usize::MAX {
-            crate::audit::dump_agent_flow(agent);
+        let a = AUDIT_DUMP_AGENT.load(Ordering::Relaxed);
+        let b = AUDIT_DUMP_AGENT_2.load(Ordering::Relaxed);
+        if a != usize::MAX {
+            crate::audit::dump_agent_flow_2(a, b);
         }
     }
     let cur = current_idx();
@@ -1063,7 +1071,7 @@ mod tests {
         unsafe {
             core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
             let t = spawn("live", dummy, 0x8000).unwrap();
-            assert_eq!(restart_task(t), false, "Ready tasks are never resettable");
+            assert!(!restart_task(t), "Ready tasks are never resettable");
             assert!(is_task_alive(t));
             core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
         }

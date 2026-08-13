@@ -280,7 +280,11 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 let mut buf = [0u8; 512];
                 let n = st.get(&mut ctrl, &h1, &mut buf);
                 let read_ok = n.map(|l| &buf[..l] == hello).unwrap_or(false);
-                sprintln!("Aegis: NVMe-store: read back {}, digest verified {}", n.is_some(), read_ok);
+                sprintln!(
+                    "Aegis: NVMe-store: read back {}, digest verified {}",
+                    n.is_some(),
+                    read_ok
+                );
 
                 // 3) COW flat directory: two versions of memo.txt are two blocks.
                 let memo7 = FileEntry {
@@ -321,7 +325,8 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 sec[..512].copy_from_slice(&ctrl.lba_data()[..512]);
                 sec[0] = 0xAA; // idempotent corruption: deterministic across reboots
                 let wr = ctrl.write_lba(DATA_BASE_LBA, &sec);
-                let detected = !st.verify(&mut ctrl, &h1) && st.get(&mut ctrl, &h1, &mut buf).is_none();
+                let detected =
+                    !st.verify(&mut ctrl, &h1) && st.get(&mut ctrl, &h1, &mut buf).is_none();
                 sprintln!(
                     "Aegis: NVMe-store: flipped a bit of h1 on disk (write-back {}), verify -> {}, get -> absent: {}",
                     wr, st.verify(&mut ctrl, &h1), detected
@@ -330,7 +335,8 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 let id3 = st.put(&mut ctrl, b"post-corruption write still works");
                 sprintln!(
                     "Aegis: NVMe-store: store usable after corruption: {} ({} blocks)",
-                    id3.is_some(), st.count()
+                    id3.is_some(),
+                    st.count()
                 );
             }
             None => {
@@ -417,10 +423,9 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     };
     match (stack_sup, cpl0_sup) {
         (Some(su), Some(cu)) => {
-            let sup = unsafe {
-                aegis_kernel::tasks::spawn_user("supervisor", task_supervisor, su, cu)
-            }
-            .expect("supervisor task slot");
+            let sup =
+                unsafe { aegis_kernel::tasks::spawn_user("supervisor", task_supervisor, su, cu) }
+                    .expect("supervisor task slot");
             // Slot 0: reserved notification endpoint, RECV only (serve).
             aegis_kernel::tasks::set_task_cap(
                 sup,
@@ -559,6 +564,12 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // scripted stand-in for a human reviewer. Its one real task: restart the
     // service when it crashes. Every escalation attempt is refused by the
     // kernel's capability gates, never by the agent's own code.
+    //
+    // §10 "broader AI orchestration": a second ring-3 agent (task 10) receives
+    // the `observe-service` role (READ over task 9 only) through the SAME
+    // grant flow. It is a watchdog: it can see the service crash, and it can
+    // never restart it — observation never becomes control, and the gate
+    // enforces that even for a fully compromised observer.
     let stack_agent = unsafe {
         aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
     };
@@ -571,21 +582,38 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     let cpl0_service = unsafe {
         aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
     };
-    match (stack_agent, cpl0_agent, stack_service, cpl0_service) {
-        (Some(sa), Some(ca), Some(ss), Some(cs)) => {
+    let stack_observer = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    let cpl0_observer = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    match (
+        stack_agent,
+        cpl0_agent,
+        stack_service,
+        cpl0_service,
+        stack_observer,
+        cpl0_observer,
+    ) {
+        (Some(sa), Some(ca), Some(ss), Some(cs), Some(so), Some(co)) => {
             unsafe {
                 aegis_kernel::tasks::spawn_user("agent", task_agent, sa, ca);
                 aegis_kernel::tasks::spawn_user("service", task_service, ss, cs);
+                aegis_kernel::tasks::spawn_user("observer", task_observer, so, co);
             }
             sprintln!(
-                "Aegis: Phase-6 agent+service spawned ({} tasks total)",
+                "Aegis: Phase-6 agent+service+observer spawned ({} tasks total)",
                 aegis_kernel::tasks::spawned_count()
             );
-            // The agent is task index 8, the service task index 9.
+            // The agent is task index 8, the service task index 9, the
+            // observer task index 10.
             aegis_kernel::tasks::arm_service_test(9, 28);
-            // After the role-grant flow settles (service crash at tick 28, agent
-            // restart + denials), the kernel prints its audit trail for it.
-            aegis_kernel::tasks::arm_audit_dump(8, 45);
+            // After the whole role-grant flow settles (service crash at tick 28,
+            // agent restart + denials, observer denials), the kernel prints its
+            // audit trail for BOTH role flows — the restart agent (8) and the
+            // observe watchdog (10) — in one kernel-side print.
+            aegis_kernel::tasks::arm_audit_dump(8, 10, 70);
         }
         _ => {
             sprintln!("Aegis: WARNING could not allocate Phase-6 task stacks");
@@ -799,6 +827,16 @@ extern "sysv64" fn task_supervisor() -> ! {
     } else {
         b"OK\r\n"
     });
+    // §10 "broader AI orchestration": grant the `observe-service` role (READ
+    // only, no CONTROL, no GRANT) to the watchdog observer (task 10) over the
+    // same service, through the same audited gate.
+    let og = user_syscall5(18, 1, 10, 9, 0); // RoleGrant(observe-service, observer, service, slot 0)
+    user_print(b"Aegis: [supervisor] role grant observe-service -> observer over service: ");
+    user_print(if og == u64::MAX {
+        b"DENIED\r\n"
+    } else {
+        b"OK\r\n"
+    });
     let notify_slot: u64 = 0;
     let child_slot: u64 = 1;
     let child_idx: u64 = 5;
@@ -830,8 +868,10 @@ extern "sysv64" fn task_supervisor() -> ! {
                 b" -> OK\r\n"
             });
         } else {
-            user_print(b"Aegis: [supervisor] ESCALATION: child restart budget exhausted, \
-leaving child dead\r\n");
+            user_print(
+                b"Aegis: [supervisor] ESCALATION: child restart budget exhausted, \
+leaving child dead\r\n",
+            );
             user_print(b"Aegis: [supervisor] escalated; kernel and peers continue\r\n");
             loop {
                 core::hint::spin_loop();
@@ -1022,7 +1062,89 @@ extern "sysv64" fn task_agent() -> ! {
     } else {
         b"UNEXPECTED SUCCESS\r\n"
     });
-    user_print(b"Aegis: [agent] all self-escalation refused by the kernel; audit trail recorded\r\n");
+    user_print(
+        b"Aegis: [agent] all self-escalation refused by the kernel; audit trail recorded\r\n",
+    );
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// The §10 "broader AI orchestration" watchdog: a second zero-capability agent
+/// granted the `observe-service` role (READ over the service task only, no
+/// CONTROL, no GRANT). Its one real task is watching the service; restarting
+/// or killing it is refused at the kernel's capability gate. This is the same
+/// discipline as Phase 6 applied to a second role — observing is not a step
+/// toward controlling, even for a fully compromised observer.
+extern "sysv64" fn task_observer() -> ! {
+    user_print(b"Aegis: [observer] online with zero capabilities\r\n");
+    // Wait for the role grant to land: task_state(slot 0) returns -1 (empty)
+    // until the supervisor's RoleGrant installs the READ cap, then 1 (alive).
+    let mut granted = false;
+    for _ in 0..1_000_000u64 {
+        if user_syscall5(14, 0, 0, 0, 0) != u64::MAX {
+            granted = true;
+            break;
+        }
+        user_syscall5(3, 0, 0, 0, 0); // yield so the grantor can run
+    }
+    if !granted {
+        user_print(b"Aegis: [observer] role grant never arrived\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    user_print(b"Aegis: [observer] observe-service role received over the service task\r\n");
+    // The watchdog reads the service's state (its one READ-granted task).
+    let mut waited = 0u64;
+    loop {
+        let s = user_syscall5(14, 0, 0, 0, 0);
+        if s == 0 {
+            break;
+        }
+        waited += 1;
+        if waited > 1_000_000 {
+            user_print(b"Aegis: [observer] service never crashed\r\n");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+        user_syscall5(3, 0, 0, 0, 0);
+    }
+    user_print(b"Aegis: [observer] service crashed (READ sees it)\r\n");
+    // The one thing the watchdog must NOT be able to do: restart the service.
+    // The gate refuses — the observe role has no CONTROL.
+    user_print(b"Aegis: [observer] attempting to restart the service\r\n");
+    let r = user_syscall5(16, 0, 0, 0, 0); // task_restart(slot 0)
+    user_print(b"Aegis: [observer] task_restart -> ");
+    user_print(if r == u64::MAX {
+        b"DENIED (-1)\r\n"
+    } else {
+        b"UNEXPECTED SUCCESS\r\n"
+    });
+    // Adversarial self-escalation attempts — all refused at the gate.
+    // 1) Attempt to upgrade the observe role to restart-service over the
+    //    service: the grantor gate needs a Task cap with READ|CONTROL over the
+    //    target; the observer holds only READ.
+    user_print(b"Aegis: [observer] attempting to upgrade to restart-service\r\n");
+    let up = user_syscall5(18, 0, 10, 9, 1); // RoleGrant(restart-service, self, service, slot 1)
+    user_print(b"Aegis: [observer] role_grant(upgrade) -> ");
+    user_print(if up == u64::MAX {
+        b"DENIED (-1)\r\n"
+    } else {
+        b"UNEXPECTED SUCCESS\r\n"
+    });
+    // 2) Attempt to kill the service: task_kill needs CONTROL; the observe
+    //    role has none.
+    user_print(b"Aegis: [observer] attempting to kill the service\r\n");
+    let k = user_syscall5(15, 0, 0, 0, 0); // task_kill(slot 0)
+    user_print(b"Aegis: [observer] task_kill -> ");
+    user_print(if k == u64::MAX {
+        b"DENIED (-1)\r\n"
+    } else {
+        b"UNEXPECTED SUCCESS\r\n"
+    });
+    user_print(b"Aegis: [observer] watch-only role held; observation never became control\r\n");
     loop {
         core::hint::spin_loop();
     }

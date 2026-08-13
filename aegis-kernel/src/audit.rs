@@ -219,6 +219,30 @@ pub fn dump_agent_flow(agent: usize) {
     }
 }
 
+/// §10: dump the same flow covering two agents at once (the restart agent and
+/// the observe watchdog), so one kernel-side print shows both role flows.
+pub fn dump_agent_flow_2(a: usize, b: usize) {
+    let head = unsafe { core::ptr::read(core::ptr::addr_of_mut!(HEAD)) };
+    let len = unsafe { core::ptr::read(core::ptr::addr_of_mut!(LEN)) };
+    let records = read_records();
+    crate::sprintln!("Aegis: audit: §10 two-role flow (kernel truth):");
+    for i in 0..len {
+        let idx = (head + MAX_AUDIT - len + i) % MAX_AUDIT;
+        if let Some(r) = &records[idx] {
+            if r.op == OpKind::RoleGrant || r.caller == a || r.caller == b {
+                crate::sprintln!(
+                    "Aegis: audit: tick={} caller={} op={:?} target={:?} ok={}",
+                    r.tick,
+                    r.caller,
+                    r.op,
+                    r.target,
+                    r.ok
+                );
+            }
+        }
+    }
+}
+
 /// Test-only: clear the whole log so contract tests start from a deterministic,
 /// empty ring.
 #[cfg(test)]

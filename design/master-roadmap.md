@@ -382,6 +382,21 @@ Not cut — sequenced, and only after Phase 6:
   through the same grant/audit/adversarial-test discipline as Phase 6,
   never a shortcut. The "AI never in the TCB" rule from Section 0 applies
   permanently here, not just during the prototype.
+
+  **§10 item 1 DONE** — the role library is now two roles, same discipline:
+  `restart-service` (READ|CONTROL over one task) plus the new
+  `observe-service` watchdog (READ over one task only, no CONTROL, no
+  GRANT). A second ring-3 agent (task 10) receives `observe-service` via the
+  same kernel-gated RoleGrant syscall 18; the observer can *see* the crashed
+  service and can never restart, kill, upgrade to `restart-service`, or
+  re-delegate — every attempt is refused at the kernel capability gate
+  (never by the agent's own code), and the refuse → audit log records the
+  flow for both roles. Kernel tests: `observer_role_grant`,
+  `observer_cannot_self_escalate`; model test: `observe_role_is_read_only_and_never_controls`.
+  Verified live under QEMU (`uefi-boot/serial-p9.log`): role grant → agent
+  restarts the crashed service → observer's restart refused (READ sees the
+  crash, CONTROL denies the restart) → audit trail shows both slots and the
+  watchdog's denials.
 - **Package/update polish:** least urgent; already has reasonable
   model-level coverage. Revisit after Phase 7's storage work, since
   packages logically sit on top of object-store.

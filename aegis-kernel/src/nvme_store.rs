@@ -358,7 +358,9 @@ mod tests {
     fn put_then_get_roundtrips_content() {
         let mut disk = MemDisk::new(9000);
         let mut s = Store::open(&mut disk).unwrap();
-        let id = s.put(&mut disk, b"hello content-addressed NVMe block").unwrap();
+        let id = s
+            .put(&mut disk, b"hello content-addressed NVMe block")
+            .unwrap();
         let mut out = [0u8; 512];
         let n = s.get(&mut disk, &id, &mut out).unwrap();
         assert_eq!(&out[..n], b"hello content-addressed NVMe block");
@@ -383,7 +385,10 @@ mod tests {
         let d2 = s
             .put_dir(&mut disk, &[entry(b"memo.txt", 8), entry(b"todo.txt", 9)])
             .unwrap();
-        assert_ne!(d1, d2, "a mutation writes a new dir block, never overwrites");
+        assert_ne!(
+            d1, d2,
+            "a mutation writes a new dir block, never overwrites"
+        );
 
         let mut e = [empty_entry(); MAX_FILES];
         let n = s.load_dir(&mut disk, &d1, &mut e).unwrap();

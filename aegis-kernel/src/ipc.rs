@@ -568,7 +568,10 @@ mod tests {
             assert_eq!(ENDPOINTS[NOTIFY_EP].state, EpState::SendWaiting);
             assert_eq!(ENDPOINTS[NOTIFY_EP].msg_len, NOTIFY_REC_LEN);
             assert_eq!(ENDPOINTS[NOTIFY_EP].caller, 5);
-            assert_eq!(u32::from_le_bytes(ENDPOINTS[NOTIFY_EP].buf[0..4].try_into().unwrap()), 5);
+            assert_eq!(
+                u32::from_le_bytes(ENDPOINTS[NOTIFY_EP].buf[0..4].try_into().unwrap()),
+                5
+            );
             assert_eq!(
                 u32::from_le_bytes(ENDPOINTS[NOTIFY_EP].buf[4..8].try_into().unwrap()),
                 REASON_PF_ISOLATION
@@ -605,7 +608,10 @@ mod tests {
             );
             // The server is runnable again with (child << 32) | len in rax.
             assert!(crate::tasks::is_task_alive(0));
-            assert_eq!(crate::tasks::task_state_of(0), crate::tasks::TaskState::Ready);
+            assert_eq!(
+                crate::tasks::task_state_of(0),
+                crate::tasks::TaskState::Ready
+            );
             let f = crate::tasks::context_frame(0) as *const u64;
             assert_eq!(*f.add(112 / 8), (5u64 << 32) | NOTIFY_REC_LEN as u64);
             // Endpoint is idle again (single-slot box consumed).

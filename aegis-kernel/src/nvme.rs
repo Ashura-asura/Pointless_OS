@@ -542,7 +542,11 @@ impl NvmeController {
         let qe = &mut self.buf.qe;
         unsafe {
             core::ptr::write_bytes(qe.as_mut_ptr() as *mut u8, 0, 4096);
-            core::ptr::copy_nonoverlapping(data.as_ptr(), qe.as_mut_ptr() as *mut u8, data.len().min(512));
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                qe.as_mut_ptr() as *mut u8,
+                data.len().min(512),
+            );
         }
         wmb();
         let tail = self.io_tail as usize;

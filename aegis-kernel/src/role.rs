@@ -4,12 +4,23 @@
 //! a role expands to a specific, narrow capability set — the role is the
 //! reviewable unit, and the grant is an explicit, audited step.
 //!
-//! Exactly one role exists today, the design doc's own §11.F example:
-//! `restart-service` = READ|CONTROL over ONE named task, with no GRANT right.
-//! The grantee can read the service's state and restart it, and can never
-//! re-delegate and never widen its own authority: there is no syscall that
-//! mints GRANT onto a role cap, and `role_grant` installs exactly the role's
-//! declared set. This mirrors the model crate's `grants::role`.
+//! Two roles exist today (master roadmap §10 "broader AI orchestration" takes
+//! the Phase 6 prototype to a role library — the same discipline for every new
+//! role: grant, audit, adversarial denial, never a shortcut).
+//!
+//! - `restart-service` — the design doc's own §11.F example: READ|CONTROL over
+//!   ONE named task, with no GRANT right. The grantee can read the service's
+//!   state and restart it.
+//! - `observe-service` — a watchdog: READ over ONE named task only. The grantee
+//!   can *see* the service's state but can never restart or kill it. A
+//!   monitor is a different, narrower capability — observing is not a step
+//!   toward controlling, and the gate enforces that even for a fully
+//!   compromised observer.
+//!
+//! Every role is declared by the kernel, installs exactly its declared right
+//! set, and never carries GRANT: there is no syscall that mints GRANT onto a
+//! role cap, and `role_grant` installs exactly the role's declared set. This
+//! mirrors the model crate's `grants::role`.
 //!
 //! The agent is never in the trusted computing base: every check on what it
 //! can do is enforced here, at the kernel capability gate, never by the
@@ -22,6 +33,9 @@ use crate::tasks::{current_idx, set_task_cap, task_cap, MAX_CAPS, MAX_TASKS};
 
 /// `restart-service` = READ|CONTROL over one named task, no GRANT.
 pub const ROLE_RESTART_SERVICE: u32 = 0;
+/// `observe-service` = READ over one named task only (a watchdog: it can see
+/// the service's state, it can never restart or kill it), no GRANT, no CONTROL.
+pub const ROLE_OBSERVE_SERVICE: u32 = 1;
 
 /// A role declared by the kernel. `rights` is the *exact* set the grantee
 /// will be allowed — the system declares it, never the requesting agent.
@@ -46,8 +60,20 @@ pub const RESTART_SERVICE: Role = Role {
     grants: false,
 };
 
+/// `observe-service` = READ over one named task only. The grantee can query
+/// the named service's state but has no CONTROL: restarting or killing it is
+/// refused at the gate. This is the watchdog complement to `restart-service` —
+/// a different, narrower capability that exists so that "monitoring" is not a
+/// step toward "controlling" even for a fully compromised observer.
+pub const OBSERVE_SERVICE: Role = Role {
+    id: ROLE_OBSERVE_SERVICE,
+    name: "observe-service",
+    rights: Rights::READ,
+    grants: false,
+};
+
 /// The role registry. Reviewable once per role type, not per grant.
-pub const ALL_ROLES: [Role; 1] = [RESTART_SERVICE];
+pub const ALL_ROLES: [Role; 2] = [RESTART_SERVICE, OBSERVE_SERVICE];
 
 /// Look up a role by id.
 pub fn lookup(id: u32) -> Option<&'static Role> {
@@ -94,14 +120,12 @@ pub fn role_grant(role_id: u64, grantee: u64, target: u64, dst_slot: u64) -> i64
     // The grantor must hold a Task cap on `target` with the role's exact
     // rights — the kernel confirms the grantor's authority over the target
     // before any grantee capability exists.
-    let authorized = (0..MAX_CAPS).any(|s| {
-        match task_cap(cur, s) {
-            CapSlot {
-                cap: Cap::Task(t),
-                rights,
-            } => t as usize == target as usize && rights.contains(role.rights),
-            _ => false,
-        }
+    let authorized = (0..MAX_CAPS).any(|s| match task_cap(cur, s) {
+        CapSlot {
+            cap: Cap::Task(t),
+            rights,
+        } => t as usize == target as usize && rights.contains(role.rights),
+        _ => false,
     });
     if !authorized {
         crate::audit::record(
@@ -134,7 +158,7 @@ pub fn role_grant(role_id: u64, grantee: u64, target: u64, dst_slot: u64) -> i64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervisor::{task_restart, task_state};
+    use crate::supervisor::{task_kill, task_restart, task_state};
     use crate::tasks::{set_current_for_test, spawn};
 
     extern "sysv64" fn dummy() -> ! {
@@ -182,7 +206,10 @@ mod tests {
                 },
             );
             set_current_for_test(grantor);
-            assert_eq!(role_grant(ROLE_RESTART_SERVICE as u64, agent as u64, svc as u64, 0), 0);
+            assert_eq!(
+                role_grant(ROLE_RESTART_SERVICE as u64, agent as u64, svc as u64, 0),
+                0
+            );
             // The grantee's slot 0 is exactly the role's set: Task(svc) with
             // READ|CONTROL and no GRANT.
             let got = task_cap(agent, 0);
@@ -190,7 +217,10 @@ mod tests {
             assert!(got.rights.contains(Rights::READ));
             assert!(got.rights.contains(Rights::CONTROL));
             assert!(!got.rights.contains(Rights::GRANT), "role never grants");
-            assert_eq!(got.rights.bits(), (Rights::READ.union(Rights::CONTROL)).bits());
+            assert_eq!(
+                got.rights.bits(),
+                (Rights::READ.union(Rights::CONTROL)).bits()
+            );
             // The granted cap rides the real gates, now as the agent.
             set_current_for_test(agent);
             assert_eq!(task_state(0), 1, "READ lets the agent query the service");
@@ -234,7 +264,10 @@ mod tests {
                 },
             );
             set_current_for_test(grantor);
-            assert_eq!(role_grant(ROLE_RESTART_SERVICE as u64, agent as u64, svc as u64, 0), 0);
+            assert_eq!(
+                role_grant(ROLE_RESTART_SERVICE as u64, agent as u64, svc as u64, 0),
+                0
+            );
             set_current_for_test(agent);
 
             // 1) Delegating the role onward requires GRANT on the role cap —
@@ -296,13 +329,140 @@ mod tests {
                 svc as u32
             ));
             assert!(
-                !crate::audit::ever_succeeded(
-                    agent,
-                    crate::audit::OpKind::RoleGrant,
-                    svc as u32
-                ),
+                !crate::audit::ever_succeeded(agent, crate::audit::OpKind::RoleGrant, svc as u32),
                 "the agent never successfully granted itself anything"
             );
+        }
+    }
+
+    /// §10 "broader AI orchestration": a second role through the SAME
+    /// discipline as Phase 6. A grantor holding READ over the service grants
+    /// `observe-service` to a zero-cap agent. The agent receives EXACTLY READ —
+    /// no CONTROL, no GRANT. It can query the service's state (its one real
+    /// task as a watchdog) but restarting the crashed service is refused at the
+    /// gate: observation never becomes control.
+    #[test]
+    fn observer_role_grant() {
+        let _g = crate::kernel_state_guard();
+        clean_world();
+        unsafe {
+            // svc = task 0, grantor = task 1, agent = task 2.
+            let (svc, grantor, agent) = (0usize, 1usize, 2usize);
+            spawn("svc", dummy, 0x100000).unwrap();
+            spawn("grantor", dummy, 0x200000).unwrap();
+            spawn("agent", dummy, 0x300000).unwrap();
+            // The agent starts with zero capabilities.
+            assert!((0..MAX_CAPS).all(|s| task_cap(agent, s).cap == Cap::None));
+            // The grantor holds READ over the service — the observe role's
+            // exact right set — as the scripted stand-in for a human reviewer.
+            set_task_cap(
+                grantor,
+                0,
+                CapSlot {
+                    cap: Cap::Task(svc as u32),
+                    rights: Rights::READ,
+                },
+            );
+            set_current_for_test(grantor);
+            assert_eq!(
+                role_grant(ROLE_OBSERVE_SERVICE as u64, agent as u64, svc as u64, 0),
+                0
+            );
+            // The grantee's slot 0 is exactly the role's set: Task(svc) with
+            // READ only, no CONTROL, no GRANT.
+            let got = task_cap(agent, 0);
+            assert_eq!(got.cap, Cap::Task(svc as u32));
+            assert!(got.rights.contains(Rights::READ));
+            assert!(
+                !got.rights.contains(Rights::CONTROL),
+                "watchdog has no CONTROL"
+            );
+            assert!(!got.rights.contains(Rights::GRANT), "role never grants");
+            assert_eq!(got.rights.bits(), Rights::READ.bits());
+            // The granted cap rides the real gates, now as the agent.
+            set_current_for_test(agent);
+            assert_eq!(task_state(0), 1, "READ lets the watchdog query the service");
+            // The one thing a watchdog must NOT be able to do: restart.
+            crate::tasks::kill_task(svc);
+            assert_eq!(task_state(0), 0, "the watchdog can see it crashed");
+            assert_eq!(
+                task_restart(0),
+                -1,
+                "observation never becomes control: restart refused at the gate"
+            );
+            assert!(!crate::tasks::is_task_alive(svc), "the service stays dead");
+        }
+    }
+
+    /// §10: the observe agent cannot turn its watch into a restart. Its cap is
+    /// exactly READ over the service — no CONTROL, no GRANT — so restarting,
+    /// killing, delegating, or re-granting itself `restart-service` is refused
+    /// by the kernel capability gate. Same adversarial discipline as Phase 6,
+    /// applied to the second role.
+    #[test]
+    fn observer_cannot_self_escalate() {
+        let _g = crate::kernel_state_guard();
+        clean_world();
+        unsafe {
+            // svc = task 0, other = task 1, grantor = task 2, agent = task 3.
+            let (svc, other, grantor, agent) = (0usize, 1usize, 2usize, 3usize);
+            spawn("svc", dummy, 0x100000).unwrap();
+            spawn("other", dummy, 0x200000).unwrap();
+            spawn("grantor", dummy, 0x300000).unwrap();
+            spawn("agent", dummy, 0x400000).unwrap();
+            // Grantor grants the observe role to the agent.
+            set_task_cap(
+                grantor,
+                0,
+                CapSlot {
+                    cap: Cap::Task(svc as u32),
+                    rights: Rights::READ,
+                },
+            );
+            set_current_for_test(grantor);
+            assert_eq!(
+                role_grant(ROLE_OBSERVE_SERVICE as u64, agent as u64, svc as u64, 0),
+                0
+            );
+            set_current_for_test(agent);
+
+            // 1) Delegating the role onward needs GRANT — the role has none.
+            assert_eq!(
+                crate::ipc::ipc_cap_grant(other as u64, 0, 0),
+                -1,
+                "no GRANT in the observe role: the agent cannot re-delegate"
+            );
+
+            // 2) Restarting the service needs CONTROL — the observe role has
+            //    none. Even after the service dies, the watchdog can only watch.
+            crate::tasks::kill_task(svc);
+            assert_eq!(task_restart(0), -1, "CONTROL is per-task, never ambient");
+
+            // 3) Killing a task it was never granted needs CONTROL — refused.
+            assert_eq!(task_kill(1), -1, "no CONTROL over the other task");
+
+            // 4) Re-granting itself `restart-service` over the service needs a
+            //    Task cap with READ|CONTROL over it — the agent holds only READ,
+            //    so the grantor gate refuses.
+            assert_eq!(
+                role_grant(ROLE_RESTART_SERVICE as u64, agent as u64, svc as u64, 2),
+                -1,
+                "a watchdog cannot upgrade its observe role to a restart role"
+            );
+
+            // 5) The audit log attributes everything: the agent's Grant and
+            //    RoleGrant records are denials only — it never succeeded at
+            //    anything it was not granted.
+            assert!(!crate::audit::ever_succeeded(
+                agent,
+                crate::audit::OpKind::RoleGrant,
+                svc as u32
+            ));
+            assert!(!crate::audit::ever_succeeded(
+                agent,
+                crate::audit::OpKind::TaskSpawn,
+                svc as u32
+            ));
         }
     }
 
@@ -329,7 +489,12 @@ mod tests {
             assert_eq!(role_grant(999, agent as u64, svc as u64, 0), -1);
             // Out-of-range grantee task.
             assert_eq!(
-                role_grant(ROLE_RESTART_SERVICE as u64, MAX_TASKS as u64 + 5, svc as u64, 0),
+                role_grant(
+                    ROLE_RESTART_SERVICE as u64,
+                    MAX_TASKS as u64 + 5,
+                    svc as u64,
+                    0
+                ),
                 -1
             );
             // Out-of-range destination slot.
