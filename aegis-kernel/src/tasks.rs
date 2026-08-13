@@ -13,7 +13,10 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::cap::{Cap, CapSlot, CapTable};
 
 pub const TASK_STACK_SIZE: u64 = 16384;
-pub const MAX_TASKS: usize = 8;
+/// Task table capacity. Bumped to 12 in Phase 6: the Phase-6 demo adds a
+/// zero-capability agent task and a crashable service task on top of the
+/// Phase-5 set (alpha/beta/server/client/supervisor/iso/nx/denied).
+pub const MAX_TASKS: usize = 12;
 /// Slots in each task's capability table.
 pub const MAX_CAPS: usize = 16;
 
@@ -608,6 +611,32 @@ pub fn arm_nx_test(idx: usize, tick: u64) {
     NX_ARM_TICK.store(tick, Ordering::Relaxed);
 }
 
+/// One-shot demo hook for the Phase-6 service task (same pattern as the
+/// ISO/NX hooks): hold task `idx` blocked until the LAPIC tick counter reaches
+/// `tick`, then let it run and fault.
+pub static SERVICE_ARM_TICK: AtomicU64 = AtomicU64::new(u64::MAX);
+static SERVICE_ARM_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Arm the one-shot unblock hook for the Phase-6 service demo task.
+pub fn arm_service_test(idx: usize, tick: u64) {
+    set_task_state(idx, TaskState::Blocked);
+    SERVICE_ARM_IDX.store(idx, Ordering::Relaxed);
+    SERVICE_ARM_TICK.store(tick, Ordering::Relaxed);
+}
+
+/// One-shot Phase-6 hook: once the LAPIC tick counter passes `tick`, dump the
+/// kernel audit trail for the role-grant flow (`audit::dump_agent_flow`) naming
+/// `agent`. Armed by boot code so the "kernel prints audit log" step of the
+/// Phase-6 demo is a kernel-side print, not a ring-3 claim.
+pub static AUDIT_DUMP_TICK: AtomicU64 = AtomicU64::new(u64::MAX);
+static AUDIT_DUMP_AGENT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Arm the one-shot audit-dump hook for the Phase-6 demo.
+pub fn arm_audit_dump(agent: usize, tick: u64) {
+    AUDIT_DUMP_AGENT.store(agent, Ordering::Relaxed);
+    AUDIT_DUMP_TICK.store(tick, Ordering::Relaxed);
+}
+
 /// Kill the currently running task: it faulted in ring 3 (page-fault-driven
 /// isolation/NX demo) and must never be scheduled again. The scheduler skips
 /// non-Ready tasks, so Zombie is permanent.
@@ -806,6 +835,21 @@ pub unsafe fn timer_preempt() {
     if crate::cpu::timer_ticks() >= NX_ARM_TICK.load(Ordering::Relaxed) {
         NX_ARM_TICK.store(u64::MAX, Ordering::Relaxed);
         unblock_task(NX_ARM_IDX.load(Ordering::Relaxed));
+    }
+    // Same one-shot hook for the Phase-6 service task (its fault is what the
+    // zero-capability agent restarts).
+    if crate::cpu::timer_ticks() >= SERVICE_ARM_TICK.load(Ordering::Relaxed) {
+        SERVICE_ARM_TICK.store(u64::MAX, Ordering::Relaxed);
+        unblock_task(SERVICE_ARM_IDX.load(Ordering::Relaxed));
+    }
+    // Phase-6 hook: once the role-grant flow has settled, print the kernel's
+    // audit trail for it (the kernel prints audit log, one shot).
+    if crate::cpu::timer_ticks() >= AUDIT_DUMP_TICK.load(Ordering::Relaxed) {
+        AUDIT_DUMP_TICK.store(u64::MAX, Ordering::Relaxed);
+        let agent = AUDIT_DUMP_AGENT.load(Ordering::Relaxed);
+        if agent != usize::MAX {
+            crate::audit::dump_agent_flow(agent);
+        }
     }
     let cur = current_idx();
     let Some(next) = schedule_next(cur) else {

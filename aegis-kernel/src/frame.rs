@@ -9,9 +9,10 @@
 //! Honest limits: the bitmap only covers the first 4 GiB (frames above
 //! are never handed out); only UEFI CONVENTIONAL memory is considered
 //! usable (bootloader/firmware regions are not reclaimed yet); and the
-//! kernel-image reservation comes from the loader-computed `image_end`
-//! in the handoff, capped at [0x0, max(image_end, 0x11000)) so the
-//! boot-info page itself is always protected.
+//! kernel-image + boot-info-handoff reservation comes from the
+//! loader-computed `image_end` in the handoff, capped at
+//! [0x0, max(image_end + handoff pages, 0x11000)) so the handoff pages
+//! (which live just above the image) are always protected.
 
 use crate::boot_info::{BootInfo, TYPE_CONVENTIONAL};
 
@@ -20,9 +21,10 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_FRAMES: u64 = 1 << 20;
 pub const FRAME_WORDS: usize = (MAX_FRAMES / 64) as usize;
 
-/// The boot-info handoff page (0x10000..0x11000) must never be handed out
-/// even if the map marks it conventional.
-const BOOT_INFO_RESERVE_END: u64 = 0x1_1000;
+/// The boot-info handoff is written by the loader on the first page(s)
+/// strictly above the kernel image (`image_end`); those pages must never be
+/// handed out even though the map may mark them conventional.
+pub const BOOT_INFO_RESERVE_END: u64 = 0x1_1000;
 
 /// Bitmap allocator over a borrowed word slice (works both on the kernel's
 /// static `BITMAP` and on a test-local buffer).
@@ -43,8 +45,8 @@ impl<'a> FrameAllocator<'a> {
     }
 
     /// Mark conventional ranges usable, then restore the reserved regions
-    /// (kernel image per the handoff's `image_end`, plus the boot-info
-    /// page itself).
+    /// (kernel image per the handoff's `image_end`, the boot-info handoff
+    /// pages at `image_end`, plus the legacy handoff page).
     pub fn init(&mut self, info: &BootInfo) {
         for e in info.entries.iter() {
             if e.ty != TYPE_CONVENTIONAL {
@@ -56,7 +58,9 @@ impl<'a> FrameAllocator<'a> {
                 clear_bits(self.bitmap, start, end);
             }
         }
-        let kernel_end = info.image_end.max(BOOT_INFO_RESERVE_END);
+        let handoff_end =
+            info.image_end.saturating_add(crate::boot_info::HANDOFF_PAGES * PAGE_SIZE);
+        let kernel_end = handoff_end.max(BOOT_INFO_RESERVE_END);
         set_bits(self.bitmap, 0, kernel_end / PAGE_SIZE);
         self.total = self
             .bitmap
@@ -275,6 +279,13 @@ mod tests {
     /// Default kernel image end assumed by the sample maps.
     const TEST_IMAGE_END: u64 = 0x1_1000;
 
+    /// Frames reserved by `init` for a given image end: the kernel image,
+    /// the boot-info handoff pages just above it, and the legacy handoff
+    /// page. Mirrors the production formula.
+    fn reserved_frames(image_end: u64) -> u64 {
+        (image_end + boot_info::HANDOFF_PAGES * PAGE_SIZE).max(BOOT_INFO_RESERVE_END) / PAGE_SIZE
+    }
+
     struct TestAlloc {
         alloc: FrameAllocator<'static>,
     }
@@ -321,24 +332,24 @@ mod tests {
     fn init_counts_conventional_frames_and_reserves() {
         let t = make(&sample_map());
         let free = t.alloc.stats().1;
-        // 160 + 256 usable; the kernel reservation covers the first 17
-        // frames (0x0..0x11000), all inside the 160-frame region.
-        assert_eq!(free, 160 + 256 - 17);
+        // 160 + 256 usable; the reservation covers the kernel image
+        // (0x0..image_end) plus the handoff pages above it — 19 frames.
+        assert_eq!(free, 160 + 256 - reserved_frames(TEST_IMAGE_END));
     }
 
     #[test]
     fn alloc_returns_lowest_free_frame() {
         let mut t = make(&sample_map());
         let f = t.alloc.alloc().unwrap();
-        // First free frame sits just above the kernel reservation.
-        assert_eq!(f, 17 * PAGE_SIZE); // 0x11000
-        assert_eq!(t.alloc.stats().1, 160 + 256 - 17 - 1);
+        // First free frame sits just above the kernel + handoff reservation.
+        assert_eq!(f, reserved_frames(TEST_IMAGE_END) * PAGE_SIZE);
+        assert_eq!(t.alloc.stats().1, 160 + 256 - reserved_frames(TEST_IMAGE_END) - 1);
     }
 
     #[test]
     fn alloc_never_returns_reserved_or_mmio() {
         let mut t = make(&sample_map());
-        for _ in 0..(160 + 256 - 17) {
+        for _ in 0..(160 + 256 - reserved_frames(TEST_IMAGE_END)) {
             let f = t.alloc.alloc().expect("should have frames left");
             assert!(f >= TEST_IMAGE_END, "allocated inside kernel: {:#x}", f);
             assert!(f < 0xFEE0_0000, "allocated MMIO: {:#x}", f);
@@ -349,11 +360,11 @@ mod tests {
     #[test]
     fn image_end_expands_reservation() {
         // A kernel image growing to 0x3_0000 must push the first free
-        // frame above it (0x3_0000 = 48 frames).
+        // frame above it, plus the handoff pages (0x3_0000 = 48 frames).
         let t = make_with_image_end(&sample_map(), 0x3_0000);
-        assert_eq!(t.alloc.stats().1, 160 + 256 - 48);
+        assert_eq!(t.alloc.stats().1, 160 + 256 - reserved_frames(0x3_0000));
         let mut t = t;
-        assert_eq!(t.alloc.alloc(), Some(48 * PAGE_SIZE));
+        assert_eq!(t.alloc.alloc(), Some(reserved_frames(0x3_0000) * PAGE_SIZE));
     }
 
     #[test]
@@ -378,7 +389,7 @@ mod tests {
     #[test]
     fn is_free_tracks_allocation() {
         let mut t = make(&sample_map());
-        let probe = 17 * PAGE_SIZE;
+        let probe = reserved_frames(TEST_IMAGE_END) * PAGE_SIZE;
         assert!(t.alloc.is_free(probe));
         let f = t.alloc.alloc().unwrap();
         assert_eq!(f, probe);
@@ -402,19 +413,19 @@ mod tests {
             },
         ];
         let t = make(&map);
-        assert_eq!(t.alloc.stats().1, 160 - 17);
+        assert_eq!(t.alloc.stats().1, 160 - reserved_frames(TEST_IMAGE_END));
     }
 
     #[test]
     fn alloc_contiguous_returns_consecutive_run() {
         let mut t = make(&sample_map());
-        // Free pool: frames 17..176 (low region) then 256+ (1 MiB region).
+        // Free pool: reserved_frames..176 (low region) then 256+ (1 MiB region).
         let base = t.alloc.alloc_contiguous(8).unwrap();
-        assert_eq!(base, 17 * PAGE_SIZE);
+        assert_eq!(base, reserved_frames(TEST_IMAGE_END) * PAGE_SIZE);
         // Second call wraps to the next 8-frame hole.
         let base2 = t.alloc.alloc_contiguous(8).unwrap();
-        assert_eq!(base2, 25 * PAGE_SIZE);
-        assert_eq!(t.alloc.stats().1, 160 + 256 - 17 - 16);
+        assert_eq!(base2, (reserved_frames(TEST_IMAGE_END) + 8) * PAGE_SIZE);
+        assert_eq!(t.alloc.stats().1, 160 + 256 - reserved_frames(TEST_IMAGE_END) - 16);
     }
 
     #[test]

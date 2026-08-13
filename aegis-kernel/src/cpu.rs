@@ -120,7 +120,10 @@ pub unsafe fn disable_smep_smap() {
 ///
 /// Must be the very first thing `_start` does. The old (loader-provided)
 /// stack is abandoned; `entry` must never return.
-pub unsafe fn switch_to_kernel_stack_and_jump(entry: extern "sysv64" fn() -> !) -> ! {
+pub unsafe fn switch_to_kernel_stack_and_jump(
+    entry: extern "sysv64" fn(u64) -> !,
+    arg: u64,
+) -> ! {
     asm!(
         "lea rsp, [rip + {stack} + {size}]",
         "and rsp, -16",
@@ -129,6 +132,7 @@ pub unsafe fn switch_to_kernel_stack_and_jump(entry: extern "sysv64" fn() -> !) 
         stack = sym KERNEL_STACK,
         size = const KERNEL_STACK_SIZE,
         entry = in(reg) entry,
+        in("rdi") arg,
         options(noreturn),
     );
 }

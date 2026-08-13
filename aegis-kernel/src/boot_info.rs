@@ -1,9 +1,19 @@
 //! Boot-info handoff received from the UEFI bootloader.
 //!
 //! After `ExitBootServices` the loader writes its final memory map to a
-//! fixed physical address (see `BOOT_INFO_ADDR`) and jumps to the kernel.
-//! The kernel must read it early — it is the only record of what physical
-//! memory exists once firmware services are gone.
+//! physical page and jumps to the kernel, passing that page's address to
+//! `_start` in `%rdi` (the first sysv64 argument). The kernel must read it
+//! early — it is the only record of what physical memory exists once
+//! firmware services are gone.
+//!
+//! The handoff page's location is deliberately *dynamic*: the loader places
+//! it on the first page strictly above the kernel image (`image_end`), so it
+//! can never collide with the image — no matter where the linker lays out
+//! `.text`/`.rodata`/`.data`/`.got`. A fixed low address like 0x10000 grows
+//! into the image as the kernel does, and the loader's handoff write then
+//! silently corrupts live data (e.g. the `.got`), producing a boot-time
+//! #PF at a garbage address. Passing the address in `%rdi` removes the
+//! fixed-address contract entirely.
 //!
 //! Layout contract (both sides must match exactly):
 //!   offset 0:  magic u64 = 0x4145_4753_4841_4E44 ("AEGSHAND")
@@ -18,10 +28,10 @@
 
 use core::mem::size_of;
 
-/// Fixed physical address agreed with uefi-boot. Chosen because the kernel
-/// image + BSS + stack occupy 0x0..0xF000, so 0x10000 is the first free
-/// page below the 1 MB mark.
-pub const BOOT_INFO_ADDR: u64 = 0x10000;
+/// Pages a full 256-entry handoff can span, starting at the handoff address
+/// (`image_end`): 24 + 256 * 20 = 5144 bytes, so 2 pages suffice. The frame
+/// allocator reserves this many pages so it never hands the handoff out.
+pub const HANDOFF_PAGES: u64 = 2;
 
 const MAGIC: u64 = 0x4145_4753_4841_4E44;
 const MAX_ENTRIES: usize = 256;
@@ -91,17 +101,15 @@ pub fn total_by_type<'a>(info: &BootInfo<'a>, ty: u32) -> u64 {
         .sum()
 }
 
-/// Read the handoff page from its fixed physical address.
+/// Read the handoff page from the physical address the loader passed in
+/// `%rdi`.
 ///
 /// # Safety
 /// Must be called before anything that could repurpose the page, and only
 /// after the bootloader has actually written the handoff (or with a
 /// validated magic).
-pub unsafe fn locate() -> Option<BootInfo<'static>> {
-    let raw = core::slice::from_raw_parts(
-        BOOT_INFO_ADDR as *const u8,
-        16 + MapEntry::size() * MAX_ENTRIES,
-    );
+pub unsafe fn locate_at(addr: u64) -> Option<BootInfo<'static>> {
+    let raw = core::slice::from_raw_parts(addr as *const u8, 24 + MapEntry::size() * MAX_ENTRIES);
     parse(raw)
 }
 
@@ -250,5 +258,17 @@ mod tests {
         let img = build_image(&entries, 0x1_1000);
         let info = parse(&img).expect("max-size image must parse");
         assert_eq!(info.entries.len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn locate_at_reads_handoff_from_any_address() {
+        let entries = sample_entries();
+        let img = build_image(&entries, 0x5_2000);
+        let (total, handoff_pages) = (img.len(), HANDOFF_PAGES);
+        assert!(total as u64 <= handoff_pages * 4096);
+        let info = unsafe { locate_at(&img as *const _ as u64) }.expect("handoff must locate");
+        assert_eq!(info.entries.len(), 3);
+        assert_eq!(info.image_end, 0x5_2000);
+        assert_eq!(total_by_type(&info, TYPE_CONVENTIONAL), 0x1000 * 4096);
     }
 }

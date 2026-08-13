@@ -39,11 +39,16 @@ pub enum OpKind {
     /// `ipc::ipc_cap_grant` (GRANT on the source slot). Also the first gate the
     /// suspension ledger freezes: a suspended agent cannot delegate onward.
     Grant,
+    /// `role::role_grant` (grantor holds the role's exact rights over the
+    /// target). Every role grant — approved and refused — lands here with the
+    /// target task attributed; this is the append-only trail the Phase 6 grant
+    /// flow is built on.
+    RoleGrant,
 }
 
 impl OpKind {
     /// Count of variants — the histogram width.
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
 
     /// Stable index for fixed-size histograms.
     pub fn index(self) -> usize {
@@ -57,6 +62,7 @@ impl OpKind {
             OpKind::MemWrite => 6,
             OpKind::Revoke => 7,
             OpKind::Grant => 8,
+            OpKind::RoleGrant => 9,
         }
     }
 
@@ -71,6 +77,7 @@ impl OpKind {
         OpKind::MemWrite,
         OpKind::Revoke,
         OpKind::Grant,
+        OpKind::RoleGrant,
     ];
 }
 
@@ -185,6 +192,31 @@ pub fn revoke_count(caller: usize) -> usize {
         }
     }
     n
+}
+
+/// Print every `RoleGrant` record plus every record attributed to `agent`, in
+/// ring order, for the live Phase-6 demo ("the kernel prints audit log").
+/// Successes and refusals alike — this is the append-only grant trail.
+pub fn dump_agent_flow(agent: usize) {
+    let head = unsafe { core::ptr::read(core::ptr::addr_of_mut!(HEAD)) };
+    let len = unsafe { core::ptr::read(core::ptr::addr_of_mut!(LEN)) };
+    let records = read_records();
+    crate::sprintln!("Aegis: audit: Phase-6 role-grant flow (kernel truth):");
+    for i in 0..len {
+        let idx = (head + MAX_AUDIT - len + i) % MAX_AUDIT;
+        if let Some(r) = &records[idx] {
+            if r.op == OpKind::RoleGrant || r.caller == agent {
+                crate::sprintln!(
+                    "Aegis: audit: tick={} caller={} op={:?} target={:?} ok={}",
+                    r.tick,
+                    r.caller,
+                    r.op,
+                    r.target,
+                    r.ok
+                );
+            }
+        }
+    }
 }
 
 /// Test-only: clear the whole log so contract tests start from a deterministic,

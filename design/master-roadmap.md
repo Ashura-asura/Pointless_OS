@@ -290,6 +290,32 @@ cd aegis-kernel && cargo test agent_cannot_self_escalate   # the headline result
 Plus a QEMU boot log: role grant → agent restarts the crashed service →
 agent's escalation attempt denied → audit log contains both events.
 
+**Status: COMPLETE** (P6 committed, `uefi-boot/serial-p6.log`).
+Delivered exactly the one-role prototype above: `restart-service` is the
+sole role in `aegis-kernel/src/role.rs` (`Role { id, name, rights, grants }`,
+rights = `READ|CONTROL` over one task, `grants` empty — the role cannot be
+re-granted); the ring-3 agent (task 8) starts with an empty CSpace and only
+acts after the supervisor (scripted human-reviewer stand-in) runs syscall 18
+`RoleGrant` (kernel-gated: grantor must hold a `Cap::Task(target)` with the
+role's exact rights); the agent's one real task is restarting the crashed
+service task (syscall 16), and every self-escalation attempt — self-grant,
+foreign role-grant, foreign kill — is denied by the Phase 1/2 capability
+mechanism (returns `-1`) with an `OpKind::RoleGrant`/agent audit record, all
+dumped by `dump_agent_flow` at boot. 4 new kernel tests
+(`agent_role_grant`, `agent_cannot_self_escalate`,
+`role_grant_never_panics_and_denies_garbage`, `locate_at_reads_handoff_from_any_address`);
+kernel suite now 336 passing.
+
+A layout-dependent boot regression discovered while verifying P6 was fixed
+in the same phase: the UEFI loader's fixed boot-info handoff page (0x10000)
+grew into the kernel image once the linker placed `.got` at 0xffa8–0x10068;
+the loader's handoff write then corrupted GOT slots and the kernel faulted at
+boot (`RIP=0x700000000`). Fix: the loader now writes the handoff on the first
+page strictly above the image (`image_end`) and passes its address to `_start`
+in `%rdi`; the kernel reads it via `boot_info::locate_at(addr)` and reserves
+the handoff pages in the frame allocator. No fixed low address can ever
+collide with the image again.
+
 ---
 
 ## 9. Phase 7 — One real subsystem (only after Phase 6 is done)

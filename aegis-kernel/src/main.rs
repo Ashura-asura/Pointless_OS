@@ -6,14 +6,17 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 #[no_mangle]
-pub extern "sysv64" fn _start() -> ! {
+pub extern "sysv64" fn _start(handoff_addr: u64) -> ! {
     // Enter on a freshly-established kernel stack: jump (never return) so
     // boot_kernel's prologue and all its %rsp-relative slots live below the
     // stack top, instead of spilling into BSS statics placed just above it.
-    unsafe { aegis_kernel::cpu::switch_to_kernel_stack_and_jump(boot_kernel) }
+    // `handoff_addr` is the loader-controlled page (image_end) where the
+    // boot-info handoff was written — it must stay valid in %rdi through the
+    // stack switch, which it does (RDI is not clobbered by the asm).
+    unsafe { aegis_kernel::cpu::switch_to_kernel_stack_and_jump(boot_kernel, handoff_addr) }
 }
 
-extern "sysv64" fn boot_kernel() -> ! {
+extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     aegis_kernel::serial::SerialWriter::init();
     aegis_kernel::vga::vga_init();
 
@@ -28,7 +31,7 @@ extern "sysv64" fn boot_kernel() -> ! {
         aegis_kernel::cpu::stack_top()
     );
 
-    let boot_info = unsafe { aegis_kernel::boot_info::locate() };
+    let boot_info = unsafe { aegis_kernel::boot_info::locate_at(handoff_addr) };
     match boot_info.as_ref() {
         Some(info) => {
             let conv = aegis_kernel::boot_info::total_by_type(
@@ -36,7 +39,8 @@ extern "sysv64" fn boot_kernel() -> ! {
                 aegis_kernel::boot_info::TYPE_CONVENTIONAL,
             );
             sprintln!(
-                "Aegis: boot-info @ 0x10000: {} descriptors, {} bytes conventional",
+                "Aegis: boot-info @ 0x{:X}: {} descriptors, {} bytes conventional",
+                handoff_addr,
                 info.entries.len(),
                 conv
             );
@@ -348,6 +352,19 @@ extern "sysv64" fn boot_kernel() -> ! {
                         .union(aegis_kernel::cap::Rights::READ),
                 },
             );
+            // Slot 2 (Phase 6): Task cap on the service (task index 9) with the
+            // role's exact rights, READ|CONTROL. The supervisor, standing in for
+            // a human reviewer of the grant, uses this to grant the
+            // `restart-service` role to the zero-capability agent at startup.
+            aegis_kernel::tasks::set_task_cap(
+                sup,
+                2,
+                aegis_kernel::cap::CapSlot {
+                    cap: aegis_kernel::cap::Cap::Task(9),
+                    rights: aegis_kernel::cap::Rights::CONTROL
+                        .union(aegis_kernel::cap::Rights::READ),
+                },
+            );
             sprintln!(
                 "Aegis: supervisor spawned @ 0x{:X} ({} tasks total)",
                 su,
@@ -442,6 +459,47 @@ extern "sysv64" fn boot_kernel() -> ! {
         }
         _ => {
             sprintln!("Aegis: WARNING could not allocate denial demo stack");
+        }
+    }
+
+    // Phase 6 capability-scoped agent prototype: a zero-capability agent (task
+    // 8) and a crashable service (task 9). The agent starts with an empty
+    // CSpace — least authority from birth — and receives exactly the
+    // `restart-service` role (READ|CONTROL over task 9, no GRANT) via the
+    // kernel-gated RoleGrant syscall 18, performed by the supervisor as the
+    // scripted stand-in for a human reviewer. Its one real task: restart the
+    // service when it crashes. Every escalation attempt is refused by the
+    // kernel's capability gates, never by the agent's own code.
+    let stack_agent = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    let cpl0_agent = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    let stack_service = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    let cpl0_service = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    match (stack_agent, cpl0_agent, stack_service, cpl0_service) {
+        (Some(sa), Some(ca), Some(ss), Some(cs)) => {
+            unsafe {
+                aegis_kernel::tasks::spawn_user("agent", task_agent, sa, ca);
+                aegis_kernel::tasks::spawn_user("service", task_service, ss, cs);
+            }
+            sprintln!(
+                "Aegis: Phase-6 agent+service spawned ({} tasks total)",
+                aegis_kernel::tasks::spawned_count()
+            );
+            // The agent is task index 8, the service task index 9.
+            aegis_kernel::tasks::arm_service_test(9, 28);
+            // After the role-grant flow settles (service crash at tick 28, agent
+            // restart + denials), the kernel prints its audit trail for it.
+            aegis_kernel::tasks::arm_audit_dump(8, 45);
+        }
+        _ => {
+            sprintln!("Aegis: WARNING could not allocate Phase-6 task stacks");
         }
     }
 
@@ -639,6 +697,19 @@ fn print_dec(v: u64) {
 /// and the capability-gated `task_restart`; the decision logic is ring 3.
 extern "sysv64" fn task_supervisor() -> ! {
     user_print(b"Aegis: [supervisor] online; observing kill notifications\r\n");
+    // Phase 6: as the scripted stand-in for a human reviewer, grant the
+    // `restart-service` role to the zero-capability agent (task 8) over the
+    // service task (task 9), installing the role's exact cap set — READ|CONTROL
+    // and no GRANT — at the agent's slot 0. The kernel gate (syscall 18)
+    // checks that we hold the role's rights over the service before any agent
+    // capability exists; the grant is an explicit, audited step.
+    let rg = user_syscall5(18, 0, 8, 9, 0); // RoleGrant(restart-service, agent, service, slot 0)
+    user_print(b"Aegis: [supervisor] role grant restart-service -> agent over service: ");
+    user_print(if rg == u64::MAX {
+        b"DENIED\r\n"
+    } else {
+        b"OK\r\n"
+    });
     let notify_slot: u64 = 0;
     let child_slot: u64 = 1;
     let child_idx: u64 = 5;
@@ -758,6 +829,111 @@ extern "sysv64" fn task_denied() -> ! {
         b"UNEXPECTED SUCCESS\r\n"
     });
     user_print(b"Aegis: [denied] all denied ops refused; kernel and peers continue\r\n");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// The Phase-6 service: a ring-3 task that crashes (illegal kernel read) so
+/// the zero-capability agent can be seen doing its one real task — restarting
+/// it. It is armed to fault at tick 28, after the Phase-5 supervision demo
+/// (iso-test/NX) has finished.
+extern "sysv64" fn task_service() -> ! {
+    user_print(b"Aegis: [service] running; will fault on an illegal kernel read\r\n");
+    unsafe {
+        let ptr = 0x1000000 as *const u64;
+        let _val = core::ptr::read_volatile(ptr);
+        user_print(b"Aegis: [service] ISOLATION FAILED - read succeeded!\r\n");
+    }
+    user_print(b"Aegis: [service] UNREACHABLE\r\n");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// The Phase-6 zero-capability agent: starts with an empty CSpace and can only
+/// act after the supervisor grants it the `restart-service` role (READ|CONTROL
+/// over the service task, no GRANT). Its one real task is restarting the
+/// crashed service. The adversarial steps below are refused by the kernel's
+/// capability gates — a fully compromised agent is refused the same way; the
+/// agent's own code never checks itself.
+extern "sysv64" fn task_agent() -> ! {
+    user_print(b"Aegis: [agent] online with zero capabilities\r\n");
+    // Wait for the role grant to land: task_state(slot 0) returns -1 (empty)
+    // until the supervisor's RoleGrant installs the role cap, then 1 (alive).
+    let mut granted = false;
+    for _ in 0..1_000_000u64 {
+        if user_syscall5(14, 0, 0, 0, 0) != u64::MAX {
+            granted = true;
+            break;
+        }
+        user_syscall5(3, 0, 0, 0, 0); // yield so the grantor can run
+    }
+    if !granted {
+        user_print(b"Aegis: [agent] role grant never arrived\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    user_print(b"Aegis: [agent] restart-service role received over the service task\r\n");
+    // Wait for the service to crash (task_state(slot 0) == 0 = dead), then do
+    // the one thing the role permits: restart it.
+    let mut waited = 0u64;
+    loop {
+        let s = user_syscall5(14, 0, 0, 0, 0);
+        if s == 0 {
+            break;
+        }
+        waited += 1;
+        if waited > 1_000_000 {
+            user_print(b"Aegis: [agent] service never crashed\r\n");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+        user_syscall5(3, 0, 0, 0, 0);
+    }
+    user_print(b"Aegis: [agent] service crashed; restarting it\r\n");
+    let r = user_syscall5(16, 0, 0, 0, 0); // task_restart(slot 0)
+    user_print(b"Aegis: [agent] task_restart -> ");
+    user_print(if r == u64::MAX {
+        b"DENIED\r\n"
+    } else {
+        b"OK\r\n"
+    });
+
+    // Adversarial self-escalation attempts — all refused by the kernel gates.
+    // 1) Grant itself an additional capability: ipc_cap_grant needs GRANT on
+    //    the source slot; the role has none.
+    user_print(b"Aegis: [agent] attempting to grant itself an extra capability\r\n");
+    let g = user_syscall5(9, 8, 0, 1, 0); // ipc_cap_grant(self, src slot 0, dst slot 1)
+    user_print(b"Aegis: [agent] ipc_cap_grant -> ");
+    user_print(if g == u64::MAX {
+        b"DENIED (-1)\r\n"
+    } else {
+        b"UNEXPECTED SUCCESS\r\n"
+    });
+    // 2) Re-grant itself the role over a foreign task: the grantor must hold a
+    //    Task cap with the role's rights over that task; the agent holds none.
+    user_print(b"Aegis: [agent] attempting to self-grant the role over a foreign task\r\n");
+    let gr = user_syscall5(18, 0, 8, 3, 2); // RoleGrant(restart-service, self, client=3, slot 2)
+    user_print(b"Aegis: [agent] role_grant(foreign) -> ");
+    user_print(if gr == u64::MAX {
+        b"DENIED (-1)\r\n"
+    } else {
+        b"UNEXPECTED SUCCESS\r\n"
+    });
+    // 3) Control a task it was never granted: task_kill needs a Task cap with
+    //    CONTROL; slot 2 is empty.
+    user_print(b"Aegis: [agent] attempting to kill a foreign task\r\n");
+    let k = user_syscall5(15, 2, 0, 0, 0); // task_kill(slot 2)
+    user_print(b"Aegis: [agent] task_kill -> ");
+    user_print(if k == u64::MAX {
+        b"DENIED (-1)\r\n"
+    } else {
+        b"UNEXPECTED SUCCESS\r\n"
+    });
+    user_print(b"Aegis: [agent] all self-escalation refused by the kernel; audit trail recorded\r\n");
     loop {
         core::hint::spin_loop();
     }

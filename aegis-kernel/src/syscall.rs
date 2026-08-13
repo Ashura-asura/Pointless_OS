@@ -63,6 +63,10 @@ pub enum SyscallNum {
     /// IPC: revoke a capability previously granted (rax=17, rsi=dst_task,
     /// rcx=dst_slot, rdx=src_slot). Requires GRANT on the source. Returns 0 or -1.
     CapRevoke = 17,
+    /// Role: grant role `rsi` over task `rcx` to task `rdx` at `r8` (rax=18).
+    /// The grantor must hold the role's exact rights over the target; the
+    /// grantee receives exactly the role's capability set. Returns 0 or -1.
+    RoleGrant = 18,
 }
 
 /// Maximum bytes a user `Write` may ask to print per call (defensive cap
@@ -132,6 +136,8 @@ fn dispatch_impl(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
         16 => crate::supervisor::task_restart(arg1),
         // IPC: CapRevoke(dst_task, dst_slot, src_slot)
         17 => unsafe { crate::ipc::ipc_cap_revoke(arg1, arg2, arg3) },
+        // Role: RoleGrant(role_id, grantee, target, dst_slot)
+        18 => crate::role::role_grant(arg1, arg2, arg3, arg4),
         _ => -1, // Unknown syscall
     }
 }
@@ -202,6 +208,7 @@ mod tests {
         assert_eq!(SyscallNum::Yield as u64, 3);
         assert_eq!(SyscallNum::Fork as u64, 4);
         assert_eq!(SyscallNum::CapRevoke as u64, 17);
+        assert_eq!(SyscallNum::RoleGrant as u64, 18);
     }
 
     #[test]

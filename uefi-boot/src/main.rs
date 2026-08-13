@@ -123,14 +123,14 @@ fn main() -> Status {
                 final_count
             );
 
-            // Write the boot-info handoff page. The kernel image's final bounds
-            // are computed from the loaded segments and rounded up to a
-            // page so the kernel can reserve exactly [0, image_end) —
-            // plus we verify the page itself (0x10000..0x11000) sits
-            // inside a CONVENTIONAL descriptor of the final map before
-            // writing (checks the contract; the kernel's frame allocator
-            // also reserves this page regardless).
-            const BOOT_INFO_ADDR: u64 = 0x10000;
+            // Write the boot-info handoff page. It lives on the first page
+            // strictly above the kernel image (`image_end`), so it can never
+            // collide with a loaded segment — a fixed low address (0x10000)
+            // used to, once the linker grew `.got`/`.relro`/`.data` into it,
+            // and the write here silently corrupted those slots, producing a
+            // boot-time #PF at a garbage address. The handoff address is
+            // passed to the kernel entry in %rdi (first sysv64 argument);
+            // the kernel reserves `image_end..+2` pages so nothing reuses it.
             const BOOT_MAGIC: u64 = 0x4145_4753_4841_4E44; // "AEGSHAND"
             const MAX_ENTRIES: usize = 256;
 
@@ -143,6 +143,7 @@ fn main() -> Status {
                 }
             }
             image_end = (image_end + 4095) & !4095;
+            let handoff_addr = image_end;
 
             #[repr(C, packed)]
             #[derive(Copy, Clone)]
@@ -165,13 +166,13 @@ fn main() -> Status {
             }
 
             let in_conventional = final_map.entries().any(|d| {
-                d.phys_start <= BOOT_INFO_ADDR
-                    && BOOT_INFO_ADDR < d.phys_start + d.page_count * 4096
+                d.phys_start <= handoff_addr
+                    && handoff_addr < d.phys_start + d.page_count * 4096
                     && d.ty == uefi::boot::MemoryType::CONVENTIONAL
             });
             sprintln!(
                 "Aegis: boot-info page 0x{:X} inside conventional memory: {} (kernel image ends 0x{:X})",
-                BOOT_INFO_ADDR,
+                handoff_addr,
                 in_conventional,
                 image_end
             );
@@ -195,12 +196,12 @@ fn main() -> Status {
                 };
             }
             unsafe {
-                core::ptr::write_volatile(BOOT_INFO_ADDR as *mut BootHandoff, handoff);
+                core::ptr::write_volatile(handoff_addr as *mut BootHandoff, handoff);
             }
             let written_count = handoff.entry_count;
             sprintln!(
                 "Aegis: boot-info written at 0x{:X} ({} descriptors, image end 0x{:X})",
-                BOOT_INFO_ADDR,
+                handoff_addr,
                 written_count,
                 image_end
             );
@@ -214,10 +215,12 @@ fn main() -> Status {
                 kernel.entry
             );
 
-            // Jump to kernel entry point
+            // Jump to kernel entry point, passing the boot-info handoff
+            // address in %rdi (first sysv64 argument).
             // UNTESTED on real hardware: requires VMware/QEMU to verify
-            let entry_fn: extern "sysv64" fn() -> ! = unsafe { core::mem::transmute(kernel.entry) };
-            entry_fn();
+            let entry_fn: extern "sysv64" fn(u64) -> ! =
+                unsafe { core::mem::transmute(kernel.entry) };
+            entry_fn(handoff_addr);
         }
         Err(_) => {
             uefi::println!("Aegis: ERROR: Invalid kernel ELF");
