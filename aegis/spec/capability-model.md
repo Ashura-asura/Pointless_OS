@@ -516,6 +516,39 @@ stack instance, ports are per-socket addresses, and routing authority (a
 Creator cap) is held by the stack's host identity — this is the "one driver,
 one capability envelope" arrangement, not an ambient networking stack.
 
+### Machine-checked verification (executable): aegis-kernel netstack (Phase 5)
+
+`aegis-kernel/src/netstack.rs` (4 tests) over `channel.rs` (the design §8
+second IPC primitive — an asynchronous FIFO box — as a real capability object,
+`Cap::Channel`; 2 tests) realizes the same §8 claim inside the bare-metal
+kernel crate, over the real capability gates instead of a mock kernel:
+
+- Sockets ARE channel capabilities: the netstack mints a fresh channel, keeps
+  a SEND|RECV router cap under its own service identity, and installs a
+  *narrowed* SEND|RECV copy into the subscriber's CSpace — no GRANT, so a
+  channel cannot be delegated onward (I2, asserted per cap). Ports are not
+  ambient authority: a task that knows a port but holds no channel cap is
+  refused by the stack AND fails the raw `ch_send` gate (-1) underneath it.
+- The stack is a real two-hop router: hop 1 is the sender injecting into its
+  own channel through its own SEND-gated cap; hop 2 is the stack draining its
+  router copy and forwarding the same bytes into the destination's channel
+  through its router caps. Both hops resolve through `caps_channel`, so there
+  is no hidden path to inject into a socket without holding its cap.
+- Loopback is FIFO (channel queue order is preserved; the drain is exact), and
+  tearing a socket down destroys the channel object — the subscriber's still
+  held cap goes dangling and every gated operation on it fails, while peers
+  keep working.
+- The stack is a router, not a root: after registrations, the census of its
+  CSpace shows exactly its channel router caps and nothing else.
+
+Honest limits: the kernel keeps no audit log, so the model's "every hop is an
+attributed op in the audit log" claim stays proven by `capability-audit`, not
+here; loopback only, one stack instance, ports are per-socket addresses;
+bounded message size (`CHANNEL_BUF=64`), depth (`CHANNEL_DEPTH=8`), channel
+table (`MAX_CHANNELS=16`) and port table (`MAX_PORTS=8`); no wire framing — the
+Ethernet/ARP/IPv4/UDP/TCP header models in `ethernet.rs`/`arp.rs`/`ipv4.rs`/
+`udp.rs`/`tcp.rs` remain separately tested, not wired into this loopback slice.
+
 ### Machine-checked verification (executable): the device model and graphics (§8)
 
 `devices` (4 contract tests) realizes the doc's §8 sentences for devices and

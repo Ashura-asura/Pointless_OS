@@ -84,6 +84,11 @@ pub enum Cap {
     Task(u32),
     /// Reference to a memory region with the given id.
     MemRegion(u32),
+    /// Reference to an asynchronous message channel (FIFO box) with the given
+    /// id. The design's second IPC primitive (§8: an async notification/queue
+    /// primitive besides the synchronous rendezvous endpoint); the loopback
+    /// netstack's sockets ARE these objects.
+    Channel(u32),
 }
 
 /// One occupied row of a capability table: the object and the rights held on it.
@@ -116,6 +121,12 @@ pub const fn new_cap_table() -> CapTable {
 /// the mailbox, GRANT to delegate it onward). Mirrors the model crate's
 /// `create_endpoint`.
 pub const ENDPOINT_RIGHTS: Rights = Rights::SEND.union(Rights::RECV).union(Rights::GRANT);
+
+/// The rights a fresh channel capability grants its holder (SEND/RECV to push
+/// and pop messages; a channel is minted without GRANT — the netstack narrows
+/// copies into subscriber CSpaces as SEND|RECV, and nothing may delegate a
+/// channel onward). Mirrors the model's socket channel.
+pub const CHANNEL_RIGHTS: Rights = Rights::SEND.union(Rights::RECV);
 
 /// The rights a fresh memory-region capability grants its holder (READ/WRITE
 /// to touch the frames, GRANT to delegate it onward). Mirrors the model
