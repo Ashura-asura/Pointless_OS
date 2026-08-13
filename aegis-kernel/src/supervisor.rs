@@ -302,7 +302,7 @@ pub fn handle_fault(idx: usize) -> bool {
 mod tests {
     use super::*;
     use crate::tasks::{
-        reset_table_for_test, set_current_for_test, spawn, spawned_count, task_cap,
+        reset_table_for_test, set_current_for_test, set_task_cap, spawn, spawned_count, task_cap,
     };
 
     extern "sysv64" fn dummy() -> ! {
@@ -393,5 +393,73 @@ mod tests {
         assert_eq!(s.handle_crash(1), Some(true));
         let _ = spawned_count();
         let _ = task_cap(0, 0);
+    }
+
+    /// Phase 2 revocation contract: a grantor holding GRANT can take back a
+    /// capability it previously granted. After revocation the recipient's gated
+    /// ops return -1 (denied, never a panic, never a silent success); a second
+    /// revoke of the same slot is refused; revoking without GRANT on the source
+    /// is denied. Mirrors the model's `revoke` (GRANT-gated, invalidates the
+    /// granted instance).
+    #[test]
+    fn revocation_grantor_takes_back_a_granted_cap() {
+        let _g = crate::kernel_state_guard();
+        unsafe {
+            reset_table_for_test();
+            spawn("target", dummy, 0x100000).unwrap();
+            spawn("grantor", dummy, 0x200000).unwrap();
+            spawn("grantee", dummy, 0x300000).unwrap();
+        }
+        let (target, grantor, grantee) = (0usize, 1usize, 2usize);
+        // Grantor holds a Task cap on target with READ|GRANT: READ so the
+        // grantee can actually use the granted copy, GRANT so the grantor can
+        // both delegate it and take it back.
+        set_task_cap(
+            grantor,
+            0,
+            CapSlot {
+                cap: Cap::Task(target as u32),
+                rights: Rights::READ.union(Rights::GRANT),
+            },
+        );
+        // Delegate a copy to the grantee at slot 0.
+        crate::tasks::set_current_for_test(grantor);
+        assert_eq!(
+            unsafe { crate::ipc::ipc_cap_grant(grantee as u64, 0, 0) },
+            0
+        );
+        // The grantee can use the granted cap: the target task is alive.
+        crate::tasks::set_current_for_test(grantee);
+        assert_eq!(task_state(0), 1);
+        // Revocation: the grantor (still holding GRANT) takes the granted
+        // instance back.
+        crate::tasks::set_current_for_test(grantor);
+        assert_eq!(
+            unsafe { crate::ipc::ipc_cap_revoke(grantee as u64, 0, 0) },
+            0
+        );
+        // The grantee's cap is gone: further use is denied.
+        crate::tasks::set_current_for_test(grantee);
+        assert_eq!(task_state(0), -1);
+        // A second revoke of the same slot is refused (nothing left to take).
+        crate::tasks::set_current_for_test(grantor);
+        assert_eq!(
+            unsafe { crate::ipc::ipc_cap_revoke(grantee as u64, 0, 0) },
+            -1
+        );
+        // Revoking without GRANT on the source is denied even for the same
+        // object: a READ-only copy cannot revoke.
+        set_task_cap(
+            grantor,
+            1,
+            CapSlot {
+                cap: Cap::Task(target as u32),
+                rights: Rights::READ,
+            },
+        );
+        assert_eq!(
+            unsafe { crate::ipc::ipc_cap_revoke(grantee as u64, 0, 1) },
+            -1
+        );
     }
 }

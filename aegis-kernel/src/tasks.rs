@@ -964,4 +964,25 @@ mod tests {
             core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
         }
     }
+
+    /// Phase 2 least-authority contract: a freshly spawned task starts with a
+    /// completely empty CSpace — spawn grants no implicit authority, every
+    /// capability must be explicitly granted by another task (or installed by
+    /// the kernel for a named demo role).
+    #[test]
+    fn least_authority_new_task_starts_with_an_empty_cspace() {
+        let _g = crate::kernel_state_guard();
+        unsafe {
+            core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
+            let t = spawn("fresh", dummy, 0x8000).unwrap();
+            for s in 0..MAX_CAPS {
+                assert_eq!(
+                    task_cap(t, s),
+                    CapSlot::empty(),
+                    "spawn must never implicitly grant authority (least authority)"
+                );
+            }
+            core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
+        }
+    }
 }

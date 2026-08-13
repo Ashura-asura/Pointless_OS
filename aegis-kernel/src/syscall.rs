@@ -60,6 +60,9 @@ pub enum SyscallNum {
     TaskKill = 15,
     /// Supervisor: restart a killed task `rsi` (rax=16). Requires CONTROL.
     TaskRestart = 16,
+    /// IPC: revoke a capability previously granted (rax=17, rsi=dst_task,
+    /// rcx=dst_slot, rdx=src_slot). Requires GRANT on the source. Returns 0 or -1.
+    CapRevoke = 17,
 }
 
 /// Maximum bytes a user `Write` may ask to print per call (defensive cap
@@ -121,6 +124,8 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
         15 => crate::supervisor::task_kill(arg1),
         // Supervisor: TaskRestart(task_slot)
         16 => crate::supervisor::task_restart(arg1),
+        // IPC: CapRevoke(dst_task, dst_slot, src_slot)
+        17 => unsafe { crate::ipc::ipc_cap_revoke(arg1, arg2, arg3) },
         _ => -1, // Unknown syscall
     }
 }
@@ -190,6 +195,7 @@ mod tests {
         assert_eq!(SyscallNum::Read as u64, 2);
         assert_eq!(SyscallNum::Yield as u64, 3);
         assert_eq!(SyscallNum::Fork as u64, 4);
+        assert_eq!(SyscallNum::CapRevoke as u64, 17);
     }
 
     #[test]

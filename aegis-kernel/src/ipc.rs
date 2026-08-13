@@ -11,8 +11,11 @@
 //! Honest limits: tasks still share one address space (no per-process page
 //! tables yet), so the user-buffer copies below are not yet cross-address-space
 //! copies — they are the same mechanism that *will* become cross-space copies
-//! once isolation lands. There is no capability sealing/revocation yet beyond
-//! the per-task table; no async/notify variant yet (only synchronous call/reply).
+//! once isolation lands. Capability revocation is slot clearing only: the
+//! GRANT-gated `ipc_cap_revoke` takes back a named granted instance, but the
+//! flat per-task CSpace tracks no grant-root derivation tree (model I4), so it
+//! cannot reach copies in CSpaces the grantor cannot name. No async/notify
+//! variant yet (only synchronous call/reply).
 
 use crate::cap::{Cap, CapSlot, Rights};
 use crate::tasks::{
@@ -159,6 +162,53 @@ pub unsafe fn ipc_cap_grant(dst: u64, src_slot: u64, dst_slot: u64) -> i64 {
     }
     set_task_cap(dst as usize, dst_slot as usize, slot);
     crate::audit::record(cur, crate::audit::OpKind::Grant, target, true);
+    0
+}
+
+/// Syscall: revoke a capability the caller previously granted — invalidate the
+/// copy task `dst` holds at `dst_slot`. The caller must hold GRANT on its own
+/// copy `src_slot` naming the *same* object (this mirrors the model's `revoke`,
+/// which is GRANT-gated; the existing `revoke_slot` self-revoke uses the same
+/// right). The recipient's slot is cleared, so every subsequent gated op on it
+/// returns -1 — never a panic, never a silent success. Revocation is permanent
+/// (Phase 2: a grantor takes back what it granted). Returns 0 or -1.
+///
+/// Honest limit: the flat per-task CSpace tracks no grant-root derivation tree
+/// (the model's I4), so this revokes a *named* instance only — the grantor must
+/// be able to name recipient and slot, and cannot reach copies in CSpaces it
+/// cannot name.
+///
+/// # Safety
+/// Must be called via syscall from ring-3 with valid task context.
+pub unsafe fn ipc_cap_revoke(dst: u64, dst_slot: u64, src_slot: u64) -> i64 {
+    let cur = current_idx();
+    let slot = if (src_slot as usize) < crate::tasks::MAX_CAPS {
+        task_cap(cur, src_slot as usize)
+    } else {
+        CapSlot::empty()
+    };
+    let target = slot.cap.id();
+    // The caller must still hold GRANT on a live copy of the object it is
+    // revoking (delegation and revocation are the same right).
+    if slot.cap == Cap::None || !slot.rights.contains(Rights::GRANT) {
+        crate::audit::record(cur, crate::audit::OpKind::Revoke, target, false);
+        return -1;
+    }
+    // Bounds-check the recipient's table before touching it (a malformed
+    // argument must be refused, never a panic).
+    if (dst as usize) >= crate::tasks::MAX_TASKS || (dst_slot as usize) >= crate::tasks::MAX_CAPS {
+        crate::audit::record(cur, crate::audit::OpKind::Revoke, target, false);
+        return -1;
+    }
+    let granted = task_cap(dst as usize, dst_slot as usize);
+    // Only take back what the grantor actually granted: the recipient's slot
+    // must name the same object. An empty or foreign slot is refused.
+    if granted.cap == Cap::None || granted.cap != slot.cap {
+        crate::audit::record(cur, crate::audit::OpKind::Revoke, target, false);
+        return -1;
+    }
+    set_task_cap(dst as usize, dst_slot as usize, CapSlot::empty());
+    crate::audit::record(cur, crate::audit::OpKind::Revoke, target, true);
     0
 }
 
