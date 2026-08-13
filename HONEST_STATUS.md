@@ -59,8 +59,14 @@ This is the **single consolidated Known Limits section** (`README.md` and
   denial trail is complete but the earliest successes may be gone from the ring
   (grant-side lines print ring3-side from the supervisor). A bigger ring costs
   kernel memory; the bound is a deliberate, documented compromise, not a bug.
-- **Graphical shell** is contract-tested model code (24 tests); the only live
-  display is the VGA text console.
+- **Graphical shell** is contract-tested model code (24 tests). The live
+  compositor demo is now *displayed* on the VM (via VMware SVGA disable →
+  VGA text mode) and its z-order occlusion is proven two ways: visually and by
+  the serial assertion `Aegis: shell-compositor: menu(#) occludes clock(.)
+  under overlap; status bar = true; z-order compositing = true`. Proven scope is
+  a two-window synthetic demo only: no real input drives focus/movement, no
+  real application content, still a scripted boot-time demo, not an
+  interactive shell.
 - **IPC overhead** vs a monolithic syscall path is reduced (batched submission,
   shared-memory capability grants), not eliminated.
 - **Capability conformance** is verdict-level, not end-to-end. The harness
