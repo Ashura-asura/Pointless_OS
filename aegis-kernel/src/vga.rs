@@ -46,6 +46,9 @@ pub fn vga_write_str(s: &str) {
 
 /// Write raw bytes (e.g. a ring-3 `Write` syscall buffer) to the screen.
 pub fn vga_write_bytes(bytes: &[u8]) {
+    if display_frozen() {
+        return;
+    }
     for &b in bytes {
         if b == b'\r' {
             continue;
@@ -64,9 +67,108 @@ pub fn vga_write_bytes(bytes: &[u8]) {
     }
 }
 
+/// True once the composited desktop has been blitted to the display. After
+/// that, `sprintln!` / ring-3 `Write` stop touching the text buffer so the
+/// GUI stays on screen; serial logging is unaffected (it happens first in
+/// `sprintln!`).
+static mut SHOWING_DESKTOP: bool = false;
+
+fn display_frozen() -> bool {
+    unsafe { SHOWING_DESKTOP }
+}
+
+/// Blit a composited screen (u16 cells: `char | attr<<8`) onto the real VGA
+/// text buffer, centered, then freeze the display so the GUI stays visible
+/// for the rest of the run.
+pub fn vga_show_desktop(screen: &[u16], sw: usize, sh: usize) {
+    unsafe {
+        cells().fill(ATTR | b' ' as u16);
+        let ox = (COLS.saturating_sub(sw)) / 2;
+        let oy = (ROWS.saturating_sub(sh)) / 2;
+        for y in 0..sh {
+            let src = &screen[y * sw..(y + 1) * sw];
+            let dst = &mut cells()[(oy + y) * COLS + ox..(oy + y) * COLS + ox + sw];
+            dst.copy_from_slice(src);
+        }
+        SHOWING_DESKTOP = true;
+        // Force the emulated VGA (QEMU/VMware) to re-scan the text buffer:
+        // a pure memory blit does not trigger a redraw, but a sequencer
+        // display-off/on transition does.
+        force_display_refresh();
+    }
+}
+
+fn out8(port: u16, val: u8) {
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, preserves_flags));
+    }
+}
+
+fn in8(port: u16) -> u8 {
+    let v: u8;
+    unsafe {
+        core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nomem, preserves_flags));
+    }
+    v
+}
+
+/// Toggle the sequencer clocking-mode display-off bit so the text buffer is
+/// re-scanned from 0xB8000 on the next frame. Works on QEMU stdvga and
+/// VMware SVGA text mode. Also nudges the CRTC cursor position, which is the
+/// classic trigger VMware/QEMU honour for re-scanning the text buffer.
+fn force_display_refresh() {
+    // SR0 index register; SR1 = clocking mode (bit 5 = screen off).
+    out8(0x3C4, 0x01);
+    let sr1 = in8(0x3C5);
+    out8(0x3C4, 0x01);
+    out8(0x3C5, sr1 | 0x20); // screen off
+    out8(0x3C4, 0x01);
+    out8(0x3C5, sr1 & !0x20); // screen back on
+    // CRTC start address (indices 0x0C/0x0D): poke it to the same value so
+    // the emulator re-reads the text buffer from row 0.
+    out8(0x3D4, 0x0C);
+    let sa_hi = in8(0x3D5);
+    out8(0x3D4, 0x0D);
+    let sa_lo = in8(0x3D5);
+    out8(0x3D4, 0x0C);
+    out8(0x3D5, sa_hi);
+    out8(0x3D4, 0x0D);
+    out8(0x3D5, sa_lo);
+    // CRTC cursor location: poke high byte register (index 0x0E), then low.
+    out8(0x3D4, 0x0E);
+    out8(0x3D5, 0x00);
+    out8(0x3D4, 0x0F);
+    out8(0x3D5, 0x00);
+    // CRTC cursor start/end (indices 0x0A/0x0B): enable a block cursor so the
+    // redraw definitely lands.
+    out8(0x3D4, 0x0A);
+    out8(0x3D5, 0x0D);
+    out8(0x3D4, 0x0B);
+    out8(0x3D5, 0x0E);
+}
+
+/// Dump the current 80x25 text buffer to serial (printable chars only) so a
+/// host-side observer can confirm exactly what the VM display holds after the
+/// desktop blit.
+pub fn vga_dump_buffer() {
+    let mut line = [0u8; COLS + 1];
+    for y in 0..ROWS {
+        for x in 0..COLS {
+            let cell = cells()[y * COLS + x];
+            let b = (cell & 0xFF) as u8;
+            line[x] = if (0x20..0x7F).contains(&b) { b } else { b'?' };
+        }
+        line[COLS] = 0;
+        crate::sprintln!("VGA[{:02}] |{}|", y, core::str::from_utf8(&line[..COLS]).unwrap_or(""));
+    }
+}
+
 /// Format one line (via `format_args!`) straight onto the screen plus a
 /// trailing newline. Used by `sprintln!` so both sinks share one format.
 pub fn vga_fmt_line(args: core::fmt::Arguments) {
+    if display_frozen() {
+        return;
+    }
     use core::fmt::Write;
     struct VgaWriter;
     impl Write for VgaWriter {
@@ -196,6 +298,70 @@ fn vga_set_palette16() {
     }
 }
 
+/// Disable the VMware SVGA device so its display falls back to legacy VGA.
+///
+/// The VMware EFI firmware hands off with the SVGA device still enabled in a
+/// GOP graphics mode; while it is, VMware ignores the 0xB8000 text buffer
+/// (and our Bochs VBE disable at 0x1CE/0x1CF is a no-op on VMware — verified
+/// by the `vbe_enable=0xffff` readback). Per VMware's SVGA interface doc,
+/// writing `SVGA_REG_ENABLE = 0` disables SVGA and "also enables VGA", so the
+/// standard text-mode path programmed afterwards finally reaches the display.
+///
+/// Returns true if a VMware SVGA device was found and disabled.
+fn vmware_svga_disable() -> bool {
+    use crate::pci::{PciAddress, BAR0, CLASS, DEVICE_ID, VENDOR_ID};
+    fn out32(port: u16, val: u32) {
+        unsafe {
+            core::arch::asm!("out dx, eax", in("dx") port, in("eax") val, options(nomem, preserves_flags));
+        }
+    }
+    fn in32(port: u16) -> u32 {
+        let v: u32;
+        unsafe {
+            core::arch::asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, preserves_flags));
+        }
+        v
+    }
+    unsafe {
+        for device in 0..32u8 {
+            let addr = PciAddress::new(0, device, 0);
+            let vendor = crate::pci::read_config_word(addr, VENDOR_ID);
+            if vendor != 0x15AD {
+                continue;
+            }
+            let device_id = crate::pci::read_config_word(addr, DEVICE_ID);
+            let class = crate::pci::read_config_byte(addr, CLASS);
+            // VMware SVGA-II (0x0405) / SVGA (0x0710), or any display class.
+            if class != 0x03 && device_id != 0x0405 && device_id != 0x0710 {
+                continue;
+            }
+            let bar0 = crate::pci::read_config_dword(addr, BAR0);
+            if bar0 & 1 == 0 {
+                continue; // BAR0 not I/O space
+            }
+            let io_base = (bar0 & 0xFFFC) as u16; // SVGA_INDEX_PORT = base+0
+            // SVGA registers are a dword index/value port pair at base+0/+1.
+            out32(io_base, 0); // index = SVGA_REG_ID (probe/version)
+            let svga_id = in32(io_base + 1);
+            out32(io_base, 1); // index = SVGA_REG_ENABLE
+            out32(io_base + 1, 0); // value = 0 (disable -> enables VGA)
+            out32(io_base, 1);
+            let enable = in32(io_base + 1);
+            crate::sprintln!(
+                "Aegis: VMware SVGA @ PCI {:02X}:{:02X}.{} bar0=0x{:X} id=0x{:08X} enable=0x{:X}",
+                addr.bus,
+                addr.device,
+                addr.function,
+                io_base,
+                svga_id,
+                enable
+            );
+            return true;
+        }
+    }
+    false
+}
+
 /// Switch the VGA into 80x25 text mode through the legacy IO ports. The
 /// UEFI firmware (OVMF/VMware EFI) leaves the display in a GOP graphics
 /// mode, so writing 0xB8000 alone would be invisible; this standard
@@ -211,6 +377,11 @@ pub fn vga_enter_text_mode() {
         out(port, index);
         out(port + 1, val);
     }
+
+    // VMware-specific: take the SVGA device out of GOP mode first (this also
+    // re-enables VGA), so the legacy registers below actually drive the
+    // display. No-op on QEMU/other machines.
+    vmware_svga_disable();
 
     // Bochs VBE (used by OVMF/EDK2 for the GOP framebuffer): while VBE mode
     // is enabled QEMU ignores the legacy VGA registers and keeps showing the

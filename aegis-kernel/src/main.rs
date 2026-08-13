@@ -5,6 +5,11 @@ use aegis_kernel::sprintln;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Composited 80x25 desktop (char | attr<<8) captured by the Phase-9/10
+/// compositor and blitted to the real VGA text buffer by `run_idle` once the
+/// boot demos have finished, so the VM display settles on the GUI.
+static mut DESKTOP_SCREEN: Option<[u16; 80 * 25]> = None;
+
 /// Write the first four bytes of `id` into `out` as xx:xx (for demo printout).
 fn hex_bytes(id: &[u8; 32], out: &mut [u8; 4]) {
     for (i, slot) in out.iter_mut().enumerate() {
@@ -565,14 +570,27 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         use aegis_kernel::compositor::{self, Cell};
         use aegis_kernel::window::{Region, WindowManager};
 
-        const SW: usize = 40;
-        const SH: usize = 12;
+        const SW: usize = 80;
+        const SH: usize = 25;
         let mut wm = WindowManager::new(SW as u16, SH as u16);
 
+        // Title bar across the top edge.
+        let title = wm
+            .create_window(
+                1,
+                b"title",
+                Region {
+                    x: 0,
+                    y: 0,
+                    width: SW as u16,
+                    height: 1,
+                },
+            )
+            .unwrap();
         // Status bar across the bottom edge.
         let status = wm
             .create_window(
-                1,
+                2,
                 b"status",
                 Region {
                     x: 0,
@@ -585,47 +603,58 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         // A "clock" app window.
         let clock = wm
             .create_window(
-                2,
+                3,
                 b"clock",
                 Region {
                     x: 2,
                     y: 2,
-                    width: 20,
-                    height: 6,
+                    width: 30,
+                    height: 8,
                 },
             )
             .unwrap();
         // A "menu" dialog overlapping the clock; focused, so it occludes it.
         let menu = wm
             .create_window(
-                3,
+                4,
                 b"menu",
                 Region {
-                    x: 10,
+                    x: 18,
                     y: 4,
-                    width: 16,
-                    height: 4,
+                    width: 24,
+                    height: 5,
                 },
             )
             .unwrap();
         wm.focus_window(menu).unwrap();
 
         // Per-window framebuffers: cell = char | attr<<8 (0x0F = white on
-        // black). The menu's first cell carries its own glyph.
+        // black; 0x1F = white on blue). The menu's first cell carries its own
+        // glyph.
+        let mut fb_title = [0u16; SW];
+        for c in fb_title.iter_mut() {
+            *c = 0x1F00 | b' ' as u16;
+        }
+        for (i, t) in b" AEGIS GRAPHICAL SHELL -- live compositor desktop (80x25) -- transparent cells = blue desktop ".iter().enumerate() {
+            if i < SW {
+                fb_title[i] = 0x1F00 | *t as u16;
+            }
+        }
         let mut fb_status = [0u16; SW];
         for c in fb_status.iter_mut() {
             *c = 0x0F00 | b'-' as u16;
         }
-        let mut fb_clock = [0u16; 20 * 6];
+        let mut fb_clock = [0u16; 30 * 8];
         for (i, c) in fb_clock.iter_mut().enumerate() {
             *c = 0x0F00 | if i == 0 { b'C' } else { b'.' } as u16;
         }
-        let mut fb_menu = [0u16; 16 * 4];
+        let mut fb_menu = [0u16; 24 * 5];
         for (i, c) in fb_menu.iter_mut().enumerate() {
             *c = 0x0F00 | if i == 0 { b'M' } else { b'#' } as u16;
         }
 
         let mut fbs: [Option<&[Cell]>; compositor::MAX_WINDOWS] = [None; compositor::MAX_WINDOWS];
+        fbs[(title as usize) - 1] = Some(&fb_title);
         fbs[(status as usize) - 1] = Some(&fb_status);
         fbs[(clock as usize) - 1] = Some(&fb_clock);
         fbs[(menu as usize) - 1] = Some(&fb_menu);
@@ -633,9 +662,25 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         let mut screen = [compositor::TRANSPARENT; SW * SH];
         compositor::composite(&wm, &fbs, &mut screen).unwrap();
 
+        // Paint the desktop background: every cell the compositor left
+        // transparent becomes the blue desktop color, so the whole screen is
+        // visibly the GUI (not a black void) when blitted to the VGA buffer.
+        let desktop_bg: Cell = 0x1000 | b' ' as u16; // space, black on blue
+        for c in screen.iter_mut() {
+            if *c == compositor::TRANSPARENT {
+                *c = desktop_bg;
+            }
+        }
+
+        // Keep the composited desktop so the real display can show it once
+        // the boot demos have finished printing (see `run_idle`).
+        unsafe {
+            DESKTOP_SCREEN = Some(screen);
+        }
+
         // Occlusion checks: the focused menu (topmost z) covers the clock
         // where they overlap; the clock is visible where the menu is not.
-        let in_menu = (screen[5 * SW + 12] & 0xFF) as u8;
+        let in_menu = (screen[5 * SW + 24] & 0xFF) as u8;
         let in_clock = (screen[3 * SW + 5] & 0xFF) as u8;
         let status_ok = (screen[(SH - 1) * SW + 0] & 0xFF) as u8 == b'-';
         let occluded_ok = in_menu == b'#' && in_clock == b'.';
@@ -936,6 +981,16 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         _ => {
             sprintln!("Aegis: WARNING could not allocate Phase-6 task stacks");
         }
+    }
+
+    // All boot/demo output has printed; put the composited desktop on the
+    // real VGA display and freeze further console mirroring, so the VM
+    // display settles on the GUI for the rest of the run.
+    let desktop = unsafe { DESKTOP_SCREEN };
+    if let Some(screen) = desktop {
+        aegis_kernel::vga::vga_show_desktop(&screen, 80, 25);
+        sprintln!("Aegis: compositor desktop shown on the VM display");
+        aegis_kernel::vga::vga_dump_buffer();
     }
 
     unsafe {
