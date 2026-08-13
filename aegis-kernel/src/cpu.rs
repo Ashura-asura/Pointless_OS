@@ -304,7 +304,13 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
                     cr2
                 );
             }
-            crate::tasks::kill_current();
+            // Phase 2 supervision hook: a supervised, budgeted task is
+            // restarted by the supervisor instead of left dead; unsupervised
+            // tasks keep the existing kill-and-continue behavior.
+            let cur = crate::tasks::current_idx();
+            if !crate::supervisor::handle_fault(cur) {
+                crate::tasks::kill_current();
+            }
             return;
         }
     }

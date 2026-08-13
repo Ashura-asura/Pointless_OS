@@ -8,9 +8,11 @@ pub mod frame;
 pub mod gdt;
 pub mod idt;
 pub mod ipc;
+pub mod mem;
 pub mod page_tables;
 pub mod process;
 pub mod scheduler;
+pub mod supervisor;
 pub mod syscall;
 pub mod tasks;
 pub mod vga;
@@ -49,3 +51,14 @@ pub mod ceiling;
 pub mod hardening;
 
 pub mod serial;
+
+/// Test-only: serialize tests that mutate the kernel's single global task /
+/// region / supervisor state. The kernel has one `static mut CURRENT` and one
+/// capability table per task, so tests that pin `CURRENT` and seed caps must
+/// not run concurrently with each other even though they use distinct task
+/// indices (the global cursor itself is shared).
+#[cfg(test)]
+pub(crate) fn kernel_state_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap()
+}

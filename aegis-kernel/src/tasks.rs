@@ -155,6 +155,10 @@ impl TaskFrame {
 /// A scheduled kernel task.
 pub struct Task {
     pub name: &'static str,
+    /// Entry point, remembered so a supervised restart can re-enter a task
+    /// image (the supervision tree respawns against the same code, not a
+    /// re-fork of arbitrary state).
+    pub entry: extern "sysv64" fn() -> !,
     pub frame: TaskFrame,
     /// Physical address of the stack region (16 KiB).
     pub stack_base: u64,
@@ -181,6 +185,7 @@ impl Task {
     pub fn new(name: &'static str, entry: extern "sysv64" fn() -> !, stack_base: u64) -> Task {
         Task {
             name,
+            entry,
             frame: TaskFrame::fresh(entry, stack_base + TASK_STACK_SIZE),
             stack_base,
             cpl0_stack_top: 0,
@@ -202,6 +207,7 @@ impl Task {
         let user_pml4 = unsafe { crate::page_tables::create_user_pml4(stack_base) };
         Task {
             name,
+            entry,
             frame: TaskFrame::fresh_user(entry, stack_base + TASK_STACK_SIZE),
             stack_base,
             cpl0_stack_top: cpl0_stack_base + TASK_STACK_SIZE,
@@ -377,7 +383,21 @@ unsafe fn spawn_impl(
 ) -> Option<usize> {
     let spawned = core::ptr::read(core::ptr::addr_of_mut!(SPAWNED));
     if spawned >= MAX_TASKS {
-        return None;
+        // Full at the high-water mark: reuse a dead (Zombie) slot if any.
+        let reuse = (0..MAX_TASKS).find(|&i| task_state(i) == TaskState::Zombie);
+        let slot = reuse?;
+        let task = if cpl0_stack_base != 0 {
+            Task::new_user(name, entry, stack_base, cpl0_stack_base)
+        } else {
+            Task::new(name, entry, stack_base)
+        };
+        core::ptr::write(
+            core::ptr::addr_of_mut!(TASKS)
+                .cast::<core::mem::MaybeUninit<Task>>()
+                .add(slot),
+            core::mem::MaybeUninit::new(task),
+        );
+        return Some(slot);
     }
     let task = if cpl0_stack_base != 0 {
         Task::new_user(name, entry, stack_base, cpl0_stack_base)
@@ -409,6 +429,22 @@ pub fn current_idx() -> usize {
 #[cfg(test)]
 pub fn set_current_for_test(idx: usize) {
     unsafe { core::ptr::write(core::ptr::addr_of_mut!(CURRENT), idx) }
+}
+
+/// Test-only: reset the task table so supervisor/reap contract tests can spawn
+/// fresh tasks in an otherwise empty, deterministic table.
+#[cfg(test)]
+pub fn reset_table_for_test() {
+    unsafe {
+        core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
+        core::ptr::write(core::ptr::addr_of_mut!(CURRENT), usize::MAX);
+        for i in 0..MAX_TASKS {
+            let slot = core::ptr::addr_of_mut!(TASKS)
+                .cast::<core::mem::MaybeUninit<Task>>()
+                .add(i);
+            core::ptr::write(slot, core::mem::MaybeUninit::uninit());
+        }
+    }
 }
 
 /// Next context in round-robin order: idle -> task 0 -> ... -> last task
@@ -559,8 +595,89 @@ pub fn arm_nx_test(idx: usize, tick: u64) {
 pub fn kill_current() {
     let cur = current_idx();
     if cur != usize::MAX {
-        set_task_state(cur, TaskState::Zombie);
+        kill_task(cur);
     }
+}
+
+/// Kill task `idx` (supervision CONTROL-right path). Marks it `Zombie`;
+/// the scheduler skips it thereafter.
+pub fn kill_task(idx: usize) {
+    if idx < MAX_TASKS {
+        set_task_state(idx, TaskState::Zombie);
+    }
+}
+
+/// True if task `idx` is still schedulable.
+pub fn is_task_alive(idx: usize) -> bool {
+    idx < MAX_TASKS && task_state(idx) != TaskState::Zombie
+}
+
+/// Rebuild a `Zombie` task's frame to its original entry point and stack so a
+/// supervised restart can re-run it (the supervision-tree respawn primitive).
+/// Leaves the task `Ready` once more. Returns false if `idx` is out of range
+/// or not a `Zombie` (so restarts can't be minted on live tasks).
+pub fn restart_task(idx: usize) -> bool {
+    if idx >= MAX_TASKS || task_state(idx) != TaskState::Zombie {
+        return false;
+    }
+    unsafe {
+        let p = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, entry))
+            .cast::<extern "sysv64" fn() -> !>();
+        let entry: extern "sysv64" fn() -> ! = *p;
+        let top = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, stack_base))
+            .cast::<u64>()
+            .read()
+            + TASK_STACK_SIZE;
+        let cpl0 = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(
+                idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, cpl0_stack_top),
+            )
+            .cast::<u64>()
+            .read();
+        // Ring-3 tasks restart into the user frame (their page tables and
+        // CPL0 stack still live); kernel tasks into the ring-0 frame.
+        let frame = if cpl0 != 0 {
+            TaskFrame::fresh_user(entry, top)
+        } else {
+            TaskFrame::fresh(entry, top)
+        };
+        core::ptr::write(
+            core::ptr::addr_of_mut!(TASKS)
+                .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, frame))
+                .cast::<TaskFrame>(),
+            frame,
+        );
+    }
+    set_task_state(idx, TaskState::Ready);
+    unsafe {
+        let p = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, blocked_ep))
+            .cast::<usize>();
+        *p = usize::MAX;
+    }
+    true
+}
+
+/// Free the frames backing `Zombie` task `idx`, so a later `spawn` can reuse
+/// the slot (supervision reaping closes the leak where killed tasks previously
+/// occupied a table slot forever). The slot stays a `Zombie` row — the
+/// scheduler skips it — and `spawn_impl` reuses `Zombie` slots by index.
+pub fn reap_task(idx: usize) -> bool {
+    if idx >= MAX_TASKS || task_state(idx) != TaskState::Zombie {
+        return false;
+    }
+    unsafe {
+        let stack_base = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, stack_base))
+            .cast::<u64>()
+            .read();
+        for off in (0..TASK_STACK_SIZE).step_by(crate::frame::PAGE_SIZE as usize) {
+            crate::frame::free_global(stack_base + off);
+        }
+    }
+    true
 }
 
 /// Switch away from `cur` to the next runnable context. Does not return to
@@ -713,11 +830,13 @@ mod tests {
 
     #[test]
     fn frame_size_is_176_bytes() {
+        let _g = crate::kernel_state_guard();
         assert_eq!(TaskFrame::size(), 176);
     }
 
     #[test]
     fn next_after_round_robins_tasks_and_idle() {
+        let _g = crate::kernel_state_guard();
         assert_eq!(next_after(usize::MAX, 2), Some(0));
         assert_eq!(next_after(0, 2), Some(1));
         assert_eq!(next_after(1, 2), Some(usize::MAX));
@@ -728,18 +847,21 @@ mod tests {
 
     #[test]
     fn next_after_without_tasks_returns_none() {
+        let _g = crate::kernel_state_guard();
         assert_eq!(next_after(usize::MAX, 0), None);
         assert_eq!(next_after(0, 0), None);
     }
 
     #[test]
     fn fresh_frame_zeroes_saved_to() {
+        let _g = crate::kernel_state_guard();
         let f = TaskFrame::fresh(dummy, 0x4000);
         assert_eq!(f.saved_to, 0);
     }
 
     #[test]
     fn fresh_frame_is_well_formed() {
+        let _g = crate::kernel_state_guard();
         let f = TaskFrame::fresh(dummy, 0x4000);
         assert_eq!(f.rip, dummy_addr());
         assert_eq!(f.cs, 0x08);
@@ -753,6 +875,7 @@ mod tests {
 
     #[test]
     fn fresh_user_frame_uses_ring3_selectors() {
+        let _g = crate::kernel_state_guard();
         let f = TaskFrame::fresh_user(dummy, 0x4000);
         assert_eq!(f.rip, dummy_addr());
         assert_eq!(f.cs, crate::gdt::USER_CODE_SELECTOR as u64); // 0x1B
@@ -764,6 +887,7 @@ mod tests {
 
     #[test]
     fn fresh_rsp_sits_inside_stack_region() {
+        let _g = crate::kernel_state_guard();
         let stack_base = 0x4000;
         let f = TaskFrame::fresh(dummy, stack_base + TASK_STACK_SIZE);
         assert!(f.rsp > stack_base && f.rsp < stack_base + TASK_STACK_SIZE);
@@ -773,6 +897,7 @@ mod tests {
 
     #[test]
     fn task_new_places_stack_top_correctly() {
+        let _g = crate::kernel_state_guard();
         let t = Task::new("t", dummy, 0x8000);
         assert_eq!(t.name, "t");
         assert_eq!(t.stack_base, 0x8000);
@@ -783,6 +908,7 @@ mod tests {
 
     #[test]
     fn task_new_user_places_both_stack_tops_correctly() {
+        let _g = crate::kernel_state_guard();
         let t = Task::new_user("u", dummy, 0x8000, 0xC000);
         assert_eq!(t.stack_base, 0x8000);
         assert_eq!(t.cpl0_stack_top, 0xC000 + TASK_STACK_SIZE);
@@ -793,6 +919,7 @@ mod tests {
 
     #[test]
     fn spawn_respects_table_capacity() {
+        let _g = crate::kernel_state_guard();
         unsafe {
             // Reset global state for the test.
             core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
@@ -814,6 +941,7 @@ mod tests {
 
     #[test]
     fn spawned_frames_hold_unique_stacks() {
+        let _g = crate::kernel_state_guard();
         unsafe {
             core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
             let a = spawn("a", dummy, 0x8000).unwrap();

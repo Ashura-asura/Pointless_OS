@@ -297,6 +297,7 @@ mod tests {
 
     #[test]
     fn blank_table_has_only_empty_slots() {
+        let _g = crate::kernel_state_guard();
         let caps = new_cap_table();
         assert!(caps
             .iter()
@@ -305,6 +306,7 @@ mod tests {
 
     #[test]
     fn endpoint_create_installs_send_recv_grant_rights() {
+        let _g = crate::kernel_state_guard();
         // Task 1 owns slot 0 here; no other test touches task 1.
         crate::tasks::set_current_for_test(1);
         let slot = unsafe { ipc_endpoint_create() };
@@ -318,6 +320,7 @@ mod tests {
 
     #[test]
     fn grants_require_grant_right_on_source() {
+        let _g = crate::kernel_state_guard();
         // Task 0 slot 0 is seeded with RECV only; slot 3 stays empty.
         crate::tasks::set_current_for_test(0);
         seed_endpoint(0, Rights::RECV);
@@ -329,6 +332,7 @@ mod tests {
 
     #[test]
     fn grant_copies_slot_verbatim() {
+        let _g = crate::kernel_state_guard();
         // Task 1 owns slot 2 here (endpoint create writes task 1 slot 0 only).
         crate::tasks::set_current_for_test(1);
         let mut caps = new_cap_table();
@@ -344,6 +348,7 @@ mod tests {
 
     #[test]
     fn call_requires_send_right_on_endpoint() {
+        let _g = crate::kernel_state_guard();
         // Task 0 slot 0 RECV-only (same seed value as grants test, so the two
         // stay consistent even if they interleave).
         crate::tasks::set_current_for_test(0);
@@ -357,6 +362,7 @@ mod tests {
 
     #[test]
     fn serve_and_reply_require_recv_right_on_endpoint() {
+        let _g = crate::kernel_state_guard();
         // Task 2 slot 0 SEND-only.
         crate::tasks::set_current_for_test(2);
         seed_endpoint(2, Rights::SEND);
@@ -369,6 +375,7 @@ mod tests {
 
     #[test]
     fn non_endpoint_caps_are_not_deliverable() {
+        let _g = crate::kernel_state_guard();
         // Task 3 slots 1,2 hold Task/MemRegion caps.
         crate::tasks::set_current_for_test(3);
         set_task_cap(
@@ -393,6 +400,7 @@ mod tests {
 
     #[test]
     fn out_of_range_slot_is_denied_not_panic() {
+        let _g = crate::kernel_state_guard();
         // Task 4 pins CURRENT; nothing else touches it.
         crate::tasks::set_current_for_test(4);
         assert_eq!(caps_endpoint(4, MAX_CAPS as u64 + 100, Rights::SEND), None);

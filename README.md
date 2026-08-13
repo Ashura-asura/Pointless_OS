@@ -4,7 +4,7 @@ An executable reference implementation of a capability-based operating system de
 
 ## Status
 
-415 tests passing, 0 failures (113 model, 289 aegis-kernel, 13 uefi-boot ELF parser). The reachable-authority auditor runs clean. The kernel boots under QEMU/OVMF: UEFI loader → page tables → bare-metal kernel (GDT/TSS/IDT, LAPIC timer, frame allocator) → **cooperative scheduler running two tasks (alpha/beta) that interleave every 512 timer ticks** — live-run verified, 0 exceptions. IPC (endpoints, call/serve/reply, capabilities) verified under both QEMU and VMware Workstation 26 with 0 exceptions. Per-task memory isolation and NX enforcement (only the kernel text window executable) verified under QEMU: the iso-test and nx-test tasks fault and are killed while the kernel keeps running. **Live PCI enumeration** at boot decodes all 6 q35 devices (host/display/network/ISA/SATA/SMBus incl. BARs) over the legacy config ports. The demo is **visible on the VM display**: a VGA text console mirrors the whole boot log white-on-black (verified via screendump decoding).
+430 tests passing, 0 failures (113 model, 304 aegis-kernel, 13 uefi-boot ELF parser). The reachable-authority auditor runs clean. The kernel boots under QEMU/OVMF: UEFI loader → page tables → bare-metal kernel (GDT/TSS/IDT, LAPIC timer, frame allocator) → **cooperative scheduler running two tasks (alpha/beta) that interleave every 512 timer ticks** — live-run verified, 0 exceptions. IPC (endpoints, call/serve/reply, capabilities) verified under both QEMU and VMware Workstation 26 with 0 exceptions. Per-task memory isolation and NX enforcement (only the kernel text window executable) verified under QEMU: the iso-test and nx-test tasks fault and are killed while the kernel keeps running. **Live PCI enumeration** at boot decodes all 6 q35 devices (host/display/network/ISA/SATA/SMBus incl. BARs) over the legacy config ports. The demo is **visible on the VM display**: a VGA text console mirrors the whole boot log white-on-black (verified via screendump decoding). Phase 2 adds frame-backed memory-region capabilities (READ/WRITE/GRANT-gated `mem_len`/`mem_read`/`mem_write`) and the supervision-tree runtime (budgeted restart, circuit-breaker trip, audit records) in `aegis-kernel`.
 
 ## What Is Implemented
 
@@ -73,7 +73,7 @@ real syscall boundary.
 
 ```
 cargo test --workspace          # Run all model tests (113)
-cargo test -p aegis-kernel     # Run kernel tests (289)
+cargo test -p aegis-kernel     # Run kernel tests (304)
 cargo test -p uefi-boot        # Run ELF parser tests (13)
 cargo run -p capability-audit   # Reachable-authority audit
 cargo run -p capability-audit -- --graph  # Capability graph visualization

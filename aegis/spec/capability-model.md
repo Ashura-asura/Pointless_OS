@@ -274,6 +274,46 @@ rights, wrong object kind, and out-of-range slots all deny cleanly.
 - Not formally verified; follows seL4-lineage design but does not inherit
   seL4's proof.
 
+### Machine-checked verification (executable): aegis-kernel memory + supervision (Phase 2)
+
+`aegis-kernel/src/mem.rs` and `aegis-kernel/src/supervisor.rs` realize the
+frame-backed memory-region capability and the supervision-tree runtime for the
+bare-metal kernel:
+
+- `mem_create` allocates real physical frames (`frame::alloc_contiguous_global`),
+  identity-maps them, and installs a READ|WRITE|GRANT `MemRegion` capability
+  (`MEM_RIGHTS`, mirroring the model's `create_mem`); `mem_len`/`mem_read`/
+  `mem_write` are gated on the caller's READ/WRITE rights over the capability
+  and bounds-checked exactly like the model (`capability-core`'s `mem_read`
+  returns bytes copied; out-of-range offsets and wrong rights deny cleanly as
+  -1, never a panic — 9 contract tests in `mem.rs`).
+- The two accessor paths (`caps_region` → `task_cap`, `region()` from the
+  `static mut REGIONS`) go through raw pointers (`addr_of_mut!` + `ptr::read`/
+  `write`), never forming shared references to the `static mut` — that is UB
+  under Rust 2024's `static_mut_refs` rule, and this crate compiles warning-free.
+- `supervisor.rs` is the kernel-side close contract of §5: a supervisor adopts
+  tasks with a per-child restart budget; a crash (`handle_crash`) restarts the
+  task against its remembered entry point (respawn, via `tasks::restart_task`
+  rebuilding the interrupted frame) up to budget, then the breaker *trips* and
+  the child stays dead. Every crash, restart and trip is recorded (audit ring),
+  and escalation/retry policy remains the `supervision-tree` crate's job.
+- The live fault path (`cpu.rs` exception hook) calls `supervisor::handle_fault`
+  so a supervised, budgeted task restarts instead of dying; unsupervised tasks
+  keep the existing kill-and-continue behavior, and killed zombies can be
+  reaped and their slots reused by `spawn` (`reset_table_for_test` in `tasks.rs`).
+- Syscall numbers 10–16 (MemCreate/MemLen/MemRead/MemWrite, TaskState/TaskKill/
+  TaskRestart) are wired in `syscall.rs`; `TaskKill`/`TaskRestart` require the
+  CONTROL right, `TaskState` requires READ.
+
+`#[cfg(test)]` contract tests (304 in the aegis-kernel lib) pin the gates. Tests
+that pin the single global `CURRENT`/task/region tables run under a shared test
+mutex (`kernel_state_guard`) so they stay serialized and deterministic.
+
+Honest limits: region caps are authority records, not address-space isolation
+(no per-task page-table windows yet); revocation is slot clearing only; the
+audit ring is in-memory; restart re-enters the same entry point (no fresh user
+state); no supervision hierarchy (single kernel-resident supervisor).
+
 ### Machine-checked verification (executable): supervision (§5)
 
 `capability-core/tests/supervision.rs` (3 tests) checks the kernel side of the
@@ -666,8 +706,9 @@ workflow (`cargo test --workspace`) will enforce it.
 The Phase 0 formal model above governs the capability-crate workspace (`aegis/crates`).
 Phases 1-7 in `aegis-kernel` implement the real-hardware-facing substrate: boot, process
 isolation, drivers, networking, AI orchestration, and shell. Every claim below is
-machine-checked by `#[cfg(test)]` contract tests in the same crate (289 total as of
-Phase 1), run by `cargo test` from `aegis-kernel/`. Honest limits: tests run as
+machine-checked by `#[cfg(test)]` contract tests in the same crate (304 total as of
+Phase 2: +9 memory-region gates in `mem.rs`, +5 supervision-runtime tests in
+`supervisor.rs`), run by `cargo test` from `aegis-kernel/`. Honest limits: tests run as
 host-target unit tests proving the *model logic*; every hardware-touching operation
 (lgdt/lidt/cr3, PCIe config I/O, IOMMU tables, NVMe queues, VirtIO MMIO, VGA writes) is
 UNTESTED on real hardware.

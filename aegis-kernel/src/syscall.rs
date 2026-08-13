@@ -42,6 +42,24 @@ pub enum SyscallNum {
     /// IPC: grant a capability to another task (rax=9, rsi=dst_task,
     /// rcx=src_slot, rdx=dst_slot). Returns 0 or -1.
     CapGrant = 9,
+    /// Memory: create a region of `rsi` pages, installs a READ|WRITE|GRANT
+    /// capability, returns its slot (rax=10).
+    MemCreate = 10,
+    /// Memory: byte length of region `rsi` (rax=11). Requires READ.
+    MemLen = 11,
+    /// Memory: copy `rdx` bytes from region `rsi` at `rcx` into `r8` (rax=12).
+    /// Requires READ. Returns bytes copied or -1.
+    MemRead = 12,
+    /// Memory: copy `rdx` bytes from `r8` into region `rsi` at `rcx` (rax=13).
+    /// Requires WRITE. Returns 0 or -1.
+    MemWrite = 13,
+    /// Supervisor: state of task `rsi` (rax=14). Requires READ: 1 alive, 0
+    /// dead, -1 not a task cap.
+    TaskState = 14,
+    /// Supervisor: kill task `rsi` (rax=15). Requires CONTROL.
+    TaskKill = 15,
+    /// Supervisor: restart a killed task `rsi` (rax=16). Requires CONTROL.
+    TaskRestart = 16,
 }
 
 /// Maximum bytes a user `Write` may ask to print per call (defensive cap
@@ -89,6 +107,20 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
         8 => unsafe { crate::ipc::ipc_endpoint_create() },
         // IPC: CapGrant(dst_task, src_slot, dst_slot)
         9 => unsafe { crate::ipc::ipc_cap_grant(arg1, arg2, arg3) },
+        // Memory: MemCreate(frames)
+        10 => unsafe { crate::mem::mem_create(arg1) },
+        // Memory: MemLen(slot)
+        11 => unsafe { crate::mem::mem_len(arg1) },
+        // Memory: MemRead(slot, offset, len, dst_va)
+        12 => unsafe { crate::mem::mem_read(arg1, arg2, arg3, arg4) },
+        // Memory: MemWrite(slot, offset, len, src_va)
+        13 => unsafe { crate::mem::mem_write(arg1, arg2, arg3, arg4) },
+        // Supervisor: TaskState(task_slot)
+        14 => crate::supervisor::task_state(arg1),
+        // Supervisor: TaskKill(task_slot)
+        15 => crate::supervisor::task_kill(arg1),
+        // Supervisor: TaskRestart(task_slot)
+        16 => crate::supervisor::task_restart(arg1),
         _ => -1, // Unknown syscall
     }
 }

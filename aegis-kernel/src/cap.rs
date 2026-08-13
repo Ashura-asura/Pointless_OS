@@ -117,6 +117,11 @@ pub const fn new_cap_table() -> CapTable {
 /// `create_endpoint`.
 pub const ENDPOINT_RIGHTS: Rights = Rights::SEND.union(Rights::RECV).union(Rights::GRANT);
 
+/// The rights a fresh memory-region capability grants its holder (READ/WRITE
+/// to touch the frames, GRANT to delegate it onward). Mirrors the model
+/// crate's `create_mem`.
+pub const MEM_RIGHTS: Rights = Rights::READ.union(Rights::WRITE).union(Rights::GRANT);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +172,15 @@ mod tests {
         assert!(ENDPOINT_RIGHTS.contains(Rights::RECV));
         assert!(ENDPOINT_RIGHTS.contains(Rights::GRANT));
         assert!(!ENDPOINT_RIGHTS.contains(Rights::CONTROL));
+    }
+
+    #[test]
+    fn mem_rights_are_the_region_role() {
+        assert!(MEM_RIGHTS.contains(Rights::READ));
+        assert!(MEM_RIGHTS.contains(Rights::WRITE));
+        assert!(MEM_RIGHTS.contains(Rights::GRANT));
+        assert!(!MEM_RIGHTS.contains(Rights::SEND));
+        assert!(!MEM_RIGHTS.contains(Rights::CONTROL));
     }
 
     #[test]
