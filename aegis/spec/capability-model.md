@@ -367,6 +367,40 @@ claims against the same kernel:
 Honest limits: single-region blocks (no multi-block files), in-memory WAL, flat
 namespace, and durability ends at process exit — a block device is Phase 3/4.
 
+### Machine-checked verification (executable): aegis-kernel object store (Phase 4)
+
+`aegis-kernel/src/store.rs` (9 tests) realizes the same §8 + §10 [CLOSED]
+claims inside the bare-metal kernel crate, over real kernel region records and
+the real capability gates — not a mock kernel:
+
+- Blocks are content-addressed immutable SHA-256 regions: the same content
+  commits to the same block (dedup asserted as `block_count`), integrity is the
+  hash itself, and the 4 FIPS 180-4 vectors (empty, `abc`, 448-bit, 1M `a`)
+  pin the self-contained, allocation-free implementation.
+- Blocks are capability-addressed at the kernel boundary: knowing a hash or
+  object id grants nothing — `grant_read` installs a *narrowed READ-only*
+  `MemRegion` copy into the recipient's own CSpace, then reads flow through the
+  genuine `mem::mem_read` gate and writes are refused by `mem::mem_write` (I2,
+  executable). A fabricated slot with no region cap returns -1 via `mem::mem_len`.
+- Mutable data is a COW layer over the immutable blocks: every write creates
+  new regions, never mutating existing ones, so a node id you hold reads that
+  version forever (snapshot stability is mechanical).
+- The §10 [CLOSED] contract is stated as *types* and *behavior*: `commit`'s and
+  `write_version`'s function-pointer types carry no index; a full file workload
+  runs with no index registered; the relationship index ingests *only* the WAL,
+  catches up later, and rebuilds identically from the log — a cache, never a
+  participant.
+- The POSIX `FlatView` is a projection: file bytes are store blocks, the flat
+  namespace is a COW store object, every mutation is WAL material.
+
+Honest limits: block/node bytes live in a fixed 8 KiB in-kernel arena
+(`ARENA_BYTES`), not on the Phase-3 NVMe/FAT block-device path (that driver
+remains separate and read-only); the region table (`MAX_REGIONS=32`), block,
+node, and WAL counts are bounded; single-region blocks (no multi-block files);
+in-memory WAL — durability still ends at process exit; contract tests bind
+regions to in-test memory, so real frame-backed binding is proven only by the
+live boot.
+
 ### Machine-checked verification (executable): packages (§8)
 
 `packages` (6 contract tests in `install_contract.rs`) realizes the package

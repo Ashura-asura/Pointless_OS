@@ -4,7 +4,7 @@ An executable reference implementation of a capability-based operating system de
 
 ## Status
 
-430 tests passing, 0 failures (113 model, 304 aegis-kernel, 13 uefi-boot ELF parser). The reachable-authority auditor runs clean. The kernel boots under QEMU/OVMF: UEFI loader → page tables → bare-metal kernel (GDT/TSS/IDT, LAPIC timer, frame allocator) → **cooperative scheduler running two tasks (alpha/beta) that interleave every 512 timer ticks** — live-run verified, 0 exceptions. IPC (endpoints, call/serve/reply, capabilities) verified under both QEMU and VMware Workstation 26 with 0 exceptions. Per-task memory isolation and NX enforcement (only the kernel text window executable) verified under QEMU: the iso-test and nx-test tasks fault and are killed while the kernel keeps running. **Live PCI enumeration** at boot decodes all 6 q35 devices (host/display/network/ISA/SATA/SMBus incl. BARs) over the legacy config ports. The demo is **visible on the VM display**: a VGA text console mirrors the whole boot log white-on-black (verified via screendump decoding). Phase 2 adds frame-backed memory-region capabilities (READ/WRITE/GRANT-gated `mem_len`/`mem_read`/`mem_write`) and the supervision-tree runtime (budgeted restart, circuit-breaker trip, audit records) in `aegis-kernel`.
+439 tests passing, 0 failures (113 model, 313 aegis-kernel, 13 uefi-boot ELF parser). The reachable-authority auditor runs clean. The kernel boots under QEMU/OVMF: UEFI loader → page tables → bare-metal kernel (GDT/TSS/IDT, LAPIC timer, frame allocator) → **cooperative scheduler running two tasks (alpha/beta) that interleave every 512 timer ticks** — live-run verified, 0 exceptions. IPC (endpoints, call/serve/reply, capabilities) verified under both QEMU and VMware Workstation 26 with 0 exceptions. Per-task memory isolation and NX enforcement (only the kernel text window executable) verified under QEMU: the iso-test and nx-test tasks fault and are killed while the kernel keeps running. **Live PCI enumeration** at boot decodes all 6 q35 devices (host/display/network/ISA/SATA/SMBus incl. BARs) over the legacy config ports. The demo is **visible on the VM display**: a VGA text console mirrors the whole boot log white-on-black (verified via screendump decoding). Phase 2 adds frame-backed memory-region capabilities (READ/WRITE/GRANT-gated `mem_len`/`mem_read`/`mem_write`) and the supervision-tree runtime (budgeted restart, circuit-breaker trip, audit records) in `aegis-kernel`. Phase 4 adds the capability-addressed object store (SHA-256 content addressing, COW versions, WAL-consumer relationship index) and the POSIX `FlatView` projection in `aegis-kernel/src/store.rs`, with reads served through the real capability gates.
 
 ## What Is Implemented
 
@@ -41,6 +41,7 @@ Proves six authority invariants (I1-I6) via TLA+ model checking (331k states, 0 
 - **Preemptive scheduler**: iretq-based `switch_frame`, the timer stub preempts round-robin every tick — tasks never yield, yet alpha/beta interleave every 2048 ticks at stable stack addresses, 0 exceptions
 - **VGA text console**: 80x25 white-on-black mirror of the COM1 stream (Bochs VBE disable, CRTC/GC/AC programming, 8x16 font uploaded into plane 2, 16-color DAC palette) — verified via screendump: glyphs decode to the exact Aegis log lines, pixels are black `000000` + white `ffffff`; text mode only, no GPU accel (run QEMU with `-display gtk` to watch the demo)
 - **Live PCI enumeration**: legacy 0xCF8/0xCFC config-port scan at boot — VID/DID/class/subclass/prog-if/rev + all 6 BARs decoded per device; verified under QEMU q35 (6 devices: host bridge, stdvga, e1000e, ISA, AHCI SATA, SMBus), bus 0 only (no PCI-PCI bridge traversal yet)
+- **Object store (Phase 4)**: capability-addressed, content-hashed immutable blocks + COW versions + WAL-consumer relationship index + `FlatView` POSIX projection in `store.rs` — reads served through the real `mem` capability gates (READ-only grant, writes refused); 9 contract tests. Honest limits: fixed 8 KiB in-kernel byte arena (not wired to the NVMe/FAT device path), in-memory WAL, flat namespace, bounded region table
 
 ### Drivers, compat layers, orchestration (contract-tested model code)
 
@@ -73,7 +74,7 @@ real syscall boundary.
 
 ```
 cargo test --workspace          # Run all model tests (113)
-cargo test -p aegis-kernel     # Run kernel tests (304)
+cargo test -p aegis-kernel     # Run kernel tests (313)
 cargo test -p uefi-boot        # Run ELF parser tests (13)
 cargo run -p capability-audit   # Reachable-authority audit
 cargo run -p capability-audit -- --graph  # Capability graph visualization

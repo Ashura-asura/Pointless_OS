@@ -15,7 +15,7 @@
 use crate::cap::{Cap, CapSlot, Rights};
 use crate::tasks::{current_idx, set_task_cap, task_cap, MAX_CAPS};
 
-pub const MAX_REGIONS: usize = 16;
+pub const MAX_REGIONS: usize = 32;
 
 /// Model crate `create_mem` installs READ|WRITE|GRANT on a fresh region.
 pub use crate::cap::MEM_RIGHTS;
@@ -63,6 +63,42 @@ fn clear_region(id: usize) {
             len: 0,
         },
     );
+}
+
+/// Resolve a region id to its backing `(base, len)`. `None` when the slot is
+/// not active.
+pub(crate) fn region_base_len(id: u32) -> Option<(u64, usize)> {
+    region(id as usize)
+        .map(|r| (r.base, r.len))
+        .filter(|(_, l)| *l > 0)
+}
+
+/// Claim the first inactive region slot, binding it to the real byte range
+/// `[base, base + len)`. Used by the kernel-resident storage service to stage
+/// block/node bytes as real regions WITHOUT going through the frame allocator
+/// (the store owns a reserved kernel-memory arena, mirrors how the model crate
+/// backs blocks with kernel objects). Returns the region id or `None` when the
+/// region table is full.
+pub(crate) unsafe fn claim_region(base: u64, len: usize) -> Option<u32> {
+    let id = (0..MAX_REGIONS).find(|&i| region(i).map(|r| !r.active).unwrap_or(false))?;
+    set_region(
+        id,
+        MemRegion {
+            active: true,
+            base,
+            len,
+        },
+    );
+    Some(id as u32)
+}
+
+/// Test-only: clear every active region so contract tests start from a clean,
+/// deterministic region table (the store shares this table with `mem.rs`).
+#[cfg(test)]
+pub(crate) fn reset_regions_for_test() {
+    for i in 0..MAX_REGIONS {
+        clear_region(i);
+    }
 }
 
 /// Resolve a capability slot to a region id, requiring the caller to hold the
