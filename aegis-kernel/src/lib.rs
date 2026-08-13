@@ -39,6 +39,7 @@ pub mod agent;
 pub mod policy_engine;
 pub mod profiler;
 
+pub mod compositor;
 pub mod input;
 pub mod object_graph;
 pub mod shell;

@@ -554,6 +554,117 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         sprintln!("Aegis: NVMe: no controller with a mapped BAR");
     }
 
+    // Phase 9/10 (roadmap §10 item 3): the graphical shell compositor
+    // exercised live. A compositor turns the window manager's z-ordered
+    // window list plus per-window framebuffers into a single composited
+    // screen: higher windows occlude lower ones in overlap, and every
+    // surface is clipped to its region and the screen bounds. Honest
+    // substrate: the VM's real display is the VGA text-mode buffer, so a
+    // "pixel" is one text cell (char | attr<<8).
+    {
+        use aegis_kernel::compositor::{self, Cell};
+        use aegis_kernel::window::{Region, WindowManager};
+
+        const SW: usize = 40;
+        const SH: usize = 12;
+        let mut wm = WindowManager::new(SW as u16, SH as u16);
+
+        // Status bar across the bottom edge.
+        let status = wm
+            .create_window(
+                1,
+                b"status",
+                Region {
+                    x: 0,
+                    y: SH as i16 - 1,
+                    width: SW as u16,
+                    height: 1,
+                },
+            )
+            .unwrap();
+        // A "clock" app window.
+        let clock = wm
+            .create_window(
+                2,
+                b"clock",
+                Region {
+                    x: 2,
+                    y: 2,
+                    width: 20,
+                    height: 6,
+                },
+            )
+            .unwrap();
+        // A "menu" dialog overlapping the clock; focused, so it occludes it.
+        let menu = wm
+            .create_window(
+                3,
+                b"menu",
+                Region {
+                    x: 10,
+                    y: 4,
+                    width: 16,
+                    height: 4,
+                },
+            )
+            .unwrap();
+        wm.focus_window(menu).unwrap();
+
+        // Per-window framebuffers: cell = char | attr<<8 (0x0F = white on
+        // black). The menu's first cell carries its own glyph.
+        let mut fb_status = [0u16; SW];
+        for c in fb_status.iter_mut() {
+            *c = 0x0F00 | b'-' as u16;
+        }
+        let mut fb_clock = [0u16; 20 * 6];
+        for (i, c) in fb_clock.iter_mut().enumerate() {
+            *c = 0x0F00 | if i == 0 { b'C' } else { b'.' } as u16;
+        }
+        let mut fb_menu = [0u16; 16 * 4];
+        for (i, c) in fb_menu.iter_mut().enumerate() {
+            *c = 0x0F00 | if i == 0 { b'M' } else { b'#' } as u16;
+        }
+
+        let mut fbs: [Option<&[Cell]>; compositor::MAX_WINDOWS] = [None; compositor::MAX_WINDOWS];
+        fbs[(status as usize) - 1] = Some(&fb_status);
+        fbs[(clock as usize) - 1] = Some(&fb_clock);
+        fbs[(menu as usize) - 1] = Some(&fb_menu);
+
+        let mut screen = [compositor::TRANSPARENT; SW * SH];
+        compositor::composite(&wm, &fbs, &mut screen).unwrap();
+
+        // Occlusion checks: the focused menu (topmost z) covers the clock
+        // where they overlap; the clock is visible where the menu is not.
+        let in_menu = (screen[5 * SW + 12] & 0xFF) as u8;
+        let in_clock = (screen[3 * SW + 5] & 0xFF) as u8;
+        let status_ok = (screen[(SH - 1) * SW + 0] & 0xFF) as u8 == b'-';
+        let occluded_ok = in_menu == b'#' && in_clock == b'.';
+        sprintln!(
+            "Aegis: shell-compositor: menu({}) occludes clock({}) under overlap; status bar = {}; z-order compositing = {}",
+            in_menu as char,
+            in_clock as char,
+            status_ok,
+            occluded_ok
+        );
+
+        // Render three rows of the composited screen as characters so the
+        // result is visible in the serial log.
+        for sy in [4usize, 5, 6] {
+            let mut rowbuf = [0u8; SW];
+            for (sx, cell) in rowbuf.iter_mut().enumerate() {
+                *cell = (screen[sy * SW + sx] & 0xFF) as u8;
+            }
+            let rowstr = core::str::from_utf8(&rowbuf).unwrap_or("");
+            sprintln!("Aegis: shell-compositor: row{}: |{}|", sy, rowstr);
+        }
+        sprintln!(
+            "Aegis: shell-compositor: composited {}x{} screen from {} windows (VGA text substrate; compositor is ordinary userspace-style UI work, per roadmap §10 item 3)",
+            SW,
+            SH,
+            wm.compositor_order().iter().filter(|&&id| id != 0).count()
+        );
+    }
+
     unsafe {
         aegis_kernel::cpu::init_lapic_timer();
     }

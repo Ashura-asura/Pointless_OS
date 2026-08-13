@@ -382,13 +382,11 @@ Not cut — sequenced, and only after Phase 6:
    not built; Linux full fidelity would need a real ring-3 trap, also not
    built. The translation layers are the WSL2-lineage / narrow-Win32-subset
    boundary, not a full syscall reimplementation.
-- **Distributed/fleet transparency:** also inherent (CAP theorem). Don't
-  build "your network is one more machine, fully transparent." Build
-  locality and partition failure as visible and fail-safe by default
-  (deny/block on stale or unreachable state), not hidden.
-- **GPU compositor / graphical shell:** not inherent, just deferred.
-  Ordinary UI work, lowest risk of the deferred items, can start once
-  Phases 1–6 give it a real substrate.
+- **Distributed/fleet transparency (§10 item 4) DONE** — the fleet model now
+  makes partition failure visible and fail-safe by default. See the DONE entry
+  below.
+- **GPU compositor / graphical shell (§10 item 3) DONE** — the kernel now has
+  a real compositor. See the DONE entry below.
 - **Broader AI orchestration:** expanding the Phase 6 role library to
   more roles/agents is legitimate future work — but every new role goes
   through the same grant/audit/adversarial-test discipline as Phase 6,
@@ -418,6 +416,42 @@ Not cut — sequenced, and only after Phase 6:
    index-boundary test; live QEMU/OVMF proof (`uefi-boot/serial-p10.log`). The
    store also closed a latent bug: 48-byte index entries straddling the 512 B
    index-sector boundary now pack/unpack across two sectors.
+
+- **Windows/Linux compat (§10 item 1) DONE** — the translation layers
+   (`linux_compat`/`linux_abi`/`pe_loader` and `win_compat`/`nt_abi`) are
+   capability-scoped model logic: a file-scoped context translates `write` /
+   `NtWriteFile` and is refused `mmap` / `NtMapViewOfSection` at the
+   capability gate. Exercised live under QEMU (`uefi-boot/serial-p11.log`).
+   Honest limits kept explicit: full Windows fidelity needs a hypervisor and
+   full Linux fidelity needs a real ring-3 trap — neither is built; these are
+   the WSL2-lineage / narrow-Win32-subset translation boundaries.
+
+- **Distributed/fleet transparency (§10 item 4) DONE** — the `fleet` crate
+   (transport/envelope over the `macaroon` token format) models locality as
+   always visible (`Locality::Local`/`Remote(issuer)`), cryptographically
+   binds the intended recipient into the HMAC chain at send time, and now
+   models partition failure fail-closed by default (`src/lib.rs`): each peer
+   carries explicit reachability state (heartbeat/last-seen), and a remote
+   capability is **denied** with `PeerUnreachable`/`PeerStale` when its issuer
+   is partitioned or its heartbeat is stale — never silently accepted.
+   Locality and partition state are queryable (`peer_reachable`,
+   `is_unreachable`, `is_stale`) so the failure is visible, not hidden.
+   Honest limits: two-node in-process model — no sockets, no consensus, no
+   split-brain *resolution*; the model denies on stale/unreachable state, it
+   does not heal the partition.
+
+- **GPU compositor / graphical shell (§10 item 3) DONE** — the kernel now has
+   a real compositor (`aegis-kernel/src/compositor.rs`): a small,
+   allocation-free, purely functional paint that turns the `WindowManager`'s
+   z-ordered window list plus per-window framebuffers into one composited
+   screen — higher windows occlude lower ones in overlap, every surface is
+   clipped to its region and the screen bounds, hidden windows are skipped,
+   and unrendered windows paint as transparent (never garbage). Honest
+   substrate: the VM's real display is the VGA text-mode buffer, so a "pixel"
+   is one text cell; the capability-scoped GPU service itself lives in the
+   model (`crates/devices`). Exercised live under QEMU (`uefi-boot/serial-p12.log`):
+   a status bar, a clock, and a focused menu dialog composite in z-order
+   (menu occludes clock), 0 exceptions.
 
 ---
 

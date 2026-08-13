@@ -24,9 +24,8 @@ pub struct WindowManager {
     windows: [Option<Window>; 32],
     count: usize,
     next_id: WindowId,
-    #[allow(dead_code)] // Screen bounds for clipping in the real compositor
+    /// Screen bounds, used by the compositor for clipping.
     screen_width: u16,
-    #[allow(dead_code)] // Screen bounds for clipping in the real compositor
     screen_height: u16,
     dirty_regions: [Region; 32],
     dirty_count: usize,
@@ -208,6 +207,16 @@ impl WindowManager {
 
     pub fn dirty_regions(&self) -> [Region; 32] {
         self.dirty_regions
+    }
+
+    /// Screen bounds, used by the compositor for clipping.
+    pub fn bounds(&self) -> (u16, u16) {
+        (self.screen_width, self.screen_height)
+    }
+
+    /// Look up a live window by id.
+    pub fn window(&self, id: WindowId) -> Option<&Window> {
+        self.windows.iter().flatten().find(|w| w.id == id)
     }
 }
 

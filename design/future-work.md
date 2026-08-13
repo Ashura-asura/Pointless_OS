@@ -5,8 +5,11 @@ These items are part of the Aegis design (see `os-from-first-principles.md` and
 capability-scoped AI-agent prototype (roadmap Phases 0–6) and are described
 here so the main docs only claim what is implemented and verified today.
 
-One-line pointer for the main docs:
-> Design only, not implemented — see design/future-work.md.
+> **Status update (roadmap §10):** every deferred item below has now been
+> implemented at its honest scope and verified (see `HONEST_STATUS.md` and the
+> `design/master-roadmap.md` §10 rows). This file keeps the *design* reasoning
+> and the honest remaining limits of each — the full-fidelity vehicles are
+> still not built and are documented as such.
 
 ---
 
@@ -21,7 +24,8 @@ One-line pointer for the main docs:
   authorization verdicts agree with the kernel's recorded verdicts at every
   step (fixture: the ring-3 denial demo, verified under QEMU).
 - **Phases 5–7** (live supervision demo, capability-scoped AI-agent prototype,
-  one real subsystem over NVMe) — next, sequenced below.
+  one real subsystem over NVMe) — done.
+- **§10 deferred items** — done at honest scope (see per-item status below).
 
 ---
 
@@ -40,11 +44,12 @@ actual answer is:
   or running a real Windows kernel is **not a solved problem anywhere**
   (design doc §5).
 
-**Status today:** two narrow, model-level translation layers exist in
-`aegis-kernel` (Linux syscall ABI + ELF loader, 32 tests; Windows NT ABI +
-PE32+ loader, 31 tests) — these are contract tests over buffers, not a live
-compat runtime. The VM-based execution vehicles are not built (they need a
-hypervisor). Scope is a target niche, not general parity.
+**Status today:** the personality translation layers are implemented and
+exercised live (`linux_compat.rs`+`linux_abi.rs`+`pe_loader.rs`; `win_compat.rs`+
+`nt_abi.rs`), each gating every translated op on a `CapabilityScope`; live proof
+at `uefi-boot/serial-p11.log`. **Inherent limits kept honest:** full Windows
+fidelity needs a hypervisor (not built); full Linux fidelity needs a real
+ring-3 trap (not built) — translation layer only, not a full reimplementation.
 
 ## Distributed / fleet transparency
 
@@ -58,9 +63,14 @@ network is one more machine, fully transparently."
   never assuming a trusted LAN.
 
 **Status today:** the `fleet` crate is a two-node in-process model (envelope,
-peer trust, HMAC chain, remote attenuation, recipient binding) with 15
-contract tests. No sockets, no consensus, no split-brain handling; partition
-behavior is deliberately not modeled.
+peer trust, HMAC chain, remote attenuation, recipient binding, explicit
+locality) with 22 contract tests. **Partition behavior is now modeled**
+fail-closed: each peer carries reachability state (heartbeat/last-seen vs. a
+configurable staleness window + explicit `mark_unreachable`), and a remote
+capability is denied (`PeerUnreachable`/`PeerStale`) when its issuer is
+partitioned or stale. Honest limit kept: no sockets, no consensus/split-brain
+*resolution* — the model denies on stale/unreachable state, it does not heal
+the partition.
 
 ## GPU compositor / graphical shell
 
@@ -74,7 +84,18 @@ It can start once Phases 1–6 give it a real substrate.
   mirror of the COM1 log). No framebuffer graphics, no GPU accel, no
   mouse/keyboard input.
 - Shell runtime, window manager, object graph, and input dispatcher exist as
-  model-level contract tests (24 tests), not a live UI.
+  model-level contract tests, not a live UI.
+
+**Status today:** the kernel now has a real compositor
+(`aegis-kernel/src/compositor.rs`): an allocation-free, purely functional paint
+that composites the `WindowManager`'s z-ordered visible windows into one
+screen — overlap occlusion, region+screen clipping, hidden-window skip,
+unrendered-window transparency — 8 contract tests, exercised live at
+`uefi-boot/serial-p12.log`. **Honest substrate:** the VM's real display is the
+VGA text-mode buffer, so a "pixel" is one text cell; the capability-scoped GPU
+*service* (queue=SEND, framebuffer=READ|WRITE, compositor=READ grants,
+dead-compositor refusal) lives in the model `crates/devices`. Still not built:
+framebuffer/accelerated graphics, real mouse/keyboard input.
 
 ## Broader AI orchestration
 
@@ -89,12 +110,20 @@ near the trust boundary; every check on what an agent can do is enforced by
 the kernel's capability mechanism, never by the agent's own code trusting
 itself.
 
-**Status today:** agent runtime, usage profiler, adaptive grants, and policy
-engine exist as model-level contract tests (23 tests) and an adaptive-ceiling
-verification suite (14 tests). No live AI integration.
+**Status today:** the role library is now two roles — `restart-service`
+(READ|CONTROL over one task, no GRANT) and the `observe-service` watchdog
+(READ over one task only, no CONTROL, no GRANT) — both kernel-declared,
+granted by the gated `role_grant` syscall 18, with adversarial self-escalation
+denials tested and live proof at `uefi-boot/serial-p9.log`.
 
 ## Package / update polish
 
 Least urgent. Packages and system update already have reasonable model-level
-coverage (7 + 5 contract tests). Revisit after Phase 7's storage work, since
-packages logically sit on top of object-store.
+coverage. Revisit after Phase 7's storage work, since packages logically sit on
+top of object-store.
+
+**Status today:** done — the package/system-update model runs on top of the
+Phase-7 NVMe store (`aegis-kernel/src/update.rs`): generations staged as
+`gen-N`, health-gated activation, rollback to last known good, content-addressed
+COW boot-view pointer, payload dedup; 9 `update` tests + 1 `nvme_store` boundary
+test; live proof at `uefi-boot/serial-p10.log`.

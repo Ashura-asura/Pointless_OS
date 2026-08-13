@@ -15,10 +15,15 @@
 //! recipient is cryptographically bound into the HMAC chain at send time, so
 //! a holder cannot relay a token to a third party), and expiry.
 //!
+//! Partition behavior is modeled as the design doc's "transparency lies under
+//! partition" warning demands: a peer carries explicit reachability state
+//! (heartbeat/last-seen), and a remote capability is **denied by default when
+//! its issuer is unreachable or stale** — fail-closed, never silently allowed.
+//! Locality and partition state are visible to the holder, not hidden.
+//!
 //! Honest limits: this is a two-node in-process model of a fleet (no sockets,
-//! no real network, no consensus/split-brain handling — the design doc's
-//! "transparency lies under partition" warning applies, and partition
-//! behavior is deliberately NOT modeled here). `macaroon::bind_caveat`
+//! no real network, no consensus/split-brain resolution — the model denies on
+//! stale/unreachable state, it does not heal the partition). `macaroon::bind_caveat`
 //! requires the signing key, so attenuation in this model is done by a node
 //! that holds the issuer key; real macaroons allow keyless attenuation, which
 //! is a documented difference, not a security claim.
@@ -71,6 +76,13 @@ pub enum FleetError {
     Serialization,
     BadEnvelope,
     NotRecipient,
+    /// The issuing peer is currently partitioned (explicitly marked
+    /// unreachable), so its capabilities are denied by default.
+    PeerUnreachable,
+    /// The issuing peer's last heartbeat is older than the staleness window,
+    /// so its capabilities are denied by default (stale state).
+    PeerStale,
+    UnknownPeer,
 }
 
 impl From<TokenError> for FleetError {
@@ -124,22 +136,36 @@ pub struct Fleet {
     signing_key: [u8; 32],
     peers: [Option<(NodeId, [u8; 32])>; MAX_PEERS],
     peer_count: usize,
+    /// Last time each peer was observed reachable (heartbeat), parallel to
+    /// `peers`. `None` means never seen. Partitions are modeled as heartbeat
+    /// gaps: a peer whose last-seen is older than the staleness window is
+    /// stale, and one explicitly marked unreachable is partitioned.
+    peer_last_seen: [Option<u64>; MAX_PEERS],
     now: u64,
+    /// Staleness window (clock ticks) after which a peer's state is stale.
+    stale_after: u64,
+    /// Peers explicitly marked unreachable (simulated partition).
+    peer_unreachable: [bool; MAX_PEERS],
 }
 
 impl Fleet {
     pub fn new(node_id: NodeId, signing_key: [u8; 32]) -> Self {
         const NONE: Option<(NodeId, [u8; 32])> = None;
+        const NO_SEEN: Option<u64> = None;
         Self {
             node_id,
             signing_key,
             peers: [NONE; MAX_PEERS],
             peer_count: 0,
+            peer_last_seen: [NO_SEEN; MAX_PEERS],
             now: 0,
+            stale_after: 100,
+            peer_unreachable: [false; MAX_PEERS],
         }
     }
 
     /// Register a peer we will verify tokens from. Symmetric secret per peer.
+    /// The peer is initially reachable (last-seen = now).
     pub fn register_peer(&mut self, id: NodeId, key: [u8; 32]) -> Result<(), FleetError> {
         if self
             .peers
@@ -152,9 +178,10 @@ impl Fleet {
         if self.peer_count >= MAX_PEERS {
             return Err(FleetError::RegistryFull);
         }
-        for slot in self.peers.iter_mut() {
+        for (slot, seen) in self.peers.iter_mut().zip(self.peer_last_seen.iter_mut()) {
             if slot.is_none() {
                 *slot = Some((id, key));
+                *seen = Some(self.now);
                 self.peer_count += 1;
                 return Ok(());
             }
@@ -176,6 +203,81 @@ impl Fleet {
     /// Advance the local clock (used for expiry verification).
     pub fn advance_time(&mut self, now: u64) {
         self.now = now;
+    }
+
+    /// Configure the staleness window (clock ticks). A peer whose last-seen
+    /// heartbeat is older than this is treated as stale, and remote
+    /// capabilities from it are denied by default.
+    pub fn set_stale_after(&mut self, ticks: u64) {
+        self.stale_after = ticks;
+    }
+
+    pub fn stale_after(&self) -> u64 {
+        self.stale_after
+    }
+
+    /// Index of a trusted peer, or None.
+    fn peer_index(&self, id: NodeId) -> Option<usize> {
+        self.peers
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|(pid, _)| *pid == id))
+    }
+
+    /// Record a heartbeat from `peer` at the current time. This makes the peer
+    /// reachable again and refreshes its last-seen timestamp.
+    pub fn heartbeat(&mut self, peer: NodeId) -> Result<(), FleetError> {
+        let idx = self.peer_index(peer).ok_or(FleetError::UnknownPeer)?;
+        self.peer_last_seen[idx] = Some(self.now);
+        self.peer_unreachable[idx] = false;
+        Ok(())
+    }
+
+    /// Explicitly mark `peer` as unreachable — simulate a partition. Remote
+    /// capabilities from it are denied by default until a heartbeat clears it.
+    pub fn mark_unreachable(&mut self, peer: NodeId) -> Result<(), FleetError> {
+        let idx = self.peer_index(peer).ok_or(FleetError::UnknownPeer)?;
+        self.peer_unreachable[idx] = true;
+        Ok(())
+    }
+
+    /// Is `peer` currently partitioned (explicitly unreachable)?
+    pub fn is_unreachable(&self, peer: NodeId) -> bool {
+        self.peer_index(peer)
+            .is_some_and(|idx| self.peer_unreachable[idx])
+    }
+
+    /// Is `peer`'s state stale (no heartbeat within the staleness window)?
+    pub fn is_stale(&self, peer: NodeId) -> bool {
+        match self.peer_index(peer) {
+            Some(idx) => {
+                self.peer_last_seen[idx].is_none_or(|seen| self.now - seen > self.stale_after)
+            }
+            None => false,
+        }
+    }
+
+    /// Is `peer` reachable and fresh right now (not partitioned, not stale)?
+    pub fn peer_reachable(&self, peer: NodeId) -> bool {
+        match self.peer_index(peer) {
+            Some(idx) => {
+                !self.peer_unreachable[idx]
+                    && self.peer_last_seen[idx]
+                        .is_some_and(|seen| self.now - seen <= self.stale_after)
+            }
+            None => false,
+        }
+    }
+
+    /// Fail-closed partition gate for a remote capability: deny by default
+    /// when the issuing peer is partitioned or its state is stale.
+    fn require_peer_reachable(&self, issuer: NodeId) -> Result<(), FleetError> {
+        if self.is_unreachable(issuer) {
+            return Err(FleetError::PeerUnreachable);
+        }
+        if self.is_stale(issuer) {
+            return Err(FleetError::PeerStale);
+        }
+        Ok(())
     }
 
     /// Mint a local capability token signed by this node.
@@ -251,6 +353,14 @@ impl Fleet {
             if self.now > exp {
                 return Err(FleetError::Expired);
             }
+        }
+        // Fail-closed partition gate: a remote capability is only valid while
+        // its issuer is reachable and its state fresh. Under partition (peer
+        // marked unreachable) or staleness (heartbeat gap), the capability is
+        // DENIED by default — never silently accepted. Locally-issued
+        // capabilities are unaffected (the issuer is this node).
+        if let Locality::Remote(issuer) = cap.locality {
+            self.require_peer_reachable(issuer)?;
         }
         Ok(())
     }
@@ -609,5 +719,108 @@ mod tests {
             locality: Locality::Remote(id_a),
         };
         assert_eq!(fleet_b.verify(&cap), Err(FleetError::UntrustedPeer));
+    }
+
+    // ---- Partition fail-safe (§10 item 4: locality + partition failure
+    // visible and fail-safe by default; deny on stale/unreachable state) ----
+
+    fn set_up_ab() -> (Fleet, Fleet, NodeId, NodeId) {
+        let (id_a, key_a) = node_a();
+        let (id_b, key_b) = node_b();
+        let mut fleet_a = Fleet::new(id_a, key_a);
+        let mut fleet_b = Fleet::new(id_b, key_b);
+        fleet_a.register_peer(id_b, key_b).unwrap();
+        fleet_b.register_peer(id_a, key_a).unwrap();
+        (fleet_a, fleet_b, id_a, id_b)
+    }
+
+    #[test]
+    fn remote_capability_denied_while_issuer_partitioned() {
+        let (fleet_a, mut fleet_b, id_a, id_b) = set_up_ab();
+        let chain = fleet_a.issue(7, ObjectKind::Task, Rights::READ, None);
+        let cap = fleet_a.send_to(chain, id_b).unwrap();
+        assert_eq!(fleet_b.verify(&cap), Ok(()));
+        // Partition: B marks A unreachable. The capability is denied by
+        // default — never silently accepted.
+        fleet_b.mark_unreachable(id_a).unwrap();
+        assert_eq!(fleet_b.verify(&cap), Err(FleetError::PeerUnreachable));
+        // A heartbeat clears the partition; the same capability verifies again.
+        fleet_b.heartbeat(id_a).unwrap();
+        assert_eq!(fleet_b.verify(&cap), Ok(()));
+    }
+
+    #[test]
+    fn remote_capability_denied_when_issuer_state_stale() {
+        let (fleet_a, mut fleet_b, id_a, id_b) = set_up_ab();
+        let chain = fleet_a.issue(7, ObjectKind::Task, Rights::READ, None);
+        let cap = fleet_a.send_to(chain, id_b).unwrap();
+        // Default staleness window is 100 ticks; no heartbeat since t=0.
+        fleet_b.advance_time(101);
+        assert_eq!(fleet_b.verify(&cap), Err(FleetError::PeerStale));
+        // Heartbeat refreshes last-seen at the new time; verify succeeds again.
+        fleet_b.heartbeat(id_a).unwrap();
+        assert_eq!(fleet_b.verify(&cap), Ok(()));
+        // And again goes stale once the window passes.
+        fleet_b.advance_time(101 + 101);
+        assert_eq!(fleet_b.verify(&cap), Err(FleetError::PeerStale));
+    }
+
+    #[test]
+    fn local_capability_unaffected_by_partition_of_peers() {
+        let (mut fleet_a, _fleet_b, _id_a, id_b) = set_up_ab();
+        let chain = fleet_a.issue(42, ObjectKind::MemRegion, Rights::READ, None);
+        let cap = fleet_a.hold_local(chain);
+        // Even with B partitioned (from A's own view of B) and stale, A's own
+        // local capability still verifies: locality is Local.
+        fleet_a.mark_unreachable(id_b).unwrap();
+        fleet_a.advance_time(500);
+        assert_eq!(fleet_a.verify(&cap), Ok(()));
+    }
+
+    #[test]
+    fn send_to_a_partitioned_peer_is_refused_by_the_recipient() {
+        let (fleet_a, mut fleet_b, id_a, id_b) = set_up_ab();
+        let chain = fleet_a.issue(7, ObjectKind::Task, Rights::READ, None);
+        let cap = fleet_a.send_to(chain, id_b).unwrap();
+        // B partitions A, then B tries to use the capability it already holds.
+        fleet_b.mark_unreachable(id_a).unwrap();
+        assert_eq!(fleet_b.verify(&cap), Err(FleetError::PeerUnreachable));
+    }
+
+    #[test]
+    fn partition_state_is_visible_not_hidden() {
+        let (mut fleet_a, _fleet_b, _id_a, id_b) = set_up_ab();
+        // A sees B reachable by default (registered with a heartbeat at t=0).
+        assert!(fleet_a.peer_reachable(id_b));
+        assert!(!fleet_a.is_unreachable(id_b));
+        assert!(!fleet_a.is_stale(id_b));
+        // Partition becomes visible: A marks B unreachable.
+        fleet_a.mark_unreachable(id_b).unwrap();
+        assert!(!fleet_a.peer_reachable(id_b));
+        assert!(fleet_a.is_unreachable(id_b));
+        // Staleness is separately visible after the window passes.
+        fleet_a.heartbeat(id_b).unwrap();
+        fleet_a.advance_time(1000);
+        assert!(fleet_a.is_stale(id_b));
+        assert!(!fleet_a.peer_reachable(id_b));
+    }
+
+    #[test]
+    fn stale_after_window_is_configurable() {
+        let (mut fleet_a, _fleet_b, _id_a, id_b) = set_up_ab();
+        fleet_a.set_stale_after(5);
+        assert_eq!(fleet_a.stale_after(), 5);
+        // No heartbeat: at t=6 the peer is stale under the short window.
+        fleet_a.advance_time(6);
+        assert!(fleet_a.is_stale(id_b));
+        assert!(!fleet_a.peer_reachable(id_b));
+    }
+
+    #[test]
+    fn unknown_peer_operations_fail_closed() {
+        let (mut fleet_a, _fleet_b, _id_a, _id_b) = set_up_ab();
+        let (id_c, _) = node_c();
+        assert_eq!(fleet_a.heartbeat(id_c), Err(FleetError::UnknownPeer));
+        assert_eq!(fleet_a.mark_unreachable(id_c), Err(FleetError::UnknownPeer));
     }
 }

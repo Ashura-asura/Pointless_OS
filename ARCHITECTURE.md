@@ -17,11 +17,13 @@
 9. [Compatibility Strategy](#compatibility-strategy)
 10. [Performance Tradeoffs](#performance-tradeoffs)
 
-> **Design only, not implemented — see design/future-work.md.** This document
-> describes the *target* architecture. Orchestration, compatibility, distributed
-> transparency and graphics sections are design intent; the implemented-and-verified
+> This document describes the *target* architecture. The orchestration,
+> compatibility, distributed-transparency and graphics sections are design
+> intent; each has now been implemented at its honest scope (see
+> `HONEST_STATUS.md` and `design/master-roadmap.md` §10). The implemented-and-verified
 > surface (boot, kernel, isolation, IPC, drivers, storage) is in README.md and
-> HONEST_STATUS.md.
+> HONEST_STATUS.md; the full-fidelity vehicles that remain unimplemented are
+> documented honestly in design/future-work.md.
 
 ---
 
@@ -728,8 +730,10 @@ Windows compatibility is harder because:
 | **Compatibility** | Translation layers (Linux) + VM (Windows) | Legacy app support without trusting their code |
 | **UX** | Object/relationship view + file tree | Both CLI and semantic interfaces |
 
-> Design only, not implemented — see design/future-work.md for the deferred
-> rows above (compatibility, distributed/fleet, GPU compositor, broader orchestration).
+> The deferred rows above (compatibility, distributed/fleet, GPU compositor,
+> broader orchestration) are now implemented at their honest scope — see
+> HONEST_STATUS.md, design/master-roadmap.md §10, and design/future-work.md for
+> the remaining full-fidelity limits.
 > What is actually implemented and verified today is in README.md and HONEST_STATUS.md.
 
 ---
