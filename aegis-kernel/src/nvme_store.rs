@@ -472,7 +472,7 @@ mod tests {
         let id = s.put(&mut disk, b"short").unwrap();
         assert!(s.verify(&mut disk, &id));
 
-// Corrupt the index: claim the block is 500 bytes of the padded sector.
+        // Corrupt the index: claim the block is 500 bytes of the padded sector.
         // Slot 0 sits at the very start of the first index sector.
         let mut sec = [0u8; SECTOR];
         disk.read_sector(STORE_START_LBA + 1, &mut sec);

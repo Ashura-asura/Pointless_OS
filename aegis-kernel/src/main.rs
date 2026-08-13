@@ -464,6 +464,92 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 sprintln!("Aegis: NVMe-store: corrupt or unreadable store region");
             }
         }
+
+        // Phase 8/9 (roadmap §10 item 1: Windows/Linux compat) exercised live.
+        // Each personality layer translates its ABI syscalls into capability-
+        // scoped Aegis operations and gates each on the context's scope — the
+        // same AI/agent ceiling that applies to native code. Fully-faithful
+        // execution would need a real ring-3 trap (Linux) or a hypervisor
+        // (Windows); both are out of this bare-metal substrate, so this is the
+        // WSL2-lineage / narrow-Win32-subset translation boundary, proven here
+        // end-to-end with capability gating.
+        {
+            use aegis_kernel::agent::CapabilityScope;
+            use aegis_kernel::linux_abi::{
+                AegisOperation as LOp, SyscallArgs, SYS_MMAP, SYS_WRITE,
+            };
+            use aegis_kernel::linux_compat::{LinuxCompatLayer, Personality as LP};
+            use aegis_kernel::nt_abi::{
+                AegisOperation as WOp, NtArgs, NT_MAP_VIEW_OF_SECTION, NT_WRITE_FILE,
+            };
+            use aegis_kernel::win_compat::{Personality as WP, WindowsCompatLayer};
+
+            // Linux-compat: a file-scoped context translates write, is refused mmap.
+            let mut lin = LinuxCompatLayer::new();
+            let lin_id = lin
+                .register(LP::LinuxCompat, CapabilityScope::restrictive())
+                .unwrap();
+            let w = lin
+                .dispatch(
+                    lin_id,
+                    SYS_WRITE,
+                    SyscallArgs {
+                        arg1: 1,
+                        arg3: 64,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let m = lin.dispatch(
+                lin_id,
+                SYS_MMAP,
+                SyscallArgs {
+                    arg2: 0x1000,
+                    arg3: 3,
+                    ..Default::default()
+                },
+            );
+            sprintln!(
+                "Aegis: compat-linux: translate write -> {}; mmap denied (file-only scope) = {}; denials = {}",
+                matches!(w, LOp::Write { fd: 1, count: 64 }),
+                m.is_err(),
+                lin.denials(lin_id).unwrap_or(0)
+            );
+
+            // Windows-compat: same gating, different ABI.
+            let mut win = WindowsCompatLayer::new();
+            let win_id = win
+                .register(WP::WindowsCompat, CapabilityScope::restrictive())
+                .unwrap();
+            let wf = win
+                .dispatch(
+                    win_id,
+                    NT_WRITE_FILE,
+                    NtArgs {
+                        arg1: 1,
+                        arg3: 64,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let mv = win.dispatch(
+                win_id,
+                NT_MAP_VIEW_OF_SECTION,
+                NtArgs {
+                    arg3: 0x1000,
+                    ..Default::default()
+                },
+            );
+            sprintln!(
+                "Aegis: compat-windows: translate NtWriteFile -> {}; NtMapView denied (file-only scope) = {}; denials = {}",
+                matches!(wf, WOp::WriteFile { handle: 1, count: 64 }),
+                mv.is_err(),
+                win.denials(win_id).unwrap_or(0)
+            );
+            sprintln!(
+                "Aegis: compat: both translation layers exercised live with capability gating (no real ring-3 trap / hypervisor in this substrate — inherent limit, per roadmap §10)"
+            );
+        }
     } else {
         sprintln!("Aegis: NVMe: no controller with a mapped BAR");
     }

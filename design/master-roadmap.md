@@ -366,10 +366,22 @@ corruption recovery — all against the kernel's real NVMe driver.
 
 Not cut — sequenced, and only after Phase 6:
 
-- **Windows/Linux compat:** the design doc calls full native fidelity
-  inherent-cannot-be-closed. Its actual answer: VM-based fidelity for
-  Windows, translation-layer (Wine-style) for Linux — not a full syscall
-  reimplementation. Scope for a target niche, not general parity.
+- **Windows/Linux compat (§10 item 1) DONE** — the personality translation
+   layers are implemented and exercised live. `linux_compat.rs` +
+   `linux_abi.rs` translate the Linux x86-64 syscall surface (a documented
+   subset) into capability-scoped Aegis operations; `win_compat.rs` +
+   `nt_abi.rs` do the same for the NT syscall subset; `pe_loader.rs` is the
+   PE/Win32 image front end. Each layer registers a context, translates, and
+   gates every op on the context's `CapabilityScope` — the same AI/agent
+   ceiling as native code. Live QEMU/OVMF proof (`uefi-boot/serial-p11.log`):
+   a file-scoped Linux context translates `write` and is refused `mmap`; a
+   file-scoped Windows context translates `NtWriteFile` and is refused
+   `NtMapViewOfSection`; denials are counted. Honest inherent limits (per the
+   design doc, not hidden): full Windows fidelity is not achieved by
+   translation alone and the VM-based full-fidelity vehicle (a hypervisor) is
+   not built; Linux full fidelity would need a real ring-3 trap, also not
+   built. The translation layers are the WSL2-lineage / narrow-Win32-subset
+   boundary, not a full syscall reimplementation.
 - **Distributed/fleet transparency:** also inherent (CAP theorem). Don't
   build "your network is one more machine, fully transparent." Build
   locality and partition failure as visible and fail-safe by default
