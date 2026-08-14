@@ -1580,6 +1580,7 @@ mod tests {
     #[test]
     fn cwnd_grows_on_acks() {
         let _g = crate::kernel_state_guard();
+        clear_tx();
         let mut net = setup();
         let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080).unwrap();
         assert!(net.tcp_connect(id));
