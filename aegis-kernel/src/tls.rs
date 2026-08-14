@@ -1329,6 +1329,172 @@ mod tests {
     }
 
     #[test]
+    fn rfc8448_application_traffic_secrets() {
+        // RFC 8448 §3, after the server Finished: both application traffic
+        // secrets derive over the SAME transcript hash (through the server
+        // Finished — 96 08 10 2a .. — NOT the client Finished). The published
+        // values are the ground truth for the s_ap derivation bug this module
+        // shipped with (the old code derived s_ap over a transcript that
+        // already contained the client Finished).
+        let master = [
+            0x18, 0xdf, 0x06, 0x84, 0x3d, 0x13, 0xa0, 0x8b, 0xf2, 0xa4, 0x49, 0x84, 0x4c, 0x5f,
+            0x8a, 0x47, 0x80, 0x01, 0xbc, 0x4d, 0x4c, 0x62, 0x79, 0x84, 0xd5, 0xa4, 0x1d, 0xa8,
+            0xd0, 0x40, 0x29, 0x19,
+        ];
+        // RFC 8448 §3 "hash (32 octets)" for both c/s ap traffic: the
+        // Transcript-Hash through the server Finished.
+        let th: [u8; 32] = [
+            0x96, 0x08, 0x10, 0x2a, 0x0f, 0x1c, 0xcc, 0x6d, 0xb6, 0x25, 0x0b, 0x7b, 0x7e, 0x41,
+            0x7b, 0x1a, 0x00, 0x0e, 0xaa, 0xda, 0x3d, 0xaa, 0xe4, 0x77, 0x7a, 0x76, 0x86, 0xc9,
+            0xff, 0x83, 0xdf, 0x13,
+        ];
+        // hkdf_expand_label(master, label, Transcript-Hash, 32) for each label.
+        let c = hkdf_expand_label(&master, b"c ap traffic", &th, 32);
+        assert_eq!(
+            &c[..32],
+            &[
+                0x9e, 0x40, 0x64, 0x6c, 0xe7, 0x9a, 0x7f, 0x9d, 0xc0, 0x5a, 0xf8, 0x88, 0x9b, 0xce,
+                0x65, 0x52, 0x87, 0x5a, 0xfa, 0x0b, 0x06, 0xdf, 0x00, 0x87, 0xf7, 0x92, 0xeb, 0xb7,
+                0xc1, 0x75, 0x04, 0xa5,
+            ]
+        );
+        let s = hkdf_expand_label(&master, b"s ap traffic", &th, 32);
+        assert_eq!(
+            &s[..32],
+            &[
+                0xa1, 0x1a, 0xf9, 0xf0, 0x55, 0x31, 0xf8, 0x56, 0xad, 0x47, 0x11, 0x6b, 0x45, 0xa9,
+                0x50, 0x32, 0x82, 0x04, 0xb4, 0xf4, 0x4b, 0xfb, 0x6b, 0x3a, 0x4b, 0x4f, 0x1f, 0x3f,
+                0xcb, 0x63, 0x16, 0x43,
+            ]
+        );
+        // And the traffic keys/IVs derived from those secrets (RFC 8448 §3
+        // "derive write/read traffic keys for application data").
+        let ck = traffic_key_from_secret(&c[..32].try_into().unwrap());
+        assert_eq!(
+            ck.key,
+            [
+                0x17, 0x42, 0x2d, 0xda, 0x59, 0x6e, 0xd5, 0xd9, 0xac, 0xd8, 0x90, 0xe3, 0xc6, 0x3f,
+                0x50, 0x51,
+            ]
+        );
+        assert_eq!(
+            ck.iv,
+            [0x5b, 0x78, 0x92, 0x3d, 0xee, 0x08, 0x57, 0x90, 0x33, 0xe5, 0x23, 0xd9]
+        );
+        let sk = traffic_key_from_secret(&s[..32].try_into().unwrap());
+        assert_eq!(
+            sk.key,
+            [
+                0x9f, 0x02, 0x28, 0x3b, 0x6c, 0x9c, 0x07, 0xef, 0xc2, 0x6b, 0xb9, 0xf2, 0xac, 0x92,
+                0xe3, 0x56,
+            ]
+        );
+        assert_eq!(
+            sk.iv,
+            [0xcf, 0x78, 0x2b, 0x88, 0xdd, 0x83, 0x54, 0x9a, 0xad, 0xf1, 0xe9, 0x84]
+        );
+    }
+
+    #[test]
+    fn rfc8448_full_transcript_app_secrets() {
+        // The authoritative end-to-end check: build the FULL RFC 8448 §3
+        // handshake transcript (ClientHello + ServerHello + the whole 657-byte
+        // encrypted server flight = EncryptedExtensions + Certificate +
+        // CertificateVerify + Finished) out of the RFC's published bytes, and
+        // drive the kernel's actual `derive_application_traffic_secrets` over
+        // it. RFC 8448 §3 publishes the resulting c_ap and s_ap application
+        // traffic secrets, so this validates the master-secret derivation,
+        // the "c/s ap traffic" labels, AND — critically for the bug this
+        // module shipped with — that BOTH secrets derive over the transcript
+        // through the server Finished, NOT over one that contains the client
+        // Finished. The vectors were extracted programmatically from the RFC
+        // text (rfc-editor.org/rfc/rfc8448) into rfc8448_vec.rs, not
+        // hand-transcribed.
+        use crate::rfc8448_vec::*;
+        let mut trans = Transcript::new();
+        assert!(trans.push_message(&RFC8448_CH));
+        assert!(trans.push_message(&RFC8448_SH));
+        // Sanity: CH..SH hash matches the RFC's published c_hs-traffic hash.
+        assert_eq!(sha256(trans.as_bytes()), RFC8448_CHSH_HASH);
+        // Sanity: full transcript through the server Finished matches the
+        // RFC's published app-traffic transcript hash (byte-level, so we
+        // don't pollute the client transcript with the flight).
+        let mut full = Vec::new();
+        full.extend_from_slice(trans.as_bytes());
+        full.extend_from_slice(&RFC8448_FLIGHT);
+        assert_eq!(sha256(&full), RFC8448_APP_HASH);
+
+        // The shared secret used to build the handshake schedule. The RFC
+        // publishes the server's ephemeral public key; the client derives the
+        // ECDHE shared secret from it with its own private key.
+        let client_priv = [
+            0x49, 0xaf, 0x42, 0xba, 0x7f, 0x79, 0x94, 0x85, 0x2d, 0x71, 0x3e, 0xf2, 0x78, 0x4b,
+            0xcb, 0xca, 0xa7, 0x91, 0x1d, 0xe2, 0x6a, 0xdc, 0x56, 0x42, 0xcb, 0x63, 0x45, 0x40,
+            0xe7, 0xea, 0x50, 0x05,
+        ];
+        let server_pub = [
+            0xc9, 0x82, 0x88, 0x76, 0x11, 0x20, 0x95, 0xfe, 0x66, 0x76, 0x2b, 0xdb, 0xf7, 0xc6,
+            0x72, 0xe1, 0x56, 0xd6, 0xcc, 0x25, 0x3b, 0x83, 0x3d, 0xf1, 0xdd, 0x69, 0xb1, 0xb0,
+            0x4e, 0x75, 0x1f, 0x0f,
+        ];
+        let shared = x25519(&client_priv, &server_pub).expect("x25519");
+        // RFC 8448 §3 handshake-secret IKM (published; guards the X25519 path).
+        assert_eq!(
+            shared,
+            [
+                0x8b, 0xd4, 0x05, 0x4f, 0xb5, 0x5b, 0x9d, 0x63, 0xfd, 0xfb, 0xac, 0xf9, 0xf0, 0x4b,
+                0x9f, 0x0d, 0x35, 0xe6, 0xd6, 0x3f, 0x53, 0x75, 0x63, 0xef, 0xd4, 0x62, 0x72, 0x90,
+                0x0f, 0x89, 0x49, 0x2d,
+            ]
+        );
+
+        // Full client state machine over the RFC transcript: handshake
+        // secrets, then app secrets derived over the pre-Finished transcript.
+        let mut client = Tls13Client::new(shared, trans);
+        assert!(client.on_server_handshake_payload(&RFC8448_FLIGHT));
+        assert!(client.server_finished_verified);
+        let mut fin = [0u8; 64];
+        let n = client
+            .build_client_finished(&mut fin)
+            .expect("client Finished");
+        assert_eq!(n, 36);
+
+        // The app secrets must match RFC 8448's published values byte-for-byte.
+        let c_ap = client.c_ap.expect("c_ap");
+        let s_ap = client.s_ap.expect("s_ap");
+        assert_eq!(
+            c_ap.key,
+            [
+                0x17, 0x42, 0x2d, 0xda, 0x59, 0x6e, 0xd5, 0xd9, 0xac, 0xd8, 0x90, 0xe3, 0xc6, 0x3f,
+                0x50, 0x51,
+            ]
+        );
+        assert_eq!(
+            s_ap.key,
+            [
+                0x9f, 0x02, 0x28, 0x3b, 0x6c, 0x9c, 0x07, 0xef, 0xc2, 0x6b, 0xb9, 0xf2, 0xac, 0x92,
+                0xe3, 0x56,
+            ]
+        );
+        // And the regression guard: if s_ap had been derived over a transcript
+        // that includes the client Finished (the old bug), its key would not
+        // match the RFC value. Re-derive the master + s_ap over
+        // transcript+Finished and confirm it differs.
+        let master = client.master_secret();
+        let wrong_s = derive_secret(&master, b"s ap traffic", client.transcript.as_bytes());
+        let right_s = derive_secret(
+            &master,
+            b"s ap traffic",
+            &client.transcript.as_bytes()[..client.transcript.len() - 36],
+        );
+        assert_ne!(
+            wrong_s, right_s,
+            "s_ap over Finished-inclusive transcript must differ"
+        );
+        assert_eq!(right_s, s_ap.secret);
+    }
+
+    #[test]
     fn client_hello_structure() {
         let keyshare = x25519_base(&EPHEMERAL_SCALAR);
         let mut out = [0u8; 600];
