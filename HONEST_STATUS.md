@@ -71,7 +71,14 @@ This is the **single consolidated Known Limits section** (`README.md` and
   become set-1), and feeds a bounded ring buffer drained by a dedicated kernel
   task; Tab cycles focus and arrows move the focused window, all asserted live
   via the serial lines `Aegis: shell-compositor@key: Tab focus -> window id=3
-  overlap_cell='.'` and `arrow move -> window id=3 region=(x,y)`. Proven scope:
+  overlap_cell='.'` and `arrow move -> window id=3 region=(x,y)`. **Screen
+  match (the prompt's "serial assertion first, screen match second" second
+  half) is now also proven**: QEMU `screendump` PPMs (committed as
+  `uefi-boot/scr0..5.ppm`) show each Tab/arrow keypress changes the VGA text
+  display in the menu-window region, and after an `up` keypress the frame is
+  byte-identical to the after-Tab frame (window returned to its origin —
+  scr5 == scr1 by SHA-256), proving the window visibly moves and is not just
+  a serial-side effect. Proven scope:
   the driver's scancode coverage is set-1 subset (letters/digits/punct,
   modifiers, arrows, Tab, Enter, Esc, Space, Backspace), translation verified
   live under QEMU (VMware's synthetic-input capture was refused, so QEMU's
