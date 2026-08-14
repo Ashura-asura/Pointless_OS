@@ -508,4 +508,46 @@ mod tests {
             "CONTROL-gated restart makes the child runnable again"
         );
     }
+
+    /// Phase B hierarchical-supervision contract: a child supervisor that
+    /// trips (budget spent, child left dead) can be ADOPTED by a parent
+    /// supervisor that starts with a FRESH budget — the parent restarts the
+    /// dead subsystem and keeps supervising it until the parent's own budget
+    /// is spent. Mirrors the model's escalate/adopt-fresh-budget semantics.
+    #[test]
+    fn parent_adopts_subsystem_with_fresh_budget_after_child_trip() {
+        let _g = crate::kernel_state_guard();
+        unsafe {
+            reset_table_for_test();
+            spawn("sub", dummy, 0x100000).unwrap();
+        }
+        // The child supervises with budget 1: one restart, then trip (the
+        // child is left dead).
+        let mut child = fresh();
+        assert!(child.supervise(0, 1));
+        assert_eq!(child.handle_crash(0), Some(true));
+        assert_eq!(child.budget_of(0), Some(0));
+        assert_eq!(child.handle_crash(0), Some(false));
+        assert!(!is_task_alive(0), "tripped child must stay dead");
+        // The parent adopts the dead subsystem with a FRESH budget.
+        let mut parent = fresh();
+        assert!(parent.supervise(0, 2));
+        assert_eq!(
+            parent.handle_crash(0),
+            Some(true),
+            "fresh budget restarts the adopted child"
+        );
+        assert_eq!(parent.budget_of(0), Some(1));
+        assert!(is_task_alive(0), "adopted child is runnable again");
+        assert_eq!(parent.handle_crash(0), Some(true));
+        assert_eq!(parent.budget_of(0), Some(0));
+        assert_eq!(
+            parent.handle_crash(0),
+            Some(false),
+            "parent trips only when ITS budget is spent"
+        );
+        assert!(!is_task_alive(0));
+        let _ = spawned_count();
+        let _ = task_cap(0, 0);
+    }
 }

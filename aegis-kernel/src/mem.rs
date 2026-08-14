@@ -489,4 +489,54 @@ mod tests {
         assert_eq!(task_cap(3, 0).cap, Cap::None);
         let _ = new_cap_table;
     }
+
+    #[test]
+    fn grant_use_revoke_deny_cycle_across_tasks() {
+        // Phase B contract for the ring-3 memory-page manager: a grantor that
+        // holds a MemRegion with GRANT hands a copy to a grantee; the grantee
+        // can use it; the grantor revokes; every later gated op is DENIED
+        // (-1) at the gate — never a panic, never a silent success.
+        let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        reset_regions_for_test();
+        unsafe {
+            crate::tasks::spawn("grantor", crate::tasks::tests_dummy, 0x100000).unwrap();
+            crate::tasks::spawn("grantee", crate::tasks::tests_dummy, 0x200000).unwrap();
+        }
+        let (grantor, grantee) = (0usize, 1usize);
+        let mut backing = [0u8; 4096];
+        // The grantor anchors the page (its slot 0, READ|WRITE|GRANT).
+        seed_region(grantor, 0, 100, backing.as_mut_ptr() as u64, 16, MEM_RIGHTS);
+        // Grant a copy to the grantee at their slot 0.
+        set_current_for_test(grantor);
+        assert_eq!(
+            unsafe { crate::ipc::ipc_cap_grant(grantee as u64, 0, 0) },
+            0
+        );
+        // The grantee can use the granted page.
+        set_current_for_test(grantee);
+        assert_eq!(unsafe { mem_len(0) }, 16);
+        let src = [0xABu8; 4];
+        assert_eq!(unsafe { mem_write(0, 0, 4, src.as_ptr() as u64) }, 0);
+        let mut out = [0u8; 4];
+        assert_eq!(unsafe { mem_read(0, 0, 4, out.as_mut_ptr() as u64) }, 4);
+        assert_eq!(out, [0xAB; 4]);
+        // Revoke: the grantee's copy is cleared — the page returns to the pool.
+        set_current_for_test(grantor);
+        assert_eq!(
+            unsafe { crate::ipc::ipc_cap_revoke(grantee as u64, 0, 0) },
+            0
+        );
+        // Every further op is refused at the capability gate.
+        set_current_for_test(grantee);
+        assert_eq!(unsafe { mem_len(0) }, -1);
+        assert_eq!(unsafe { mem_read(0, 0, 4, out.as_mut_ptr() as u64) }, -1);
+        assert_eq!(unsafe { mem_write(0, 0, 4, src.as_ptr() as u64) }, -1);
+        // A second revoke is refused: nothing left to take.
+        set_current_for_test(grantor);
+        assert_eq!(
+            unsafe { crate::ipc::ipc_cap_revoke(grantee as u64, 0, 0) },
+            -1
+        );
+    }
 }

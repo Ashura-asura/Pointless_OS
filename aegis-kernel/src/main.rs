@@ -13,6 +13,26 @@ fn hex_bytes(id: &[u8; 32], out: &mut [u8; 4]) {
     let _ = out;
 }
 
+// Demo task indices, pinned to the boot spawn order (below). The `input`
+// task occupies index 2, so every ring-3 demo task sits one slot higher than
+// the pre-shell layout; these constants are the single source of truth so a
+// future task can never silently shift a hardcoded index again.
+const IDX_ALPHA: u64 = 0;
+const IDX_BETA: u64 = 1;
+const IDX_INPUT: u64 = 2;
+const IDX_SERVER: u64 = 3;
+const IDX_CLIENT: u64 = 4;
+const IDX_SUPERVISOR: u64 = 5;
+const IDX_ISO_TEST: u64 = 6;
+const IDX_NX_TEST: u64 = 7;
+const IDX_DENIED: u64 = 8;
+const IDX_AGENT: u64 = 9;
+const IDX_SERVICE: u64 = 10;
+const IDX_OBSERVER: u64 = 11;
+const IDX_MEM_RM: u64 = 12;
+const IDX_MEM_CLIENT: u64 = 13;
+const IDX_PARENT_SUP: u64 = 14;
+
 #[no_mangle]
 pub extern "sysv64" fn _start(handoff_addr: u64) -> ! {
     // Enter on a freshly-established kernel stack: jump (never return) so
@@ -713,25 +733,26 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 },
             );
             // Slot 1: Task cap on the supervised child (the isolation test at
-            // task index 5), CONTROL to restart/kill it, READ to query state.
+            // task index IDX_ISO_TEST), CONTROL to restart/kill it, READ to query
+            // state.
             aegis_kernel::tasks::set_task_cap(
                 sup,
                 1,
                 aegis_kernel::cap::CapSlot {
-                    cap: aegis_kernel::cap::Cap::Task(5),
+                    cap: aegis_kernel::cap::Cap::Task(IDX_ISO_TEST as u32),
                     rights: aegis_kernel::cap::Rights::CONTROL
                         .union(aegis_kernel::cap::Rights::READ),
                 },
             );
-            // Slot 2 (Phase 6): Task cap on the service (task index 9) with the
-            // role's exact rights, READ|CONTROL. The supervisor, standing in for
-            // a human reviewer of the grant, uses this to grant the
-            // `restart-service` role to the zero-capability agent at startup.
+            // Slot 2 (Phase 6): Task cap on the service (task index IDX_SERVICE)
+            // with the role's exact rights, READ|CONTROL. The supervisor,
+            // standing in for a human reviewer of the grant, uses this to grant
+            // the `restart-service` role to the zero-capability agent at startup.
             aegis_kernel::tasks::set_task_cap(
                 sup,
                 2,
                 aegis_kernel::cap::CapSlot {
-                    cap: aegis_kernel::cap::Cap::Task(9),
+                    cap: aegis_kernel::cap::Cap::Task(IDX_SERVICE as u32),
                     rights: aegis_kernel::cap::Rights::CONTROL
                         .union(aegis_kernel::cap::Rights::READ),
                 },
@@ -767,9 +788,11 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             );
             // Hold the isolation test until the IPC demo (server/client
             // echo) has finished, so the two demos don't race for slices.
-            // This task (index 5) is the supervisor's supervised child: it
-            // crashes, the supervisor restarts it twice, then escalates.
-            aegis_kernel::tasks::arm_isolation_test(5, 15);
+            // This task (index IDX_ISO_TEST) is the supervisor's supervised
+            // child: it crashes, the supervisor restarts it twice, then
+            // escalates to its parent (IDX_PARENT_SUP), which adopts the
+            // subsystem with a fresh budget.
+            aegis_kernel::tasks::arm_isolation_test(IDX_ISO_TEST as usize, 15);
         }
         _ => {
             sprintln!("Aegis: WARNING could not allocate isolation test stack");
@@ -798,7 +821,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             );
             // After the isolation test faults (tick 15), let the NX test run
             // and fault too (tick 22).
-            aegis_kernel::tasks::arm_nx_test(6, 22);
+            aegis_kernel::tasks::arm_nx_test(IDX_NX_TEST as usize, 22);
         }
         _ => {
             sprintln!("Aegis: WARNING could not allocate NX test stack");
@@ -834,19 +857,19 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     }
 
     // Phase 6 capability-scoped agent prototype: a zero-capability agent (task
-    // 8) and a crashable service (task 9). The agent starts with an empty
-    // CSpace — least authority from birth — and receives exactly the
-    // `restart-service` role (READ|CONTROL over task 9, no GRANT) via the
-    // kernel-gated RoleGrant syscall 18, performed by the supervisor as the
+    // IDX_AGENT) and a crashable service (task IDX_SERVICE). The agent starts
+    // with an empty CSpace — least authority from birth — and receives exactly
+    // the `restart-service` role (READ|CONTROL over the service, no GRANT) via
+    // the kernel-gated RoleGrant syscall 18, performed by the supervisor as the
     // scripted stand-in for a human reviewer. Its one real task: restart the
     // service when it crashes. Every escalation attempt is refused by the
     // kernel's capability gates, never by the agent's own code.
     //
-    // §10 "broader AI orchestration": a second ring-3 agent (task 10) receives
-    // the `observe-service` role (READ over task 9 only) through the SAME
-    // grant flow. It is a watchdog: it can see the service crash, and it can
-    // never restart it — observation never becomes control, and the gate
-    // enforces that even for a fully compromised observer.
+    // §10 "broader AI orchestration": a second ring-3 agent (task
+    // IDX_OBSERVER) receives the `observe-service` role (READ over the service
+    // only) through the SAME grant flow. It is a watchdog: it can see the
+    // service crash, and it can never restart it — observation never becomes
+    // control, and the gate enforces that even for a fully compromised observer.
     let stack_agent = unsafe {
         aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
     };
@@ -883,17 +906,109 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 "Aegis: Phase-6 agent+service+observer spawned ({} tasks total)",
                 aegis_kernel::tasks::spawned_count()
             );
-            // The agent is task index 8, the service task index 9, the
-            // observer task index 10.
-            aegis_kernel::tasks::arm_service_test(9, 28);
+            // The agent is task index IDX_AGENT, the service task index
+            // IDX_SERVICE, the observer task index IDX_OBSERVER.
+            aegis_kernel::tasks::arm_service_test(IDX_SERVICE as usize, 28);
             // After the whole role-grant flow settles (service crash at tick 28,
             // agent restart + denials, observer denials), the kernel prints its
-            // audit trail for BOTH role flows — the restart agent (8) and the
-            // observe watchdog (10) — in one kernel-side print.
-            aegis_kernel::tasks::arm_audit_dump(8, 10, 70);
+            // audit trail for BOTH role flows — the restart agent (IDX_AGENT)
+            // and the observe watchdog (IDX_OBSERVER) — in one kernel-side print.
+            aegis_kernel::tasks::arm_audit_dump(IDX_AGENT as usize, IDX_OBSERVER as usize, 70);
         }
         _ => {
             sprintln!("Aegis: WARNING could not allocate Phase-6 task stacks");
+        }
+    }
+
+    // Phase B: userspace resource managers + hierarchical supervision. Three
+    // new ring-3 tasks join the running system:
+    //   mem-rm   (IDX_MEM_RM, 12): a userspace memory-PAGE manager. It mints
+    //            two regions (its pool), holds their anchors, and hands them
+    //            out / recycles them purely through capability-gated IPC —
+    //            "alloc" grants a copy, "free" revokes it, so a client's page
+    //            returns to the manager the moment the client returns it.
+    //   mem-client (IDX_MEM_CLIENT, 13): exercises the manager end-to-end.
+    //   parent-sup (IDX_PARENT_SUP, 14): the supervisor ABOVE the existing
+    //            ring-3 supervisor. It holds a NOTIFY_EP RECV cap (slot 0)
+    //            and a Task cap on the iso-test subsystem (CONTROL|READ,
+    //            slot 1), kernel-installed here. When the child supervisor's
+    //            restart budget is spent it calls back up; the parent ADOPTS
+    //            the subsystem with a fresh budget and keeps supervising it.
+    {
+        let stack_memrm = unsafe {
+            aegis_kernel::frame::alloc_contiguous_global(
+                aegis_kernel::tasks::TASK_STACK_SIZE / 4096,
+            )
+        };
+        let cpl0_memrm = unsafe {
+            aegis_kernel::frame::alloc_contiguous_global(
+                aegis_kernel::tasks::TASK_STACK_SIZE / 4096,
+            )
+        };
+        let stack_memcli = unsafe {
+            aegis_kernel::frame::alloc_contiguous_global(
+                aegis_kernel::tasks::TASK_STACK_SIZE / 4096,
+            )
+        };
+        let cpl0_memcli = unsafe {
+            aegis_kernel::frame::alloc_contiguous_global(
+                aegis_kernel::tasks::TASK_STACK_SIZE / 4096,
+            )
+        };
+        let stack_parent = unsafe {
+            aegis_kernel::frame::alloc_contiguous_global(
+                aegis_kernel::tasks::TASK_STACK_SIZE / 4096,
+            )
+        };
+        let cpl0_parent = unsafe {
+            aegis_kernel::frame::alloc_contiguous_global(
+                aegis_kernel::tasks::TASK_STACK_SIZE / 4096,
+            )
+        };
+        match (
+            stack_memrm,
+            cpl0_memrm,
+            stack_memcli,
+            cpl0_memcli,
+            stack_parent,
+            cpl0_parent,
+        ) {
+            (Some(sm), Some(cm), Some(sc), Some(cc), Some(sp), Some(cp)) => {
+                unsafe {
+                    aegis_kernel::tasks::spawn_user("mem-rm", task_mem_rm, sm, cm);
+                    aegis_kernel::tasks::spawn_user("mem-client", task_mem_client, sc, cc);
+                    aegis_kernel::tasks::spawn_user("parent-sup", task_parent_supervisor, sp, cp);
+                    // parent-sup boots with its supervisor-side caps
+                    // kernel-installed: NOTIFY_EP receive (slot 0) and a Task
+                    // cap on the iso-test subsystem it will adopt (slot 1).
+                    aegis_kernel::tasks::set_task_cap(
+                        IDX_PARENT_SUP as usize,
+                        0,
+                        aegis_kernel::cap::CapSlot {
+                            cap: aegis_kernel::cap::Cap::Endpoint(
+                                aegis_kernel::ipc::NOTIFY_EP as u32,
+                            ),
+                            rights: aegis_kernel::cap::Rights::RECV,
+                        },
+                    );
+                    aegis_kernel::tasks::set_task_cap(
+                        IDX_PARENT_SUP as usize,
+                        1,
+                        aegis_kernel::cap::CapSlot {
+                            cap: aegis_kernel::cap::Cap::Task(IDX_ISO_TEST as u32),
+                            rights: aegis_kernel::cap::Rights::CONTROL
+                                .union(aegis_kernel::cap::Rights::READ),
+                        },
+                    );
+                }
+                sprintln!(
+                    "Aegis: Phase-B mem-rm+mem-client+parent-sup spawned ({} tasks total)",
+                    aegis_kernel::tasks::spawned_count()
+                );
+            }
+            _ => {
+                sprintln!("Aegis: WARNING could not allocate Phase-B task stacks");
+            }
         }
     }
 
@@ -1060,8 +1175,9 @@ extern "sysv64" fn task_server() -> ! {
     let ep_slot = ep_slot as u64;
     user_print(b"Aegis: [server] endpoint created\r\n");
 
-    // Grant the endpoint capability to the client (task index 3, slot 0).
-    let client_idx: u64 = 3;
+    // Grant the endpoint capability to the client (task index IDX_CLIENT,
+    // slot 0).
+    let client_idx: u64 = IDX_CLIENT;
     user_syscall5(9, client_idx, ep_slot, 0, 0);
     user_print(b"Aegis: [server] endpoint granted to client\r\n");
 
@@ -1137,20 +1253,24 @@ fn print_dec(v: u64) {
 /// Ring-3 supervisor (Phase 5 supervision tree): the live policy, entirely
 /// outside the kernel and the trusted compute base. It observes TaskKill
 /// notifications on the reserved endpoint (slot 0, RECV), and for its one
-/// adopted child (task 5 via the CONTROL cap at slot 1) applies a bounded
-/// restart policy: respawn after each crash while budget remains, then a
-/// distinct ESCALATION message once the budget is spent (the child is left
-/// dead — never retried forever). The kernel only provides the notification
-/// and the capability-gated `task_restart`; the decision logic is ring 3.
+/// adopted child (task IDX_ISO_TEST via the CONTROL cap at slot 1) applies a
+/// bounded restart policy: respawn after each crash while budget remains,
+/// then a distinct ESCALATION message once the budget is spent — the child
+/// is left dead (never retried forever). Phase B: the escalation is now a
+/// real surrender — the supervisor hands the subsystem to its ring-3 parent
+/// (IDX_PARENT_SUP) via IPC, and the parent adopts it with a fresh budget.
+/// The kernel only provides the notification and the capability-gated
+/// `task_restart`; the decision logic is ring 3.
 extern "sysv64" fn task_supervisor() -> ! {
     user_print(b"Aegis: [supervisor] online; observing kill notifications\r\n");
     // Phase 6: as the scripted stand-in for a human reviewer, grant the
-    // `restart-service` role to the zero-capability agent (task 8) over the
-    // service task (task 9), installing the role's exact cap set — READ|CONTROL
-    // and no GRANT — at the agent's slot 0. The kernel gate (syscall 18)
-    // checks that we hold the role's rights over the service before any agent
-    // capability exists; the grant is an explicit, audited step.
-    let rg = user_syscall5(18, 0, 8, 9, 0); // RoleGrant(restart-service, agent, service, slot 0)
+    // `restart-service` role to the zero-capability agent (task IDX_AGENT)
+    // over the service task (IDX_SERVICE), installing the role's exact cap set
+    // — READ|CONTROL and no GRANT — at the agent's slot 0. The kernel gate
+    // (syscall 18) checks that we hold the role's rights over the service
+    // before any agent capability exists; the grant is an explicit, audited
+    // step.
+    let rg = user_syscall5(18, 0, IDX_AGENT, IDX_SERVICE, 0); // RoleGrant(restart-service, agent, service, slot 0)
     user_print(b"Aegis: [supervisor] role grant restart-service -> agent over service: ");
     user_print(if rg == u64::MAX {
         b"DENIED\r\n"
@@ -1158,9 +1278,9 @@ extern "sysv64" fn task_supervisor() -> ! {
         b"OK\r\n"
     });
     // §10 "broader AI orchestration": grant the `observe-service` role (READ
-    // only, no CONTROL, no GRANT) to the watchdog observer (task 10) over the
-    // same service, through the same audited gate.
-    let og = user_syscall5(18, 1, 10, 9, 0); // RoleGrant(observe-service, observer, service, slot 0)
+    // only, no CONTROL, no GRANT) to the watchdog observer (task
+    // IDX_OBSERVER) over the same service, through the same audited gate.
+    let og = user_syscall5(18, 1, IDX_OBSERVER, IDX_SERVICE, 0); // RoleGrant(observe-service, observer, service, slot 0)
     user_print(b"Aegis: [supervisor] role grant observe-service -> observer over service: ");
     user_print(if og == u64::MAX {
         b"DENIED\r\n"
@@ -1169,7 +1289,7 @@ extern "sysv64" fn task_supervisor() -> ! {
     });
     let notify_slot: u64 = 0;
     let child_slot: u64 = 1;
-    let child_idx: u64 = 5;
+    let child_idx: u64 = IDX_ISO_TEST;
     let budget_limit: u64 = 2;
     let mut budget = budget_limit;
     let mut recvbuf = [0u8; 64];
@@ -1198,11 +1318,41 @@ extern "sysv64" fn task_supervisor() -> ! {
                 b" -> OK\r\n"
             });
         } else {
+            // Phase B hierarchical supervision: our restart budget is spent.
+            // Leave the child dead and SURRENDER the subsystem upward. The
+            // parent supervisor (task IDX_PARENT_SUP) granted us an escalation
+            // endpoint at slot 3 at its startup; call it to adopt the
+            // subsystem, then stop serving the notification channel so the
+            // parent becomes its sole observer under a fresh budget.
             user_print(
                 b"Aegis: [supervisor] ESCALATION: child restart budget exhausted, \
 leaving child dead\r\n",
             );
-            user_print(b"Aegis: [supervisor] escalated; kernel and peers continue\r\n");
+            user_print(b"Aegis: [supervisor] escalating to parent supervisor\r\n");
+            let msg = b"adopt";
+            let mut reply = [0u8; 32];
+            let mut tried = 0u64;
+            loop {
+                // Wait for the parent's grant to land (poll, like the client).
+                // Until then ipc_call on the empty slot returns -1.
+                let rlen = user_syscall5(
+                    5,
+                    3,
+                    msg.as_ptr() as u64,
+                    msg.len() as u64,
+                    reply.as_mut_ptr() as u64,
+                );
+                if rlen != u64::MAX {
+                    break;
+                }
+                tried += 1;
+                if tried > 1_000_000 {
+                    user_print(b"Aegis: [supervisor] parent escalation endpoint never arrived\r\n");
+                    break;
+                }
+                user_syscall5(3, 0, 0, 0, 0); // yield so the parent can run
+            }
+            user_print(b"Aegis: [supervisor] subsystem surrendered to parent; peers continue\r\n");
             loop {
                 core::hint::spin_loop();
             }
@@ -1365,7 +1515,7 @@ extern "sysv64" fn task_agent() -> ! {
     // 1) Grant itself an additional capability: ipc_cap_grant needs GRANT on
     //    the source slot; the role has none.
     user_print(b"Aegis: [agent] attempting to grant itself an extra capability\r\n");
-    let g = user_syscall5(9, 8, 0, 1, 0); // ipc_cap_grant(self, src slot 0, dst slot 1)
+    let g = user_syscall5(9, IDX_AGENT, 0, 1, 0); // ipc_cap_grant(self, src slot 0, dst slot 1)
     user_print(b"Aegis: [agent] ipc_cap_grant -> ");
     user_print(if g == u64::MAX {
         b"DENIED (-1)\r\n"
@@ -1375,7 +1525,7 @@ extern "sysv64" fn task_agent() -> ! {
     // 2) Re-grant itself the role over a foreign task: the grantor must hold a
     //    Task cap with the role's rights over that task; the agent holds none.
     user_print(b"Aegis: [agent] attempting to self-grant the role over a foreign task\r\n");
-    let gr = user_syscall5(18, 0, 8, 3, 2); // RoleGrant(restart-service, self, client=3, slot 2)
+    let gr = user_syscall5(18, 0, IDX_AGENT, IDX_CLIENT, 2); // RoleGrant(restart-service, self, client, slot 2)
     user_print(b"Aegis: [agent] role_grant(foreign) -> ");
     user_print(if gr == u64::MAX {
         b"DENIED (-1)\r\n"
@@ -1457,7 +1607,7 @@ extern "sysv64" fn task_observer() -> ! {
     //    service: the grantor gate needs a Task cap with READ|CONTROL over the
     //    target; the observer holds only READ.
     user_print(b"Aegis: [observer] attempting to upgrade to restart-service\r\n");
-    let up = user_syscall5(18, 0, 10, 9, 1); // RoleGrant(restart-service, self, service, slot 1)
+    let up = user_syscall5(18, 0, IDX_OBSERVER, IDX_SERVICE, 1); // RoleGrant(restart-service, self, service, slot 1)
     user_print(b"Aegis: [observer] role_grant(upgrade) -> ");
     user_print(if up == u64::MAX {
         b"DENIED (-1)\r\n"
@@ -1477,6 +1627,262 @@ extern "sysv64" fn task_observer() -> ! {
     user_print(b"Aegis: [observer] watch-only role held; observation never became control\r\n");
     loop {
         core::hint::spin_loop();
+    }
+}
+
+/// Phase B, resource manager 1: a userspace memory-PAGE manager (ring 3). It
+/// mints two memory regions (its pool), KEEPS the anchors in its own table,
+/// and hands pages out / recycles them purely through capability-gated IPC.
+/// "alloc" grants a copy of an anchored page to the caller (at the caller's
+/// slot 2); "free" revokes that copy, so the page returns to the pool and the
+/// client's slot is empty again — every later use is denied at the kernel's
+/// capability gate. The manager, not the kernel, decides when a page is lent.
+extern "sysv64" fn task_mem_rm() -> ! {
+    user_print(b"Aegis: [mem-rm] online; minting the page pool\r\n");
+    // Mint two pages: each installs a READ|WRITE|GRANT cap in OUR table
+    // (slots 0, 1) — the manager's pool. Both regions are backed by real
+    // frames from the kernel allocator.
+    let p0 = user_syscall5(10, 1, 0, 0, 0); // MemCreate(1 frame)
+    let p1 = user_syscall5(10, 1, 0, 0, 0);
+    if (p0 as i64) < 0 || (p1 as i64) < 0 {
+        user_print(b"Aegis: [mem-rm] pool mint failed\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    user_print(b"Aegis: [mem-rm] pool pages minted\r\n");
+    // Create the request endpoint (slot 2) and grant a cap to the mem-client.
+    let ep = user_syscall5(8, 0, 0, 0, 0);
+    if (ep as i64) < 0 {
+        user_print(b"Aegis: [mem-rm] endpoint create failed\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    let ep = ep as u64;
+    user_syscall5(9, IDX_MEM_CLIENT, ep, 0, 0);
+    user_print(b"Aegis: [mem-rm] endpoint granted to mem-client\r\n");
+    let mut lent = [false; 2];
+    let mut recvbuf = [0u8; 16];
+    loop {
+        let packed = user_syscall5(6, ep, recvbuf.as_mut_ptr() as u64, 0, 0);
+        let caller = packed >> 32;
+        let rlen = packed & 0xFFFF_FFFF;
+        if rlen < 2 {
+            continue;
+        }
+        let op = recvbuf[0];
+        let page = (recvbuf[1] as usize) % 2;
+        let page_slot = page as u64;
+        if op == b'a' {
+            // Alloc: grant a copy of the anchored page to the caller at their
+            // slot 2. The minted cap carries GRANT, which is what makes this
+            // legal for a plain userspace task.
+            if lent[page] {
+                user_syscall5(7, ep, caller, b"BUSY".as_ptr() as u64, 4);
+                continue;
+            }
+            let r = user_syscall5(9, caller, page_slot, 2, 0); // CapGrant(caller, our slot, their slot 2)
+            if r == u64::MAX {
+                user_syscall5(7, ep, caller, b"DENIED".as_ptr() as u64, 6);
+            } else {
+                lent[page] = true;
+                user_syscall5(7, ep, caller, b"OK".as_ptr() as u64, 2);
+            }
+        } else if op == b'f' {
+            // Free: revoke the granted copy — the page returns to the pool and
+            // the caller's slot 2 is empty again.
+            if !lent[page] {
+                user_syscall5(7, ep, caller, b"IDLE".as_ptr() as u64, 4);
+                continue;
+            }
+            let r = user_syscall5(17, caller, 2, page_slot, 0); // CapRevoke(caller, their slot 2, our slot)
+            if r == u64::MAX {
+                user_syscall5(7, ep, caller, b"DENIED".as_ptr() as u64, 6);
+            } else {
+                lent[page] = false;
+                user_syscall5(7, ep, caller, b"OK".as_ptr() as u64, 2);
+            }
+        } else {
+            user_syscall5(7, ep, caller, b"BAD".as_ptr() as u64, 3);
+        }
+    }
+}
+
+/// Phase B, resource client: exercises the ring-3 memory manager end-to-end.
+/// For each page: alloc -> mem_len/mem_write/mem_read all succeed while the
+/// grant is live; free -> the page is revoked and every later op on the slot
+/// returns -1 (DENIED) at the capability gate. Two pages, to show the pool
+/// recycling.
+extern "sysv64" fn task_mem_client() -> ! {
+    user_print(b"Aegis: [mem-client] online; waiting for the mem-rm endpoint\r\n");
+    // Wait for the endpoint grant to land: ipc_call(slot 0) returns -1 until
+    // the mem-rm's grant installs a cap there.
+    let mut reply = [0u8; 32];
+    let mut endpoint = false;
+    for _ in 0..1_000_000u64 {
+        let msg = b"ping";
+        let rlen = user_syscall5(
+            5,
+            0,
+            msg.as_ptr() as u64,
+            msg.len() as u64,
+            reply.as_mut_ptr() as u64,
+        );
+        if rlen != u64::MAX {
+            endpoint = true;
+            break;
+        }
+        user_syscall5(3, 0, 0, 0, 0); // yield so the grantor can run
+    }
+    if !endpoint {
+        user_print(b"Aegis: [mem-client] mem-rm endpoint never arrived\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    user_print(b"Aegis: [mem-client] mem-rm endpoint received\r\n");
+    // ---- page 0: alloc, use, free, re-check (denied) ----
+    let req = b"a0";
+    let rlen = user_syscall5(5, 0, req.as_ptr() as u64, 2, reply.as_mut_ptr() as u64);
+    user_print(b"Aegis: [mem-client] alloc page 0 -> ");
+    user_print(&reply[..rlen as usize]);
+    user_print(b"\r\n");
+    let len = user_syscall5(11, 2, 0, 0, 0); // MemLen(slot 2)
+    user_print(b"Aegis: [mem-client] mem_len(slot 2) = ");
+    print_dec(len);
+    user_print(b"\r\n");
+    let data = *b"from RM";
+    let w = user_syscall5(13, 2, 0, data.len() as u64, data.as_ptr() as u64); // MemWrite
+    user_print(b"Aegis: [mem-client] mem_write -> ");
+    user_print(if w == u64::MAX {
+        b"DENIED\r\n"
+    } else {
+        b"OK\r\n"
+    });
+    let mut buf = [0u8; 16];
+    let r = user_syscall5(12, 2, 0, buf.len() as u64, buf.as_mut_ptr() as u64); // MemRead
+    user_print(b"Aegis: [mem-client] mem_read -> ");
+    user_print(if r == u64::MAX {
+        b"DENIED\r\n"
+    } else {
+        b"OK\r\n"
+    });
+    let req = b"f0";
+    let rlen = user_syscall5(5, 0, req.as_ptr() as u64, 2, reply.as_mut_ptr() as u64);
+    user_print(b"Aegis: [mem-client] free page 0 -> ");
+    user_print(&reply[..rlen as usize]);
+    user_print(b"\r\n");
+    let len = user_syscall5(11, 2, 0, 0, 0);
+    user_print(b"Aegis: [mem-client] mem_len(slot 2) after free = ");
+    print_dec(len);
+    user_print(if len == u64::MAX {
+        b" (DENIED, recycled)\r\n"
+    } else {
+        b" (UNEXPECTED)\r\n"
+    });
+    // ---- page 1: the pool recycles ----
+    let req = b"a1";
+    let rlen = user_syscall5(5, 0, req.as_ptr() as u64, 2, reply.as_mut_ptr() as u64);
+    user_print(b"Aegis: [mem-client] alloc page 1 -> ");
+    user_print(&reply[..rlen as usize]);
+    user_print(b"\r\n");
+    let len = user_syscall5(11, 2, 0, 0, 0);
+    user_print(b"Aegis: [mem-client] mem_len(slot 2) = ");
+    print_dec(len);
+    user_print(b"\r\n");
+    let req = b"f1";
+    let rlen = user_syscall5(5, 0, req.as_ptr() as u64, 2, reply.as_mut_ptr() as u64);
+    user_print(b"Aegis: [mem-client] free page 1 -> ");
+    user_print(&reply[..rlen as usize]);
+    user_print(b"\r\n");
+    let len = user_syscall5(11, 2, 0, 0, 0);
+    user_print(b"Aegis: [mem-client] mem_len(slot 2) after free = ");
+    print_dec(len);
+    user_print(if len == u64::MAX {
+        b" (DENIED, recycled)\r\n"
+    } else {
+        b" (UNEXPECTED)\r\n"
+    });
+    user_print(b"Aegis: [mem-client] pages granted and recycled through the gate\r\n");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Phase B, parent supervisor (ring 3): the supervisor ABOVE the existing
+/// ring-3 supervisor. Kernel-installed caps: slot 0 = NOTIFY_EP RECV (so it
+/// can observe kill notifications once it adopts), slot 1 = Task(iso-test)
+/// CONTROL|READ (so it can restart the adopted subsystem). At runtime it
+/// creates an escalation endpoint, grants it to the child supervisor (task
+/// IDX_SUPERVISOR) at the child's slot 3, and waits. When the child's restart
+/// budget is spent it calls back up with "adopt"; the parent ADOPTS the
+/// subsystem with a fresh budget, takes over serving the notification
+/// channel, and trips only when ITS budget is spent — escalate/adopt
+/// semantics, live in ring 3.
+extern "sysv64" fn task_parent_supervisor() -> ! {
+    user_print(b"Aegis: [parent-sup] online; escalation endpoint ready\r\n");
+    // Create the escalation endpoint and hand a cap to the child supervisor.
+    let esc = user_syscall5(8, 0, 0, 0, 0);
+    if (esc as i64) < 0 {
+        user_print(b"Aegis: [parent-sup] endpoint create failed\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    let esc = esc as u64;
+    user_syscall5(9, IDX_SUPERVISOR, esc, 3, 0); // CapGrant(supervisor, our esc, their slot 3)
+    user_print(b"Aegis: [parent-sup] escalation endpoint granted to child supervisor\r\n");
+    // Wait for the child to escalate (serve blocks until it calls).
+    let mut recvbuf = [0u8; 32];
+    let packed = user_syscall5(6, esc, recvbuf.as_mut_ptr() as u64, 0, 0);
+    let caller = packed >> 32;
+    user_print(b"Aegis: [parent-sup] escalation received; adopting subsystem\r\n");
+    // Acknowledge (unblocks the child's surrender call), then restart the
+    // adopted child under a fresh budget.
+    let ok = b"adopted";
+    user_syscall5(7, esc, caller, ok.as_ptr() as u64, ok.len() as u64);
+    let child_slot: u64 = 1;
+    let child_idx: u64 = IDX_ISO_TEST;
+    let notify_slot: u64 = 0;
+    let budget_limit: u64 = 2;
+    let mut budget = budget_limit;
+    let r = user_syscall5(16, child_slot, 0, 0, 0); // task_restart(slot 1)
+    user_print(b"Aegis: [parent-sup] adopting child restart -> ");
+    user_print(if r == u64::MAX {
+        b"DENIED\r\n"
+    } else {
+        b"OK\r\n"
+    });
+    loop {
+        let packed = user_syscall5(6, notify_slot, recvbuf.as_mut_ptr() as u64, 0, 0);
+        let child = packed >> 32;
+        user_print(b"Aegis: [parent-sup] child ");
+        print_dec(child);
+        user_print(b" DIED (under parent supervision)\r\n");
+        if child != child_idx {
+            user_print(b"Aegis: [parent-sup] not my adopted child, ignoring\r\n");
+            continue;
+        }
+        if budget > 0 {
+            budget -= 1;
+            let r = user_syscall5(16, child_slot, 0, 0, 0);
+            user_print(b"Aegis: [parent-sup] restarting adopted child, budget left ");
+            print_dec(budget);
+            user_print(if r == u64::MAX {
+                b" -> DENIED\r\n"
+            } else {
+                b" -> OK\r\n"
+            });
+        } else {
+            user_print(
+                b"Aegis: [parent-sup] PARENT TRIP: adopted child left dead; \
+subsystem tripped after a fresh parent budget\r\n",
+            );
+            loop {
+                core::hint::spin_loop();
+            }
+        }
     }
 }
 
