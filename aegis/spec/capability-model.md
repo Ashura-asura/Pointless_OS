@@ -894,7 +894,10 @@ delegation — the supervisor/channel/mem gates do not consult it.
 `shell.rs` (6), `window.rs` (7), `object_graph.rs` (6), `input.rs` (5): app
 launch/stop/restart and focus, window z-order/hit-test/compositor order/dirty regions,
 graph node/relationship CRUD and traversal, input ring buffer and focus dispatch. Honest
-limits: no GPU, no framebuffer output, no real keyboard/mouse hardware.
+limits: no GPU, no framebuffer output; these model tests use synthetic events — real
+keyboard input is proven live in the kernel (see `aegis-kernel/src/ps2.rs` +
+`desktop.rs` and the `shell-compositor@key` serial assertions in
+`HONEST_STATUS.md`), no mouse hardware.
 
 ### Machine-checked verification (executable): Linux compatibility (§5/§7 Phase 8)
 

@@ -39,9 +39,11 @@ Every new capability gets a section in `spec/capability-model.md` with:
 - A `### Machine-checked verification (executable): <name> (§N)` heading
 - The honest-limits paragraph (what the test proves and what it doesn't)
 
-## 7. No external dependencies in capability-core
+## 7. No external dependencies in the kernel crates
 
-The kernel crate (`capability-core`) stays zero-dependency. All crypto, serialization, and networking happen in sibling crates. This is a hard boundary, not a suggestion.
+The kernel crates (the bare-metal `aegis-kernel` and the model `capability-core`)
+stay zero-dependency. All crypto, serialization, and networking happen in
+sibling crates. This is a hard boundary, not a suggestion.
 
 ## 8. No scope creep
 

@@ -452,6 +452,19 @@ Not cut — sequenced, and only after Phase 6:
    model (`crates/devices`). Exercised live under QEMU (`uefi-boot/serial-p12.log`):
    a status bar, a clock, and a focused menu dialog composite in z-order
    (menu occludes clock), 0 exceptions.
+- **Interactive shell (post-§10 item) DONE** — the compositor went from a
+   scripted boot-time demo to a real input-driven one. A PS/2 keyboard driver
+   (`aegis-kernel/src/ps2.rs`, 7 tests) receives IRQ1 through the legacy PIC →
+   LAPIC LVT0 ExtINT virtual-wire path, translates scancode set 1, and feeds a
+   bounded ring buffer drained by a dedicated kernel task; `desktop.rs`
+   (5 tests) maps Tab to focus cycling and arrows to clamp-moved windows.
+   Live-verified under QEMU both ways: serial assertions
+   (`shell-compositor@key: Tab focus -> window id=3 overlap_cell='.'` and
+   `arrow move -> window id=3 region=(x,y)`, committed `uefi-boot/serial-qemu2.log`)
+   and screen captures (`uefi-boot/scr0..5.ppm`: each keypress changes the VGA
+   display in the menu-window region, and after `up` the frame is byte-identical
+   to the after-Tab frame — window returned to origin). Honest limits: set-1
+   subset scancode coverage, keyboard only, no framebuffer graphics.
 
 ---
 

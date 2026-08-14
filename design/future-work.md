@@ -81,8 +81,9 @@ It can start once Phases 1–6 give it a real substrate.
   submission shape); compositing, window management and the graphics stack
   are ordinary userspace services.
 - Today the only live display is the VGA text console (80x25 white-on-black
-  mirror of the COM1 log). No framebuffer graphics, no GPU accel, no
-  mouse/keyboard input.
+  mirror of the COM1 log). No framebuffer graphics, no GPU accel, no mouse;
+  keyboard input now works live (real PS/2 IRQ path driving Tab-focus +
+  arrow-move — see HONEST_STATUS.md).
 - Shell runtime, window manager, object graph, and input dispatcher exist as
   model-level contract tests, not a live UI.
 
@@ -95,7 +96,9 @@ unrendered-window transparency — 8 contract tests, exercised live at
 VGA text-mode buffer, so a "pixel" is one text cell; the capability-scoped GPU
 *service* (queue=SEND, framebuffer=READ|WRITE, compositor=READ grants,
 dead-compositor refusal) lives in the model `crates/devices`. Still not built:
-framebuffer/accelerated graphics, real mouse/keyboard input.
+framebuffer/accelerated graphics, mouse input (PS/2 keyboard input is done —
+Tab cycles focus, arrows move the focused window, serial- and screen-verified
+under QEMU).
 
 ## Broader AI orchestration
 

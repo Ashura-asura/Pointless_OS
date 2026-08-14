@@ -68,7 +68,7 @@ PCIe/VT-d/NVMe drivers, VirtIO-net/Ethernet/ARP/IPv4, adaptive-ceiling verificat
 - Priority/blocking scheduling — single fixed-priority round-robin; no wait queues
 - User-mode isolation — per-task *page-fault-driven* isolation via U/S bits verified under QEMU (iso-test task faults on a kernel-only read and is killed); not run on physical hardware
 - Hypervisor-based Linux/Windows execution vehicles (WSL2-lineage design paths)
-- Real NIC traffic, real socket layer over a NIC, real wire framing (the capability-scoped loopback netstack and UDP/TCP header models exist in the kernel crate but are not wired into the boot path; Ethernet/ARP/IPv4 framing stays proven at header level only), real GPU-accelerated display output (a VGA text console works; no framebuffer graphics, no real input devices)
+- Real NIC traffic, real socket layer over a NIC, real wire framing (the capability-scoped loopback netstack and UDP/TCP header models exist in the kernel crate but are not wired into the boot path; Ethernet/ARP/IPv4 framing stays proven at header level only), real GPU-accelerated display output (a VGA text console works; a real PS/2 keyboard drives Tab-focus + arrow-move in the live compositor — see HONEST_STATUS.md — but no framebuffer graphics, no mouse)
 - Cross-machine macaroon transport (in-process model only, no network)
 - SeL4-class inductive proof (TLA+ model-checking is finite-instance)
 
@@ -84,8 +84,8 @@ real syscall boundary.
 ## Running
 
 ```
-cargo test --workspace          # Run all model tests (113)
-cargo test -p aegis-kernel       # Run kernel tests (327)
+cargo test --workspace          # Run all model tests (125)
+cargo test -p aegis-kernel       # Run kernel tests (376)
 cargo test -p uefi-boot          # Run ELF parser tests (13)
 cargo run -p capability-audit   # Reachable-authority audit
 cargo run -p capability-audit -- --graph  # Capability graph visualization

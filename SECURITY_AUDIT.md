@@ -10,8 +10,8 @@ No claim below outruns its test evidence; nothing here certifies production beha
 | Capability model invariants (I1-I6) | `aegis/crates/capability-core` | 20+ contract tests; TLA+ model-check (331k states, 2 tasks, 3 slots) |
 | Reachable-authority vs compiled manifests | `aegis/crates/capability-audit` + `security-audit` | `cargo run -p capability-audit` (CI); 10 aggregate contract tests (clean reference world, kernel-equivalent rejection, undeclared-holdings rejection, overhang-warns-not-fails, self-cap exclusion) |
 | Adaptive/AI ceiling (monotonic non-expansion) | `aegis-kernel/src/ceiling.rs` | 14 property tests; caught+fixed a real scope-expansion bug |
-| Parser/syscall total functions (no panic on garbage) | `aegis-kernel/src/hardening.rs` | 13 boundary tests over ELF/PE loaders, IPv4/Ethernet/ARP parsers, both syscall ABIs, compat layers, shell/window/graph/input |
-| Per-phase contracts | all crates | 364 total tests, 0 failures (113 workspace + 238 kernel + 13 bootloader) |
+| Parser/syscall total functions (no panic on garbage) | `aegis-kernel/src/hardening.rs` | 21 boundary tests over ELF/PE loaders, IPv4/Ethernet/ARP/UDP/TCP parsers, both syscall ABIs, compat layers, shell/window/graph/input |
+| Per-phase contracts | all crates | 514 total tests, 0 failures (125 workspace + 376 kernel + 13 bootloader) |
 
 ## Certification status by claim
 
