@@ -186,6 +186,35 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         sprintln!("Aegis: PCI: NVMe controller present");
     }
 
+    // Phase H (roadmap §5): minimal GPU framebuffer driver. Probe the
+    // display device (Bochs VBE "dispi"), set an 800x600x32 linear mode,
+    // and install it as the desktop's second output backend so every
+    // boot_blit/handle_key re-blit fans the composited screen out to real
+    // pixels in addition to the VGA text cells. Strictly additive: if no
+    // Bochs-VBE display is present (or it rejects the mode), the desktop
+    // falls back to the text backend alone — the pixel output is a
+    // superset of the old proof, never a requirement for it.
+    {
+        use aegis_kernel::desktop::install_gpu;
+        match aegis_kernel::gpu::BochsGpu::probe(&pci) {
+            Some(mut g) => {
+                let ok = g.set_mode(800, 600);
+                sprintln!("Aegis: GPU: set_mode(800x600x32) = {}", ok);
+                if ok {
+                    unsafe {
+                        install_gpu(g);
+                    }
+                    sprintln!("Aegis: GPU: framebuffer backend installed (desktop -> pixels too)");
+                } else {
+                    sprintln!("Aegis: GPU: mode rejected - text backend only");
+                }
+            }
+            None => {
+                sprintln!("Aegis: GPU: no Bochs-VBE display device - text backend only");
+            }
+        }
+    }
+
     // Live network stack demo: the q35 NIC (Intel 82574L/e1000e) is attached
     // to a QEMU `socket` netdev. The kernel brings the interface up, resolves
     // the host gateway (10.0.2.2) over real ARP, then opens a TCP socket to
@@ -1669,6 +1698,14 @@ extern "sysv64" fn task_input() -> ! {
                                     "Aegis: shell-compositor@key: enter -> window id={} submitted {} char(s)",
                                     window_id,
                                     len
+                                );
+                            }
+                            aegis_kernel::desktop::KeyOutcome::Moved { window_id, x, y } => {
+                                sprintln!(
+                                    "Aegis: shell-compositor@key: arrow -> window id={} moved to ({},{})",
+                                    window_id,
+                                    x,
+                                    y
                                 );
                             }
                         }

@@ -247,7 +247,10 @@ impl Desktop {
                 })
             }
             Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight => {
-                let (cur_x, cur_y) = self.wm.window(self.shell_id).map(|w| (w.region.x, w.region.y))?;
+                let (cur_x, cur_y) = self
+                    .wm
+                    .window(self.shell_id)
+                    .map(|w| (w.region.x, w.region.y))?;
                 let (dx, dy): (i16, i16) = match ke.key {
                     Key::ArrowUp => (0, -1),
                     Key::ArrowDown => (0, 1),
