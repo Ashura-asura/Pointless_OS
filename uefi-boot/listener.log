@@ -1,0 +1,6 @@
+listener: waiting for QEMU on 127.0.0.1:45556 ...
+listener: QEMU connected from ('127.0.0.1', 64178)
+listener: ARP request from 52:54:00:12:34:56 10.0.2.15
+listener: echoed ARP reply (42 bytes)
+listener: timeout waiting for frames
+listener: wrote 1 frame(s) to uefi-boot/e1000-phase-d.pcap

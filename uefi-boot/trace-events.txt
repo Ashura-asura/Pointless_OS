@@ -1,0 +1,7 @@
+e1000x_rx_*
+e1000e_rx_*
+e1000e_ring_*
+e1000e_set_rdt
+e1000e_start_recv
+e1000e_start_xmit
+e1000e_can_recv*

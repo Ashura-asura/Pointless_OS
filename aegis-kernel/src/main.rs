@@ -186,6 +186,63 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         sprintln!("Aegis: PCI: NVMe controller present");
     }
 
+    // Live e1000 demo: the q35 NIC (Intel 82574L/e1000e) is attached to a
+    // QEMU `socket` netdev. The kernel transmits a broadcast ARP request for
+    // the host gateway (10.0.2.2); an external process on the host captures
+    // that frame off the emulated wire, writes it to a pcap, and echoes an
+    // ARP reply back into the guest, where the polled RX ring picks it up.
+    // This proves real Ethernet bytes leaving and re-entering the kernel.
+    if let Some(mut nic) = aegis_kernel::e1000::E1000::probe(&pci) {
+        let ok = nic.reset();
+        sprintln!(
+            "Aegis: e1000: reset: {} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            ok,
+            nic.mac[0],
+            nic.mac[1],
+            nic.mac[2],
+            nic.mac[3],
+            nic.mac[4],
+            nic.mac[5]
+        );
+        nic.tx_enable();
+        nic.rx_enable();
+        sprintln!("Aegis: e1000: link up: {}", nic.link_up());
+        let req = aegis_kernel::e1000::build_arp_request(nic.mac, [10, 0, 2, 2]);
+        let sent = nic.send(&req);
+        sprintln!("Aegis: e1000: ARP request sent (42 bytes): {}", sent);
+        // Poll the RX ring for the host's ARP reply.
+        let mut buf = [0u8; 2048];
+        let mut got = 0usize;
+        let mut deadline = 0u32;
+        while deadline < 20_000_000 {
+            if let Some(n) = nic.receive(&mut buf) {
+                got = n;
+                break;
+            }
+            deadline += 1;
+            unsafe { core::arch::asm!("pause", options(nomem, nostack)) };
+        }
+        let arp_ok = got >= 42 && aegis_kernel::e1000::is_arp_reply_for(&buf[..got], nic.mac);
+        sprintln!(
+            "Aegis: e1000: ARP reply received ({} bytes, ARP reply for us: {})",
+            got,
+            arp_ok
+        );
+        if got >= 42 {
+            sprintln!(
+                "Aegis: e1000: reply sender {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} @ 10.0.2.2",
+                buf[22],
+                buf[23],
+                buf[24],
+                buf[25],
+                buf[26],
+                buf[27]
+            );
+        }
+    } else {
+        sprintln!("Aegis: e1000: no NIC found - driver skipped");
+    }
+
     // Live NVMe demo: probe BAR0, reset, admin + IO queues, identify, read
     // LBA 0/1 and check the GPT signature (disk image is GPT-partitioned).
     if let Some(mut ctrl) = aegis_kernel::nvme::NvmeController::probe(&pci) {

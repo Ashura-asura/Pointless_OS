@@ -25,7 +25,7 @@ pub fn timer_ticks() -> u64 {
 #[unsafe(link_section = ".bss.stack")]
 static mut KERNEL_STACK: [u8; KERNEL_STACK_SIZE] = [0u8; KERNEL_STACK_SIZE];
 
-const KERNEL_STACK_SIZE: usize = 16384;
+const KERNEL_STACK_SIZE: usize = 65536;
 
 /// Top of the dedicated idle stack, allocated from the frame allocator at
 /// boot (see `set_idle_stack_top`). The idle loop runs here so its saved

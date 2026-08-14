@@ -28,6 +28,7 @@ pub mod nvme_store;
 pub mod pci;
 
 pub mod arp;
+pub mod e1000;
 pub mod ethernet;
 pub mod ipv4;
 pub mod net;
