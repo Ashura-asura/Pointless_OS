@@ -16,6 +16,17 @@
 //!   monitor is a different, narrower capability — observing is not a step
 //!   toward controlling, and the gate enforces that even for a fully
 //!   compromised observer.
+//! - `query-advisor` (master roadmap Phase F) — network access to exactly ONE
+//!   kernel-declared host (`netif::ADVISOR_HOST_IP`/`ADVISOR_HOST_PORT`), and
+//!   nothing else. The grantee receives a `NetEndpoint` capability that is
+//!   already bound to that one destination at mint time — it never calls
+//!   `sys_net_socket` itself, so it never gets to choose where the socket
+//!   points, and no syscall exists to rebind an endpoint once minted. No
+//!   GRANT, so the capability cannot be re-delegated. The role's own network
+//!   access can *advise* — the response is data, read into a bounded buffer —
+//!   but it carries none of the rights (CONTROL, GRANT) that would let it
+//!   authorize anything on its own. Acting on the advice still requires
+//!   whatever capability that action already needed.
 //!
 //! Every role is declared by the kernel, installs exactly its declared right
 //! set, and never carries GRANT: there is no syscall that mints GRANT onto a
@@ -28,7 +39,7 @@
 //! the gate refuses it — the agent has no code path that could widen its
 //! authority even if all of it were malicious.
 
-use crate::cap::{Cap, CapSlot, Rights};
+use crate::cap::{Cap, CapSlot, Rights, NET_RIGHTS};
 use crate::tasks::{current_idx, set_task_cap, task_cap, MAX_CAPS, MAX_TASKS};
 
 /// `restart-service` = READ|CONTROL over one named task, no GRANT.
@@ -36,6 +47,9 @@ pub const ROLE_RESTART_SERVICE: u32 = 0;
 /// `observe-service` = READ over one named task only (a watchdog: it can see
 /// the service's state, it can never restart or kill it), no GRANT, no CONTROL.
 pub const ROLE_OBSERVE_SERVICE: u32 = 1;
+/// `query-advisor` = SEND|RECV on a `NetEndpoint` bound to the one
+/// kernel-declared advisor host, no GRANT. See the module docs above.
+pub const ROLE_QUERY_ADVISOR: u32 = 2;
 
 /// A role declared by the kernel. `rights` is the *exact* set the grantee
 /// will be allowed — the system declares it, never the requesting agent.
@@ -48,6 +62,20 @@ pub struct Role {
     /// a role-granted cap never carries GRANT, so an agent cannot mint new
     /// authority from an existing grant.
     pub grants: bool,
+    /// False for a `Task`-shaped role (`restart-service`, `observe-service`):
+    /// the grantee receives `Cap::Task(target)` with `rights`, and `target`
+    /// names the object the capability points at.
+    ///
+    /// True for a network-shaped role (`query-advisor`): the grantee receives
+    /// a `Cap::NetEndpoint` bound to the kernel-declared advisor host, never
+    /// to `target`. `target` is still required and still audited — it names
+    /// the service this advisory access is granted *in the context of* (the
+    /// grantor must hold at least READ over it, i.e. watchdog-level standing)
+    /// — but it is not what the resulting capability points at. Keeping the
+    /// same `(grantee, target, dst_slot)` grant shape lets a network-scoped
+    /// role reuse the exact grant/audit pipeline every other role already
+    /// goes through, rather than inventing a parallel one.
+    pub network_scoped: bool,
 }
 
 /// The one role the kernel knows. The grantee may read the named service's
@@ -58,6 +86,7 @@ pub const RESTART_SERVICE: Role = Role {
     name: "restart-service",
     rights: Rights::READ.union(Rights::CONTROL),
     grants: false,
+    network_scoped: false,
 };
 
 /// `observe-service` = READ over one named task only. The grantee can query
@@ -70,10 +99,25 @@ pub const OBSERVE_SERVICE: Role = Role {
     name: "observe-service",
     rights: Rights::READ,
     grants: false,
+    network_scoped: false,
+};
+
+/// `query-advisor` = SEND|RECV on a `NetEndpoint` bound to the one
+/// kernel-declared advisor host (`netif::ADVISOR_HOST_IP`/`ADVISOR_HOST_PORT`).
+/// No GRANT — the capability cannot be re-delegated — and no CONTROL of any
+/// kind: this role can read an HTTPS response into a bounded buffer and
+/// nothing more. It cannot restart, kill, or grant anything; the advisory
+/// answer is input to whichever role's own logic reads it, never authority.
+pub const QUERY_ADVISOR: Role = Role {
+    id: ROLE_QUERY_ADVISOR,
+    name: "query-advisor",
+    rights: NET_RIGHTS,
+    grants: false,
+    network_scoped: true,
 };
 
 /// The role registry. Reviewable once per role type, not per grant.
-pub const ALL_ROLES: [Role; 2] = [RESTART_SERVICE, OBSERVE_SERVICE];
+pub const ALL_ROLES: [Role; 3] = [RESTART_SERVICE, OBSERVE_SERVICE, QUERY_ADVISOR];
 
 /// Look up a role by id.
 pub fn lookup(id: u32) -> Option<&'static Role> {
@@ -117,14 +161,25 @@ pub fn role_grant(role_id: u64, grantee: u64, target: u64, dst_slot: u64) -> i64
         );
         return -1;
     }
-    // The grantor must hold a Task cap on `target` with the role's exact
-    // rights — the kernel confirms the grantor's authority over the target
-    // before any grantee capability exists.
+    // The grantor must hold a Task cap on `target` carrying enough authority
+    // to make this grant. For a Task-shaped role that means the role's exact
+    // rights (the grantor can only hand out what it already has). For a
+    // network-shaped role (`query-advisor`) `target` is not what the grantee
+    // ends up holding — it is the service this advisory access is granted in
+    // the context of — so the bar is watchdog-level standing (READ) over
+    // that service, matching the spec's own wiring: the observe-service
+    // watchdog is what earns the right to ask for advice about what it
+    // watches.
+    let required = if role.network_scoped {
+        Rights::READ
+    } else {
+        role.rights
+    };
     let authorized = (0..MAX_CAPS).any(|s| match task_cap(cur, s) {
         CapSlot {
             cap: Cap::Task(t),
             rights,
-        } => t as usize == target as usize && rights.contains(role.rights),
+        } => t as usize == target as usize && rights.contains(required),
         _ => false,
     });
     if !authorized {
@@ -138,14 +193,38 @@ pub fn role_grant(role_id: u64, grantee: u64, target: u64, dst_slot: u64) -> i64
     }
     // The role is declared by the kernel: install exactly its rights. A role
     // never carries GRANT, so the grantee cannot re-delegate the role.
-    set_task_cap(
-        grantee as usize,
-        dst_slot as usize,
-        CapSlot {
-            cap: Cap::Task(target as u32),
-            rights: role.rights,
-        },
-    );
+    if role.network_scoped {
+        // The grantee never calls `sys_net_socket` for this capability — the
+        // kernel mints the socket itself, bound to the one host it declares.
+        // The agent has no code path that could choose a different
+        // destination, because there is no argument here for it to supply.
+        let Some(id) = crate::netif::open_advisor_endpoint() else {
+            crate::audit::record(
+                cur,
+                crate::audit::OpKind::RoleGrant,
+                Some(target as u32),
+                false,
+            );
+            return -1;
+        };
+        set_task_cap(
+            grantee as usize,
+            dst_slot as usize,
+            CapSlot {
+                cap: Cap::NetEndpoint(id as u32),
+                rights: role.rights,
+            },
+        );
+    } else {
+        set_task_cap(
+            grantee as usize,
+            dst_slot as usize,
+            CapSlot {
+                cap: Cap::Task(target as u32),
+                rights: role.rights,
+            },
+        );
+    }
     crate::audit::record(
         cur,
         crate::audit::OpKind::RoleGrant,
@@ -516,6 +595,159 @@ mod tests {
             // No capability ever landed.
             assert_eq!(task_cap(agent, 0).cap, Cap::None);
             assert_eq!(task_cap(grantor, 0).cap, Cap::Task(svc as u32));
+        }
+    }
+
+    /// Phase F: the DoD grant test for `query-advisor`. A grantor holding
+    /// READ over the watched service (watchdog-level standing) grants
+    /// `query-advisor` to a zero-cap agent. The agent receives a
+    /// `NetEndpoint` — NOT a `Task` cap — bound to the kernel-declared
+    /// advisor host, with exactly SEND|RECV and no GRANT.
+    #[test]
+    fn advisor_role_grant() {
+        let _g = crate::kernel_state_guard();
+        clean_world();
+        unsafe {
+            // svc = task 0, grantor = task 1, agent = task 2.
+            let (svc, grantor, agent) = (0usize, 1usize, 2usize);
+            spawn("svc", dummy, 0x100000).unwrap();
+            spawn("grantor", dummy, 0x200000).unwrap();
+            spawn("agent", dummy, 0x300000).unwrap();
+            assert!((0..MAX_CAPS).all(|s| task_cap(agent, s).cap == Cap::None));
+            // The grantor holds READ over the service — watchdog-level
+            // standing is enough to ask for advice about what it watches.
+            set_task_cap(
+                grantor,
+                0,
+                CapSlot {
+                    cap: Cap::Task(svc as u32),
+                    rights: Rights::READ,
+                },
+            );
+            set_current_for_test(grantor);
+            assert_eq!(
+                role_grant(ROLE_QUERY_ADVISOR as u64, agent as u64, svc as u64, 0),
+                0
+            );
+            let got = task_cap(agent, 0);
+            let id = match got.cap {
+                Cap::NetEndpoint(id) => id,
+                other => panic!("query-advisor must grant a NetEndpoint, got {other:?}"),
+            };
+            assert!(got.rights.contains(Rights::SEND));
+            assert!(got.rights.contains(Rights::RECV));
+            assert!(!got.rights.contains(Rights::GRANT), "role never grants");
+            assert!(
+                !got.rights.contains(Rights::CONTROL),
+                "advisory access carries no CONTROL of anything"
+            );
+            assert_eq!(got.rights.bits(), crate::cap::NET_RIGHTS.bits());
+            // The socket the kernel minted is bound to exactly the
+            // kernel-declared advisor host — not `svc`, not anything the
+            // grantor or agent named.
+            assert_eq!(
+                crate::netif::socket_remote(id as u16),
+                Some((
+                    crate::netif::ADVISOR_HOST_IP,
+                    crate::netif::ADVISOR_HOST_PORT
+                )),
+                "the granted endpoint is bound to the one kernel-declared advisor host"
+            );
+        }
+    }
+
+    /// Phase F headline result: the query-advisor agent cannot parlay its one
+    /// narrow network capability into anything beyond reading a response from
+    /// its pre-approved host. Every escape attempt is refused by the kernel
+    /// capability gate, not by any check in the agent's own logic.
+    #[test]
+    fn advisor_cannot_escape_host_scope() {
+        let _g = crate::kernel_state_guard();
+        clean_world();
+        unsafe {
+            // svc = task 0, other = task 1, grantor = task 2, agent = task 3.
+            let (svc, other, grantor, agent) = (0usize, 1usize, 2usize, 3usize);
+            spawn("svc", dummy, 0x100000).unwrap();
+            spawn("other", dummy, 0x200000).unwrap();
+            spawn("grantor", dummy, 0x300000).unwrap();
+            spawn("agent", dummy, 0x400000).unwrap();
+            set_task_cap(
+                grantor,
+                0,
+                CapSlot {
+                    cap: Cap::Task(svc as u32),
+                    rights: Rights::READ,
+                },
+            );
+            set_current_for_test(grantor);
+            assert_eq!(
+                role_grant(ROLE_QUERY_ADVISOR as u64, agent as u64, svc as u64, 0),
+                0
+            );
+            let advisor_slot_cap = task_cap(agent, 0);
+            let Cap::NetEndpoint(net_id) = advisor_slot_cap.cap else {
+                panic!("setup: expected a NetEndpoint cap");
+            };
+            set_current_for_test(agent);
+
+            // 1) No syscall exists to rebind an endpoint's destination: the
+            //    binding recorded on the live socket is still exactly the
+            //    advisor host, unchanged, after the agent holds the cap.
+            assert_eq!(
+                crate::netif::socket_remote(net_id as u16),
+                Some((
+                    crate::netif::ADVISOR_HOST_IP,
+                    crate::netif::ADVISOR_HOST_PORT
+                )),
+                "nothing the agent can do rebinds the granted endpoint"
+            );
+
+            // 2) Delegating the role onward needs GRANT — the role has none.
+            assert_eq!(
+                crate::ipc::ipc_cap_grant(other as u64, 0, 1),
+                -1,
+                "no GRANT in query-advisor: the agent cannot re-delegate its network access"
+            );
+
+            // 3) The agent holds no Task capability at all (its one cap is a
+            //    NetEndpoint), so it cannot act as a role_grant grantor over
+            //    ANY target — it has no authority to escalate itself into
+            //    restart-service, observe-service, or a second advisor grant
+            //    naming a different host-adjacent target.
+            assert_eq!(
+                role_grant(ROLE_RESTART_SERVICE as u64, agent as u64, svc as u64, 2),
+                -1,
+                "a NetEndpoint cap carries no Task authority to grant from"
+            );
+            assert_eq!(
+                role_grant(ROLE_QUERY_ADVISOR as u64, agent as u64, other as u64, 2),
+                -1,
+                "the agent cannot mint itself a second advisor grant either"
+            );
+
+            // 4) The one capability the agent holds cannot be used to control
+            //    the service it's advising about: CONTROL was never part of
+            //    NET_RIGHTS, so there is no restart/kill path through it —
+            //    unlike restart-service, nothing here ever touches
+            //    supervisor::task_restart/task_kill in the first place.
+            assert!(
+                !advisor_slot_cap.rights.contains(Rights::CONTROL),
+                "advisory network access was never wired to any control right"
+            );
+
+            // 5) The audit trail attributes everything: the agent never
+            //    succeeded at a RoleGrant naming a target other than the one
+            //    it was legitimately granted advisory context for.
+            assert!(!crate::audit::ever_succeeded(
+                agent,
+                crate::audit::OpKind::RoleGrant,
+                svc as u32
+            ));
+            assert!(!crate::audit::ever_succeeded(
+                agent,
+                crate::audit::OpKind::RoleGrant,
+                other as u32
+            ));
         }
     }
 }

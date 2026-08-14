@@ -28,6 +28,19 @@ pub const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 pub const GW_IP: [u8; 4] = [10, 0, 2, 2];
 pub const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x02];
 
+/// Phase F (`query-advisor`): the ONE host a `query-advisor`-role agent may
+/// ever reach. Declared here, by the kernel, not by whoever calls
+/// `role::role_grant` — the grantor names a *service* to grant advisory
+/// authority in the context of, never a destination. QEMU user-mode
+/// networking routes the guest's default gateway (`GW_IP`) to the host, so
+/// this reaches a real external network path the same way the Phase E TLS
+/// demo does. A production deployment would point this at a real advisor
+/// endpoint; the identity of the constant is not the security property — the
+/// property is that it is fixed by the kernel and the granted capability
+/// cannot be rebound to anything else.
+pub const ADVISOR_HOST_IP: [u8; 4] = GW_IP;
+pub const ADVISOR_HOST_PORT: u16 = 443;
+
 pub const MAX_SOCKETS: usize = 4;
 pub const SEND_BUFLEN: usize = 4096;
 pub const RECV_BUFLEN: usize = 8192;
@@ -691,6 +704,21 @@ impl NetIf {
             .position(|s| s.as_ref().is_some_and(|sock| sock.id == id))
     }
 
+    /// The destination a socket is bound to — its capability scope — if the
+    /// socket still exists. There is no corresponding setter: a socket's
+    /// binding is fixed at `socket_open` and nothing in this module ever
+    /// changes it. Exposed for tests and audit tooling to verify a
+    /// `NetEndpoint` capability's binding without touching the socket's live
+    /// transport state.
+    pub fn socket_remote(&self, id: u16) -> Option<([u8; 4], u16)> {
+        self.socket_index(id).map(|i| {
+            (
+                self.sockets[i].as_ref().unwrap().remote_ip,
+                self.sockets[i].as_ref().unwrap().remote_port,
+            )
+        })
+    }
+
     /// The current TCP state of a socket, or `None` if it does not exist.
     pub fn socket_state(&self, id: u16) -> Option<TcpState> {
         let i = self.socket_index(id)?;
@@ -946,6 +974,25 @@ pub fn ones_complement(data: &[u8]) -> u16 {
 
 fn seq_ge(a: u32, b: u32) -> bool {
     a.wrapping_sub(b) < 0x8000_0000
+}
+
+/// Phase F: mint a TCP socket bound to the one kernel-declared advisor host
+/// (`ADVISOR_HOST_IP`/`ADVISOR_HOST_PORT`), never to a caller-chosen
+/// destination. This is the mint path `role::role_grant` uses for the
+/// `query-advisor` role — the agent never calls `sys_net_socket` itself for
+/// this capability, so it never gets to name the destination. Returns the new
+/// socket id, or `None` if the socket table is full.
+pub fn open_advisor_endpoint() -> Option<u16> {
+    unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }
+        .socket_open(SockKind::Tcp, ADVISOR_HOST_IP, ADVISOR_HOST_PORT)
+        .map(|(id, _local_port)| id)
+}
+
+/// The live destination bound to socket `id` on the shared kernel netif, if
+/// it still exists. Read-only; there is no way to change a socket's binding
+/// through this or any other entry point.
+pub fn socket_remote(id: u16) -> Option<([u8; 4], u16)> {
+    unsafe { &*core::ptr::addr_of!(NETIF) }.socket_remote(id)
 }
 
 // ---- capability-gated socket syscalls ----
