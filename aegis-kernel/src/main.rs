@@ -555,35 +555,37 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     }
 
     // Phase 9/10 (roadmap §10 item 3) + item 4: the graphical shell's live
-    // desktop. A compositor turns the window manager's z-ordered window list
-    // plus per-window framebuffers into a single composited screen: higher
-    // windows occlude lower ones in overlap, and every surface is clipped to
-    // its region and the screen bounds. Honest substrate: the VM's real
-    // display is the VGA text-mode buffer, so a "pixel" is one text cell
-    // (char | attr<<8). The desktop object is installed here so the PS/2
-    // input path can re-composite and re-blit it live (see `run_idle`).
+    // desktop, now the kernel's default post-boot state. A compositor turns
+    // the window manager's z-ordered window list plus per-window framebuffers
+    // into a single composited screen: higher windows occlude lower ones in
+    // overlap, and every surface is clipped to its region and the screen
+    // bounds. Honest substrate: the VM's real display is the VGA text-mode
+    // buffer, so a "pixel" is one text cell (char | attr<<8). The desktop
+    // object is installed here so the PS/2 input path can re-composite and
+    // re-blit it live (see `task_input`). The shell window — a prompt with
+    // typed-character echo — is what the machine boots into; no demo windows.
     {
-        use aegis_kernel::desktop::{Desktop, SH, SW};
+        use aegis_kernel::desktop::{Desktop, SH, SHELL_W, SHELL_X, SHELL_Y, SW};
         let d = Desktop::new();
         let screen = d.screen();
 
-        // Occlusion checks: the focused menu (topmost z) covers the clock
-        // where they overlap; the clock is visible where the menu is not.
-        let in_menu = (screen[5 * SW + 24] & 0xFF) as u8;
-        let in_clock = (screen[3 * SW + 5] & 0xFF) as u8;
+        // The default post-boot surface: the focused shell window renders the
+        // prompt `aegis:~$ ` at its origin, and the status bar spans the
+        // bottom row. Verify the composited screen shows them.
+        let prompt_cell = (screen[SHELL_Y as usize * SW + SHELL_X as usize] & 0xFF) as u8;
         let status_ok = (screen[(SH - 1) * SW + 0] & 0xFF) as u8 == b'-';
-        let occluded_ok = in_menu == b'#' && in_clock == b'.';
         sprintln!(
-            "Aegis: shell-compositor: menu({}) occludes clock({}) under overlap; status bar = {}; z-order compositing = {}",
-            in_menu as char,
-            in_clock as char,
+            "Aegis: shell-compositor: boot shell surface: prompt first cell '{}' @ ({},{}), status bar = {}, {} windows",
+            prompt_cell as char,
+            SHELL_X,
+            SHELL_Y,
             status_ok,
-            occluded_ok
+            d.window_count()
         );
 
         // Render three rows of the composited screen as characters so the
-        // result is visible in the serial log.
-        for sy in [4usize, 5, 6] {
+        // result is visible in the serial log (shell window is 60x12 @ 2,2).
+        for sy in [2usize, 3, 4] {
             let mut rowbuf = [0u8; SW];
             for (sx, cell) in rowbuf.iter_mut().enumerate() {
                 *cell = (screen[sy * SW + sx] & 0xFF) as u8;
@@ -592,10 +594,14 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             sprintln!("Aegis: shell-compositor: row{}: |{}|", sy, rowstr);
         }
         sprintln!(
-            "Aegis: shell-compositor: composited {}x{} screen from {} windows (VGA text substrate; compositor is ordinary userspace-style UI work, per roadmap §10 item 3)",
+            "Aegis: shell-compositor: composited {}x{} screen from {} windows (shell window {}x{} @ ({},{}); VGA text substrate; compositor is ordinary userspace-style UI work, per roadmap §10 item 3)",
             SW,
             SH,
-            d.window_count()
+            d.window_count(),
+            SHELL_W,
+            aegis_kernel::desktop::SHELL_H,
+            SHELL_X,
+            SHELL_Y
         );
         unsafe {
             aegis_kernel::desktop::install(d);
@@ -943,30 +949,28 @@ extern "sysv64" fn task_input() -> ! {
         while let Some(ev) = aegis_kernel::ps2::pop_event() {
             if let aegis_kernel::input::InputEvent::Key(ke) = ev {
                 if ke.pressed {
-                    if let Some(out) = aegis_kernel::desktop::handle_key(ke.key) {
+                    if let Some(out) = aegis_kernel::desktop::handle_key(ke) {
                         match out {
-                            aegis_kernel::desktop::KeyOutcome::FocusChanged {
-                                window_id,
-                                overlap_cell,
-                            } => {
+                            aegis_kernel::desktop::KeyOutcome::Echoed { window_id, ch, pos } => {
                                 sprintln!(
-                                    "Aegis: shell-compositor@key: Tab focus -> window id={} overlap_cell='{}'",
+                                    "Aegis: shell-compositor@key: echo '{}' -> window id={} line pos={}",
+                                    ch as char,
                                     window_id,
-                                    overlap_cell as char
+                                    pos
                                 );
                             }
-                            aegis_kernel::desktop::KeyOutcome::Moved {
-                                window_id,
-                                x,
-                                y,
-                                clipped,
-                            } => {
+                            aegis_kernel::desktop::KeyOutcome::Backspace { window_id, pos } => {
                                 sprintln!(
-                                    "Aegis: shell-compositor@key: arrow move -> window id={} region=({},{}) clipped={}",
+                                    "Aegis: shell-compositor@key: backspace -> window id={} line pos={}",
                                     window_id,
-                                    x,
-                                    y,
-                                    clipped
+                                    pos
+                                );
+                            }
+                            aegis_kernel::desktop::KeyOutcome::Enter { window_id, len } => {
+                                sprintln!(
+                                    "Aegis: shell-compositor@key: enter -> window id={} submitted {} char(s)",
+                                    window_id,
+                                    len
                                 );
                             }
                         }

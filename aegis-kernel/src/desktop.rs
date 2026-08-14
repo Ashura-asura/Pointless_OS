@@ -3,42 +3,52 @@
 //! screen for the whole run, so input-driven re-composition and re-blits can
 //! mutate live state instead of a one-shot boot-time demo.
 //!
-//! Input contract, serial-first: the idle loop drains the PS/2 ring buffer
-//! and calls `Desktop::apply_key`. Tab cycles focus between the clock and
-//! menu windows (raising z-order and re-occluding them); the arrow keys move
-//! the focused window one cell and clamp it to the screen bounds. Each
-//! applied key re-composites and re-blits, and the caller prints the
-//! resulting outcome over serial (a `KeyOutcome` mirror of the boot-time
-//! `menu(#) occludes clock(.)` assertion, but driven by a real keypress).
+//! Input contract, serial-first: the input task drains the PS/2 ring buffer
+//! and calls `Desktop::apply_key`. Printable keys echo into the focused shell
+//! window's line (the prompt `aegis:~$ ` is rendered first; typed characters
+//! follow it, with a `_` cursor); Backspace removes the last character; Enter
+//! submits (clears) the line. Each applied key re-composites and re-blits,
+//! and the caller prints the resulting outcome over serial (a `KeyOutcome`
+//! that mirrors the echoed character into the composited screen). The shell
+//! window is the default post-boot surface — there are no demo windows.
+//!
+//! Honest limit: the shell echoes a single command line (no scrollback yet),
+//! and only characters the PS/2 driver can translate (letters, digits,
+//! Space) reach the line; punctuation has no `Key` variant in the input
+//! model and is dropped upstream.
 
 use crate::compositor::{self, Cell, MAX_WINDOWS};
-use crate::input::Key;
+use crate::input::{Key, KeyEvent};
 use crate::window::{Region, WindowManager};
 
 /// Screen size in VGA text cells.
 pub const SW: usize = 80;
 pub const SH: usize = 25;
 
-const CLOCK_W: u16 = 30;
-const CLOCK_H: u16 = 8;
-const MENU_W: u16 = 24;
-const MENU_H: u16 = 5;
+/// Shell window geometry (the default post-boot surface).
+pub const SHELL_X: i16 = 2;
+pub const SHELL_Y: i16 = 2;
+pub const SHELL_W: u16 = 60;
+pub const SHELL_H: u16 = 12;
 
-/// What a keypress did to the live desktop. The caller (idle loop) prints
-/// it over serial as the keypress-driven analogue of the boot-time occlusion
-/// assertion.
+/// The shell prompt rendered at the start of the shell line.
+const PROMPT: &[u8] = b"aegis:~$ ";
+
+/// Maximum length of the echoed command line (prompt + chars must fit the
+/// shell window width).
+const LINE_MAX: usize = (SHELL_W as usize) - PROMPT.len();
+
+/// What a keypress did to the live desktop. The caller (input task) prints
+/// it over serial as the keypress-driven analogue of the boot-time shell
+/// assertion: the echoed character is visible in the composited screen.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KeyOutcome {
-    FocusChanged {
-        window_id: u32,
-        overlap_cell: u8,
-    },
-    Moved {
-        window_id: u32,
-        x: i16,
-        y: i16,
-        clipped: bool,
-    },
+    /// A printable key was appended to the shell line at `pos`.
+    Echoed { window_id: u32, ch: u8, pos: usize },
+    /// Backspace removed the last character; the line now has `pos` chars.
+    Backspace { window_id: u32, pos: usize },
+    /// Enter submitted (cleared) a `len`-character line.
+    Enter { window_id: u32, len: usize },
 }
 
 /// Live shell desktop: window manager + framebuffers + composited screen.
@@ -46,13 +56,11 @@ pub struct Desktop {
     wm: WindowManager,
     fb_title: [Cell; SW],
     fb_status: [Cell; SW],
-    fb_clock: [Cell; (CLOCK_W as usize) * (CLOCK_H as usize)],
-    fb_menu: [Cell; (MENU_W as usize) * (MENU_H as usize)],
+    fb_shell: [Cell; (SHELL_W as usize) * (SHELL_H as usize)],
     screen: [Cell; SW * SH],
-    clock_id: u32,
-    menu_id: u32,
-    focus_cycle: [u32; 2],
-    focus_pos: usize,
+    shell_id: u32,
+    line: [u8; LINE_MAX],
+    line_len: usize,
 }
 
 impl Default for Desktop {
@@ -62,8 +70,8 @@ impl Default for Desktop {
 }
 
 impl Desktop {
-    /// Build the desktop exactly as the boot-time demo did: title and status
-    /// bars plus a clock window and a focused menu window that occludes it.
+    /// Build the default post-boot desktop: title and status bars plus the
+    /// focused shell window that echoes typed characters.
     pub fn new() -> Desktop {
         let mut wm = WindowManager::new(SW as u16, SH as u16);
         let _title = wm
@@ -90,37 +98,25 @@ impl Desktop {
                 },
             )
             .unwrap();
-        let clock = wm
+        let shell = wm
             .create_window(
                 3,
-                b"clock",
+                b"shell",
                 Region {
-                    x: 2,
-                    y: 2,
-                    width: CLOCK_W,
-                    height: CLOCK_H,
+                    x: SHELL_X,
+                    y: SHELL_Y,
+                    width: SHELL_W,
+                    height: SHELL_H,
                 },
             )
             .unwrap();
-        let menu = wm
-            .create_window(
-                4,
-                b"menu",
-                Region {
-                    x: 18,
-                    y: 4,
-                    width: MENU_W,
-                    height: MENU_H,
-                },
-            )
-            .unwrap();
-        wm.focus_window(menu).unwrap();
+        wm.focus_window(shell).unwrap();
 
         let mut fb_title = [0u16; SW];
         for c in fb_title.iter_mut() {
             *c = 0x1F00 | b' ' as u16;
         }
-        for (i, t) in b" AEGIS GRAPHICAL SHELL -- live compositor desktop (80x25) -- transparent cells = blue desktop ".iter().enumerate()
+        for (i, t) in b" AEGIS GRAPHICAL SHELL -- interactive shell: type to echo (80x25) -- transparent cells = blue desktop ".iter().enumerate()
         {
             if i < SW {
                 fb_title[i] = 0x1F00 | *t as u16;
@@ -130,29 +126,45 @@ impl Desktop {
         for c in fb_status.iter_mut() {
             *c = 0x0F00 | b'-' as u16;
         }
-        let mut fb_clock = [0u16; (CLOCK_W as usize) * (CLOCK_H as usize)];
-        for (i, c) in fb_clock.iter_mut().enumerate() {
-            *c = 0x0F00 | if i == 0 { b'C' } else { b'.' } as u16;
-        }
-        let mut fb_menu = [0u16; (MENU_W as usize) * (MENU_H as usize)];
-        for (i, c) in fb_menu.iter_mut().enumerate() {
-            *c = 0x0F00 | if i == 0 { b'M' } else { b'#' } as u16;
-        }
 
         let mut d = Desktop {
             wm,
             fb_title,
             fb_status,
-            fb_clock,
-            fb_menu,
+            fb_shell: [0u16; (SHELL_W as usize) * (SHELL_H as usize)],
             screen: [compositor::TRANSPARENT; SW * SH],
-            clock_id: clock,
-            menu_id: menu,
-            focus_cycle: [clock, menu],
-            focus_pos: 1,
+            shell_id: shell,
+            line: [0u8; LINE_MAX],
+            line_len: 0,
         };
+        d.render_shell();
         d.composite();
         d
+    }
+
+    /// Render the shell window's framebuffer from the prompt + echoed line.
+    fn render_shell(&mut self) {
+        let w = SHELL_W as usize;
+        for (i, c) in self.fb_shell.iter_mut().enumerate() {
+            *c = 0x0F00 | if i == 0 { b' ' } else { b'.' } as u16;
+        }
+        let mut col = 0usize;
+        for &b in PROMPT.iter() {
+            if col < w {
+                self.fb_shell[col] = 0x0F00 | b as u16;
+            }
+            col += 1;
+        }
+        for (i, &b) in self.line[..self.line_len].iter().enumerate() {
+            let idx = col + i;
+            if idx < w {
+                self.fb_shell[idx] = 0x0F00 | b as u16;
+            }
+        }
+        let cur = col + self.line_len;
+        if cur < w {
+            self.fb_shell[cur] = 0x0F00 | b'_' as u16;
+        }
     }
 
     /// Re-composite the window manager + framebuffers into `screen`, then
@@ -162,8 +174,7 @@ impl Desktop {
         let mut fbs: [Option<&[Cell]>; MAX_WINDOWS] = [None; MAX_WINDOWS];
         fbs[0] = Some(&self.fb_title);
         fbs[1] = Some(&self.fb_status);
-        fbs[2] = Some(&self.fb_clock);
-        fbs[3] = Some(&self.fb_menu);
+        fbs[2] = Some(&self.fb_shell);
         compositor::composite(&self.wm, &fbs, &mut self.screen).unwrap();
         let desktop_bg: Cell = 0x1000 | b' ' as u16;
         for c in self.screen.iter_mut() {
@@ -192,96 +203,260 @@ impl Desktop {
             .count()
     }
 
-    /// Apply one keypress to the live desktop: Tab cycles focus between the
-    /// clock and menu windows (re-occluding them); arrows move the focused
-    /// window one cell, clamped to the screen bounds. Pure — re-composites
-    /// in memory but does not blit, so tests can assert on `screen()`.
-    pub fn apply_key(&mut self, key: Key) -> Option<KeyOutcome> {
-        match key {
-            Key::Tab => {
-                self.focus_pos = (self.focus_pos + 1) % self.focus_cycle.len();
-                let id = self.focus_cycle[self.focus_pos];
-                self.wm.focus_window(id).ok()?;
+    /// Apply one keypress to the live desktop: printable keys echo into the
+    /// shell window's line, Backspace removes the last character, Enter
+    /// submits (clears) the line. Pure — re-composites in memory but does
+    /// not blit, so tests can assert on `screen()`.
+    pub fn apply_key(&mut self, ke: KeyEvent) -> Option<KeyOutcome> {
+        match ke.key {
+            Key::Backspace => {
+                if self.line_len > 0 {
+                    self.line_len -= 1;
+                    self.render_shell();
+                    self.composite();
+                    Some(KeyOutcome::Backspace {
+                        window_id: self.shell_id,
+                        pos: self.line_len,
+                    })
+                } else {
+                    None
+                }
+            }
+            Key::Enter => {
+                let len = self.line_len;
+                self.line_len = 0;
+                self.render_shell();
                 self.composite();
-                let cell = (self.screen[5 * SW + 24] & 0xFF) as u8;
-                Some(KeyOutcome::FocusChanged {
-                    window_id: id,
-                    overlap_cell: cell,
+                Some(KeyOutcome::Enter {
+                    window_id: self.shell_id,
+                    len,
                 })
             }
-            Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight => {
-                let id = self.focus_cycle[self.focus_pos];
-                let region = self.wm.window(id)?.region;
-                let (nx, ny, clipped) = clamp_move(region, key);
-                self.wm.move_window(id, nx, ny).ok()?;
+            _ => {
+                let ch = key_to_char(ke.key, ke.modifiers.shift)?;
+                if self.line_len >= LINE_MAX {
+                    return None;
+                }
+                self.line[self.line_len] = ch;
+                self.line_len += 1;
+                let pos = self.line_len - 1;
+                self.render_shell();
                 self.composite();
-                Some(KeyOutcome::Moved {
-                    window_id: id,
-                    x: nx,
-                    y: ny,
-                    clipped,
+                Some(KeyOutcome::Echoed {
+                    window_id: self.shell_id,
+                    ch,
+                    pos,
                 })
             }
-            _ => None,
         }
     }
 
-    /// Current region of the focused window.
-    pub fn focused_region(&self) -> Region {
-        self.wm
-            .window(self.focus_cycle[self.focus_pos])
-            .map(|w| w.region)
-            .unwrap()
-    }
-
-    /// Window id of the clock app window.
-    pub fn clock_id(&self) -> u32 {
-        self.clock_id
-    }
-
-    /// Window id of the menu dialog window.
-    pub fn menu_id(&self) -> u32 {
-        self.menu_id
+    /// Window id of the shell window.
+    pub fn shell_id(&self) -> u32 {
+        self.shell_id
     }
 }
 
-/// Move `r` one cell in the arrow direction, clamped so the window never
-/// leaves the screen. Returns the new origin and whether clamping fired.
-fn clamp_move(r: Region, key: Key) -> (i16, i16, bool) {
-    let (mut x, mut y) = (r.x, r.y);
-    let mut clipped = false;
-    match key {
-        Key::ArrowUp => {
-            y -= 1;
-            if y < 0 {
-                y = 0;
-                clipped = true;
+/// Map a `Key` to its echoed byte, honoring the left-shift modifier for
+/// uppercase letters. Returns `None` for keys the shell does not echo
+/// (Tab, Escape, arrows, function keys).
+fn key_to_char(key: Key, shift: bool) -> Option<u8> {
+    Some(match key {
+        Key::A => {
+            if shift {
+                b'A'
+            } else {
+                b'a'
             }
         }
-        Key::ArrowDown => {
-            y += 1;
-            if (y as i32 + r.height as i32) > SH as i32 {
-                y = (SH as i32 - r.height as i32) as i16;
-                clipped = true;
+        Key::B => {
+            if shift {
+                b'B'
+            } else {
+                b'b'
             }
         }
-        Key::ArrowLeft => {
-            x -= 1;
-            if x < 0 {
-                x = 0;
-                clipped = true;
+        Key::C => {
+            if shift {
+                b'C'
+            } else {
+                b'c'
             }
         }
-        Key::ArrowRight => {
-            x += 1;
-            if (x as i32 + r.width as i32) > SW as i32 {
-                x = (SW as i32 - r.width as i32) as i16;
-                clipped = true;
+        Key::D => {
+            if shift {
+                b'D'
+            } else {
+                b'd'
             }
         }
-        _ => {}
-    }
-    (x, y, clipped)
+        Key::E => {
+            if shift {
+                b'E'
+            } else {
+                b'e'
+            }
+        }
+        Key::F => {
+            if shift {
+                b'F'
+            } else {
+                b'f'
+            }
+        }
+        Key::G => {
+            if shift {
+                b'G'
+            } else {
+                b'g'
+            }
+        }
+        Key::H => {
+            if shift {
+                b'H'
+            } else {
+                b'h'
+            }
+        }
+        Key::I => {
+            if shift {
+                b'I'
+            } else {
+                b'i'
+            }
+        }
+        Key::J => {
+            if shift {
+                b'J'
+            } else {
+                b'j'
+            }
+        }
+        Key::K => {
+            if shift {
+                b'K'
+            } else {
+                b'k'
+            }
+        }
+        Key::L => {
+            if shift {
+                b'L'
+            } else {
+                b'l'
+            }
+        }
+        Key::M => {
+            if shift {
+                b'M'
+            } else {
+                b'm'
+            }
+        }
+        Key::N => {
+            if shift {
+                b'N'
+            } else {
+                b'n'
+            }
+        }
+        Key::O => {
+            if shift {
+                b'O'
+            } else {
+                b'o'
+            }
+        }
+        Key::P => {
+            if shift {
+                b'P'
+            } else {
+                b'p'
+            }
+        }
+        Key::Q => {
+            if shift {
+                b'Q'
+            } else {
+                b'q'
+            }
+        }
+        Key::R => {
+            if shift {
+                b'R'
+            } else {
+                b'r'
+            }
+        }
+        Key::S => {
+            if shift {
+                b'S'
+            } else {
+                b's'
+            }
+        }
+        Key::T => {
+            if shift {
+                b'T'
+            } else {
+                b't'
+            }
+        }
+        Key::U => {
+            if shift {
+                b'U'
+            } else {
+                b'u'
+            }
+        }
+        Key::V => {
+            if shift {
+                b'V'
+            } else {
+                b'v'
+            }
+        }
+        Key::W => {
+            if shift {
+                b'W'
+            } else {
+                b'w'
+            }
+        }
+        Key::X => {
+            if shift {
+                b'X'
+            } else {
+                b'x'
+            }
+        }
+        Key::Y => {
+            if shift {
+                b'Y'
+            } else {
+                b'y'
+            }
+        }
+        Key::Z => {
+            if shift {
+                b'Z'
+            } else {
+                b'z'
+            }
+        }
+        Key::Zero => b'0',
+        Key::One => b'1',
+        Key::Two => b'2',
+        Key::Three => b'3',
+        Key::Four => b'4',
+        Key::Five => b'5',
+        Key::Six => b'6',
+        Key::Seven => b'7',
+        Key::Eight => b'8',
+        Key::Nine => b'9',
+        Key::Space => b' ',
+        _ => return None,
+    })
 }
 
 /// The one live desktop, installed at boot after the demo assertions print.
@@ -309,9 +484,9 @@ pub fn boot_blit() -> bool {
 
 /// Apply one keypress to the live desktop and re-blit. Returns the outcome
 /// for the caller to print over serial.
-pub fn handle_key(key: Key) -> Option<KeyOutcome> {
+pub fn handle_key(ke: KeyEvent) -> Option<KeyOutcome> {
     let d = unsafe { core::ptr::addr_of_mut!(DESKTOP).as_mut() }.and_then(|o| o.as_mut())?;
-    let out = d.apply_key(key)?;
+    let out = d.apply_key(ke)?;
     d.blit();
     Some(out)
 }
@@ -322,121 +497,127 @@ mod tests {
     use crate::input::{InputBuffer, InputEvent};
     use crate::ps2::Ps2State;
 
+    /// Screen index of the first character cell after the shell prompt.
+    fn echo_base() -> usize {
+        SHELL_Y as usize * SW + SHELL_X as usize + PROMPT.len()
+    }
+
     #[test]
-    fn boot_layout_matches_original_assertion() {
+    fn boot_shell_surface_is_default() {
         let d = Desktop::new();
-        let in_menu = (d.screen()[5 * SW + 24] & 0xFF) as u8;
-        let in_clock = (d.screen()[3 * SW + 5] & 0xFF) as u8;
+        // The prompt is rendered in the focused shell window.
+        let prompt_cell = (d.screen()[SHELL_Y as usize * SW + SHELL_X as usize] & 0xFF) as u8;
+        assert_eq!(prompt_cell, b'a');
         let status_ok = (d.screen()[(SH - 1) * SW] & 0xFF) as u8 == b'-';
-        assert_eq!(in_menu, b'#');
-        assert_eq!(in_clock, b'.');
         assert!(status_ok);
-        assert_eq!(d.window_count(), 4);
+        // Title + status + shell: no demo windows.
+        assert_eq!(d.window_count(), 3);
     }
 
     #[test]
-    fn tab_via_ring_buffer_changes_focus_and_composite() {
-        // Phase-I ring buffer: translate a real Tab make scancode.
+    fn keystroke_echoes_through_full_path() {
+        // PS/2 ring buffer path: scancodes for 'h' (0x23) then 'i' (0x17).
         let mut st = Ps2State::new();
         let mut buf = InputBuffer::new();
-        st.feed(&mut buf, 0x0F);
-        let ev = buf.pop().unwrap();
-        let InputEvent::Key(ke) = ev else {
-            panic!("expected a Key event")
-        };
-        assert_eq!(ke.key, Key::Tab);
-        assert!(ke.pressed);
-
-        // Apply it to a fresh desktop: menu was occluding the clock at the
-        // probe cell; the clock must now be topmost there.
+        st.feed(&mut buf, 0x23);
+        st.feed(&mut buf, 0x17);
         let mut d = Desktop::new();
-        assert_eq!((d.screen()[5 * SW + 24] & 0xFF) as u8, b'#');
-        let out = d.apply_key(ke.key).unwrap();
-        match out {
-            KeyOutcome::FocusChanged {
-                window_id,
-                overlap_cell,
-            } => {
-                assert_eq!(window_id, d.clock_id());
-                assert_eq!(overlap_cell, b'.');
+        let mut echoed: [u8; 2] = [0; 2];
+        let mut n = 0;
+        while let Some(ev) = buf.pop() {
+            if let InputEvent::Key(ke) = ev {
+                if ke.pressed {
+                    if let Some(KeyOutcome::Echoed { ch, .. }) = d.apply_key(ke) {
+                        echoed[n] = ch;
+                        n += 1;
+                    }
+                }
             }
-            _ => panic!("expected a focus change"),
         }
-        assert_eq!((d.screen()[5 * SW + 24] & 0xFF) as u8, b'.');
+        assert_eq!(n, 2);
+        assert_eq!(echoed, [b'h', b'i']);
+        // The composited screen shows prompt + echoed chars.
+        let base = echo_base();
+        assert_eq!((d.screen()[base] & 0xFF) as u8, b'h');
+        assert_eq!((d.screen()[base + 1] & 0xFF) as u8, b'i');
     }
 
     #[test]
-    fn arrow_moves_focused_window_and_clamps() {
+    fn shift_produces_uppercase_echo() {
         let mut d = Desktop::new();
-        // Focused window is the menu at (18,4): one ArrowLeft -> (17,4).
-        let out = d.apply_key(Key::ArrowLeft).unwrap();
+        let out = d
+            .apply_key(KeyEvent {
+                key: Key::A,
+                pressed: true,
+                modifiers: crate::input::KeyModifiers {
+                    shift: true,
+                    ctrl: false,
+                    alt: false,
+                },
+            })
+            .unwrap();
         match out {
-            KeyOutcome::Moved {
-                window_id,
-                x,
-                y,
-                clipped,
-            } => {
-                assert_eq!(window_id, d.menu_id());
-                assert_eq!((x, y), (17, 4));
-                assert!(!clipped);
-            }
-            _ => panic!("expected a move"),
+            KeyOutcome::Echoed { ch, .. } => assert_eq!(ch, b'A'),
+            _ => panic!("expected an echo"),
         }
-        // Hammer left until the window hits the screen edge: clamped at x=0.
-        for _ in 0..30 {
-            let _ = d.apply_key(Key::ArrowLeft);
-        }
-        let out = d.apply_key(Key::ArrowLeft).unwrap();
-        match out {
-            KeyOutcome::Moved { x, clipped, .. } => {
-                assert_eq!(x, 0);
-                assert!(clipped);
-            }
-            _ => panic!("expected a move"),
-        }
-        let r = d.focused_region();
-        assert!(r.x >= 0 && (r.x as i32 + r.width as i32) <= SW as i32);
-        assert!(r.y >= 0 && (r.y as i32 + r.height as i32) <= SH as i32);
+        assert_eq!((d.screen()[echo_base()] & 0xFF) as u8, b'A');
     }
 
     #[test]
-    fn arrow_down_moves_into_clock_space() {
+    fn backspace_removes_last_char() {
         let mut d = Desktop::new();
-        let out = d.apply_key(Key::ArrowDown).unwrap();
+        d.apply_key(KeyEvent {
+            key: Key::H,
+            pressed: true,
+            modifiers: Default::default(),
+        })
+        .unwrap();
+        d.apply_key(KeyEvent {
+            key: Key::I,
+            pressed: true,
+            modifiers: Default::default(),
+        })
+        .unwrap();
+        let base = echo_base();
+        assert_eq!((d.screen()[base + 1] & 0xFF) as u8, b'i');
+        let out = d
+            .apply_key(KeyEvent {
+                key: Key::Backspace,
+                pressed: true,
+                modifiers: Default::default(),
+            })
+            .unwrap();
         match out {
-            KeyOutcome::Moved { x, y, .. } => assert_eq!((x, y), (18, 5)),
-            _ => panic!("expected a move"),
+            KeyOutcome::Backspace { pos, .. } => assert_eq!(pos, 1),
+            _ => panic!("expected a backspace"),
         }
+        // The second char is gone; the cursor now sits after 'h'.
+        let cur = d.screen()[echo_base() + 1] & 0xFF;
+        assert_eq!(cur as u8, b'_');
     }
 
     #[test]
-    fn arrow_sequence_via_ring_buffer_reports_regions() {
-        // Phase-I ring buffer feeding Phase-III movement: scancodes for
-        // Left then Down, applied to the live desktop, must report the menu
-        // at (17,4) then (17,5).
-        let mut st = Ps2State::new();
-        let mut buf = InputBuffer::new();
-        st.feed(&mut buf, 0xE0);
-        st.feed(&mut buf, 0x4B);
-        st.feed(&mut buf, 0xE0);
-        st.feed(&mut buf, 0x50);
-        let first = buf.pop().unwrap();
-        let second = buf.pop().unwrap();
-        let InputEvent::Key(ke1) = first else {
-            panic!("expected a Key event")
-        };
-        let InputEvent::Key(ke2) = second else {
-            panic!("expected a Key event")
-        };
+    fn enter_clears_the_line() {
         let mut d = Desktop::new();
-        match d.apply_key(ke1.key).unwrap() {
-            KeyOutcome::Moved { x, y, .. } => assert_eq!((x, y), (17, 4)),
-            _ => panic!("expected a move"),
+        d.apply_key(KeyEvent {
+            key: Key::H,
+            pressed: true,
+            modifiers: Default::default(),
+        })
+        .unwrap();
+        let out = d
+            .apply_key(KeyEvent {
+                key: Key::Enter,
+                pressed: true,
+                modifiers: Default::default(),
+            })
+            .unwrap();
+        match out {
+            KeyOutcome::Enter { len, .. } => assert_eq!(len, 1),
+            _ => panic!("expected an enter"),
         }
-        match d.apply_key(ke2.key).unwrap() {
-            KeyOutcome::Moved { x, y, .. } => assert_eq!((x, y), (17, 5)),
-            _ => panic!("expected a move"),
-        }
+        // Line cleared: the cursor is back at the prompt end.
+        let cur = d.screen()[echo_base()] & 0xFF;
+        assert_eq!(cur as u8, b'_');
     }
 }
