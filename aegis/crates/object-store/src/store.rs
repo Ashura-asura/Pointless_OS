@@ -415,3 +415,521 @@ impl FlatView {
         self.write_dir(k, store, &entries)
     }
 }
+
+// ---------------------------------------------------------------------------
+// TreeView: the full POSIX file-tree projection (design doc §8) — the
+// hierarchical upgrade over `FlatView`'s flat namespace. Directories and files
+// are nothing but store objects; the root is a COW dir node, every
+// subdirectory is a COW dir node, every file is a COW file node. A mutation
+// commits new versions of the target's parent dir AND of every dir up to the
+// root (path persistence); a node id you hold reads that version forever.
+//
+// Paths are absolute (`/a/b/c.txt`) or relative to the working directory; `.`
+// and `..` resolve; the cwd is tracked as a path (re-resolved from the root,
+// since node ids move under COW). Entries carry POSIX mode/uid as projection
+// metadata; the authority that actually gates access stays capability-shaped
+// (region caps), per the design-doc position that permission bits are
+// subsumed by capabilities.
+// ---------------------------------------------------------------------------
+
+// (The kernel's `TreeView` enforces an in-kernel `MAX_DEPTH` bound; this std
+// mirror is unbounded, which is the honest divergence between an implementation
+// ceiling and a design's semantics.)
+
+/// POSIX-compat mode metadata for a regular file (S_IFREG | 0644).
+pub const MODE_FILE: u16 = 0o100644;
+/// POSIX-compat mode metadata for a directory (S_IFDIR | 0755).
+pub const MODE_DIR: u16 = 0o040755;
+
+/// POSIX entry kind in the hierarchical view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Dir,
+}
+
+/// One entry of the hierarchical POSIX projection: a name, kind, mode/uid
+/// metadata, and the store-node it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PEntry {
+    pub name: String,
+    pub kind: EntryKind,
+    pub mode: u16,
+    pub uid: u32,
+    pub node: u64,
+}
+
+fn encode_posix_entries(entries: &[PEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        let name = e.name.as_bytes();
+        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.extend_from_slice(name);
+        out.push(match e.kind {
+            EntryKind::File => 0,
+            EntryKind::Dir => 1,
+        });
+        out.extend_from_slice(&e.mode.to_le_bytes());
+        out.extend_from_slice(&e.uid.to_le_bytes());
+        out.extend_from_slice(&e.node.to_le_bytes());
+    }
+    out
+}
+
+fn decode_posix_entries(bytes: &[u8]) -> Vec<PEntry> {
+    let mut out = Vec::new();
+    if bytes.len() < 4 {
+        return out;
+    }
+    let mut at = 0usize;
+    let count = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    at += 4;
+    for _ in 0..count {
+        let Some(nlen_bytes) = bytes.get(at..at + 4) else {
+            break;
+        };
+        let nlen = u32::from_le_bytes(nlen_bytes.try_into().unwrap()) as usize;
+        at += 4;
+        let Some(name_bytes) = bytes.get(at..at + nlen) else {
+            break;
+        };
+        let Ok(name) = String::from_utf8(name_bytes.to_vec()) else {
+            break;
+        };
+        at += nlen;
+        let Some(&kind_byte) = bytes.get(at) else {
+            break;
+        };
+        at += 1;
+        let Some(mode_bytes) = bytes.get(at..at + 2) else {
+            break;
+        };
+        let mode = u16::from_le_bytes(mode_bytes.try_into().unwrap());
+        at += 2;
+        let Some(uid_bytes) = bytes.get(at..at + 4) else {
+            break;
+        };
+        let uid = u32::from_le_bytes(uid_bytes.try_into().unwrap());
+        at += 4;
+        let Some(node_bytes) = bytes.get(at..at + 8) else {
+            break;
+        };
+        let node = u64::from_le_bytes(node_bytes.try_into().unwrap());
+        at += 8;
+        out.push(PEntry {
+            name,
+            kind: if kind_byte == 1 {
+                EntryKind::Dir
+            } else {
+                EntryKind::File
+            },
+            mode,
+            uid,
+            node,
+        });
+    }
+    out
+}
+
+/// Split `path` on `/`, dropping empty segments. `.`/`..` resolve later.
+fn split_path(path: &str) -> (bool, Vec<String>) {
+    let absolute = path.starts_with('/');
+    let comps = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    (absolute, comps)
+}
+
+/// Apply `.` (skip) and `..` (pop) over the full component list.
+fn normalize(comps: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in comps {
+        if c == "." {
+            continue;
+        }
+        if c == ".." {
+            out.pop();
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The hierarchical POSIX projection over the store.
+pub struct TreeView {
+    root: u64,
+    cwd: Vec<String>,
+}
+
+struct Resolved {
+    parent: u64,
+    target: PEntry,
+    found: bool,
+    /// (dir node, child name) for every dir descended through, root-down.
+    levels: Vec<(u64, String)>,
+}
+
+impl TreeView {
+    pub fn new(k: &mut Kernel, store: &mut Store) -> Option<TreeView> {
+        store.new_object(k).map(|root| TreeView {
+            root,
+            cwd: Vec::new(),
+        })
+    }
+
+    pub fn root(&self) -> u64 {
+        self.root
+    }
+
+    fn read_dir(&mut self, k: &mut Kernel, store: &mut Store, node: u64) -> Option<Vec<PEntry>> {
+        let bytes = store.snapshot(k, node)?;
+        Some(decode_posix_entries(&bytes))
+    }
+
+    fn resolve_components(&self, path: &str) -> Vec<String> {
+        let (abs, raw) = split_path(path);
+        let mut full = Vec::new();
+        if !abs {
+            full.extend(self.cwd.iter().cloned());
+        }
+        full.extend(raw);
+        normalize(full)
+    }
+
+    fn resolve(&mut self, k: &mut Kernel, store: &mut Store, path: &str) -> Option<Resolved> {
+        let comps = self.resolve_components(path);
+        let mut dir = self.root;
+        let mut levels = Vec::new();
+        for (i, name) in comps.iter().enumerate() {
+            let entries = self.read_dir(k, store, dir)?;
+            if i == comps.len() - 1 {
+                let pos = entries.iter().position(|e| &e.name == name);
+                let target = pos.map(|p| entries[p].clone()).unwrap_or(PEntry {
+                    name: name.clone(),
+                    kind: EntryKind::File,
+                    mode: 0,
+                    uid: 0,
+                    node: 0,
+                });
+                return Some(Resolved {
+                    parent: dir,
+                    target,
+                    found: pos.is_some(),
+                    levels,
+                });
+            }
+            let sub = entries.iter().find(|e| &e.name == name)?;
+            if sub.kind != EntryKind::Dir {
+                return None;
+            }
+            levels.push((dir, name.clone()));
+            dir = sub.node;
+        }
+        let target = PEntry {
+            name: String::new(),
+            kind: EntryKind::Dir,
+            mode: MODE_DIR,
+            uid: 0,
+            node: dir,
+        };
+        Some(Resolved {
+            parent: dir,
+            target,
+            found: true,
+            levels,
+        })
+    }
+
+    /// The working directory node, re-resolved from the root.
+    pub fn cwd(&mut self, k: &mut Kernel, store: &mut Store) -> Option<u64> {
+        let mut dir = self.root;
+        let cwd = self.cwd.clone();
+        for name in &cwd {
+            let entries = self.read_dir(k, store, dir)?;
+            let sub = entries.iter().find(|e| &e.name == name)?;
+            if sub.kind != EntryKind::Dir {
+                return None;
+            }
+            dir = sub.node;
+        }
+        Some(dir)
+    }
+
+    fn rewrite_entry(
+        &mut self,
+        k: &mut Kernel,
+        store: &mut Store,
+        dir: u64,
+        name: &str,
+        node: u64,
+    ) -> Option<u64> {
+        let mut entries = self.read_dir(k, store, dir)?;
+        let pos = entries.iter().position(|e| e.name == name)?;
+        entries[pos].node = node;
+        store.write_version(k, dir, &encode_posix_entries(&entries))
+    }
+
+    fn add_entry(
+        &mut self,
+        k: &mut Kernel,
+        store: &mut Store,
+        dir: u64,
+        entry: PEntry,
+    ) -> Option<u64> {
+        let mut entries = self.read_dir(k, store, dir)?;
+        if entries.iter().any(|e| e.name == entry.name) {
+            return None;
+        }
+        entries.push(entry);
+        store.write_version(k, dir, &encode_posix_entries(&entries))
+    }
+
+    fn remove_entry(
+        &mut self,
+        k: &mut Kernel,
+        store: &mut Store,
+        dir: u64,
+        name: &str,
+    ) -> Option<u64> {
+        let mut entries = self.read_dir(k, store, dir)?;
+        let pos = entries.iter().position(|e| e.name == name)?;
+        entries.remove(pos);
+        store.write_version(k, dir, &encode_posix_entries(&entries))
+    }
+
+    /// Install a mutated parent dir into the tree, committing new versions of
+    /// every dir on the root→parent path. Returns the new root node id (the
+    /// old root keeps reading the old tree — COW all the way up).
+    fn commit_tree(
+        &mut self,
+        k: &mut Kernel,
+        store: &mut Store,
+        parent_new: u64,
+        levels: &[(u64, String)],
+    ) -> Option<u64> {
+        if levels.is_empty() {
+            return Some(parent_new);
+        }
+        let mut cur = parent_new;
+        for (dir, name) in levels.iter().rev() {
+            cur = self.rewrite_entry(k, store, *dir, name, cur)?;
+        }
+        Some(cur)
+    }
+
+    fn commit(&mut self, k: &mut Kernel, store: &mut Store, parent_new: u64, r: &Resolved) -> bool {
+        match self.commit_tree(k, store, parent_new, &r.levels) {
+            Some(new_root) => {
+                self.root = new_root;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn cd(&mut self, k: &mut Kernel, store: &mut Store, path: &str) -> bool {
+        let comps = self.resolve_components(path);
+        let mut dir = self.root;
+        for name in &comps {
+            let entries = self.read_dir(k, store, dir).unwrap_or_default();
+            let Some(sub) = entries.iter().find(|e| &e.name == name) else {
+                return false;
+            };
+            if sub.kind != EntryKind::Dir {
+                return false;
+            }
+            dir = sub.node;
+        }
+        self.cwd = comps;
+        true
+    }
+
+    pub fn mkdir(&mut self, k: &mut Kernel, store: &mut Store, path: &str, mode: u16) -> bool {
+        let Some(r) = self.resolve(k, store, path) else {
+            return false;
+        };
+        if r.found {
+            return false;
+        }
+        let node = match store.new_object(k) {
+            Some(n) => n,
+            None => return false,
+        };
+        let parent_new = match self.add_entry(
+            k,
+            store,
+            r.parent,
+            PEntry {
+                name: r.target.name.clone(),
+                kind: EntryKind::Dir,
+                mode,
+                uid: 0,
+                node,
+            },
+        ) {
+            Some(n) => n,
+            None => return false,
+        };
+        self.commit(k, store, parent_new, &r)
+    }
+
+    pub fn create_file(
+        &mut self,
+        k: &mut Kernel,
+        store: &mut Store,
+        path: &str,
+        mode: u16,
+    ) -> bool {
+        let Some(r) = self.resolve(k, store, path) else {
+            return false;
+        };
+        if r.found {
+            return false;
+        }
+        let node = match store.new_object(k) {
+            Some(n) => n,
+            None => return false,
+        };
+        let parent_new = match self.add_entry(
+            k,
+            store,
+            r.parent,
+            PEntry {
+                name: r.target.name.clone(),
+                kind: EntryKind::File,
+                mode,
+                uid: 0,
+                node,
+            },
+        ) {
+            Some(n) => n,
+            None => return false,
+        };
+        self.commit(k, store, parent_new, &r)
+    }
+
+    pub fn write_file(
+        &mut self,
+        k: &mut Kernel,
+        store: &mut Store,
+        path: &str,
+        data: &[u8],
+    ) -> bool {
+        let Some(r) = self.resolve(k, store, path) else {
+            return false;
+        };
+        if !r.found || r.target.kind != EntryKind::File {
+            return false;
+        }
+        let file_new = match store.write_version(k, r.target.node, data) {
+            Some(n) => n,
+            None => return false,
+        };
+        let parent_new = match self.rewrite_entry(k, store, r.parent, &r.target.name, file_new) {
+            Some(n) => n,
+            None => return false,
+        };
+        self.commit(k, store, parent_new, &r)
+    }
+
+    pub fn read_file(&mut self, k: &mut Kernel, store: &mut Store, path: &str) -> Option<Vec<u8>> {
+        let r = self.resolve(k, store, path)?;
+        if !r.found || r.target.kind != EntryKind::File {
+            return None;
+        }
+        store.snapshot(k, r.target.node)
+    }
+
+    pub fn node_of(&mut self, k: &mut Kernel, store: &mut Store, path: &str) -> Option<u64> {
+        let r = self.resolve(k, store, path)?;
+        if !r.found {
+            return None;
+        }
+        Some(r.target.node)
+    }
+
+    /// Entries of the *historical* dir node `node` (a node id from an earlier
+    /// `root()`), decoded exactly as live dirs — version-stable COW.
+    pub fn snapshot_dir(
+        &mut self,
+        k: &mut Kernel,
+        store: &mut Store,
+        node: u64,
+    ) -> Option<Vec<PEntry>> {
+        self.read_dir(k, store, node)
+    }
+
+    pub fn list(&mut self, k: &mut Kernel, store: &mut Store, path: &str) -> Option<Vec<PEntry>> {
+        let r = self.resolve(k, store, path)?;
+        if r.target.kind != EntryKind::Dir {
+            return None;
+        }
+        self.read_dir(k, store, r.target.node)
+    }
+
+    pub fn unlink(&mut self, k: &mut Kernel, store: &mut Store, path: &str) -> bool {
+        let Some(r) = self.resolve(k, store, path) else {
+            return false;
+        };
+        if !r.found || r.target.kind != EntryKind::File {
+            return false;
+        }
+        let parent_new = match self.remove_entry(k, store, r.parent, &r.target.name) {
+            Some(n) => n,
+            None => return false,
+        };
+        self.commit(k, store, parent_new, &r)
+    }
+
+    pub fn rmdir(&mut self, k: &mut Kernel, store: &mut Store, path: &str) -> bool {
+        let Some(r) = self.resolve(k, store, path) else {
+            return false;
+        };
+        if !r.found || r.target.kind != EntryKind::Dir {
+            return false;
+        }
+        if r.target.node == self.root {
+            return false;
+        }
+        if !self
+            .read_dir(k, store, r.target.node)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return false;
+        }
+        let parent_new = match self.remove_entry(k, store, r.parent, &r.target.name) {
+            Some(n) => n,
+            None => return false,
+        };
+        self.commit(k, store, parent_new, &r)
+    }
+
+    /// `(kind, mode, uid, size)` where size is bytes for a file and entry
+    /// count for a directory.
+    pub fn stat(
+        &mut self,
+        k: &mut Kernel,
+        store: &mut Store,
+        path: &str,
+    ) -> Option<(EntryKind, u16, u32, usize)> {
+        let r = self.resolve(k, store, path)?;
+        if !r.found {
+            return None;
+        }
+        match r.target.kind {
+            EntryKind::File => {
+                let size = store.snapshot(k, r.target.node)?.len();
+                Some((EntryKind::File, r.target.mode, r.target.uid, size))
+            }
+            EntryKind::Dir => {
+                let count = self.read_dir(k, store, r.target.node)?.len();
+                Some((EntryKind::Dir, r.target.mode, r.target.uid, count))
+            }
+        }
+    }
+}

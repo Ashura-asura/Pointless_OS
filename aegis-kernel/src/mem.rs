@@ -16,7 +16,7 @@ use crate::audit::OpKind as AuditedOp;
 use crate::cap::{Cap, CapSlot, Rights};
 use crate::tasks::{current_idx, set_task_cap, task_cap, MAX_CAPS};
 
-pub const MAX_REGIONS: usize = 32;
+pub const MAX_REGIONS: usize = 112;
 
 /// Model crate `create_mem` installs READ|WRITE|GRANT on a fresh region.
 pub use crate::cap::MEM_RIGHTS;

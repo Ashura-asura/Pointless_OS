@@ -574,6 +574,127 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         sprintln!("Aegis: NVMe: no controller with a mapped BAR");
     }
 
+    // Phase C: the full POSIX view over the in-kernel object store — a
+    // hierarchical namespace (nested directories, path resolution, cwd,
+    // mode/uid metadata) replacing the flat single-level projection. Files
+    // and directories are nothing but COW store objects; a mutation commits
+    // new versions of every dir on the root->parent path (path
+    // persistence). The authority that gates access stays capability-shaped
+    // (region caps); mode bits are compat metadata for the projection.
+    {
+        use aegis_kernel::store::{EntryKind, TreeView, MAX_FILES, MODE_DIR, MODE_FILE};
+        let mut st = aegis_kernel::store::Store::new();
+        let mut view = TreeView::new(&mut st).expect("tree view");
+        let mkd = |v: &mut TreeView, s: &mut aegis_kernel::store::Store, p: &[u8]| {
+            v.mkdir(s, p, MODE_DIR)
+        };
+        let ok_home = mkd(&mut view, &mut st, b"/home");
+        let ok_alice = mkd(&mut view, &mut st, b"/home/alice");
+        let ok_docs = mkd(&mut view, &mut st, b"/home/alice/docs");
+        let ok_f = view.create_file(&mut st, b"/home/alice/docs/report.txt", MODE_FILE);
+        let ok_w = view.write_file(
+            &mut st,
+            b"/home/alice/docs/report.txt",
+            b"Phase C: nested POSIX view",
+        );
+        sprintln!(
+            "Aegis: POSIX-view: nested /home/alice/docs/report.txt mkdir {}/{}/{} file {} write {} ({} blocks)",
+            ok_home, ok_alice, ok_docs, ok_f, ok_w, st.block_count()
+        );
+
+        let mut buf = [0u8; 128];
+        let n = view
+            .read_file(&mut st, b"/home/alice/docs/report.txt", &mut buf)
+            .unwrap_or(0);
+        sprintln!(
+            "Aegis: POSIX-view: read back {} bytes: {}",
+            n,
+            core::str::from_utf8(&buf[..n]).unwrap_or("?")
+        );
+
+        // Relative paths + cwd + `.`/`..` resolution.
+        let cd_ok = view.cd(&mut st, b"/home/alice");
+        let n_rel = view
+            .read_file(&mut st, b"docs/report.txt", &mut buf)
+            .unwrap_or(0);
+        let n_dot = view
+            .read_file(&mut st, b"./docs/../docs/report.txt", &mut buf)
+            .unwrap_or(0);
+        let n_abs = view
+            .read_file(&mut st, b"/home/alice/docs/report.txt", &mut buf)
+            .unwrap_or(0);
+        sprintln!(
+            "Aegis: POSIX-view: cd {} ; relative {} ; ././/.. {} ; absolute {} (same = {})",
+            cd_ok,
+            n_rel == n,
+            n_dot == n,
+            n_abs == n,
+            n_rel == n && n_dot == n && n_abs == n
+        );
+
+        // stat: kind + mode metadata + size.
+        let (kind, mode, _uid, size) =
+            view.stat(&mut st, b"docs/report.txt")
+                .unwrap_or((EntryKind::File, 0, 0, 0));
+        sprintln!(
+            "Aegis: POSIX-view: stat mode={:04o} kind={} size={}",
+            mode,
+            if kind == EntryKind::Dir {
+                "dir"
+            } else {
+                "file"
+            },
+            size
+        );
+
+        // COW all the way up: a mutation rewrites the root; the old root
+        // still reads the old tree.
+        let root_v1 = view.root();
+        let ok_notes = view.create_file(&mut st, b"docs/notes.txt", MODE_FILE);
+        let root_v2 = view.root();
+        let mut old_ents = [aegis_kernel::store::PEntry {
+            name: aegis_kernel::store::Name::from_slice(b"x").unwrap(),
+            kind: EntryKind::File,
+            mode: 0,
+            uid: 0,
+            node: 0,
+        }; MAX_FILES];
+        let n_old = view
+            .snapshot_dir(&mut st, root_v1, &mut old_ents)
+            .unwrap_or(0);
+        let still_home = old_ents[..n_old].iter().any(|e| e.name.matches(b"home"));
+        sprintln!(
+            "Aegis: POSIX-view: COW to the root: root rewritten = {}, old root lists {} entry(s), home still there = {} (notes create {})",
+            root_v1 != root_v2, n_old, still_home, ok_notes
+        );
+
+        // rmdir/unlink: an empty dir is removable, a non-empty one is not,
+        // and the root is never removable.
+        let ok_rm_notes = view.unlink(&mut st, b"docs/notes.txt");
+        let ok_rm_empty =
+            view.mkdir(&mut st, b"docs/tmp", MODE_DIR) && view.rmdir(&mut st, b"docs/tmp");
+        let ok_rm_nonempty = view.rmdir(&mut st, b"docs");
+        let root_refused = !view.rmdir(&mut st, b"/");
+        sprintln!(
+            "Aegis: POSIX-view: unlink {} ; rmdir empty {} ; rmdir non-empty {} ; root not removable = {}",
+            ok_rm_notes, ok_rm_empty, ok_rm_nonempty, root_refused
+        );
+
+        // The relationship index still rebuilds from the WAL after all the
+        // tree activity (graph as index, not ground truth).
+        let mut idx = aegis_kernel::store::RelationshipIndex::new();
+        idx.ingest(st.wal());
+        let nodes = idx.node_count();
+        let mut fresh = aegis_kernel::store::RelationshipIndex::new();
+        fresh.rebuild(st.wal());
+        sprintln!(
+            "Aegis: POSIX-view: index consumed {} WAL seq(s), {} node(s), rebuild identical = {}",
+            idx.consumed_seq(),
+            nodes,
+            fresh.node_count() == nodes
+        );
+    }
+
     // Phase 9/10 (roadmap §10 item 3) + item 4: the graphical shell's live
     // desktop, now the kernel's default post-boot state. A compositor turns
     // the window manager's z-ordered window list plus per-window framebuffers
@@ -593,7 +714,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         // prompt `aegis:~$ ` at its origin, and the status bar spans the
         // bottom row. Verify the composited screen shows them.
         let prompt_cell = (screen[SHELL_Y as usize * SW + SHELL_X as usize] & 0xFF) as u8;
-        let status_ok = (screen[(SH - 1) * SW + 0] & 0xFF) as u8 == b'-';
+        let status_ok = (screen[(SH - 1) * SW] & 0xFF) as u8 == b'-';
         sprintln!(
             "Aegis: shell-compositor: boot shell surface: prompt first cell '{}' @ ({},{}), status bar = {}, {} windows",
             prompt_cell as char,
@@ -1698,7 +1819,6 @@ extern "sysv64" fn task_mem_rm() -> ! {
             core::hint::spin_loop();
         }
     }
-    let ep = ep as u64;
     user_syscall5(9, IDX_MEM_CLIENT, ep, 0, 0);
     user_print(b"Aegis: [mem-rm] endpoint granted to mem-client\r\n");
     let mut lent = [false; 2];
@@ -1869,7 +1989,6 @@ extern "sysv64" fn task_parent_supervisor() -> ! {
             core::hint::spin_loop();
         }
     }
-    let esc = esc as u64;
     user_syscall5(9, IDX_SUPERVISOR, esc, 3, 0); // CapGrant(supervisor, our esc, their slot 3)
     user_print(b"Aegis: [parent-sup] escalation endpoint granted to child supervisor\r\n");
     // Wait for the child to escalate (serve blocks until it calls).

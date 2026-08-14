@@ -24,10 +24,13 @@
 //! arena (block/node contents live in kernel memory, not on a block device —
 //! the NVMe/FAT path of Phase 3 is a separate driver, not wired to this store);
 //! the region table and arena are bounded (`MAX_REGIONS`, `ARENA_BYTES`); the
-//! POSIX view is a flat single-level namespace (no nested directories, no path
-//! resolution, no permission bits); the WAL is in-memory — "durable" means
-//! "survives while the kernel process lives", real durability needs the block
-//! device (Phase 4's own roadmap note).
+//! POSIX view is hierarchical (`TreeView`: nested directories, path resolution,
+//! mode/uid metadata) but still bounded (`MAX_DEPTH`, `MAX_FILES` per dir) and
+//! has no symlinks or hard links; permission *bits* are projection metadata —
+//! the authority that gates access is capability-shaped, so the view does not
+//! re-enforce ACLs (the design doc subsumes them under capabilities); the WAL
+//! is in-memory — "durable" means "survives while the kernel process lives",
+//! real durability needs the block device (Phase 4's own roadmap note).
 //!
 //! Contract tests exercise the gate + COW + WAL/index logic in-process, binding
 //! region records to real in-test memory (the frame allocator has no pool in
@@ -39,10 +42,19 @@ use crate::mem;
 
 pub const NAME_BYTES: usize = 32;
 pub const MAX_FILES: usize = 8;
-pub const MAX_BLOCKS: usize = 16;
-pub const MAX_NODES: usize = 16;
-pub const MAX_WAL: usize = 64;
+pub const MAX_BLOCKS: usize = 48;
+pub const MAX_NODES: usize = 48;
+pub const MAX_WAL: usize = 128;
 const ENTRY_BUF: usize = 1024;
+
+/// Maximum path depth (components) in the hierarchical POSIX view. The root
+/// is depth 0, so `/a/b/c.txt` is 3 components.
+pub const MAX_DEPTH: usize = 8;
+
+/// POSIX-compat mode metadata for a regular file (S_IFREG | 0644).
+pub const MODE_FILE: u16 = 0o100644;
+/// POSIX-compat mode metadata for a directory (S_IFDIR | 0755).
+pub const MODE_DIR: u16 = 0o040755;
 
 /// 32-byte content hash; a block's identity and its integrity check combined.
 pub type BlockId = [u8; 32];
@@ -216,7 +228,7 @@ impl Wal {
 // creates a real `MemRegion`, served to readers through the capability gates.
 // ---------------------------------------------------------------------------
 
-const ARENA_BYTES: usize = 8192;
+const ARENA_BYTES: usize = 49152;
 
 static mut ARENA: [u8; ARENA_BYTES] = [0u8; ARENA_BYTES];
 static mut ARENA_CURSOR: usize = 0;
@@ -603,6 +615,24 @@ impl Store {
         });
         Some(next)
     }
+
+    /// Content length (bytes) of the version `node` names, without copying the
+    /// content (used by the POSIX view's `stat`).
+    pub fn node_len(&mut self, node: u64) -> Option<usize> {
+        let loc = *self.nodes.iter().flatten().find(|n| n.id == node)?;
+        let (base, len) = mem::region_base_len(loc.region)?;
+        let mut node_bytes = [0u8; 64];
+        if !arena_load(base, len.min(64), &mut node_bytes) {
+            return None;
+        }
+        let (_, block) = decode_node(&node_bytes);
+        let Some(block) = block else {
+            // A node naming no block is an empty object.
+            return Some(0);
+        };
+        let bloc = *self.blocks.iter().flatten().find(|b| b.id == block)?;
+        Some(bloc.len as usize)
+    }
 }
 
 impl Default for Store {
@@ -736,6 +766,640 @@ fn empty_entry() -> FileEntry {
             len: 0,
         },
         node: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TreeView: the full POSIX file-tree projection (design doc §8). The upgrade
+// from `FlatView`'s flat single-level namespace: a hierarchical namespace over
+// store objects. The root is a COW dir node; every subdirectory is a COW dir
+// node; every file is a COW file node — files and directories are nothing but
+// store objects, there is exactly one place bytes live.
+//
+// A mutation commits a new version of the target's parent dir AND of every dir
+// node on the path up to the root (path persistence); a node id you already
+// hold reads that version forever, so snapshots are version-stable at every
+// level of the tree.
+//
+// Paths: absolute (`/a/b/c.txt`) or relative to the working directory; `.`
+// and `..` components resolve; a trailing slash is irrelevant (empty segments
+// are dropped). The cwd is tracked as a path — a real POSIX shell's cwd is a
+// path, not a node id — and survives COW exactly because it is re-resolved
+// from the root on demand.
+//
+// Permission bits: entries carry POSIX `mode`/`uid` as projection metadata
+// (so POSIX tools see a familiar `st_mode`), but the authority that actually
+// gates access is capability-shaped — reads/writes flow through the store's
+// region caps (READ/WRITE rights). This is the design-doc position that
+// ACL-style permission bits are subsumed by capabilities; the view does not
+// add a second, ambient authority.
+// ---------------------------------------------------------------------------
+
+/// POSIX entry kind in the hierarchical view.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EntryKind {
+    File,
+    Dir,
+}
+
+/// One entry of the hierarchical POSIX projection: a name, kind, mode bits and
+/// owner as metadata, and the store-node it names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PEntry {
+    pub name: Name,
+    pub kind: EntryKind,
+    pub mode: u16,
+    pub uid: u32,
+    pub node: u64,
+}
+
+fn empty_pentry() -> PEntry {
+    PEntry {
+        name: Name::default(),
+        kind: EntryKind::File,
+        mode: 0,
+        uid: 0,
+        node: 0,
+    }
+}
+
+/// Encode `entries` (max `MAX_FILES`) as a directory node block:
+/// [(count u32)((name_len u32)(name)(kind u8)(mode u16 LE)(uid u32 LE)(node u64))*].
+pub(crate) fn encode_posix_entries(entries: &[PEntry]) -> Option<([u8; ENTRY_BUF], usize)> {
+    let mut out = [0u8; ENTRY_BUF];
+    let mut at = 0usize;
+    out[at..at + 4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    at += 4;
+    for e in entries {
+        let name = e.name.as_slice();
+        if at + 4 + name.len() + 1 + 2 + 4 + 8 > ENTRY_BUF {
+            return None;
+        }
+        out[at..at + 4].copy_from_slice(&(name.len() as u32).to_le_bytes());
+        at += 4;
+        out[at..at + name.len()].copy_from_slice(name);
+        at += name.len();
+        out[at] = match e.kind {
+            EntryKind::File => 0,
+            EntryKind::Dir => 1,
+        };
+        at += 1;
+        out[at..at + 2].copy_from_slice(&e.mode.to_le_bytes());
+        at += 2;
+        out[at..at + 4].copy_from_slice(&e.uid.to_le_bytes());
+        at += 4;
+        out[at..at + 8].copy_from_slice(&e.node.to_le_bytes());
+        at += 8;
+    }
+    Some((out, at))
+}
+
+/// Decode at most `MAX_FILES` entries; returns how many were decoded.
+pub(crate) fn decode_posix_entries(bytes: &[u8], out: &mut [PEntry; MAX_FILES]) -> usize {
+    let mut written = 0usize;
+    if bytes.len() < 4 {
+        return 0;
+    }
+    let mut at = 0usize;
+    let count = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    at += 4;
+    for _ in 0..count.min(MAX_FILES) {
+        if at + 4 > bytes.len() {
+            break;
+        }
+        let nlen = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        at += 4;
+        if at + nlen > bytes.len() {
+            break;
+        }
+        let Some(name) = Name::from_slice(&bytes[at..at + nlen]) else {
+            break;
+        };
+        at += nlen;
+        if at + 1 > bytes.len() {
+            break;
+        }
+        let kind = if bytes[at] == 1 {
+            EntryKind::Dir
+        } else {
+            EntryKind::File
+        };
+        at += 1;
+        if at + 2 > bytes.len() {
+            break;
+        }
+        let mode = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+        at += 2;
+        if at + 4 > bytes.len() {
+            break;
+        }
+        let uid = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        at += 4;
+        if at + 8 > bytes.len() {
+            break;
+        }
+        let node = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        at += 8;
+        out[written] = PEntry {
+            name,
+            kind,
+            mode,
+            uid,
+            node,
+        };
+        written += 1;
+    }
+    written
+}
+
+/// Split `path` on `/`, dropping empty segments (leading/trailing/repeated
+/// slashes). Returns `(absolute, components)`. `.` and `..` are NOT resolved
+/// here — `normalize` resolves them against the full component list (which
+/// includes the cwd components for relative paths).
+fn split_path(path: &[u8]) -> Option<(bool, [Name; MAX_DEPTH], usize)> {
+    if path.contains(&0) {
+        return None;
+    }
+    let absolute = path.first() == Some(&b'/');
+    let mut comps = [Name::default(); MAX_DEPTH];
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i <= path.len() {
+        let end = path[i..]
+            .iter()
+            .position(|b| *b == b'/')
+            .map(|p| i + p)
+            .unwrap_or(path.len());
+        if end > i {
+            let seg = &path[i..end];
+            if n >= MAX_DEPTH {
+                return None;
+            }
+            comps[n] = Name::from_slice(seg)?;
+            n += 1;
+        }
+        if end >= path.len() {
+            break;
+        }
+        i = end + 1;
+    }
+    Some((absolute, comps, n))
+}
+
+/// Apply `.` (skip) and `..` (pop) over the full component list; pops below
+/// the root floor at the root.
+fn normalize(comps: &[Name], n: usize) -> Option<([Name; MAX_DEPTH], usize)> {
+    let mut out = [Name::default(); MAX_DEPTH];
+    let mut m = 0usize;
+    for c in &comps[..n] {
+        let s = c.as_slice();
+        if s == b"." {
+            continue;
+        }
+        if s == b".." {
+            m = m.saturating_sub(1);
+            continue;
+        }
+        if m >= MAX_DEPTH {
+            return None;
+        }
+        out[m] = *c;
+        m += 1;
+    }
+    Some((out, m))
+}
+
+/// A resolved path: where the target lives and how to get back to the root.
+struct Resolved {
+    /// The dir node containing the target (for a path with >= 1 component, the
+    /// last dir on the walk; for an empty path, the resolved dir itself).
+    parent: u64,
+    /// The target entry as resolved; when not found, carries the last
+    /// component's name so create operations can use it.
+    target: PEntry,
+    found: bool,
+    /// (dir node, child name) for every dir descended through, in root-down
+    /// order: `levels[i].0` is the dir at depth i, `levels[i].1` is the name
+    /// of its child that the walk followed.
+    levels: [(u64, Name); MAX_DEPTH],
+    nlevels: usize,
+}
+
+/// The hierarchical POSIX projection over the store.
+pub struct TreeView {
+    root: u64,
+    cwd: [Name; MAX_DEPTH],
+    cwd_n: usize,
+}
+
+fn read_dir_entries(store: &mut Store, node: u64, out: &mut [PEntry; MAX_FILES]) -> Option<usize> {
+    let mut buf = [0u8; ENTRY_BUF];
+    let n = store.snapshot(node, &mut buf)?;
+    Some(decode_posix_entries(&buf[..n], out))
+}
+
+fn write_dir_entries(store: &mut Store, dir: u64, entries: &[PEntry]) -> Option<u64> {
+    let (enc, enc_len) = encode_posix_entries(entries)?;
+    store.write_version(dir, &enc[..enc_len])
+}
+
+/// Commit a new version of `dir` with the entry `name` now pointing at `node`.
+fn rewrite_entry(store: &mut Store, dir: u64, name: Name, node: u64) -> Option<u64> {
+    let mut entries = [empty_pentry(); MAX_FILES];
+    let n = read_dir_entries(store, dir, &mut entries)?;
+    let pos = entries[..n].iter().position(|e| e.name == name)?;
+    entries[pos].node = node;
+    write_dir_entries(store, dir, &entries[..n])
+}
+
+/// Commit a new version of `dir` with `entry` added (refused if the name is
+/// taken or the dir is full).
+fn add_entry(store: &mut Store, dir: u64, entry: PEntry) -> Option<u64> {
+    let mut entries = [empty_pentry(); MAX_FILES];
+    let n = read_dir_entries(store, dir, &mut entries)?;
+    if entries[..n].iter().any(|e| e.name == entry.name) || n >= MAX_FILES {
+        return None;
+    }
+    let mut next = [empty_pentry(); MAX_FILES];
+    next[..n].copy_from_slice(&entries[..n]);
+    next[n] = entry;
+    write_dir_entries(store, dir, &next[..n + 1])
+}
+
+/// Commit a new version of `dir` with the entry `name` removed.
+fn remove_entry(store: &mut Store, dir: u64, name: Name) -> Option<u64> {
+    let mut entries = [empty_pentry(); MAX_FILES];
+    let n = read_dir_entries(store, dir, &mut entries)?;
+    let pos = entries[..n].iter().position(|e| e.name == name)?;
+    let mut kept = [empty_pentry(); MAX_FILES];
+    kept[..pos].copy_from_slice(&entries[..pos]);
+    kept[pos..n - 1].copy_from_slice(&entries[pos + 1..n]);
+    write_dir_entries(store, dir, &kept[..n - 1])
+}
+
+impl TreeView {
+    pub fn new(store: &mut Store) -> Option<TreeView> {
+        store.new_object().map(|root| TreeView {
+            root,
+            cwd: [Name::default(); MAX_DEPTH],
+            cwd_n: 0,
+        })
+    }
+
+    /// The current root node id (changes as COW rewrites the tree).
+    pub fn root(&self) -> u64 {
+        self.root
+    }
+
+    /// The working directory, re-resolved from the root — its node id changes
+    /// as COW rewrites the tree; the path it lives at does not.
+    pub fn cwd(&mut self, store: &mut Store) -> Option<u64> {
+        let mut dir = self.root;
+        for i in 0..self.cwd_n {
+            let name = self.cwd[i];
+            let mut entries = [empty_pentry(); MAX_FILES];
+            let n = read_dir_entries(store, dir, &mut entries)?;
+            let sub = entries[..n].iter().find(|e| e.name == name)?;
+            if sub.kind != EntryKind::Dir {
+                return None;
+            }
+            dir = sub.node;
+        }
+        Some(dir)
+    }
+
+    /// Resolve the full normalized component list for `path`, combining the
+    /// cwd (for relative paths) before applying `.`/`..`.
+    fn resolve_components(&self, path: &[u8]) -> Option<(bool, [Name; MAX_DEPTH], usize)> {
+        let (abs, raw, raw_n) = split_path(path)?;
+        let mut full = [Name::default(); MAX_DEPTH];
+        let mut m = 0usize;
+        if !abs {
+            for i in 0..self.cwd_n {
+                if m >= MAX_DEPTH {
+                    return None;
+                }
+                full[m] = self.cwd[i];
+                m += 1;
+            }
+        }
+        for r in &raw[..raw_n] {
+            if m >= MAX_DEPTH {
+                return None;
+            }
+            full[m] = *r;
+            m += 1;
+        }
+        let (norm, nn) = normalize(&full[..m], m)?;
+        Some((abs, norm, nn))
+    }
+
+    /// Resolve `path` to its parent dir and target entry, recording the
+    /// root→parent dir chain for COW propagation. `None` if any intermediate
+    /// component is missing or names a file.
+    fn resolve(&mut self, store: &mut Store, path: &[u8]) -> Option<Resolved> {
+        let (_, comps, n) = self.resolve_components(path)?;
+        let mut dir = self.root;
+        let mut levels = [(0u64, Name::default()); MAX_DEPTH];
+        let mut nl = 0usize;
+        for (i, name) in comps[..n].iter().enumerate() {
+            let mut entries = [empty_pentry(); MAX_FILES];
+            let count = self.read_dir(store, dir, &mut entries)?;
+            if i == n - 1 {
+                let pos = entries[..count].iter().position(|e| e.name == *name);
+                let target = match pos {
+                    Some(p) => entries[p],
+                    None => PEntry {
+                        name: *name,
+                        kind: EntryKind::File,
+                        mode: 0,
+                        uid: 0,
+                        node: 0,
+                    },
+                };
+                return Some(Resolved {
+                    parent: dir,
+                    target,
+                    found: pos.is_some(),
+                    levels,
+                    nlevels: nl,
+                });
+            }
+            let sub = entries[..count].iter().find(|e| e.name == *name)?;
+            if sub.kind != EntryKind::Dir {
+                return None;
+            }
+            levels[nl] = (dir, *name);
+            nl += 1;
+            dir = sub.node;
+        }
+        // Empty path: the target is the resolved dir itself (the root).
+        let target = PEntry {
+            name: Name::default(),
+            kind: EntryKind::Dir,
+            mode: MODE_DIR,
+            uid: 0,
+            node: dir,
+        };
+        Some(Resolved {
+            parent: dir,
+            target,
+            found: true,
+            levels,
+            nlevels: nl,
+        })
+    }
+
+    fn read_dir(
+        &mut self,
+        store: &mut Store,
+        node: u64,
+        out: &mut [PEntry; MAX_FILES],
+    ) -> Option<usize> {
+        read_dir_entries(store, node, out)
+    }
+
+    /// Install a mutated parent dir into the tree, committing new versions of
+    /// every dir on the root→parent path. Returns the new root node id (the
+    /// old root keeps reading the old tree — COW all the way up).
+    fn commit_tree(
+        &mut self,
+        store: &mut Store,
+        parent_new: u64,
+        levels: &[(u64, Name)],
+        nlevels: usize,
+    ) -> Option<u64> {
+        if nlevels == 0 {
+            // The parent IS the root: the new root is the rewritten parent.
+            return Some(parent_new);
+        }
+        let mut cur = parent_new;
+        for i in (0..nlevels).rev() {
+            let (dir, name) = levels[i];
+            cur = rewrite_entry(store, dir, name, cur)?;
+        }
+        Some(cur)
+    }
+
+    fn commit(&mut self, store: &mut Store, parent_new: u64, r: &Resolved) -> bool {
+        match self.commit_tree(store, parent_new, &r.levels, r.nlevels) {
+            Some(new_root) => {
+                self.root = new_root;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Change the working directory. `false` if the path does not resolve to a
+    /// directory.
+    pub fn cd(&mut self, store: &mut Store, path: &[u8]) -> bool {
+        let (_, comps, n) = match self.resolve_components(path) {
+            Some(x) => x,
+            None => return false,
+        };
+        let mut dir = self.root;
+        for name in &comps[..n] {
+            let mut entries = [empty_pentry(); MAX_FILES];
+            let Some(count) = read_dir_entries(store, dir, &mut entries) else {
+                return false;
+            };
+            let Some(sub) = entries[..count].iter().find(|e| e.name == *name) else {
+                return false;
+            };
+            if sub.kind != EntryKind::Dir {
+                return false;
+            }
+            dir = sub.node;
+        }
+        self.cwd[..n].copy_from_slice(&comps[..n]);
+        self.cwd_n = n;
+        true
+    }
+
+    /// Create an empty directory at `path` (parents must exist). `false` if
+    /// the path is taken or the parent is missing/full.
+    pub fn mkdir(&mut self, store: &mut Store, path: &[u8], mode: u16) -> bool {
+        let Some(r) = self.resolve(store, path) else {
+            return false;
+        };
+        if r.found {
+            return false;
+        }
+        let node = match store.new_object() {
+            Some(n) => n,
+            None => return false,
+        };
+        let parent_new = match add_entry(
+            store,
+            r.parent,
+            PEntry {
+                name: r.target.name,
+                kind: EntryKind::Dir,
+                mode,
+                uid: 0,
+                node,
+            },
+        ) {
+            Some(n) => n,
+            None => return false,
+        };
+        self.commit(store, parent_new, &r)
+    }
+
+    /// Create an empty regular file at `path` (parents must exist). `false` if
+    /// the path is taken or the parent is missing/full.
+    pub fn create_file(&mut self, store: &mut Store, path: &[u8], mode: u16) -> bool {
+        let Some(r) = self.resolve(store, path) else {
+            return false;
+        };
+        if r.found {
+            return false;
+        }
+        let node = match store.new_object() {
+            Some(n) => n,
+            None => return false,
+        };
+        let parent_new = match add_entry(
+            store,
+            r.parent,
+            PEntry {
+                name: r.target.name,
+                kind: EntryKind::File,
+                mode,
+                uid: 0,
+                node,
+            },
+        ) {
+            Some(n) => n,
+            None => return false,
+        };
+        self.commit(store, parent_new, &r)
+    }
+
+    /// Overwrite `path` with `data` (COW: a new file version plus new versions
+    /// of every dir up to the root).
+    pub fn write_file(&mut self, store: &mut Store, path: &[u8], data: &[u8]) -> bool {
+        let Some(r) = self.resolve(store, path) else {
+            return false;
+        };
+        if !r.found || r.target.kind != EntryKind::File {
+            return false;
+        }
+        let file_new = match store.write_version(r.target.node, data) {
+            Some(n) => n,
+            None => return false,
+        };
+        let parent_new = match rewrite_entry(store, r.parent, r.target.name, file_new) {
+            Some(n) => n,
+            None => return false,
+        };
+        self.commit(store, parent_new, &r)
+    }
+
+    /// Read `path` into `out`; returns the number of bytes copied.
+    pub fn read_file(&mut self, store: &mut Store, path: &[u8], out: &mut [u8]) -> Option<usize> {
+        let r = self.resolve(store, path)?;
+        if !r.found || r.target.kind != EntryKind::File {
+            return None;
+        }
+        store.snapshot(r.target.node, out)
+    }
+
+    /// The store-node id of the object `path` names (a name, not authority —
+    /// reading it still needs a region cap).
+    pub fn node_of(&mut self, store: &mut Store, path: &[u8]) -> Option<u64> {
+        let r = self.resolve(store, path)?;
+        if !r.found {
+            return None;
+        }
+        Some(r.target.node)
+    }
+
+    /// Entries of the *historical* dir node `node` (a node id captured from an
+    /// earlier `root()`), decoded exactly as live dirs — version-stable COW.
+    pub fn snapshot_dir(
+        &mut self,
+        store: &mut Store,
+        node: u64,
+        out: &mut [PEntry; MAX_FILES],
+    ) -> Option<usize> {
+        read_dir_entries(store, node, out)
+    }
+
+    /// Entries of the dir at `path` (or the cwd when `path` is empty).
+    pub fn list(
+        &mut self,
+        store: &mut Store,
+        path: &[u8],
+        out: &mut [PEntry; MAX_FILES],
+    ) -> Option<usize> {
+        let r = self.resolve(store, path)?;
+        if r.target.kind != EntryKind::Dir {
+            return None;
+        }
+        read_dir_entries(store, r.target.node, out)
+    }
+
+    /// Remove the regular file at `path`. `false` if missing or a directory.
+    pub fn unlink(&mut self, store: &mut Store, path: &[u8]) -> bool {
+        let Some(r) = self.resolve(store, path) else {
+            return false;
+        };
+        if !r.found || r.target.kind != EntryKind::File {
+            return false;
+        }
+        let parent_new = match remove_entry(store, r.parent, r.target.name) {
+            Some(n) => n,
+            None => return false,
+        };
+        self.commit(store, parent_new, &r)
+    }
+
+    /// Remove the *empty* directory at `path` (POSIX `rmdir`). The root itself
+    /// cannot be removed.
+    pub fn rmdir(&mut self, store: &mut Store, path: &[u8]) -> bool {
+        let Some(r) = self.resolve(store, path) else {
+            return false;
+        };
+        if !r.found || r.target.kind != EntryKind::Dir {
+            return false;
+        }
+        if r.target.node == self.root {
+            return false; // the root is not removable
+        }
+        let mut entries = [empty_pentry(); MAX_FILES];
+        let Some(count) = read_dir_entries(store, r.target.node, &mut entries) else {
+            return false;
+        };
+        if count != 0 {
+            return false; // POSIX: rmdir requires an empty dir
+        }
+        let parent_new = match remove_entry(store, r.parent, r.target.name) {
+            Some(n) => n,
+            None => return false,
+        };
+        self.commit(store, parent_new, &r)
+    }
+
+    /// `(kind, mode, uid, size)` where size is bytes for a file and entry
+    /// count for a directory.
+    pub fn stat(&mut self, store: &mut Store, path: &[u8]) -> Option<(EntryKind, u16, u32, usize)> {
+        let r = self.resolve(store, path)?;
+        if !r.found {
+            return None;
+        }
+        match r.target.kind {
+            EntryKind::File => {
+                let size = store.node_len(r.target.node)?;
+                Some((EntryKind::File, r.target.mode, r.target.uid, size))
+            }
+            EntryKind::Dir => {
+                let mut entries = [empty_pentry(); MAX_FILES];
+                let count = read_dir_entries(store, r.target.node, &mut entries)?;
+                Some((EntryKind::Dir, r.target.mode, r.target.uid, count))
+            }
+        }
     }
 }
 
@@ -1124,5 +1788,216 @@ mod tests {
         assert!(Name::from_slice(b"").is_none());
         assert!(Name::from_slice(b"x").is_some());
         assert!(Name::from_slice(&[0u8; NAME_BYTES + 1]).is_none());
+        assert!(empty_pentry().name.len == 0);
+        assert_eq!(MODE_FILE & 0o777, 0o644);
+        assert_eq!(MODE_DIR & 0o777, 0o755);
+    }
+
+    fn tree_world() -> (Store, TreeView) {
+        reset_store_arena();
+        crate::tasks::reset_table_for_test();
+        crate::tasks::set_current_for_test(7);
+        let mut store = Store::new();
+        let view = TreeView::new(&mut store).unwrap();
+        (store, view)
+    }
+
+    fn read_str(store: &mut Store, view: &mut TreeView, path: &[u8]) -> String {
+        let mut buf = [0u8; 256];
+        let n = view.read_file(store, path, &mut buf).unwrap();
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+
+    #[test]
+    fn treeview_creates_nested_dirs_and_files_with_modes() {
+        let _g = crate::kernel_state_guard();
+        let (mut store, mut view) = tree_world();
+        assert!(view.mkdir(&mut store, b"/docs", MODE_DIR));
+        assert!(view.create_file(&mut store, b"/docs/report.txt", MODE_FILE));
+        assert!(view.write_file(
+            &mut store,
+            b"/docs/report.txt",
+            b"Phase C: nested POSIX view"
+        ));
+
+        assert_eq!(
+            read_str(&mut store, &mut view, b"/docs/report.txt"),
+            "Phase C: nested POSIX view"
+        );
+        let (kind, mode, uid, size) = view.stat(&mut store, b"/docs/report.txt").unwrap();
+        assert_eq!(kind, EntryKind::File);
+        assert_eq!(mode, MODE_FILE);
+        assert_eq!(uid, 0);
+        assert_eq!(size, 26);
+        let (dkind, dmode, _, dsize) = view.stat(&mut store, b"/docs").unwrap();
+        assert_eq!(dkind, EntryKind::Dir);
+        assert_eq!(dmode, MODE_DIR);
+        assert_eq!(dsize, 1, "docs holds one entry");
+
+        // Duplicate creation refused; missing parents refused.
+        assert!(!view.mkdir(&mut store, b"/docs", MODE_DIR));
+        assert!(!view.create_file(&mut store, b"/docs/report.txt", MODE_FILE));
+        assert!(!view.create_file(&mut store, b"/missing/a.txt", MODE_FILE));
+    }
+
+    #[test]
+    fn treeview_path_resolution_handles_abs_dot_dotdot_and_cwd() {
+        let _g = crate::kernel_state_guard();
+        let (mut store, mut view) = tree_world();
+        assert!(view.mkdir(&mut store, b"/home", MODE_DIR));
+        assert!(view.mkdir(&mut store, b"/home/alice", MODE_DIR));
+        assert!(view.create_file(&mut store, b"/home/alice/notes.txt", MODE_FILE));
+        assert!(view.write_file(&mut store, b"/home/alice/notes.txt", b"alpha"));
+
+        assert_eq!(
+            read_str(&mut store, &mut view, b"/home/alice/notes.txt"),
+            "alpha"
+        );
+        assert!(view.cd(&mut store, b"/home/alice"));
+        assert_eq!(read_str(&mut store, &mut view, b"notes.txt"), "alpha");
+        assert_eq!(read_str(&mut store, &mut view, b"./notes.txt"), "alpha");
+        assert_eq!(read_str(&mut store, &mut view, b"././notes.txt"), "alpha");
+        assert_eq!(
+            view.list(&mut store, b"..", &mut [empty_pentry(); MAX_FILES])
+                .unwrap(),
+            1,
+            ".. from /home/alice resolves to /home"
+        );
+        assert_eq!(
+            read_str(&mut store, &mut view, b"../alice/notes.txt"),
+            "alpha"
+        );
+        assert_eq!(
+            read_str(&mut store, &mut view, b"/home/alice/notes.txt"),
+            "alpha"
+        );
+
+        // cd back to root, then relative .. cannot escape the root.
+        assert!(view.cd(&mut store, b"/"));
+        assert!(view.cd(&mut store, b".."));
+        assert_eq!(view.cwd(&mut store).unwrap(), view.root());
+
+        // A file cannot be cd'd into.
+        assert!(!view.cd(&mut store, b"/home/alice/notes.txt"));
+    }
+
+    #[test]
+    fn treeview_cow_rewrites_the_whole_root_path_version_stably() {
+        let _g = crate::kernel_state_guard();
+        let (mut store, mut view) = tree_world();
+        assert!(view.mkdir(&mut store, b"/a", MODE_DIR));
+        assert!(view.mkdir(&mut store, b"/a/b", MODE_DIR));
+        assert!(view.create_file(&mut store, b"/a/b/f.txt", MODE_FILE));
+        assert!(view.write_file(&mut store, b"/a/b/f.txt", b"v1"));
+
+        // Every level is a COW object: hold old node ids, then mutate.
+        let root_v1 = view.root();
+        let file_v1 = view.node_of(&mut store, b"/a/b/f.txt").unwrap();
+        let mut dir_old = [empty_pentry(); MAX_FILES];
+        let n_root_v1 = view
+            .snapshot_dir(&mut store, root_v1, &mut dir_old)
+            .unwrap();
+
+        assert!(view.write_file(&mut store, b"/a/b/f.txt", b"v2 - longer"));
+        let root_v2 = view.root();
+        assert_ne!(root_v1, root_v2, "the root is rewritten by a deep write");
+        assert_eq!(
+            read_str(&mut store, &mut view, b"/a/b/f.txt"),
+            "v2 - longer"
+        );
+
+        // Old ids still read the old versions.
+        let mut out = [0u8; 64];
+        let n = store.snapshot(file_v1, &mut out).unwrap();
+        assert_eq!(&out[..n], b"v1");
+        let mut old_dir = [empty_pentry(); MAX_FILES];
+        let n_old = view
+            .snapshot_dir(&mut store, root_v1, &mut old_dir)
+            .unwrap();
+        assert_eq!(n_old, n_root_v1, "old root dir block still decodes");
+        assert!(old_dir[..n_old].iter().any(|e| e.name.matches(b"a")));
+    }
+
+    #[test]
+    fn treeview_unlink_and_rmdir_enforce_emptiness_and_existence() {
+        let _g = crate::kernel_state_guard();
+        let (mut store, mut view) = tree_world();
+        assert!(view.mkdir(&mut store, b"/d", MODE_DIR));
+        assert!(view.create_file(&mut store, b"/d/x.txt", MODE_FILE));
+        assert!(view.write_file(&mut store, b"/d/x.txt", b"x"));
+
+        // rmdir of a non-empty dir refused.
+        assert!(!view.rmdir(&mut store, b"/d"));
+        // unlink a missing file refused.
+        assert!(!view.unlink(&mut store, b"/d/missing.txt"));
+        assert!(view.unlink(&mut store, b"/d/x.txt"));
+        assert!(view.rmdir(&mut store, b"/d"));
+        assert!(!view.stat(&mut store, b"/d").is_some(), "dir is gone");
+        assert_eq!(
+            view.list(&mut store, b"/", &mut [empty_pentry(); MAX_FILES])
+                .unwrap(),
+            0
+        );
+
+        // The root itself cannot be removed.
+        assert!(!view.rmdir(&mut store, b"/"));
+        assert!(view.stat(&mut store, b"/").is_some());
+    }
+
+    #[test]
+    fn treeview_relationship_index_rebuilds_after_nested_ops() {
+        let _g = crate::kernel_state_guard();
+        let (mut store, mut view) = tree_world();
+        let root_v0 = view.root();
+        assert!(view.mkdir(&mut store, b"/home", MODE_DIR));
+        assert!(view.mkdir(&mut store, b"/home/alice", MODE_DIR));
+        assert!(view.create_file(&mut store, b"/home/alice/a.txt", MODE_FILE));
+        let file_v0 = view.node_of(&mut store, b"/home/alice/a.txt").unwrap();
+        assert!(view.write_file(&mut store, b"/home/alice/a.txt", b"body"));
+        let file_v1 = view.node_of(&mut store, b"/home/alice/a.txt").unwrap();
+        assert!(view.write_file(&mut store, b"/home/alice/a.txt", b"body two"));
+        let file_v2 = view.node_of(&mut store, b"/home/alice/a.txt").unwrap();
+
+        let mut idx = RelationshipIndex::new();
+        idx.ingest(store.wal());
+        assert_eq!(idx.consumed_seq(), store.wal().len() as u64);
+        // COW version chains are derived-from edges in the graph: the root's
+        // latest version derives from its first, and each file write chains
+        // off the previous file version.
+        assert!(idx.is_derived_from(root_v0, view.root()));
+        assert!(idx.is_derived_from(file_v0, file_v1));
+        assert!(idx.is_derived_from(file_v0, file_v2));
+
+        let mut fresh = RelationshipIndex::new();
+        fresh.rebuild(store.wal());
+        assert_eq!(fresh.node_count(), idx.node_count());
+        assert_eq!(fresh.block_count(), idx.block_count());
+        assert_eq!(fresh.consumed_seq(), idx.consumed_seq());
+        assert!(fresh.is_derived_from(root_v0, view.root()));
+    }
+
+    #[test]
+    fn treeview_entries_respect_the_bounds() {
+        let _g = crate::kernel_state_guard();
+        let (mut store, mut view) = tree_world();
+        // MAX_FILES per dir.
+        for i in 0..MAX_FILES {
+            let name = format!("f{i}.txt");
+            assert!(
+                view.create_file(&mut store, name.as_bytes(), MODE_FILE),
+                "file {i}"
+            );
+        }
+        assert!(!view.create_file(&mut store, b"overflow.txt", MODE_FILE));
+        assert_eq!(
+            view.list(&mut store, b"/", &mut [empty_pentry(); MAX_FILES])
+                .unwrap(),
+            MAX_FILES
+        );
+
+        // Depth bound: more than MAX_DEPTH components is refused up front.
+        assert!(split_path(b"/a/b/c/d/e/f/g/h/i").is_none());
+        // NUL bytes are refused outright.
+        assert!(!view.create_file(&mut store, b"bad\0name", MODE_FILE));
     }
 }

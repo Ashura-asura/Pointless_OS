@@ -8,4 +8,6 @@ pub mod sha256;
 mod store;
 
 pub use index::RelationshipIndex;
-pub use store::{sha256, BlockId, FlatView, Store, Wal, WalOp, WalRec};
+pub use store::{
+    sha256, BlockId, EntryKind, FlatView, Store, TreeView, Wal, WalOp, WalRec, MODE_DIR, MODE_FILE,
+};

@@ -232,3 +232,137 @@ fn posix_view_is_a_projection_with_no_second_source_of_truth() {
     // The bytes live only in the store: the WAL grew at every mutation.
     assert!(w.store.wal().len() > wal_before);
 }
+
+/// The hierarchical POSIX view (TreeView): nested directories, path
+/// resolution (absolute, relative, `.`/`..`), mode/uid as projection metadata,
+/// and COW rewriting of the whole root→parent path so snapshots stay
+/// version-stable at every level.
+#[test]
+fn treeview_creates_nested_paths_and_rewrites_the_root_cow() {
+    let mut w = world();
+    let mut view = object_store::TreeView::new(&mut w.k, &mut w.store).unwrap();
+    let root_v0 = view.root();
+
+    assert!(view.mkdir(&mut w.k, &mut w.store, "/home", object_store::MODE_DIR));
+    assert!(view.mkdir(
+        &mut w.k,
+        &mut w.store,
+        "/home/alice",
+        object_store::MODE_DIR
+    ));
+    // Parents /home/alice/docs missing: refused, nothing half-created.
+    assert!(!view.create_file(
+        &mut w.k,
+        &mut w.store,
+        "/home/alice/docs/report.txt",
+        object_store::MODE_FILE
+    ));
+    assert!(view.mkdir(
+        &mut w.k,
+        &mut w.store,
+        "/home/alice/docs",
+        object_store::MODE_DIR
+    ));
+    assert!(view.create_file(
+        &mut w.k,
+        &mut w.store,
+        "/home/alice/docs/report.txt",
+        object_store::MODE_FILE
+    ));
+    assert!(view.write_file(
+        &mut w.k,
+        &mut w.store,
+        "/home/alice/docs/report.txt",
+        b"Phase C: nested POSIX view"
+    ));
+
+    assert_eq!(
+        view.read_file(&mut w.k, &mut w.store, "/home/alice/docs/report.txt")
+            .unwrap(),
+        b"Phase C: nested POSIX view".to_vec()
+    );
+    let (kind, mode, _, size) = view
+        .stat(&mut w.k, &mut w.store, "/home/alice/docs/report.txt")
+        .unwrap();
+    assert_eq!(kind, object_store::EntryKind::File);
+    assert_eq!(mode, object_store::MODE_FILE);
+    assert_eq!(size, 26);
+
+    // The root is rewritten by a deep mutation; the old root still reads the
+    // old tree (COW all the way up).
+    let root_v1 = view.root();
+    assert_ne!(root_v0, root_v1);
+    assert!(view.write_file(&mut w.k, &mut w.store, "/home/alice/docs/report.txt", b"v2"));
+    let old_root_entries = view.snapshot_dir(&mut w.k, &mut w.store, root_v1).unwrap();
+    assert!(
+        old_root_entries.iter().any(|e| e.name == "home"),
+        "old root still lists the tree it pointed at"
+    );
+}
+
+#[test]
+fn treeview_path_resolution_handles_abs_dot_dotdot_and_cwd() {
+    let mut w = world();
+    let mut view = object_store::TreeView::new(&mut w.k, &mut w.store).unwrap();
+    assert!(view.mkdir(&mut w.k, &mut w.store, "/home", object_store::MODE_DIR));
+    assert!(view.mkdir(
+        &mut w.k,
+        &mut w.store,
+        "/home/alice",
+        object_store::MODE_DIR
+    ));
+    assert!(view.create_file(
+        &mut w.k,
+        &mut w.store,
+        "/home/alice/notes.txt",
+        object_store::MODE_FILE
+    ));
+    assert!(view.write_file(&mut w.k, &mut w.store, "/home/alice/notes.txt", b"alpha"));
+
+    assert_eq!(
+        view.read_file(&mut w.k, &mut w.store, "/home/alice/notes.txt")
+            .unwrap(),
+        b"alpha".to_vec()
+    );
+    assert!(view.cd(&mut w.k, &mut w.store, "/home/alice"));
+    assert_eq!(
+        view.read_file(&mut w.k, &mut w.store, "notes.txt").unwrap(),
+        b"alpha".to_vec()
+    );
+    assert_eq!(
+        view.read_file(&mut w.k, &mut w.store, "./notes.txt")
+            .unwrap(),
+        b"alpha".to_vec()
+    );
+    assert_eq!(
+        view.read_file(&mut w.k, &mut w.store, "../alice/notes.txt")
+            .unwrap(),
+        b"alpha".to_vec()
+    );
+    assert_eq!(
+        view.list(&mut w.k, &mut w.store, "..").unwrap().len(),
+        1,
+        ".. -> /home"
+    );
+
+    assert!(view.cd(&mut w.k, &mut w.store, "/"));
+    assert!(view.cd(&mut w.k, &mut w.store, ".."));
+    assert_eq!(view.cwd(&mut w.k, &mut w.store).unwrap(), view.root());
+}
+
+#[test]
+fn treeview_unlink_and_rmdir_enforce_emptiness_and_existence() {
+    let mut w = world();
+    let mut view = object_store::TreeView::new(&mut w.k, &mut w.store).unwrap();
+    assert!(view.mkdir(&mut w.k, &mut w.store, "/d", object_store::MODE_DIR));
+    assert!(view.create_file(&mut w.k, &mut w.store, "/d/x.txt", object_store::MODE_FILE));
+    assert!(view.write_file(&mut w.k, &mut w.store, "/d/x.txt", b"x"));
+
+    assert!(!view.rmdir(&mut w.k, &mut w.store, "/d")); // not empty
+    assert!(!view.unlink(&mut w.k, &mut w.store, "/d/missing.txt"));
+    assert!(view.unlink(&mut w.k, &mut w.store, "/d/x.txt"));
+    assert!(view.rmdir(&mut w.k, &mut w.store, "/d"));
+    assert!(view.stat(&mut w.k, &mut w.store, "/d").is_none());
+    assert!(!view.rmdir(&mut w.k, &mut w.store, "/")); // the root is not removable
+    assert!(view.stat(&mut w.k, &mut w.store, "/").is_some());
+}
