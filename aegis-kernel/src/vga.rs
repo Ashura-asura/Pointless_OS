@@ -170,34 +170,44 @@ pub fn vga_dump_buffer() {
 /// Format one line (via `format_args!`) straight onto the screen plus a
 /// trailing newline. Used by `sprintln!` so both sinks share one format.
 pub fn vga_fmt_line(args: core::fmt::Arguments) {
-    if display_frozen() {
-        return;
+    #[cfg(test)]
+    {
+        // Host unit tests have no VGA hardware or 0xB8000 mapping; keep
+        // `sprintln!` safe to call from any code path exercised by tests.
+        let _ = args;
     }
-    use core::fmt::Write;
-    struct VgaWriter;
-    impl Write for VgaWriter {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            vga_write_str(s);
-            Ok(())
+    #[cfg(not(test))]
+    {
+        if display_frozen() {
+            return;
         }
-    }
-    let _ = VgaWriter.write_fmt(args);
-    vga_write_str("\n");
-    unsafe {
-        if !DIAGED {
-            DIAGED = true;
-            // One-shot proof that the text buffer really holds our output.
-            let mut row0 = [0u8; 40];
-            for (i, c) in cells()[0..40].iter().enumerate() {
-                let b = (c & 0xFF) as u8;
-                row0[i] = if (0x20..0x7F).contains(&b) { b } else { b'?' };
+        use core::fmt::Write;
+        struct VgaWriter;
+        impl Write for VgaWriter {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                vga_write_str(s);
+                Ok(())
             }
-            crate::sprintln!("VGA BUF row0 raw={:x?}", &row0[..]);
+        }
+        let _ = VgaWriter.write_fmt(args);
+        vga_write_str("\n");
+        unsafe {
+            if !DIAGED {
+                DIAGED = true;
+                // One-shot proof that the text buffer really holds our output.
+                let mut row0 = [0u8; 40];
+                for (i, c) in cells()[0..40].iter().enumerate() {
+                    let b = (c & 0xFF) as u8;
+                    row0[i] = if (0x20..0x7F).contains(&b) { b } else { b'?' };
+                }
+                crate::sprintln!("VGA BUF row0 raw={:x?}", &row0[..]);
+            }
         }
     }
 }
 
 /// One-shot text-buffer diagnostic (see `vga_fmt_line`).
+#[cfg(not(test))]
 static mut DIAGED: bool = false;
 
 /// Clear the screen and reset the cursor. Text-mode entry is split out so

@@ -186,58 +186,112 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         sprintln!("Aegis: PCI: NVMe controller present");
     }
 
-    // Live e1000 demo: the q35 NIC (Intel 82574L/e1000e) is attached to a
-    // QEMU `socket` netdev. The kernel transmits a broadcast ARP request for
-    // the host gateway (10.0.2.2); an external process on the host captures
-    // that frame off the emulated wire, writes it to a pcap, and echoes an
-    // ARP reply back into the guest, where the polled RX ring picks it up.
-    // This proves real Ethernet bytes leaving and re-entering the kernel.
-    if let Some(mut nic) = aegis_kernel::e1000::E1000::probe(&pci) {
-        let ok = nic.reset();
-        sprintln!(
-            "Aegis: e1000: reset: {} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            ok,
-            nic.mac[0],
-            nic.mac[1],
-            nic.mac[2],
-            nic.mac[3],
-            nic.mac[4],
-            nic.mac[5]
-        );
-        nic.tx_enable();
-        nic.rx_enable();
-        sprintln!("Aegis: e1000: link up: {}", nic.link_up());
-        let req = aegis_kernel::e1000::build_arp_request(nic.mac, [10, 0, 2, 2]);
-        let sent = nic.send(&req);
-        sprintln!("Aegis: e1000: ARP request sent (42 bytes): {}", sent);
-        // Poll the RX ring for the host's ARP reply.
-        let mut buf = [0u8; 2048];
-        let mut got = 0usize;
-        let mut deadline = 0u32;
-        while deadline < 20_000_000 {
-            if let Some(n) = nic.receive(&mut buf) {
-                got = n;
-                break;
-            }
-            deadline += 1;
-            unsafe { core::arch::asm!("pause", options(nomem, nostack)) };
-        }
-        let arp_ok = got >= 42 && aegis_kernel::e1000::is_arp_reply_for(&buf[..got], nic.mac);
-        sprintln!(
-            "Aegis: e1000: ARP reply received ({} bytes, ARP reply for us: {})",
-            got,
-            arp_ok
-        );
-        if got >= 42 {
-            sprintln!(
-                "Aegis: e1000: reply sender {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} @ 10.0.2.2",
-                buf[22],
-                buf[23],
-                buf[24],
-                buf[25],
-                buf[26],
-                buf[27]
-            );
+    // Live network stack demo: the q35 NIC (Intel 82574L/e1000e) is attached
+    // to a QEMU `socket` netdev. The kernel brings the interface up, resolves
+    // the host gateway (10.0.2.2) over real ARP, then opens a TCP socket to
+    // the host peer on 10.0.2.2:8080 and drives a real three-way handshake,
+    // an HTTP request/response, and a close over the wire. An external process
+    // on the host captures every frame (SYN → SYN-ACK → ACK → data → FIN) off
+    // the emulated wire into a pcap and serves the peer side. This proves real
+    // TCP/IP bytes leaving and re-entering the kernel.
+    if aegis_kernel::netif::NetIf::init(&pci) {
+        unsafe {
+            aegis_kernel::netif::NetIf::with(|net| {
+                // Resolve the gateway over real ARP (request + reply exchange).
+                let gw = net.arp_resolve(aegis_kernel::netif::GW_IP);
+                match gw {
+                    Some(mac) => {
+                        sprintln!(
+                        "Aegis: netif: ARP reply received: gateway at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} @ 10.0.2.2",
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                    );
+                    }
+                    None => {
+                        sprintln!("Aegis: netif: ARP reply timed out - stack demo skipped");
+                        return;
+                    }
+                }
+
+                // Open a TCP socket bound to exactly one destination (the host's
+                // demo server) and connect: sends a real SYN.
+                let Some((id, _lp)) = net.socket_open(
+                    aegis_kernel::netif::SockKind::Tcp,
+                    aegis_kernel::netif::GW_IP,
+                    8080,
+                ) else {
+                    sprintln!("Aegis: netif: no free socket slot");
+                    return;
+                };
+                if !net.tcp_connect(id) {
+                    sprintln!("Aegis: netif: connect failed");
+                    return;
+                }
+                sprintln!("Aegis: netif: TCP SYN sent (10.0.2.15:40000 -> 10.0.2.2:8080)");
+
+                // Poll until the handshake completes (SYN-ACK arrives and is ACKed).
+                let mut spins = 0u64;
+                while spins < 50_000_000 {
+                    net.poll();
+                    if net.socket_connected(id) {
+                        break;
+                    }
+                    spins += 1;
+                    core::arch::asm!("pause", options(nomem, nostack));
+                }
+                match net.socket_state(id) {
+                    Some(aegis_kernel::netif::TcpState::Established) => {
+                        sprintln!("Aegis: netif: TCP handshake complete (Established)");
+                    }
+                    Some(_) => {
+                        sprintln!("Aegis: netif: handshake timed out");
+                        return;
+                    }
+                    None => {
+                        sprintln!("Aegis: netif: socket vanished");
+                        return;
+                    }
+                }
+
+                // Send a real HTTP request.
+                const HTTP_REQ: &[u8] = b"GET / HTTP/1.0\r\nHost: 10.0.2.2\r\n\r\n";
+                let n = net.socket_send(id, HTTP_REQ);
+                sprintln!("Aegis: netif: HTTP request sent ({} bytes)", n);
+
+                // Poll until the response arrives.
+                let mut resp = [0u8; 1024];
+                let mut got = 0usize;
+                let mut spins = 0u64;
+                while spins < 50_000_000 && got == 0 {
+                    net.poll();
+                    if let Some(r) = net.socket_recv(id, &mut resp[got..]) {
+                        got += r;
+                    }
+                    spins += 1;
+                    core::arch::asm!("pause", options(nomem, nostack));
+                }
+                sprintln!("Aegis: netif: HTTP response received ({} bytes)", got);
+                if got > 0 {
+                    let mut ascii = [0u8; 1024];
+                    for i in 0..got {
+                        let b = resp[i];
+                        ascii[i] = if b == b'\r' || b == b'\n' {
+                            b' '
+                        } else if b.is_ascii_graphic() || b == b' ' {
+                            b
+                        } else {
+                            b'.'
+                        };
+                    }
+                    if let Ok(s) = core::str::from_utf8(&ascii[..got]) {
+                        sprintln!("Aegis: netif: body: {}", s);
+                    }
+                }
+
+                // Close: sends a real FIN.
+                if net.socket_close(id) {
+                    sprintln!("Aegis: netif: socket closed (FIN sent)");
+                }
+            });
         }
     } else {
         sprintln!("Aegis: e1000: no NIC found - driver skipped");

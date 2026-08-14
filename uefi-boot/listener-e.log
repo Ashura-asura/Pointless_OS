@@ -1,0 +1,11 @@
+listener: waiting for QEMU on 127.0.0.1:45556 ...
+listener: QEMU connected from ('127.0.0.1', 60748)
+listener: ARP request from 52:54:00:12:34:56 10.0.2.15
+listener: echoed ARP reply (42 bytes)
+listener: TCP SYN (isn=2654435768) -> SYN-ACK
+listener: ACK received - handshake complete
+listener: data segment (34 bytes): b'GET / HTTP/1.0\r\nHost: 10.0.2.2\r\n\r\n'
+listener: HTTP response sent (134 bytes)
+listener: FIN acknowledged
+listener: timeout waiting for frames
+listener: wrote 6 frame(s) to uefi-boot/e1000-phase-e.pcap

@@ -96,6 +96,12 @@ pub enum Cap {
     /// primitive besides the synchronous rendezvous endpoint); the loopback
     /// netstack's sockets ARE these objects.
     Channel(u32),
+    /// Reference to a network endpoint (a socket) with the given id. The
+    /// design's §8 socket: holding a network capability means holding a
+    /// specific, revocable right to talk to a *specific* endpoint — the socket
+    /// is bound to one destination at creation and the kernel refuses any
+    /// operation outside it. No ambient "open any socket" authority.
+    NetEndpoint(u32),
 }
 
 /// One occupied row of a capability table: the object and the rights held on it.
@@ -126,6 +132,7 @@ impl Cap {
             Cap::Task(id) => Some(id),
             Cap::MemRegion(id) => Some(id),
             Cap::Channel(id) => Some(id),
+            Cap::NetEndpoint(id) => Some(id),
         }
     }
 }
@@ -148,6 +155,12 @@ pub const ENDPOINT_RIGHTS: Rights = Rights::SEND.union(Rights::RECV).union(Right
 /// copies into subscriber CSpaces as SEND|RECV, and nothing may delegate a
 /// channel onward). Mirrors the model's socket channel.
 pub const CHANNEL_RIGHTS: Rights = Rights::SEND.union(Rights::RECV);
+
+/// The rights a fresh network-endpoint capability grants its holder: SEND to
+/// connect/send, RECV to receive. Never GRANT — a network capability is bound
+/// to one destination and cannot be delegated onward (a socket holder cannot
+/// hand a third party the right to talk to that endpoint).
+pub const NET_RIGHTS: Rights = Rights::SEND.union(Rights::RECV);
 
 /// The rights a fresh memory-region capability grants its holder (READ/WRITE
 /// to touch the frames, GRANT to delegate it onward). Mirrors the model

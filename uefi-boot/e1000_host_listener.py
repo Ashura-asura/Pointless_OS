@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-side capture + ARP reply echo for the Aegis e1000 demo.
+"""Host-side capture + peer for the Aegis network-stack demo (Phase E).
 
 QEMU is launched with `-nic socket,connect=127.0.0.1:PORT,model=e1000e,...`
 (an external helper, like this script, accepts the connection).
@@ -8,10 +8,13 @@ then the raw Ethernet frame bytes (net/socket.c `net_socket_receive`).
 
 This process:
   1. listens on 127.0.0.1:PORT and accepts QEMU's connection,
-  2. reads every frame, writes it to a pcap (link type 1, Ethernet),
-  3. for the first broadcast ARP request (op 1) it echoes an ARP reply
-     back into the guest from gateway 10.0.2.2, so the kernel's polled
-     RX ring has a real external packet to receive.
+  2. reads every frame and writes it to a pcap (link type 1, Ethernet),
+  3. answers the kernel's gateway ARP request (10.0.2.2) with an ARP reply,
+  4. acts as a minimal TCP server on 10.0.2.2:8080: it completes a real
+     three-way handshake (SYN -> SYN-ACK -> ACK), acknowledges the kernel's
+     HTTP request and replies with a real HTTP response, and acknowledges
+     the kernel's FIN. Correct IPv4 + TCP checksums are computed so the
+     kernel's checksum-verifying parser accepts every frame.
 
 Usage: python e1000_host_listener.py PORT OUTFILE.pcap
 """
@@ -19,6 +22,102 @@ Usage: python e1000_host_listener.py PORT OUTFILE.pcap
 import socket
 import struct
 import sys
+
+# The peer the kernel will talk to.  The kernel resolves this gateway over ARP,
+# so frames FROM us must carry the gateway MAC/IP and frames TO us must be
+# addressed to the guest MAC/IP.
+GUEST_MAC = bytes.fromhex("525400123456")
+GUEST_IP = bytes([10, 0, 2, 15])
+GATEWAY_MAC = bytes.fromhex("525400123402")
+GATEWAY_IP = bytes([10, 0, 2, 2])
+SERVER_PORT = 8080
+
+HTTP_RESPONSE = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Type: text/plain\r\n"
+    b"Connection: close\r\n"
+    b"Content-Length: 47\r\n"
+    b"\r\n"
+    b"Aegis kernel TCP demo: hello from the host peer!\r\n"
+)
+
+
+def checksum(data: bytes) -> int:
+    """RFC 1071 ones'-complement checksum over an even-length buffer."""
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) | data[i + 1]
+        total = (total & 0xFFFF) + (total >> 16)
+    total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def ipv4_checksum(header: bytes) -> int:
+    return checksum(header)
+
+
+def tcp_checksum(src_ip: bytes, dst_ip: bytes, segment: bytes) -> int:
+    """TCP checksum over the IPv4 pseudo-header + segment (checksum field 0)."""
+    pseudo = src_ip + dst_ip + bytes([0, 6]) + struct.pack(">H", len(segment))
+    return checksum(pseudo + segment)
+
+
+def build_tcp_frame(
+    src_mac: bytes,
+    dst_mac: bytes,
+    src_ip: bytes,
+    dst_ip: bytes,
+    src_port: int,
+    dst_port: int,
+    seq: int,
+    ack: int,
+    flags: int,
+    payload: bytes,
+) -> bytes:
+    """Assemble an Ethernet + IPv4 + TCP frame with valid checksums."""
+    seg_len = 20 + len(payload)
+    seg = bytearray(seg_len)
+    seg[0:2] = struct.pack(">H", src_port)
+    seg[2:4] = struct.pack(">H", dst_port)
+    seg[4:8] = struct.pack(">I", seq)
+    seg[8:12] = struct.pack(">I", ack)
+    seg[12] = 5 << 4  # data offset 5, no options
+    seg[13] = flags
+    seg[14:16] = struct.pack(">H", 8192)  # window
+    seg[16:18] = b"\x00\x00"  # checksum placeholder
+    seg[20:] = payload
+    ck = tcp_checksum(src_ip, dst_ip, bytes(seg))
+    seg[16:18] = struct.pack(">H", ck)
+
+    ip_len = 20 + seg_len
+    ip = bytearray(20)
+    ip[0] = 0x45
+    ip[2:4] = struct.pack(">H", ip_len)
+    ip[8] = 64  # ttl
+    ip[9] = 6  # TCP
+    ip[12:16] = src_ip
+    ip[16:20] = dst_ip
+    ip[10:12] = struct.pack(">H", ipv4_checksum(bytes(ip)))
+
+    # Ethernet II header: destination first, then source, then ethertype.
+    return dst_mac + src_mac + b"\x08\x00" + bytes(ip) + bytes(seg)
+
+
+def parse_ipv4_tcp(frame: bytes):
+    """Return (src_ip, dst_ip, src_port, dst_port, seq, ack, flags, payload)."""
+    ip = frame[14:]
+    src_ip = ip[12:16]
+    dst_ip = ip[16:20]
+    tcp_off = 14 + ((ip[0] & 0x0F) * 4)
+    tcp = frame[tcp_off:]
+    src_port, dst_port = struct.unpack(">HH", tcp[0:4])
+    seq, ack = struct.unpack(">II", tcp[4:12])
+    flags = tcp[13]
+    hlen = (tcp[12] >> 4) * 4
+    payload = tcp[hlen:]
+    return src_ip, dst_ip, src_port, dst_port, seq, ack, flags, payload
 
 
 def main() -> int:
@@ -44,6 +143,26 @@ def main() -> int:
     print(f"listener: QEMU connected from {addr}", flush=True)
     conn.settimeout(30.0)
 
+    # Host->guest frames (what the peer writes onto the wire), recorded
+    # separately so we can see exactly what the guest should be receiving.
+    host_tx = open(outfile + "-host-tx.pcap", "wb")
+    host_tx.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1))
+
+    # TCP server state for the one connection the kernel opens.
+    server_isn = 0x1A2B3C4D
+    server_seq = server_isn
+    client_isn = None
+    handshake_done = False
+    served = False
+
+    def send(frame: bytes) -> None:
+        conn.sendall(struct.pack(">I", len(frame)) + frame)
+        ts = struct.pack("<II", 0, 0)
+        host_tx.write(ts)
+        host_tx.write(struct.pack("<II", len(frame), len(frame)))
+        host_tx.write(frame)
+        host_tx.flush()
+
     buf = bytearray()
     echoed = False
     total = 0
@@ -66,7 +185,7 @@ def main() -> int:
             del buf[: 4 + flen]
             total += 1
 
-            # Record the frame in the pcap, flushing each time so the pcap
+            # Record every frame in the pcap, flushing each time so the pcap
             # is usable even if this process is killed mid-run.
             ts = struct.pack("<II", 0, 0)
             pcap.write(ts)
@@ -86,34 +205,158 @@ def main() -> int:
                         flush=True,
                     )
                     if not echoed:
-                        # Build an ARP reply addressed back to the sender.
                         reply = bytearray(42)
                         reply[0:6] = sender_mac
-                        reply[6:12] = bytes.fromhex("525400123402")  # gateway MAC
+                        reply[6:12] = GATEWAY_MAC
                         reply[12:14] = b"\x08\x06"
                         reply[14:16] = b"\x00\x01"
                         reply[16:18] = b"\x08\x00"
                         reply[18] = 6
                         reply[19] = 4
-                        reply[20:22] = b"\x00\x02"  # op: reply
-                        reply[22:28] = reply[6:12]  # gateway hw
-                        reply[28:32] = bytes([10, 0, 2, 2])  # gateway proto
-                        reply[32:38] = sender_mac  # target hw
-                        reply[38:42] = sender_ip  # target proto
-                        conn.sendall(struct.pack(">I", len(reply)) + reply)
+                        reply[20:22] = b"\x00\x02"
+                        reply[22:28] = GATEWAY_MAC
+                        reply[28:32] = GATEWAY_IP
+                        reply[32:38] = sender_mac
+                        reply[38:42] = sender_ip
+                        send(bytes(reply))
                         echoed = True
                         print("listener: echoed ARP reply (42 bytes)", flush=True)
                 elif op == b"\x00\x02":
                     print("listener: ARP reply from guest", flush=True)
-            else:
+                continue
+
+            if proto != b"\x08\x00" or len(frame) < 34:
                 print(
                     "listener: frame %d, %d bytes, proto %s"
                     % (total, len(frame), proto.hex()),
                     flush=True,
                 )
+                continue
+
+            try:
+                src_ip, dst_ip, src_port, dst_port, seq, ack, flags, payload = parse_ipv4_tcp(
+                    frame
+                )
+            except (struct.error, IndexError):
+                print("listener: frame %d: short/malformed IPv4", total, flush=True)
+                continue
+
+            if dst_port != SERVER_PORT:
+                print(
+                    "listener: frame %d: TCP to port %d (ignored)" % (total, dst_port),
+                    flush=True,
+                )
+                continue
+
+            # ---- minimal TCP server state machine ----
+            if flags & 0x02 and not handshake_done:  # SYN
+                client_isn = seq
+                server_seq = server_isn
+                send(
+                    build_tcp_frame(
+                        GATEWAY_MAC,
+                        GUEST_MAC,
+                        GATEWAY_IP,
+                        GUEST_IP,
+                        SERVER_PORT,
+                        src_port,
+                        server_isn,
+                        client_isn + 1,
+                        0x12,  # SYN|ACK
+                        b"",
+                    )
+                )
+                # The SYN consumed one sequence number: data begins at ISN+1.
+                server_seq = (server_isn + 1) & 0xFFFFFFFF
+                print("listener: TCP SYN (isn=%d) -> SYN-ACK" % seq, flush=True)
+            elif flags & 0x10:  # ACK set
+                data = payload
+                if flags & 0x02 and not handshake_done:  # retransmitted SYN
+                    server_seq = (server_isn + 1) & 0xFFFFFFFF
+                    send(
+                        build_tcp_frame(
+                            GATEWAY_MAC,
+                            GUEST_MAC,
+                            GATEWAY_IP,
+                            GUEST_IP,
+                            SERVER_PORT,
+                            src_port,
+                            server_isn,
+                            client_isn + 1,
+                            0x12,
+                            b"",
+                        )
+                    )
+                    print("listener: retransmitted SYN -> SYN-ACK", flush=True)
+                    continue
+                if not handshake_done:
+                    handshake_done = True
+                    print("listener: ACK received - handshake complete", flush=True)
+                if data:
+                    print(
+                        "listener: data segment (%d bytes): %r" % (len(data), data[:64]),
+                        flush=True,
+                    )
+                    # ACK the data.
+                    send(
+                        build_tcp_frame(
+                            GATEWAY_MAC,
+                            GUEST_MAC,
+                            GATEWAY_IP,
+                            GUEST_IP,
+                            SERVER_PORT,
+                            src_port,
+                            server_seq,
+                            seq + len(data),
+                            0x10,  # ACK
+                            b"",
+                        )
+                    )
+                    # And serve the HTTP response (PSH|ACK).
+                    if not served:
+                        resp = HTTP_RESPONSE
+                        send(
+                            build_tcp_frame(
+                                GATEWAY_MAC,
+                                GUEST_MAC,
+                                GATEWAY_IP,
+                                GUEST_IP,
+                                SERVER_PORT,
+                                src_port,
+                                server_seq,
+                                seq + len(data),
+                                0x18,  # PSH|ACK
+                                resp,
+                            )
+                        )
+                        server_seq = (server_seq + len(resp)) & 0xFFFFFFFF
+                        served = True
+                        print("listener: HTTP response sent (%d bytes)" % len(resp), flush=True)
+                elif flags & 0x01:  # FIN|ACK
+                    send(
+                        build_tcp_frame(
+                            GATEWAY_MAC,
+                            GUEST_MAC,
+                            GATEWAY_IP,
+                            GUEST_IP,
+                            SERVER_PORT,
+                            src_port,
+                            server_seq,
+                            seq + 1,
+                            0x10,  # ACK
+                            b"",
+                        )
+                    )
+                    print("listener: FIN acknowledged", flush=True)
+            else:
+                print(
+                    "listener: frame %d: unhandled TCP flags 0x%02x" % (total, flags),
+                    flush=True,
+                )
 
     with pcap:
         print(f"listener: wrote {total} frame(s) to {outfile}", flush=True)
+    host_tx.close()
     return 0
 
 

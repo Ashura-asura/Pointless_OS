@@ -32,6 +32,7 @@ pub mod e1000;
 pub mod ethernet;
 pub mod ipv4;
 pub mod net;
+pub mod netif;
 pub mod tcp;
 pub mod udp;
 

@@ -138,6 +138,17 @@ fn dispatch_impl(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
         17 => unsafe { crate::ipc::ipc_cap_revoke(arg1, arg2, arg3) },
         // Role: RoleGrant(role_id, grantee, target, dst_slot)
         18 => crate::role::role_grant(arg1, arg2, arg3, arg4),
+        // Net: NetSocket(kind, ip_packed, port) — mint a destination-scoped
+        // NetEndpoint cap. kind 1 = TCP, 2 = UDP.
+        19 => unsafe { crate::netif::sys_net_socket(arg1, arg2, arg3) },
+        // Net: NetConnect(slot) — SEND-gated; 3-way handshake to the bound dst.
+        20 => unsafe { crate::netif::sys_net_connect(arg1) },
+        // Net: NetSend(slot, va, len) — SEND-gated; queue + transmit.
+        21 => unsafe { crate::netif::sys_net_send(arg1, arg2, arg3) },
+        // Net: NetRecv(slot, va, len) — RECV-gated; drain the socket buffer.
+        22 => unsafe { crate::netif::sys_net_recv(arg1, arg2, arg3) },
+        // Net: NetClose(slot) — close + clear the cap slot.
+        23 => unsafe { crate::netif::sys_net_close(arg1) },
         _ => -1, // Unknown syscall
     }
 }

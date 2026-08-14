@@ -28,7 +28,7 @@ pub struct ArpTable {
 }
 
 impl ArpTable {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         const NONE: Option<ArpEntry> = None;
         ArpTable {
             entries: [NONE; 64],

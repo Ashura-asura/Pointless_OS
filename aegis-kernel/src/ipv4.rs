@@ -12,6 +12,7 @@ pub enum ParseError {
     TooShort,
     WrongVersion,
     InvalidIhl,
+    InvalidTotalLength,
     ChecksumMismatch,
 }
 
@@ -135,6 +136,10 @@ impl<'a> IPv4Packet<'a> {
 
         let dscp_ecn = data[1];
         let total_length = u16::from_be_bytes([data[2], data[3]]);
+        let total = total_length as usize;
+        if total < header_len || total > data.len() {
+            return Err(ParseError::InvalidTotalLength);
+        }
         let identification = u16::from_be_bytes([data[4], data[5]]);
         let flags_frag = u16::from_be_bytes([data[6], data[7]]);
         let flags = ((flags_frag >> 13) & 0x07) as u8;
@@ -165,7 +170,7 @@ impl<'a> IPv4Packet<'a> {
             checksum,
             src_ip,
             dst_ip,
-            payload: &data[header_len..],
+            payload: &data[header_len..total],
         })
     }
 
@@ -289,6 +294,43 @@ mod tests {
         assert_eq!(parsed.src_ip, pkt.src_ip);
         assert_eq!(parsed.dst_ip, pkt.dst_ip);
         assert_eq!(parsed.payload, pkt.payload);
+    }
+
+    #[test]
+    fn payload_is_bounded_by_total_length_not_buffer_len() {
+        // A 40-byte IPv4/TCP packet carried inside a 60-byte Ethernet frame
+        // (the NIC pads short frames to the 64-byte minimum). The payload must
+        // be sliced to `total_length` (20 bytes), excluding the trailing
+        // padding, so TCP checksum verification sees exactly the segment.
+        let mut buf = [0u8; 60];
+        let pkt = build_test_packet();
+        let len = pkt.serialize(&mut buf).unwrap();
+        assert_eq!(len, 24);
+        buf[len..60].fill(0xAA); // simulated Ethernet padding
+
+        let parsed = IPv4Packet::parse(&buf[..60]).unwrap();
+        assert_eq!(parsed.total_length, 24);
+        assert_eq!(parsed.payload.len(), 4);
+        assert_eq!(parsed.payload, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn rejects_total_length_exceeding_buffer() {
+        let mut buf = [0u8; 24];
+        let pkt = build_test_packet();
+        let len = pkt.serialize(&mut buf).unwrap();
+        // Corrupt total_length to claim more bytes than the buffer holds.
+        buf[2] = 0xFF;
+        buf[3] = 0xFF;
+        // Recompute the header checksum so the length check is what fires.
+        buf[10] = 0;
+        buf[11] = 0;
+        let cksum = IPv4Packet::compute_checksum(&buf[..20]);
+        buf[10..12].copy_from_slice(&cksum.to_be_bytes());
+        assert_eq!(
+            IPv4Packet::parse(&buf[..len]),
+            Err(ParseError::InvalidTotalLength)
+        );
     }
 
     #[test]

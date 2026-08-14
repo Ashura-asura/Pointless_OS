@@ -10,7 +10,9 @@
 
 use core::fmt::Write;
 
-/// COM1 base port.
+/// COM1 base port (only touched on the live kernel; unit tests never do
+/// port I/O).
+#[cfg(not(test))]
 const COM1: u16 = 0x3F8;
 
 /// SerialWriter — a `core::fmt::Write` sink that emits to COM1.
@@ -18,20 +20,23 @@ pub struct SerialWriter;
 
 impl SerialWriter {
     pub fn init() {
-        unsafe {
-            // Disable interrupts, enable DLAB.
-            core::arch::asm!("out dx, al", in("dx") COM1, in("al") 0x00u8, options(nomem, preserves_flags));
-            core::arch::asm!("out dx, al", in("dx") COM1 + 1, in("al") 0x00u8, options(nomem, preserves_flags));
-            // Baud divisor for 115200: 1 (1.8432 MHz / 16 / 1).
-            core::arch::asm!("out dx, al", in("dx") COM1 + 3, in("al") 0x80u8, options(nomem, preserves_flags));
-            core::arch::asm!("out dx, al", in("dx") COM1, in("al") 0x01u8, options(nomem, preserves_flags));
-            core::arch::asm!("out dx, al", in("dx") COM1 + 1, in("al") 0x00u8, options(nomem, preserves_flags));
-            // 8N1, DLAB off.
-            core::arch::asm!("out dx, al", in("dx") COM1 + 3, in("al") 0x03u8, options(nomem, preserves_flags));
-            // Enable FIFO, clear, 14-byte threshold.
-            core::arch::asm!("out dx, al", in("dx") COM1 + 2, in("al") 0xC7u8, options(nomem, preserves_flags));
-            // DTR/RTS.
-            core::arch::asm!("out dx, al", in("dx") COM1 + 4, in("al") 0x0Bu8, options(nomem, preserves_flags));
+        #[cfg(not(test))]
+        {
+            unsafe {
+                // Disable interrupts, enable DLAB.
+                core::arch::asm!("out dx, al", in("dx") COM1, in("al") 0x00u8, options(nomem, preserves_flags));
+                core::arch::asm!("out dx, al", in("dx") COM1 + 1, in("al") 0x00u8, options(nomem, preserves_flags));
+                // Baud divisor for 115200: 1 (1.8432 MHz / 16 / 1).
+                core::arch::asm!("out dx, al", in("dx") COM1 + 3, in("al") 0x80u8, options(nomem, preserves_flags));
+                core::arch::asm!("out dx, al", in("dx") COM1, in("al") 0x01u8, options(nomem, preserves_flags));
+                core::arch::asm!("out dx, al", in("dx") COM1 + 1, in("al") 0x00u8, options(nomem, preserves_flags));
+                // 8N1, DLAB off.
+                core::arch::asm!("out dx, al", in("dx") COM1 + 3, in("al") 0x03u8, options(nomem, preserves_flags));
+                // Enable FIFO, clear, 14-byte threshold.
+                core::arch::asm!("out dx, al", in("dx") COM1 + 2, in("al") 0xC7u8, options(nomem, preserves_flags));
+                // DTR/RTS.
+                core::arch::asm!("out dx, al", in("dx") COM1 + 4, in("al") 0x0Bu8, options(nomem, preserves_flags));
+            }
         }
     }
 
@@ -44,6 +49,7 @@ impl SerialWriter {
     }
 
     fn putc(&mut self, c: u8) {
+        #[cfg(not(test))]
         unsafe {
             // Wait for the transmit-holding-register-empty bit (bit 5 of LSR).
             loop {
@@ -54,6 +60,10 @@ impl SerialWriter {
                 }
             }
             core::arch::asm!("out dx, al", in("dx") COM1, in("al") c, options(nomem, preserves_flags));
+        }
+        #[cfg(test)]
+        {
+            let _ = c;
         }
     }
 }
