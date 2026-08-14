@@ -195,11 +195,22 @@ struct DmaFrame {
 }
 
 impl DmaFrame {
-    fn alloc(len: usize) -> Option<DmaFrame> {
+    /// Allocate `len` bytes of physical, contiguous DMA memory and
+    /// identity-map it into `domain` (Phase G) before returning it —
+    /// nothing is ever handed back to a caller as a DMA target without
+    /// first being a real, mapped entry in that device's IOMMU domain.
+    fn alloc(len: usize, domain: u32) -> Option<DmaFrame> {
         let frames = len.div_ceil(4096) as u64;
         let phys = unsafe { crate::frame::alloc_contiguous_global(frames) }?;
         let bytes = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, len) };
         bytes.fill(0);
+        let flags = crate::iommu::PAGE_READ | crate::iommu::PAGE_WRITE;
+        let mapped =
+            unsafe { crate::iommu::with(|i| i.identity_map(domain, phys, frames * 4096, flags)) };
+        if !mapped {
+            crate::sprintln!("Aegis: e1000: IOMMU identity-map failed for DMA frame");
+            return None;
+        }
         Some(DmaFrame { phys, len })
     }
 
@@ -212,6 +223,10 @@ pub struct E1000 {
     base: *mut u8,
     pub bar_addr: u64,
     pub mac: [u8; 6],
+    /// Phase G: this device's IOMMU requester id. Every DMA address handed
+    /// to hardware is translated through `dma_addr` first, gated on this
+    /// bdf's domain.
+    bdf: u32,
     tx: DmaFrame,
     tx_buf: DmaFrame,
     rx: DmaFrame,
@@ -234,14 +249,21 @@ impl E1000 {
             crate::pci::enable_bus_mastering(dev.address);
         }
         let base = addr as *mut u8;
-        let tx = DmaFrame::alloc(TX_RING_LEN * DESC_BYTES)?;
-        let tx_buf = DmaFrame::alloc(2048)?;
-        let rx = DmaFrame::alloc(RX_RING_LEN * DESC_BYTES)?;
-        let rx_buf = DmaFrame::alloc(RX_RING_LEN * RX_BUF_BYTES)?;
+
+        // Phase G: own IOMMU domain, all four DMA rings/buffers identity-
+        // mapped into it before any address reaches hardware. Same pattern
+        // as `nvme::NvmeController::probe`.
+        let bdf = crate::iommu::bdf(dev.address.bus, dev.address.device, dev.address.function);
+        let domain = unsafe { crate::iommu::with(|i| i.provision_device(bdf)) };
+        let tx = DmaFrame::alloc(TX_RING_LEN * DESC_BYTES, domain)?;
+        let tx_buf = DmaFrame::alloc(2048, domain)?;
+        let rx = DmaFrame::alloc(RX_RING_LEN * DESC_BYTES, domain)?;
+        let rx_buf = DmaFrame::alloc(RX_RING_LEN * RX_BUF_BYTES, domain)?;
         Some(E1000 {
             base,
             bar_addr: addr,
             mac: [0; 6],
+            bdf,
             tx,
             tx_buf,
             rx,
@@ -249,6 +271,32 @@ impl E1000 {
             tx_head: 0,
             rx_next: 0,
         })
+    }
+
+    /// This device's IOMMU requester id, exposed for the boot-demo denial
+    /// test in `main.rs`.
+    pub fn iommu_bdf(&self) -> u32 {
+        self.bdf
+    }
+
+    /// Translate a physical DMA address through this device's IOMMU domain
+    /// before it is written into any descriptor or BAR register. A no-op
+    /// pass-through for the real rings/buffers allocated in `probe` (they
+    /// were identity-mapped there); a hard denial — logged, address 0
+    /// returned — for anything else.
+    fn dma_addr(&self, phys: u64) -> u64 {
+        let flags = crate::iommu::PAGE_READ | crate::iommu::PAGE_WRITE;
+        match unsafe { crate::iommu::with(|i| i.translate(self.bdf, phys, flags)) } {
+            Ok(p) => p,
+            Err(reason) => {
+                crate::sprintln!(
+                    "Aegis: e1000: IOMMU denied DMA phys={:#x} ({:?})",
+                    phys,
+                    reason
+                );
+                0
+            }
+        }
     }
 
     /// Reset the device, bring the link up and read the MAC.
@@ -279,17 +327,24 @@ impl E1000 {
         wr32(self.base, RAL0, ral);
         wr32(self.base, RAH0, rah);
 
-        wr64(self.base, RDBAL, self.rx.phys);
+        wr64(self.base, RDBAL, self.dma_addr(self.rx.phys));
         wr32(self.base, RDLEN, (RX_RING_LEN * DESC_BYTES) as u32);
         wr32(self.base, RDH, 0);
         wr32(self.base, RDT, (RX_RING_LEN - 1) as u32);
 
-        // Fill the ring with buffer descriptors.
+        // Fill the ring with buffer descriptors. Addresses are translated
+        // through the IOMMU *before* `self.rx` is mutably borrowed below —
+        // `dma_addr` needs `&self` (whole struct), so it can't run while
+        // `ring` holds an exclusive borrow of `self.rx`.
         {
+            let rx_buf_phys = self.rx_buf.phys;
+            let mut addrs = [0u64; RX_RING_LEN];
+            for (i, a) in addrs.iter_mut().enumerate() {
+                *a = self.dma_addr(rx_buf_phys + (i * RX_BUF_BYTES) as u64);
+            }
             let ring = self.rx.as_mut();
-            for i in 0..RX_RING_LEN {
-                let addr = self.rx_buf.phys + (i * RX_BUF_BYTES) as u64;
-                let d = LegacyDescriptor::rx(addr);
+            for (i, addr) in addrs.iter().enumerate() {
+                let d = LegacyDescriptor::rx(*addr);
                 write_desc(ring, i, &d);
             }
         }
@@ -301,7 +356,7 @@ impl E1000 {
 
     /// Program and enable the transmit unit.
     pub fn tx_enable(&mut self) {
-        wr64(self.base, TDBAL, self.tx.phys);
+        wr64(self.base, TDBAL, self.dma_addr(self.tx.phys));
         wr32(self.base, TDLEN, (TX_RING_LEN * DESC_BYTES) as u32);
         wr32(self.base, TDH, 0);
         wr32(self.base, TDT, 0);
@@ -321,8 +376,9 @@ impl E1000 {
         }
         let slot = self.tx_head as usize % TX_RING_LEN;
         self.tx_buf.as_mut()[..frame.len()].copy_from_slice(frame);
+        let tx_buf_addr = self.dma_addr(self.tx_buf.phys);
         let desc = LegacyDescriptor::tx(
-            self.tx_buf.phys,
+            tx_buf_addr,
             frame.len() as u16,
             DESC_CMD_EOP | DESC_CMD_IFCS | DESC_CMD_RS,
         );
@@ -347,12 +403,10 @@ impl E1000 {
         let buf_off = slot * RX_BUF_BYTES;
         let src = &self.rx_buf.as_mut()[buf_off..buf_off + len];
         out[..len].copy_from_slice(src);
-        // Re-arm the descriptor and advance RDT.
-        write_desc(
-            self.rx.as_mut(),
-            slot,
-            &LegacyDescriptor::rx(self.rx_buf.phys + (slot * RX_BUF_BYTES) as u64),
-        );
+        // Re-arm the descriptor and advance RDT. Translate before borrowing
+        // `self.rx` mutably, same reasoning as in `rx_enable`.
+        let rearm_addr = self.dma_addr(self.rx_buf.phys + (slot * RX_BUF_BYTES) as u64);
+        write_desc(self.rx.as_mut(), slot, &LegacyDescriptor::rx(rearm_addr));
         wr32(self.base, RDT, slot as u32);
         self.rx_next = (self.rx_next + 1) % RX_RING_LEN as u16;
         Some(len)
@@ -487,6 +541,7 @@ mod tests {
             base: core::ptr::null_mut(),
             bar_addr: 0,
             mac: [0; 6],
+            bdf: 0,
             tx: DmaFrame {
                 phys: 0x1000,
                 len: TX_RING_LEN * DESC_BYTES,

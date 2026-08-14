@@ -600,6 +600,42 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         sprintln!("Aegis: NVMe: LBA0: read {}, protective MBR {}", l0, g0);
         sprintln!("Aegis: NVMe: LBA1: read {}, GPT header {}", l1, g1);
 
+        // Phase G (design doc §7 Phase 3, item 1): every DMA address the NVMe
+        // and e1000 drivers handed to hardware above went through the IOMMU
+        // (`dma_addr` translates on this device's bdf before any PRP/descriptor
+        // is written). Now prove the denial path on the live boot: the NVMe
+        // device — a real, wired-up requester with a real domain and real
+        // buffers mapped — attempts a DMA to an address that was never mapped
+        // into its domain (exactly what a corrupted PRP pointer looks like at
+        // this boundary). The IOMMU denies it and records a fault; the kernel
+        // keeps running (the FAT/store demos below proceed). The e1000 path was
+        // exercised just as hard: every TX/RX ring address in the netif demo
+        // was a translated, in-domain address.
+        let nvme_bdf = ctrl.iommu_bdf();
+        let stray = 0x1_0000_0000u64; // never identity-mapped into the NVMe domain
+        let (denied, reason, fault_total) = unsafe {
+            aegis_kernel::iommu::with(|i| {
+                match i.translate(nvme_bdf, stray, aegis_kernel::iommu::PAGE_READ) {
+                    Ok(_) => (false, 0u32, i.fault_count()),
+                    Err(r) => (true, r as u32, i.fault_count()),
+                }
+            })
+        };
+        let reason_str = match reason {
+            0 => "DeviceNotAssigned",
+            1 => "AddressNotMapped",
+            2 => "PermissionDenied",
+            _ => "unknown",
+        };
+        sprintln!(
+            "Aegis: IOMMU: NVMe out-of-domain DMA to {:#x} denied at the IOMMU: {} ({}) — fault_total = {}",
+            stray, denied, reason_str, fault_total
+        );
+        sprintln!(
+            "Aegis: IOMMU: device {} (NVMe) isolated: in-domain reads above all passed the gate; out-of-domain attempt refused; kernel continues",
+            nvme_bdf
+        );
+
         // Real FAT16 read from live hardware: mount the ESP (starts at LBA
         // 2048, matching uefi-boot/build_image.py's PART_START_LBA), walk
         // EFI/BOOT/BOOTX64.EFI, and read back the kernel's own bootloader

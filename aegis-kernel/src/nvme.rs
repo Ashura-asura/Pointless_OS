@@ -239,6 +239,11 @@ impl Bufs {
 pub struct NvmeController {
     base: *mut u8,
     pub bar_addr: u64,
+    /// Phase G: this device's IOMMU requester id. Every DMA address handed
+    /// to the controller is translated through `dma_addr` first, gated on
+    /// this bdf's domain.
+    bdf: u32,
+    domain: u32,
     sq_tail: u16,
     io_tail: u16,
     cq_head: u16,
@@ -265,9 +270,32 @@ impl NvmeController {
             crate::sprintln!("Aegis: NVMe: BAR {:x} out of identity map - skipped", addr);
             return None;
         };
+
+        // Phase G: give this device its own IOMMU domain and identity-map
+        // every DMA buffer it will ever use into it *before* any address
+        // is handed to hardware. Nothing else is mapped into this domain,
+        // so a PRP pointer aimed anywhere else (another device's buffer,
+        // kernel memory, MMIO) is denied at `dma_addr` below.
+        let bdf = crate::iommu::bdf(dev.address.bus, dev.address.device, dev.address.function);
+        let buf = Bufs::new();
+        let flags = crate::iommu::PAGE_READ | crate::iommu::PAGE_WRITE;
+        let domain = unsafe {
+            crate::iommu::with(|i| {
+                let dom = i.provision_device(bdf);
+                i.identity_map(dom, Bufs::phys(buf.sq), 4096, flags);
+                i.identity_map(dom, Bufs::phys(buf.cq), 4096, flags);
+                i.identity_map(dom, Bufs::phys(buf.qe), 4096, flags);
+                i.identity_map(dom, Bufs::phys(buf.id), 4096, flags);
+                i.identity_map(dom, Bufs::phys(buf.ad), 4096, flags);
+                dom
+            })
+        };
+
         Some(Self {
             base: bar_addr as *mut u8,
             bar_addr,
+            bdf,
+            domain,
             sq_tail: 0,
             io_tail: 0,
             cq_head: 0,
@@ -275,8 +303,41 @@ impl NvmeController {
             io_cq_head: 0,
             io_phase: true,
             ns_size_bytes: 0,
-            buf: Bufs::new(),
+            buf,
         })
+    }
+
+    /// This device's IOMMU requester id, exposed for the boot-demo denial
+    /// test (`main.rs`) and for tests elsewhere that need to exercise the
+    /// gate against a real, wired-up controller.
+    pub fn iommu_bdf(&self) -> u32 {
+        self.bdf
+    }
+
+    /// This device's IOMMU domain id.
+    pub fn iommu_domain(&self) -> u32 {
+        self.domain
+    }
+
+    /// Translate a physical DMA address through this device's IOMMU domain
+    /// before it is written into any hardware register or PRP field. Every
+    /// legitimate buffer this driver uses was identity-mapped into
+    /// `self.domain` in `probe`, so this is a no-op pass-through for real
+    /// traffic and a hard denial (logged, address 0 returned) for anything
+    /// else — including a deliberately misdirected target.
+    fn dma_addr(&self, phys: u64) -> u64 {
+        let flags = crate::iommu::PAGE_READ | crate::iommu::PAGE_WRITE;
+        match unsafe { crate::iommu::with(|i| i.translate(self.bdf, phys, flags)) } {
+            Ok(p) => p,
+            Err(reason) => {
+                crate::sprintln!(
+                    "Aegis: NVMe: IOMMU denied DMA phys={:#x} ({:?})",
+                    phys,
+                    reason
+                );
+                0
+            }
+        }
     }
 
     pub fn cap(&self) -> u32 {
@@ -302,8 +363,14 @@ impl NvmeController {
             REG_AQA,
             ((QUEUE_SIZE - 1) << 16) | (QUEUE_SIZE - 1),
         );
-        wr32(self.base, REG_ASQ, Bufs::phys(self.buf.sq) as u32);
-        wr32(self.base, REG_ACQ, Bufs::phys(self.buf.cq) as u32);
+        let asq = self.dma_addr(Bufs::phys(self.buf.sq));
+        let acq = self.dma_addr(Bufs::phys(self.buf.cq));
+        if asq == 0 || acq == 0 {
+            crate::sprintln!("Aegis: NVMe: IOMMU denied admin queue DMA setup");
+            return false;
+        }
+        wr32(self.base, REG_ASQ, asq as u32);
+        wr32(self.base, REG_ACQ, acq as u32);
         let cc = CC_EN | (6 << CC_IOSQES_SHIFT) | (4 << CC_IOCQES_SHIFT);
         wr32(self.base, REG_CC, cc);
         wmb();
@@ -314,6 +381,7 @@ impl NvmeController {
 
     /// Submit one admin command; returns the command id used.
     fn admin_cmd(&mut self, opcode: u8, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32) -> u16 {
+        let prp1 = self.dma_addr(prp1);
         let tail = self.sq_tail as usize;
         let s = &mut self.buf.sq[tail * 8..tail * 8 + 8];
         s[0] = opcode as u64 | ((tail as u64) << 16) | ((nsid as u64) << 32);
@@ -505,10 +573,14 @@ impl NvmeController {
     pub fn read_lba(&mut self, lba: u64) -> bool {
         let tail = self.io_tail as usize;
         let cid = tail as u16;
+        // Translate before `self.buf.sq` is mutably borrowed: `dma_addr`
+        // takes `&self` (whole struct), so it cannot run while the sq slice
+        // holds an exclusive borrow.
+        let qe_addr = self.dma_addr(Bufs::phys(self.buf.qe));
         let s = &mut self.buf.sq[tail * 8..tail * 8 + 8];
         s[0] = IO_READ as u64 | ((tail as u64) << 16) | (1 << 32);
         s[1] = 0;
-        s[3] = Bufs::phys(self.buf.qe);
+        s[3] = qe_addr;
         s[4] = 0;
         s[5] = lba;
         s[6] = 0;
@@ -551,10 +623,13 @@ impl NvmeController {
         wmb();
         let tail = self.io_tail as usize;
         let cid = tail as u16;
+        // Translate before `self.buf.sq` is mutably borrowed (same reason as
+        // `read_lba`).
+        let qe_addr = self.dma_addr(Bufs::phys(self.buf.qe));
         let s = &mut self.buf.sq[tail * 8..tail * 8 + 8];
         s[0] = IO_WRITE as u64 | ((tail as u64) << 16) | (1 << 32);
         s[1] = 0;
-        s[3] = Bufs::phys(self.buf.qe);
+        s[3] = qe_addr;
         s[4] = 0;
         s[5] = lba;
         s[6] = 0;

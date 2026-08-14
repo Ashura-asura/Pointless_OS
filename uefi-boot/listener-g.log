@@ -1,0 +1,26 @@
+listener: waiting for QEMU on 127.0.0.1:45556 ...
+listener: QEMU connected from ('127.0.0.1', 56340)
+listener: frame 1, 86 bytes, proto 86dd
+listener: frame 2, 78 bytes, proto 86dd
+listener: ARP request from 52:54:00:12:34:56 10.0.2.15
+listener: echoed ARP reply (42 bytes)
+listener: TCP SYN to 8080 (isn=2654435768) -> SYN-ACK
+listener: ACK received - handshake complete (port 8080)
+listener: port 8080 data segment (34 bytes): b'GET / HTTP/1.0\r\nHost: 10.0.2.2\r\n\r\n'
+listener: HTTP response sent (134 bytes)
+listener: FIN acknowledged (port 8080)
+listener: TCP SYN to 8443 (isn=3668340001) -> SYN-ACK
+listener: ACK received - handshake complete (port 8443)
+listener: port 8443 data segment (133 bytes): b'\x16\x03\x01\x00\x80\x01\x00\x00|\x03\x03\xa6\x07o>\x1b,M^op\x81\x92\xa3\xb4\xc5\xd6\xe7\xf8\t\x1a+<M^op\x81\x92\xa3\xb4\xc5\xd6\x00\x00\x02\x13\x01\x01\x00\x00Q\x00\x00\x00\n\x00\x08\x00\x00\x05aeg'
+listener: TLS records from server sent (1291 bytes)
+listener: ECDHE shared secret (host side): 78f9c9fdea6b669db1d855b79adc08a67bdd3e8d75c6ceaea93670876305a705
+listener: server keyshare: 94ccf9325fe16b0940d754a0b6cee54cefb7caea94d516af02f393460201427f
+listener: port 8443 data segment (58 bytes): b'\x17\x03\x03\x0056\x05Y9\xf8\xdbD\xc6\x9d\xfc\x1cfh\xd7\xff\x0b\xf3\xd9\x94\xfd\xde\xd6:\xd22\x9b\x9b\x19\xf1]o\xdb\xf1&3>\xc1\xc2\xae\x84Qp\x99/\xb1\xbc\xa8\x02\x16\x92&\xccV'
+listener: TLS records from server sent (478 bytes)
+listener: port 8443 data segment (62 bytes): b'\x17\x03\x03\x009\xc4\x8e\xf3\xf2\x14\xcb\x95D\x07\x175\xef\xa1+\xdfa\x9b\xc9\xe5C`\xc3;\xd1\xa8p\xec\xf0i\xfbG\xbc\xb9\x1b_1\x03\xe9\xa9\x8aA\xb9M\xfd\x96\xc9\xf8\xb1\xcc\xa8#k\x80\xc0m\xd5a'
+listener: TLS server produced no output yet
+listener: TLS application data from kernel (40 bytes): b'GET /aegis-tls HTTP/1.0\r\nHost: aegis\r\n\r\n'
+listener: TLS HTTPS response sent (156 bytes)
+listener: FIN acknowledged (port 8443)
+listener: timeout waiting for frames
+listener: wrote 17 frame(s) to e1000-phase-g.pcap
