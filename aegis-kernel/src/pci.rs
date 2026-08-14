@@ -1,5 +1,4 @@
 // PCIe device enumeration
-
 // PCI config register offsets
 pub const VENDOR_ID: u16 = 0x00;
 pub const DEVICE_ID: u16 = 0x02;
@@ -354,6 +353,15 @@ impl PciDeviceList {
     pub fn find_network(&self) -> Option<&PciDevice> {
         self.iter().find(|d| d.is_network())
     }
+
+    /// First display-class (`CLASS_DISPLAY`) device, if any. Phase H:
+    /// `gpu::BochsGpu::probe` calls this, then confirms the device actually
+    /// speaks the Bochs dispi register interface before using it — a
+    /// display-class device that isn't Bochs-VBE-compatible (e.g. VMware's
+    /// SVGA-II) is still found here, just rejected one layer up.
+    pub fn find_display(&self) -> Option<&PciDevice> {
+        self.iter().find(|d| d.is_display())
+    }
 }
 
 impl Default for PciDeviceList {
@@ -515,5 +523,41 @@ mod tests {
         };
         list.push(net);
         assert!(list.find_network().is_some());
+    }
+
+    #[test]
+    fn find_display_finds_display_device() {
+        let mut list = PciDeviceList::new();
+        let net = PciDevice {
+            address: PciAddress::new(0, 1, 0),
+            vendor_id: 0,
+            device_id: 0,
+            class: CLASS_NETWORK,
+            subclass: 0,
+            prog_if: 0,
+            revision: 0,
+            header_type: 0,
+            bar: [0; 6],
+            interrupt_line: 0,
+            interrupt_pin: 0,
+        };
+        let gpu = PciDevice {
+            address: PciAddress::new(0, 2, 0),
+            vendor_id: 0x1234,
+            device_id: 0x1111,
+            class: CLASS_DISPLAY,
+            subclass: 0,
+            prog_if: 0,
+            revision: 0,
+            header_type: 0,
+            bar: [0x1000_0000, 0, 0, 0, 0, 0],
+            interrupt_line: 0,
+            interrupt_pin: 0,
+        };
+        list.push(net);
+        list.push(gpu);
+        let found = list.find_display().unwrap();
+        assert_eq!(found.vendor_id, 0x1234);
+        assert!(found.is_display());
     }
 }

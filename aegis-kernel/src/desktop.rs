@@ -49,7 +49,21 @@ pub enum KeyOutcome {
     Backspace { window_id: u32, pos: usize },
     /// Enter submitted (cleared) a `len`-character line.
     Enter { window_id: u32, len: usize },
+    /// An arrow key moved the shell window; it is now at `(x, y)` (clamped
+    /// to stay fully on screen and below the title / above the status bar
+    /// — see `MOVE_MIN_X`..`MOVE_MAX_Y`).
+    Moved { window_id: u32, x: i16, y: i16 },
 }
+
+/// Shell-window move bounds for arrow-key handling: horizontally clamped to
+/// stay fully on screen (`0..=SW-SHELL_W`), vertically clamped to stay
+/// fully below the title bar (row 0) and above the status bar (row
+/// `SH-1`). One cell per keypress — the same granularity every other
+/// dimension in this text-mode-native project already uses.
+const MOVE_MIN_X: i16 = 0;
+const MOVE_MAX_X: i16 = SW as i16 - SHELL_W as i16;
+const MOVE_MIN_Y: i16 = 1;
+const MOVE_MAX_Y: i16 = SH as i16 - 1 - SHELL_H as i16;
 
 /// Live shell desktop: window manager + framebuffers + composited screen.
 pub struct Desktop {
@@ -230,6 +244,25 @@ impl Desktop {
                 Some(KeyOutcome::Enter {
                     window_id: self.shell_id,
                     len,
+                })
+            }
+            Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight => {
+                let (cur_x, cur_y) = self.wm.window(self.shell_id).map(|w| (w.region.x, w.region.y))?;
+                let (dx, dy): (i16, i16) = match ke.key {
+                    Key::ArrowUp => (0, -1),
+                    Key::ArrowDown => (0, 1),
+                    Key::ArrowLeft => (-1, 0),
+                    Key::ArrowRight => (1, 0),
+                    _ => unreachable!(),
+                };
+                let nx = (cur_x + dx).clamp(MOVE_MIN_X, MOVE_MAX_X);
+                let ny = (cur_y + dy).clamp(MOVE_MIN_Y, MOVE_MAX_Y);
+                self.wm.move_window(self.shell_id, nx, ny).ok()?;
+                self.composite();
+                Some(KeyOutcome::Moved {
+                    window_id: self.shell_id,
+                    x: nx,
+                    y: ny,
                 })
             }
             _ => {
@@ -462,6 +495,14 @@ fn key_to_char(key: Key, shift: bool) -> Option<u8> {
 /// The one live desktop, installed at boot after the demo assertions print.
 static mut DESKTOP: Option<Desktop> = None;
 
+/// Optional GPU pixel backend for the live desktop (Phase H). Strictly
+/// additive: the text-mode VGA backend above works unconditionally, with
+/// or without this. When present, every `boot_blit`/`handle_key` re-blit
+/// fans the same composited `Cell` screen out to real pixels too, via
+/// `gpu_compositor::blit_cells` — see that module for why this is "a
+/// second output backend", not a rewrite of the compositor itself.
+static mut GPU: Option<crate::gpu::BochsGpu> = None;
+
 /// Install the live desktop.
 ///
 /// # Safety
@@ -471,23 +512,53 @@ pub unsafe fn install(d: Desktop) {
     core::ptr::addr_of_mut!(DESKTOP).write(Some(d));
 }
 
+/// Install the GPU pixel output backend (Phase H). Optional: call this
+/// before or after `install`, any time before the first `boot_blit`/
+/// `handle_key`, only if `gpu::BochsGpu::probe` + `set_mode` succeeded.
+///
+/// # Safety
+///
+/// Single-threaded boot-time call, once.
+pub unsafe fn install_gpu(g: crate::gpu::BochsGpu) {
+    core::ptr::addr_of_mut!(GPU).write(Some(g));
+}
+
+/// True if a GPU pixel backend was installed (for boot-log clarity only).
+pub fn gpu_installed() -> bool {
+    unsafe { core::ptr::addr_of!(GPU).as_ref() }
+        .map(|o| o.is_some())
+        .unwrap_or(false)
+}
+
+/// Fan `screen` out to the GPU pixel backend, if one is installed. A no-op
+/// (and `gpu_compositor::blit_cells` is itself a no-op on an unset mode)
+/// when there is none — the VGA text backend never depends on this.
+fn gpu_blit(screen: &[Cell]) {
+    if let Some(g) = unsafe { core::ptr::addr_of_mut!(GPU).as_mut() }.and_then(|o| o.as_mut()) {
+        crate::gpu_compositor::blit_cells(g, screen, SW, SH);
+    }
+}
+
 /// Blit the installed desktop onto the display (called once, after all boot
-/// demo output has printed). Returns false if none was installed.
+/// demo output has printed) — both the VGA text backend and, if installed,
+/// the GPU pixel backend. Returns false if no desktop was installed.
 pub fn boot_blit() -> bool {
     if let Some(d) = unsafe { core::ptr::addr_of_mut!(DESKTOP).as_mut() }.and_then(|o| o.as_mut()) {
         d.blit();
+        gpu_blit(d.screen());
         true
     } else {
         false
     }
 }
 
-/// Apply one keypress to the live desktop and re-blit. Returns the outcome
-/// for the caller to print over serial.
+/// Apply one keypress to the live desktop and re-blit both backends.
+/// Returns the outcome for the caller to print over serial.
 pub fn handle_key(ke: KeyEvent) -> Option<KeyOutcome> {
     let d = unsafe { core::ptr::addr_of_mut!(DESKTOP).as_mut() }.and_then(|o| o.as_mut())?;
     let out = d.apply_key(ke)?;
     d.blit();
+    gpu_blit(d.screen());
     Some(out)
 }
 
@@ -619,5 +690,60 @@ mod tests {
         // Line cleared: the cursor is back at the prompt end.
         let cur = d.screen()[echo_base()] & 0xFF;
         assert_eq!(cur as u8, b'_');
+    }
+
+    fn arrow(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            pressed: true,
+            modifiers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn arrow_key_moves_shell_window() {
+        let mut d = Desktop::new();
+        let out = d.apply_key(arrow(Key::ArrowRight)).unwrap();
+        match out {
+            KeyOutcome::Moved { window_id, x, y } => {
+                assert_eq!(window_id, d.shell_id());
+                assert_eq!((x, y), (SHELL_X + 1, SHELL_Y));
+            }
+            _ => panic!("expected a move"),
+        }
+        // The prompt now renders one cell to the right of its original
+        // origin; the old origin cell is back to desktop background.
+        let moved_cell = (d.screen()[SHELL_Y as usize * SW + SHELL_X as usize + 1] & 0xFF) as u8;
+        assert_eq!(moved_cell, b'a');
+        let old_cell = d.screen()[SHELL_Y as usize * SW + SHELL_X as usize];
+        assert_ne!((old_cell & 0xFF) as u8, b'a');
+    }
+
+    #[test]
+    fn arrow_key_move_clamps_at_minimum() {
+        let mut d = Desktop::new();
+        // SHELL_Y is already 2; MOVE_MIN_Y is 1, so a single Up reaches the
+        // clamp and a second Up must not go any further.
+        d.apply_key(arrow(Key::ArrowUp)).unwrap();
+        let out = d.apply_key(arrow(Key::ArrowUp)).unwrap();
+        match out {
+            KeyOutcome::Moved { y, .. } => assert_eq!(y, MOVE_MIN_Y),
+            _ => panic!("expected a move"),
+        }
+    }
+
+    #[test]
+    fn arrow_key_move_clamps_at_maximum() {
+        let mut d = Desktop::new();
+        // Drive far past the right edge; must clamp at MOVE_MAX_X and stay
+        // fully on screen (never past SW - SHELL_W).
+        for _ in 0..(SW as i16) {
+            d.apply_key(arrow(Key::ArrowRight)).unwrap();
+        }
+        let out = d.apply_key(arrow(Key::ArrowRight)).unwrap();
+        match out {
+            KeyOutcome::Moved { x, .. } => assert_eq!(x, MOVE_MAX_X),
+            _ => panic!("expected a move"),
+        }
     }
 }

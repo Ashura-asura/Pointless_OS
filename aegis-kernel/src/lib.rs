@@ -43,6 +43,8 @@ pub mod profiler;
 
 pub mod compositor;
 pub mod desktop;
+pub mod gpu;
+pub mod gpu_compositor;
 pub mod input;
 pub mod object_graph;
 pub mod ps2;
