@@ -721,6 +721,17 @@ impl Tls13Client {
         hkdf_extract(&derived, &[0u8; 32])
     }
 
+    /// The resumption master secret (RFC 8446 §7.1): derived over the
+    /// ClientHello…client Finished transcript, unlike the application traffic
+    /// secrets which use the transcript through the server Finished.
+    pub fn res_master(&self) -> [u8; 32] {
+        derive_secret(
+            &self.master_secret(),
+            b"res master",
+            self.transcript.as_bytes(),
+        )
+    }
+
     /// Decrypt one server record using the current handshake read key (seq
     /// tracked internally). Records of type ChangeCipherSpec (20) are legacy
     /// no-ops and are passed through untouched so the caller can skip them
@@ -1492,6 +1503,23 @@ mod tests {
             "s_ap over Finished-inclusive transcript must differ"
         );
         assert_eq!(right_s, s_ap.secret);
+
+        // The resumption master secret: RFC 8446 §7.1 says it derives over
+        // ClientHello…client Finished — the FULL transcript, including the
+        // client Finished that build_client_finished just appended. RFC 8448
+        // §3 publishes it; assert byte-for-byte.
+        let rm = client.res_master();
+        assert_eq!(
+            rm,
+            [
+                0x7d, 0xf2, 0x35, 0xf2, 0x03, 0x1d, 0x2a, 0x05, 0x12, 0x87, 0xd0, 0x2b, 0x02, 0x41,
+                0xb0, 0xbf, 0xda, 0xf8, 0x6c, 0xc8, 0x56, 0x23, 0x1f, 0x2d, 0x5a, 0xba, 0x46, 0xc4,
+                0x34, 0xec, 0x19, 0x6c,
+            ]
+        );
+        // The res master transcript hash is the RFC's published hash through
+        // the client Finished.
+        assert_eq!(sha256(client.transcript.as_bytes()), RFC8448_RES_HASH);
     }
 
     #[test]
