@@ -124,8 +124,8 @@ fn force_display_refresh() {
     out8(0x3C5, sr1 | 0x20); // screen off
     out8(0x3C4, 0x01);
     out8(0x3C5, sr1 & !0x20); // screen back on
-    // CRTC start address (indices 0x0C/0x0D): poke it to the same value so
-    // the emulator re-reads the text buffer from row 0.
+                              // CRTC start address (indices 0x0C/0x0D): poke it to the same value so
+                              // the emulator re-reads the text buffer from row 0.
     out8(0x3D4, 0x0C);
     let sa_hi = in8(0x3D5);
     out8(0x3D4, 0x0D);
@@ -153,13 +153,17 @@ fn force_display_refresh() {
 pub fn vga_dump_buffer() {
     let mut line = [0u8; COLS + 1];
     for y in 0..ROWS {
-        for x in 0..COLS {
+        for (x, c) in line.iter_mut().enumerate().take(COLS) {
             let cell = cells()[y * COLS + x];
             let b = (cell & 0xFF) as u8;
-            line[x] = if (0x20..0x7F).contains(&b) { b } else { b'?' };
+            *c = if (0x20..0x7F).contains(&b) { b } else { b'?' };
         }
         line[COLS] = 0;
-        crate::sprintln!("VGA[{:02}] |{}|", y, core::str::from_utf8(&line[..COLS]).unwrap_or(""));
+        crate::sprintln!(
+            "VGA[{:02}] |{}|",
+            y,
+            core::str::from_utf8(&line[..COLS]).unwrap_or("")
+        );
     }
 }
 
@@ -340,7 +344,7 @@ fn vmware_svga_disable() -> bool {
                 continue; // BAR0 not I/O space
             }
             let io_base = (bar0 & 0xFFFC) as u16; // SVGA_INDEX_PORT = base+0
-            // SVGA registers are a dword index/value port pair at base+0/+1.
+                                                  // SVGA registers are a dword index/value port pair at base+0/+1.
             out32(io_base, 0); // index = SVGA_REG_ID (probe/version)
             let svga_id = in32(io_base + 1);
             out32(io_base, 1); // index = SVGA_REG_ENABLE

@@ -29,8 +29,16 @@ const MENU_H: u16 = 5;
 /// assertion.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KeyOutcome {
-    FocusChanged { window_id: u32, overlap_cell: u8 },
-    Moved { window_id: u32, x: i16, y: i16, clipped: bool },
+    FocusChanged {
+        window_id: u32,
+        overlap_cell: u8,
+    },
+    Moved {
+        window_id: u32,
+        x: i16,
+        y: i16,
+        clipped: bool,
+    },
 }
 
 /// Live shell desktop: window manager + framebuffers + composited screen.
@@ -45,6 +53,12 @@ pub struct Desktop {
     menu_id: u32,
     focus_cycle: [u32; 2],
     focus_pos: usize,
+}
+
+impl Default for Desktop {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Desktop {

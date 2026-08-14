@@ -86,10 +86,7 @@ impl Ps2State {
         }
         let ext = self.extended;
         self.extended = false;
-        let key = match translate(ext, code) {
-            Some(k) => k,
-            None => return None,
-        };
+        let key = translate(ext, code)?;
         let ev = KeyEvent {
             key,
             pressed: press,
@@ -381,7 +378,7 @@ mod tests {
         assert!(st.feed(&mut buf, 0x0C).is_none()); // '-': no Key variant
         assert!(st.feed(&mut buf, 0xE0).is_none()); // E0 prefix alone
         assert!(st.feed(&mut buf, 0x5B).is_none()); // extended, unmapped
-        // The stray E0 prefix must not corrupt the next plain key.
+                                                    // The stray E0 prefix must not corrupt the next plain key.
         st.feed(&mut buf, 0x1E);
         assert_eq!(buf.pop(), Some(ev(Key::A, true, false, false)));
         assert!(buf.is_empty());

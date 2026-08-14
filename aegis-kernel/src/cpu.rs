@@ -162,7 +162,7 @@ pub unsafe fn init_legacy_pic_irq1() {
     asm!("out dx, al", in("dx") 0x21u16, in("al") 0x20u8, options(nomem, preserves_flags)); // ICW2: base vector 0x20
     asm!("out dx, al", in("dx") 0x21u16, in("al") 0x04u8, options(nomem, preserves_flags)); // ICW3: slave on IR2
     asm!("out dx, al", in("dx") 0x21u16, in("al") 0x01u8, options(nomem, preserves_flags)); // ICW4: 8086 mode
-    // Slave 8259A: remapped for correctness, kept fully masked.
+                                                                                            // Slave 8259A: remapped for correctness, kept fully masked.
     asm!("out dx, al", in("dx") 0xA0u16, in("al") 0x11u8, options(nomem, preserves_flags));
     asm!("out dx, al", in("dx") 0xA1u16, in("al") 0x28u8, options(nomem, preserves_flags));
     asm!("out dx, al", in("dx") 0xA1u16, in("al") 0x02u8, options(nomem, preserves_flags));
