@@ -5,11 +5,6 @@ use aegis_kernel::sprintln;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Composited 80x25 desktop (char | attr<<8) captured by the Phase-9/10
-/// compositor and blitted to the real VGA text buffer by `run_idle` once the
-/// boot demos have finished, so the VM display settles on the GUI.
-static mut DESKTOP_SCREEN: Option<[u16; 80 * 25]> = None;
-
 /// Write the first four bytes of `id` into `out` as xx:xx (for demo printout).
 fn hex_bytes(id: &[u8; 32], out: &mut [u8; 4]) {
     for (i, slot) in out.iter_mut().enumerate() {
@@ -131,7 +126,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     unsafe {
         aegis_kernel::cpu::init_idt();
     }
-    sprintln!("Aegis: IDT loaded (exception vectors 0-31 + timer at 0x30)");
+    sprintln!("Aegis: IDT loaded (exception vectors 0-31 + timer at 0x30 + keyboard at 0x21)");
 
     unsafe {
         aegis_kernel::cpu::mask_pic();
@@ -559,124 +554,18 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         sprintln!("Aegis: NVMe: no controller with a mapped BAR");
     }
 
-    // Phase 9/10 (roadmap §10 item 3): the graphical shell compositor
-    // exercised live. A compositor turns the window manager's z-ordered
-    // window list plus per-window framebuffers into a single composited
-    // screen: higher windows occlude lower ones in overlap, and every
-    // surface is clipped to its region and the screen bounds. Honest
-    // substrate: the VM's real display is the VGA text-mode buffer, so a
-    // "pixel" is one text cell (char | attr<<8).
+    // Phase 9/10 (roadmap §10 item 3) + item 4: the graphical shell's live
+    // desktop. A compositor turns the window manager's z-ordered window list
+    // plus per-window framebuffers into a single composited screen: higher
+    // windows occlude lower ones in overlap, and every surface is clipped to
+    // its region and the screen bounds. Honest substrate: the VM's real
+    // display is the VGA text-mode buffer, so a "pixel" is one text cell
+    // (char | attr<<8). The desktop object is installed here so the PS/2
+    // input path can re-composite and re-blit it live (see `run_idle`).
     {
-        use aegis_kernel::compositor::{self, Cell};
-        use aegis_kernel::window::{Region, WindowManager};
-
-        const SW: usize = 80;
-        const SH: usize = 25;
-        let mut wm = WindowManager::new(SW as u16, SH as u16);
-
-        // Title bar across the top edge.
-        let title = wm
-            .create_window(
-                1,
-                b"title",
-                Region {
-                    x: 0,
-                    y: 0,
-                    width: SW as u16,
-                    height: 1,
-                },
-            )
-            .unwrap();
-        // Status bar across the bottom edge.
-        let status = wm
-            .create_window(
-                2,
-                b"status",
-                Region {
-                    x: 0,
-                    y: SH as i16 - 1,
-                    width: SW as u16,
-                    height: 1,
-                },
-            )
-            .unwrap();
-        // A "clock" app window.
-        let clock = wm
-            .create_window(
-                3,
-                b"clock",
-                Region {
-                    x: 2,
-                    y: 2,
-                    width: 30,
-                    height: 8,
-                },
-            )
-            .unwrap();
-        // A "menu" dialog overlapping the clock; focused, so it occludes it.
-        let menu = wm
-            .create_window(
-                4,
-                b"menu",
-                Region {
-                    x: 18,
-                    y: 4,
-                    width: 24,
-                    height: 5,
-                },
-            )
-            .unwrap();
-        wm.focus_window(menu).unwrap();
-
-        // Per-window framebuffers: cell = char | attr<<8 (0x0F = white on
-        // black; 0x1F = white on blue). The menu's first cell carries its own
-        // glyph.
-        let mut fb_title = [0u16; SW];
-        for c in fb_title.iter_mut() {
-            *c = 0x1F00 | b' ' as u16;
-        }
-        for (i, t) in b" AEGIS GRAPHICAL SHELL -- live compositor desktop (80x25) -- transparent cells = blue desktop ".iter().enumerate() {
-            if i < SW {
-                fb_title[i] = 0x1F00 | *t as u16;
-            }
-        }
-        let mut fb_status = [0u16; SW];
-        for c in fb_status.iter_mut() {
-            *c = 0x0F00 | b'-' as u16;
-        }
-        let mut fb_clock = [0u16; 30 * 8];
-        for (i, c) in fb_clock.iter_mut().enumerate() {
-            *c = 0x0F00 | if i == 0 { b'C' } else { b'.' } as u16;
-        }
-        let mut fb_menu = [0u16; 24 * 5];
-        for (i, c) in fb_menu.iter_mut().enumerate() {
-            *c = 0x0F00 | if i == 0 { b'M' } else { b'#' } as u16;
-        }
-
-        let mut fbs: [Option<&[Cell]>; compositor::MAX_WINDOWS] = [None; compositor::MAX_WINDOWS];
-        fbs[(title as usize) - 1] = Some(&fb_title);
-        fbs[(status as usize) - 1] = Some(&fb_status);
-        fbs[(clock as usize) - 1] = Some(&fb_clock);
-        fbs[(menu as usize) - 1] = Some(&fb_menu);
-
-        let mut screen = [compositor::TRANSPARENT; SW * SH];
-        compositor::composite(&wm, &fbs, &mut screen).unwrap();
-
-        // Paint the desktop background: every cell the compositor left
-        // transparent becomes the blue desktop color, so the whole screen is
-        // visibly the GUI (not a black void) when blitted to the VGA buffer.
-        let desktop_bg: Cell = 0x1000 | b' ' as u16; // space, black on blue
-        for c in screen.iter_mut() {
-            if *c == compositor::TRANSPARENT {
-                *c = desktop_bg;
-            }
-        }
-
-        // Keep the composited desktop so the real display can show it once
-        // the boot demos have finished printing (see `run_idle`).
-        unsafe {
-            DESKTOP_SCREEN = Some(screen);
-        }
+        use aegis_kernel::desktop::{Desktop, SH, SW};
+        let d = Desktop::new();
+        let screen = d.screen();
 
         // Occlusion checks: the focused menu (topmost z) covers the clock
         // where they overlap; the clock is visible where the menu is not.
@@ -706,14 +595,28 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             "Aegis: shell-compositor: composited {}x{} screen from {} windows (VGA text substrate; compositor is ordinary userspace-style UI work, per roadmap §10 item 3)",
             SW,
             SH,
-            wm.compositor_order().iter().filter(|&&id| id != 0).count()
+            d.window_count()
         );
+        unsafe {
+            aegis_kernel::desktop::install(d);
+        }
     }
 
     unsafe {
         aegis_kernel::cpu::init_lapic_timer();
     }
     sprintln!("Aegis: LAPIC timer armed (periodic, vector 0x30)");
+
+    // Phase 10 item 4 (interactive shell): one real input path. Remap the
+    // legacy PIC so IRQ1 -> vector 0x21, route it through the LAPIC in
+    // virtual-wire mode (LVT0 ExtINT), then bring the PS/2 controller up.
+    unsafe {
+        aegis_kernel::cpu::init_legacy_pic_irq1();
+    }
+    sprintln!("Aegis: legacy PIC remapped; IRQ1 (keyboard) -> 0x21 via LAPIC LVT0 ExtINT");
+    unsafe {
+        aegis_kernel::ps2::init();
+    }
 
     // Two kernel tasks, each on a 16 KiB stack carved from the frame
     // allocator (4 consecutive frames per task).
@@ -723,16 +626,21 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     let stack_beta = unsafe {
         aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
     };
-    match (stack_alpha, stack_beta) {
-        (Some(sa), Some(sb)) => {
+    let stack_input = unsafe {
+        aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
+    };
+    match (stack_alpha, stack_beta, stack_input) {
+        (Some(sa), Some(sb), Some(si)) => {
             unsafe {
                 aegis_kernel::tasks::spawn("alpha", task_alpha, sa);
                 aegis_kernel::tasks::spawn("beta", task_beta, sb);
+                aegis_kernel::tasks::spawn("input", task_input, si);
             }
             sprintln!(
-                "Aegis: tasks spawned: alpha @ 0x{:X}, beta @ 0x{:X} ({} tasks)",
+                "Aegis: tasks spawned: alpha @ 0x{:X}, beta @ 0x{:X}, input @ 0x{:X} ({} tasks)",
                 sa,
                 sb,
+                si,
                 aegis_kernel::tasks::spawned_count()
             );
         }
@@ -986,9 +894,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // All boot/demo output has printed; put the composited desktop on the
     // real VGA display and freeze further console mirroring, so the VM
     // display settles on the GUI for the rest of the run.
-    let desktop = unsafe { DESKTOP_SCREEN };
-    if let Some(screen) = desktop {
-        aegis_kernel::vga::vga_show_desktop(&screen, 80, 25);
+    if aegis_kernel::desktop::boot_blit() {
         sprintln!("Aegis: compositor desktop shown on the VM display");
         aegis_kernel::vga::vga_dump_buffer();
     }
@@ -1010,7 +916,9 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
 
 /// Ring-0 idle loop: halts until the next timer tick. Entered on a private
 /// idle stack (see `switch_to_idle_stack`); the scheduler switches back to
-/// it whenever no task is runnable.
+/// it whenever no task is runnable. The keyboard ring buffer is drained by
+/// the dedicated `task_input` kernel task (which the round-robin actually
+/// schedules), so input is serviced even though the demo tasks never block.
 #[no_mangle]
 pub extern "sysv64" fn run_idle() -> ! {
     let mut next_print: u64 = 512;
@@ -1024,6 +932,51 @@ pub extern "sysv64" fn run_idle() -> ! {
     }
 }
 
+/// Kernel input task: drains the PS/2 ring buffer and applies each keypress
+/// to the live desktop (Tab cycles focus, arrows move the focused window),
+/// re-compositing and re-blitting, then prints the outcome over serial —
+/// the keypress-driven analogue of the boot-time occlusion assertion. Runs
+/// forever like alpha/beta; the timer preempts it round-robin.
+extern "sysv64" fn task_input() -> ! {
+    sprintln!("Aegis: [input] online (PS/2 -> desktop)");
+    loop {
+        while let Some(ev) = aegis_kernel::ps2::pop_event() {
+            if let aegis_kernel::input::InputEvent::Key(ke) = ev {
+                if ke.pressed {
+                    if let Some(out) = aegis_kernel::desktop::handle_key(ke.key) {
+                        match out {
+                            aegis_kernel::desktop::KeyOutcome::FocusChanged {
+                                window_id,
+                                overlap_cell,
+                            } => {
+                                sprintln!(
+                                    "Aegis: shell-compositor@key: Tab focus -> window id={} overlap_cell='{}'",
+                                    window_id,
+                                    overlap_cell as char
+                                );
+                            }
+                            aegis_kernel::desktop::KeyOutcome::Moved {
+                                window_id,
+                                x,
+                                y,
+                                clipped,
+                            } => {
+                                sprintln!(
+                                    "Aegis: shell-compositor@key: arrow move -> window id={} region=({},{}) clipped={}",
+                                    window_id,
+                                    x,
+                                    y,
+                                    clipped
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        core::hint::spin_loop();
+    }
+}
 static ALPHA_NEXT: AtomicU64 = AtomicU64::new(2048);
 static BETA_NEXT: AtomicU64 = AtomicU64::new(4096);
 

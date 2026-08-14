@@ -145,6 +145,36 @@ pub unsafe fn mask_pic() {
     asm!("out dx, al", in("dx") 0xA1u16, in("al") 0xFFu8, options(nomem, preserves_flags));
 }
 
+/// Remap the legacy PICs (master base 0x20, slave base 0x28), unmask IRQ1
+/// (keyboard) on the master, and configure LAPIC LVT0 for ExtINT delivery so
+/// the software-enabled LAPIC passes the PIC's INTR through (virtual-wire
+/// mode). The LAPIC timer remains the only tick source: IRQ0 and the slave
+/// stay masked.
+///
+/// # Safety
+///
+/// Must run after `init_lapic_timer` (so LAPIC_BASE is known and the LAPIC is
+/// software-enabled) and after `init_idt` (the IRQ1 gate must be live).
+/// Boot-time, single-threaded.
+pub unsafe fn init_legacy_pic_irq1() {
+    // Master 8259A: ICW1-4. Vector base 0x20 so IRQ1 -> 0x21.
+    asm!("out dx, al", in("dx") 0x20u16, in("al") 0x11u8, options(nomem, preserves_flags)); // ICW1: init, edge, cascade
+    asm!("out dx, al", in("dx") 0x21u16, in("al") 0x20u8, options(nomem, preserves_flags)); // ICW2: base vector 0x20
+    asm!("out dx, al", in("dx") 0x21u16, in("al") 0x04u8, options(nomem, preserves_flags)); // ICW3: slave on IR2
+    asm!("out dx, al", in("dx") 0x21u16, in("al") 0x01u8, options(nomem, preserves_flags)); // ICW4: 8086 mode
+    // Slave 8259A: remapped for correctness, kept fully masked.
+    asm!("out dx, al", in("dx") 0xA0u16, in("al") 0x11u8, options(nomem, preserves_flags));
+    asm!("out dx, al", in("dx") 0xA1u16, in("al") 0x28u8, options(nomem, preserves_flags));
+    asm!("out dx, al", in("dx") 0xA1u16, in("al") 0x02u8, options(nomem, preserves_flags));
+    asm!("out dx, al", in("dx") 0xA1u16, in("al") 0x01u8, options(nomem, preserves_flags));
+    // IMR: master = 0xFD (all masked except IRQ1), slave fully masked.
+    asm!("out dx, al", in("dx") 0x21u16, in("al") 0xFDu8, options(nomem, preserves_flags));
+    asm!("out dx, al", in("dx") 0xA1u16, in("al") 0xFFu8, options(nomem, preserves_flags));
+    // LVT0 (0x350): delivery mode ExtINT (bits 10:8 = 111), unmasked.
+    let lvt0 = lapic_read(0x350);
+    lapic_write(0x350, (lvt0 | 0x700) & !0x1_0000);
+}
+
 static mut KERNEL_GDT: crate::gdt::Gdt = crate::gdt::Gdt::new();
 
 /// Load the kernel GDT (and TSS).
@@ -218,6 +248,10 @@ pub unsafe fn init_idt() {
     core::ptr::write(idt, crate::idt::Idt::new());
     crate::idt::install_exception_handlers(idt);
     idt.set_irq_handler(TIMER_VECTOR as usize, timer_stub as *const () as u64);
+    idt.set_irq_handler(
+        crate::ps2::KEYBOARD_VECTOR as usize,
+        crate::ps2::keyboard_stub as *const () as u64,
+    );
     idt.set_handler(
         crate::syscall::SYS_VECTOR as usize,
         crate::syscall::syscall_stub as *const () as u64,

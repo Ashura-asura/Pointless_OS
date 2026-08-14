@@ -40,8 +40,10 @@ pub mod policy_engine;
 pub mod profiler;
 
 pub mod compositor;
+pub mod desktop;
 pub mod input;
 pub mod object_graph;
+pub mod ps2;
 pub mod shell;
 pub mod window;
 
