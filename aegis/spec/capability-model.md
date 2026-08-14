@@ -338,7 +338,7 @@ decides *how often* to retry.
 
 ### Machine-checked verification (executable): object store (§8 + §10 [CLOSED])
 
-`object-store` (8 tests: 4 SHA-256 vectors + 6 contract) realizes the storage
+`object-store` (8 tests: 6 contract + 1 SHA-256 vectors + 1 index) realizes the storage
 claims against the same kernel:
 
 - Ground truth is content-addressed immutable blocks: identical bytes are the
@@ -403,7 +403,7 @@ live boot.
 
 ### Machine-checked verification (executable): packages (§8)
 
-`packages` (6 contract tests in `install_contract.rs`) realizes the package
+`packages` (7 contract tests: 6 in `install_contract.rs` + 1 in `exec_contract.rs`) realizes the package
 model against the same kernel, the store, and the auditor:
 
 - A package is a declared authority ceiling (manifest, repository boundary as
@@ -933,7 +933,7 @@ design doc.
 
 ### Machine-checked verification (executable): distributed extension (§3/§5/§7 Phase 11)
 
-`crates/fleet` (15): cross-machine capability transport over the macaroon token format.
+`crates/fleet` (22): cross-machine capability transport over the macaroon token format.
 Node identity, explicit locality (`Local`/`Remote` — never hidden, per the design doc),
 a wire-format `RemoteCapability` envelope (serialize/deserialize round-trip), a peer
 trust registry, and verification that checks HMAC chain integrity under the issuer's

@@ -2,6 +2,47 @@
 
 *Generated: 2026-08-14. Every claim below is verified by `cargo test` on the current commit.*
 
+## Deep audit vs `os-from-first-principles.md` (2026-08-14)
+
+A phase-by-phase audit against the design doc's §7 roadmap, based on the
+**actual code** (`aegis-kernel/src/`, `aegis/crates/*`, `uefi-boot/`) — not on
+the docs' claims. Two numbers, honestly separated:
+
+- **Full 12-phase roadmap completion: ~59%** (unweighted mean of the per-phase
+  scores below). The remaining 40% is almost entirely in phases the design doc
+  itself defers ("do nothing on Windows compatibility, distributed systems, or
+  a graphical shell — those are all later-phase and premature before the core
+  claim is validated", §11.G) plus genuinely absent engineering (real IOMMU,
+  real NIC/GPU, full POSIX view, real network, hypervisor vehicles).
+- **Core architectural claim (§11.F prototype / Phase 6): ~85–90%** — the
+  "smallest prototype that proves the architecture" (role-granted,
+  zero-capability AI agent that provably cannot self-escalate, running one
+  real task) is genuinely delivered and live-verified under QEMU. This is the
+  claim the design doc itself says to bet the project on.
+
+| Phase (§7) | Honest score | What is real | What is missing |
+|---|---|---|---|
+| 0 — Capability model formalization | 90% | TLA+ spec (`AegisCapabilities.tla`+`.cfg`), invariants I1–I6, TLC 331k states (documented), 961-line `capability-model.md` | Isabelle-style spec (doc says "TLA+/Isabelle-style" — either/or; only TLA+ done) |
+| 1 — Boot + minimal kernel | 75% | UEFI boot, 4-level paging, NX, per-task isolation, capability-aware IPC — all live under QEMU | No seL4-class formal proof (multi-year; master-roadmap chose own kernel); "verified" = QEMU/TCG, not proof |
+| 2 — Resource managers + supervision | 65% | Real `mem.rs` MemRegion caps, `supervisor.rs` budgeted restart/trip, `tasks.rs` kill/restart | Resource managers are kernel-side, not userspace; supervision is single-level, not a tree |
+| 3 — IOMMU-backed drivers (NVMe/NIC/GPU) | 35% | Real NVMe driver (live QEMU) | `iommu.rs` is a stub ("can't do MMIO here"); no NIC driver (`net.rs` stubbed); no GPU path; drivers not IOMMU-fenced |
+| 4 — Storage + POSIX view | 75% | Object store twice (in-kernel `store.rs` + write-through `nvme_store.rs`, SHA-256/COW/dedup/digest-verify), live | POSIX `FlatView` is a flat single-level namespace — no nested dirs, no path resolution, no permission bits |
+| 5 — Networking as a service | 40% | Real capability-gated loopback `netstack.rs` (6 tests) | Loopback-only, NOT wired into boot, no NIC, no real traffic; header models only |
+| 6 — AI orchestration layer (the §11.F target) | 85% | Zero-cap ring-3 agent, kernel-declared roles (`restart-service`/`observe-service`), RoleGrant syscall 18, adversarial self-escalation all refused at gates, audit log — live under QEMU | No real AI model (histogram profiler), no real-time integration; anomaly observer test-only (ledger wired) |
+| 7 — Native app model + shell | 55% | `shell.rs`/window/graph/input (model-tested); live VGA text compositor + PS/2 keyboard (Tab-focus/arrows) | Shell not wired into boot; no object/relationship-based UI; no framebuffer graphics |
+| 8 — Linux compat | 55% | Linux ABI translation + ELF loader + personality gating (32 tests), exercised live | No lightweight-VM vehicle (needs hypervisor), no ring-3 trap |
+| 9 — Windows compat | 45% | NT ABI translation + PE loader + personality gating (31 tests), exercised live | No VM full-fidelity path (design doc: unsolved anywhere by translation) |
+| 10 — Supervision hardening + chaos + formal ceiling | 60% | Ceiling property tests (14), model chaos tests (6), model supervision (10) | Ceiling checks are contract tests, not an inductive proof; no kernel chaos testing |
+| 11 — Distributed extension | 50% | `fleet` crate (22 tests): locality, recipient binding, fail-closed partition | Two-node in-process model; no sockets, no consensus; no real network |
+| 12 — Production hardening + real-hardware certification | 40% | security-audit gate (10), kernel boundary tests (21), `SECURITY_AUDIT.md` matrix | NO real-hardware certification of anything; no fuzzing; no inductive proof |
+
+**Why the two numbers differ.** The design doc (§11) says the actual target is
+§11.F's "smallest prototype that proves the architecture", and explicitly
+calls Phases 7–12 later-phase/premature. That target is delivered. But if the
+yardstick is "everything in the §7 roadmap done at real, production depth",
+the honest number is **~59%** — and the missing 41% is not hidden, it is
+listed row by row above and in the "What doesn't exist" table below.
+
 ## Known Limits
 
 This is the **single consolidated Known Limits section** (`README.md` and
