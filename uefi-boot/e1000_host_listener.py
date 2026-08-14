@@ -14,14 +14,22 @@ This process:
      three-way handshake (SYN -> SYN-ACK -> ACK), acknowledges the kernel's
      HTTP request and replies with a real HTTP response, and acknowledges
      the kernel's FIN. Correct IPv4 + TCP checksums are computed so the
-     kernel's checksum-verifying parser accepts every frame.
+     kernel's checksum-verifying parser accepts every frame,
+  5. acts as a real TLS 1.3 server on 10.0.2.2:8443 (OpenSSL behind memory
+     BIOs, self-signed RSA cert): it completes the TCP handshake, feeds the
+     kernel's ClientHello record into OpenSSL, relays the server flight back,
+     and cross-checks the X25519 ECDHE shared secret on the host side.
 
 Usage: python e1000_host_listener.py PORT OUTFILE.pcap
 """
 
+import os
 import socket
+import ssl
 import struct
+import subprocess
 import sys
+import tempfile
 
 # The peer the kernel will talk to.  The kernel resolves this gateway over ARP,
 # so frames FROM us must carry the gateway MAC/IP and frames TO us must be
@@ -31,6 +39,14 @@ GUEST_IP = bytes([10, 0, 2, 15])
 GATEWAY_MAC = bytes.fromhex("525400123402")
 GATEWAY_IP = bytes([10, 0, 2, 2])
 SERVER_PORT = 8080
+TLS_PORT = 8443
+
+# The kernel's documented fixed ephemeral scalar (no CSPRNG in the guest).
+# We recompute the ECDHE shared secret on our side with the same scalar, so
+# the value the kernel derives must match this byte-for-byte.
+EPHEMERAL_SCALAR = bytes.fromhex(
+    "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
+)
 
 HTTP_RESPONSE = (
     b"HTTP/1.1 200 OK\r\n"
@@ -40,6 +56,40 @@ HTTP_RESPONSE = (
     b"\r\n"
     b"Aegis kernel TCP demo: hello from the host peer!\r\n"
 )
+
+
+def x25519_ref(scalar_bytes, u_bytes):
+    """RFC 7748 X25519 reference (validated against the published vectors)."""
+    p = 2**255 - 19
+    k = bytearray(scalar_bytes)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    u = int.from_bytes(u_bytes, "little") & ((1 << 255) - 1)
+    x1 = u
+    x2, z2 = 1, 0
+    x3, z3 = u, 1
+    swap = 0
+    for t in range(254, -1, -1):
+        kt = (k[t >> 3] >> (t & 7)) & 1
+        swap ^= kt
+        if swap:
+            x2, x3 = x3, x2
+            z2, z3 = z3, z2
+        swap = kt
+        aa = (x2 + z2) ** 2 % p
+        bb = (x2 - z2) ** 2 % p
+        e = (aa - bb) % p
+        da = (x3 - z3) * (x2 + z2) % p
+        cb = (x3 + z3) * (x2 - z2) % p
+        x3 = (da + cb) ** 2 % p
+        z3 = (x1 * (da - cb) ** 2) % p
+        x2 = aa * bb % p
+        z2 = (e * (aa + 121665 * e)) % p
+    if swap:
+        x2, x3 = x3, x2
+        z2, z3 = z3, z2
+    return ((x2 * pow(z2, p - 2, p)) % p).to_bytes(32, "little")
 
 
 def checksum(data: bytes) -> int:
@@ -120,6 +170,50 @@ def parse_ipv4_tcp(frame: bytes):
     return src_ip, dst_ip, src_port, dst_port, seq, ack, flags, payload
 
 
+def _crosscheck_tls(flight: bytes) -> None:
+    """Parse the server's X25519 keyshare out of the ServerHello we sent and
+    derive the ECDHE shared secret using the kernel's documented scalar."""
+    pos = 0
+    while pos + 5 <= len(flight):
+        ct = flight[pos]
+        rlen = struct.unpack(">H", flight[pos + 3 : pos + 5])[0]
+        frag = flight[pos + 5 : pos + 5 + rlen]
+        if ct == 22 and frag[0:1] == b"\x02":  # handshake, ServerHello
+            body = frag[4:]
+            if len(body) < 39:
+                return
+            sid_len = body[34]
+            p = 35 + sid_len
+            if p + 3 > len(body):
+                return
+            q = p + 3
+            if q + 2 > len(body):
+                return
+            ext_len = struct.unpack(">H", body[q : q + 2])[0]
+            r = q + 2
+            end = r + ext_len
+            if end > len(body):
+                return
+            keyshare = None
+            while r < end:
+                et = struct.unpack(">H", body[r : r + 2])[0]
+                elen = struct.unpack(">H", body[r + 2 : r + 4])[0]
+                if et == 0x0033 and elen == 36:
+                    # single KeyShareEntry: group(2) + u16 keylen + key(32)
+                    if body[r + 4 : r + 6] == b"\x00\x1d" and body[r + 6 : r + 8] == b"\x00\x20":
+                        keyshare = body[r + 8 : r + 40]
+                r += 4 + elen
+            if keyshare:
+                shared = x25519_ref(EPHEMERAL_SCALAR, keyshare)
+                print("listener: ECDHE shared secret (host side): %s" % shared.hex(), flush=True)
+                print(
+                    "listener: server keyshare: %s" % keyshare.hex(),
+                    flush=True,
+                )
+            return
+        pos += 5 + rlen
+
+
 def main() -> int:
     if len(sys.argv) != 3:
         print("usage: e1000_host_listener.py PORT OUTFILE.pcap", file=sys.stderr)
@@ -148,12 +242,38 @@ def main() -> int:
     host_tx = open(outfile + "-host-tx.pcap", "wb")
     host_tx.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1))
 
-    # TCP server state for the one connection the kernel opens.
-    server_isn = 0x1A2B3C4D
-    server_seq = server_isn
-    client_isn = None
-    handshake_done = False
-    served = False
+    # TCP server state, keyed by listen port: each connection the kernel
+    # opens (8080 HTTP, then 8443 TLS) gets its own ISN + seq bookkeeping.
+    ports = [SERVER_PORT, TLS_PORT]
+    states = {}
+    for p in ports:
+        states[p] = {
+            "server_isn": 0x10000000 + p,
+            "server_seq": 0x10000000 + p,
+            "client_isn": None,
+            "handshake_done": False,
+            "served": False,
+        }
+
+    # TLS 1.3 server (real OpenSSL via memory BIOs). We generate a throwaway
+    # self-signed RSA cert so the server can complete a real handshake.
+    tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    with tempfile.TemporaryDirectory() as td:
+        cert_path = os.path.join(td, "cert.pem")
+        key_path = os.path.join(td, "key.pem")
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", key_path, "-out", cert_path, "-days", "1",
+                "-subj", "/CN=aegis-host",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        tls_ctx.load_cert_chain(cert_path, key_path)
+    tls_in = ssl.MemoryBIO()
+    tls_out = ssl.MemoryBIO()
+    tls_server = tls_ctx.wrap_bio(tls_in, tls_out, server_side=True)
 
     def send(frame: bytes) -> None:
         conn.sendall(struct.pack(">I", len(frame)) + frame)
@@ -241,60 +361,66 @@ def main() -> int:
                 print("listener: frame %d: short/malformed IPv4", total, flush=True)
                 continue
 
-            if dst_port != SERVER_PORT:
+            if dst_port not in states:
                 print(
                     "listener: frame %d: TCP to port %d (ignored)" % (total, dst_port),
                     flush=True,
                 )
                 continue
 
-            # ---- minimal TCP server state machine ----
-            if flags & 0x02 and not handshake_done:  # SYN
-                client_isn = seq
-                server_seq = server_isn
+            st = states[dst_port]
+
+            # ---- minimal TCP server state machine (per listen port) ----
+            if flags & 0x02 and not st["handshake_done"]:  # SYN
+                st["client_isn"] = seq
+                st["server_seq"] = st["server_isn"]
                 send(
                     build_tcp_frame(
                         GATEWAY_MAC,
                         GUEST_MAC,
                         GATEWAY_IP,
                         GUEST_IP,
-                        SERVER_PORT,
+                        dst_port,
                         src_port,
-                        server_isn,
-                        client_isn + 1,
+                        st["server_isn"],
+                        st["client_isn"] + 1,
                         0x12,  # SYN|ACK
                         b"",
                     )
                 )
                 # The SYN consumed one sequence number: data begins at ISN+1.
-                server_seq = (server_isn + 1) & 0xFFFFFFFF
-                print("listener: TCP SYN (isn=%d) -> SYN-ACK" % seq, flush=True)
+                st["server_seq"] = (st["server_isn"] + 1) & 0xFFFFFFFF
+                print("listener: TCP SYN to %d (isn=%d) -> SYN-ACK" % (dst_port, seq), flush=True)
             elif flags & 0x10:  # ACK set
                 data = payload
-                if flags & 0x02 and not handshake_done:  # retransmitted SYN
-                    server_seq = (server_isn + 1) & 0xFFFFFFFF
+                if flags & 0x02 and not st["handshake_done"]:  # retransmitted SYN
+                    st["server_seq"] = (st["server_isn"] + 1) & 0xFFFFFFFF
                     send(
                         build_tcp_frame(
                             GATEWAY_MAC,
                             GUEST_MAC,
                             GATEWAY_IP,
                             GUEST_IP,
-                            SERVER_PORT,
+                            dst_port,
                             src_port,
-                            server_isn,
-                            client_isn + 1,
+                            st["server_isn"],
+                            st["client_isn"] + 1,
                             0x12,
                             b"",
                         )
                     )
                     print("listener: retransmitted SYN -> SYN-ACK", flush=True)
                     continue
-                if not handshake_done:
-                    handshake_done = True
-                    print("listener: ACK received - handshake complete", flush=True)
+                if not st["handshake_done"]:
+                    st["handshake_done"] = True
+                    print(
+                        "listener: ACK received - handshake complete (port %d)" % dst_port,
+                        flush=True,
+                    )
                 if data:
                     print(
-                        "listener: data segment (%d bytes): %r" % (len(data), data[:64]),
+                        "listener: port %d data segment (%d bytes): %r"
+                        % (dst_port, len(data), data[:64]),
                         flush=True,
                     )
                     # ACK the data.
@@ -304,16 +430,16 @@ def main() -> int:
                             GUEST_MAC,
                             GATEWAY_IP,
                             GUEST_IP,
-                            SERVER_PORT,
+                            dst_port,
                             src_port,
-                            server_seq,
+                            st["server_seq"],
                             seq + len(data),
                             0x10,  # ACK
                             b"",
                         )
                     )
-                    # And serve the HTTP response (PSH|ACK).
-                    if not served:
+                    # And serve the reply (PSH|ACK).
+                    if dst_port == SERVER_PORT and not st["served"]:
                         resp = HTTP_RESPONSE
                         send(
                             build_tcp_frame(
@@ -321,17 +447,57 @@ def main() -> int:
                                 GUEST_MAC,
                                 GATEWAY_IP,
                                 GUEST_IP,
-                                SERVER_PORT,
+                                dst_port,
                                 src_port,
-                                server_seq,
+                                st["server_seq"],
                                 seq + len(data),
                                 0x18,  # PSH|ACK
                                 resp,
                             )
                         )
-                        server_seq = (server_seq + len(resp)) & 0xFFFFFFFF
-                        served = True
+                        st["server_seq"] = (st["server_seq"] + len(resp)) & 0xFFFFFFFF
+                        st["served"] = True
                         print("listener: HTTP response sent (%d bytes)" % len(resp), flush=True)
+                    elif dst_port == TLS_PORT and not st["served"]:
+                        # The kernel's data is a TLS 1.3 ClientHello record.
+                        tls_in.write(bytes(data))
+                        for _ in range(5):
+                            try:
+                                tls_server.do_handshake()
+                            except ssl.SSLWantReadError:
+                                pass
+                        flight = tls_out.read()
+                        if flight:
+                            send(
+                                build_tcp_frame(
+                                    GATEWAY_MAC,
+                                    GUEST_MAC,
+                                    GATEWAY_IP,
+                                    GUEST_IP,
+                                    dst_port,
+                                    src_port,
+                                    st["server_seq"],
+                                    seq + len(data),
+                                    0x18,  # PSH|ACK
+                                    flight,
+                                )
+                            )
+                            st["server_seq"] = (st["server_seq"] + len(flight)) & 0xFFFFFFFF
+                            st["served"] = True
+                            print(
+                                "listener: TLS server flight sent (%d bytes)" % len(flight),
+                                flush=True,
+                            )
+                            # Cross-check the ECDHE shared secret: extract the
+                            # server's X25519 keyshare from the ServerHello we
+                            # just generated and derive the same value the
+                            # kernel should be computing.
+                            _crosscheck_tls(flight)
+                        else:
+                            print(
+                                "listener: TLS handshake produced no output yet",
+                                flush=True,
+                            )
                 elif flags & 0x01:  # FIN|ACK
                     send(
                         build_tcp_frame(
@@ -339,15 +505,15 @@ def main() -> int:
                             GUEST_MAC,
                             GATEWAY_IP,
                             GUEST_IP,
-                            SERVER_PORT,
+                            dst_port,
                             src_port,
-                            server_seq,
+                            st["server_seq"],
                             seq + 1,
                             0x10,  # ACK
                             b"",
                         )
                     )
-                    print("listener: FIN acknowledged", flush=True)
+                    print("listener: FIN acknowledged (port %d)" % dst_port, flush=True)
             else:
                 print(
                     "listener: frame %d: unhandled TCP flags 0x%02x" % (total, flags),

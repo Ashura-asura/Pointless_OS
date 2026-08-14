@@ -1,0 +1,20 @@
+listener: waiting for QEMU on 127.0.0.1:45556 ...
+listener: QEMU connected from ('127.0.0.1', 55710)
+listener: frame 1, 86 bytes, proto 86dd
+listener: frame 2, 78 bytes, proto 86dd
+listener: ARP request from 52:54:00:12:34:56 10.0.2.15
+listener: echoed ARP reply (42 bytes)
+listener: TCP SYN to 8080 (isn=2654435768) -> SYN-ACK
+listener: ACK received - handshake complete (port 8080)
+listener: port 8080 data segment (34 bytes): b'GET / HTTP/1.0\r\nHost: 10.0.2.2\r\n\r\n'
+listener: HTTP response sent (134 bytes)
+listener: FIN acknowledged (port 8080)
+listener: TCP SYN to 8443 (isn=2027808466) -> SYN-ACK
+listener: ACK received - handshake complete (port 8443)
+listener: port 8443 data segment (133 bytes): b'\x16\x03\x01\x00\x80\x01\x00\x00|\x03\x03\xa6\x07o>\x1b,M^op\x81\x92\xa3\xb4\xc5\xd6\xe7\xf8\t\x1a+<M^op\x81\x92\xa3\xb4\xc5\xd6\x00\x00\x02\x13\x01\x01\x00\x00Q\x00\x00\x00\n\x00\x08\x00\x00\x05aeg'
+listener: TLS server flight sent (1291 bytes)
+listener: ECDHE shared secret (host side): 2f146937b2d89afca8c38d212ed250d8d6f3b130c5e4df0405e931ae8e23114b
+listener: server keyshare: 63d4632e151d77f6c3ea911fe67f2eec3a4a421c4c8da18e6b243fb6cbd88703
+listener: FIN acknowledged (port 8443)
+listener: timeout waiting for frames
+listener: wrote 13 frame(s) to e1000-tls.pcap

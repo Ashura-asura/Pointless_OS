@@ -71,6 +71,8 @@ pub mod channel;
 pub mod netstack;
 pub mod role;
 
+pub mod tls;
+
 /// Test-only: serialize tests that mutate the kernel's single global task /
 /// region / supervisor state. The kernel has one `static mut CURRENT` and one
 /// capability table per task, so tests that pin `CURRENT` and seed caps must

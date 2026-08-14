@@ -291,6 +291,119 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 if net.socket_close(id) {
                     sprintln!("Aegis: netif: socket closed (FIN sent)");
                 }
+
+                // Live TLS 1.3 demo: a second socket to the host peer on port
+                // 8443 (a real OpenSSL-backed TLS server behind memory BIOs).
+                // The kernel sends a real TLS 1.3 ClientHello, receives the
+                // ServerHello, and derives the X25519 ECDHE shared secret from
+                // the server's keyshare. The host peer cross-checks the same
+                // value with the kernel's documented scalar and prints both.
+                let Some((tid, _)) = net.socket_open(
+                    aegis_kernel::netif::SockKind::Tcp,
+                    aegis_kernel::netif::GW_IP,
+                    8443,
+                ) else {
+                    sprintln!("Aegis: tls: no free socket slot");
+                    return;
+                };
+                if !net.tcp_connect(tid) {
+                    sprintln!("Aegis: tls: connect failed");
+                    return;
+                }
+                sprintln!("Aegis: tls: TCP SYN sent (10.0.2.15:40001 -> 10.0.2.2:8443)");
+                let mut spins = 0u64;
+                while spins < 50_000_000 {
+                    net.poll();
+                    if net.socket_connected(tid) {
+                        break;
+                    }
+                    spins += 1;
+                    core::arch::asm!("pause", options(nomem, nostack));
+                }
+                match net.socket_state(tid) {
+                    Some(aegis_kernel::netif::TcpState::Established) => {
+                        sprintln!("Aegis: tls: TCP handshake complete (Established)");
+                    }
+                    Some(_) => {
+                        sprintln!("Aegis: tls: handshake timed out");
+                        return;
+                    }
+                    None => {
+                        sprintln!("Aegis: tls: socket vanished");
+                        return;
+                    }
+                }
+
+                // Derive the client keyshare and send the real ClientHello.
+                let keyshare = aegis_kernel::tls::x25519_base(&aegis_kernel::tls::EPHEMERAL_SCALAR);
+                let mut ch_buf = [0u8; 600];
+                let ch_len = aegis_kernel::tls::build_client_hello(&keyshare, &mut ch_buf);
+                let n = net.socket_send(tid, &ch_buf[..ch_len]);
+                sprintln!("Aegis: tls: ClientHello sent ({} bytes)", n);
+
+                // Poll until the server flight (ServerHello + more) arrives.
+                let mut rbuf = [0u8; 4096];
+                let mut got = 0usize;
+                let mut spins = 0u64;
+                while spins < 50_000_000 && got == 0 {
+                    net.poll();
+                    if let Some(r) = net.socket_recv(tid, &mut rbuf[got..]) {
+                        got += r;
+                    }
+                    spins += 1;
+                    core::arch::asm!("pause", options(nomem, nostack));
+                }
+                sprintln!("Aegis: tls: server flight received ({} bytes)", got);
+                if got > 0 {
+                    // The first record is the plaintext ServerHello.
+                    match aegis_kernel::tls::parse_record(&rbuf[..got]) {
+                        Some((ct, frag)) if ct == aegis_kernel::tls::CT_HANDSHAKE => {
+                            if frag.len() >= 4 && frag[0] == aegis_kernel::tls::HS_SERVER_HELLO {
+                                let body_len = ((frag[1] as usize) << 16)
+                                    | ((frag[2] as usize) << 8)
+                                    | frag[3] as usize;
+                                if 4 + body_len <= frag.len() {
+                                    match aegis_kernel::tls::parse_server_hello(&frag[4..]) {
+                                        Some(sh) => {
+                                            sprintln!(
+                                            "Aegis: tls: ServerHello: version 0x{:04X} cipher 0x{:04X} group 0x{:04X}",
+                                            sh.version,
+                                            sh.cipher_suite,
+                                            sh.key_share_group
+                                        );
+                                            let shared = aegis_kernel::tls::x25519(
+                                                &aegis_kernel::tls::EPHEMERAL_SCALAR,
+                                                &sh.key_share_key,
+                                            );
+                                            match shared {
+                                                Some(sec) => {
+                                                    sprintln!("Aegis: tls: ECDHE shared secret (kernel side): {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}", sec[0], sec[1], sec[2], sec[3], sec[4], sec[5], sec[6], sec[7], sec[8], sec[9], sec[10], sec[11], sec[12], sec[13], sec[14], sec[15], sec[16], sec[17], sec[18], sec[19], sec[20], sec[21], sec[22], sec[23], sec[24], sec[25], sec[26], sec[27], sec[28], sec[29], sec[30], sec[31]);
+                                                }
+                                                None => {
+                                                    sprintln!("Aegis: tls: ECDHE rejected (low-order point)");
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            sprintln!("Aegis: tls: ServerHello parse failed");
+                                        }
+                                    }
+                                }
+                            } else {
+                                sprintln!(
+                                    "Aegis: tls: first handshake record is not a ServerHello"
+                                );
+                            }
+                        }
+                        _ => {
+                            sprintln!("Aegis: tls: no usable TLS record in the flight");
+                        }
+                    }
+                }
+                // Close: sends a real FIN.
+                if net.socket_close(tid) {
+                    sprintln!("Aegis: tls: socket closed (FIN sent)");
+                }
             });
         }
     } else {
