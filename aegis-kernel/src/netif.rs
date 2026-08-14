@@ -997,21 +997,95 @@ pub fn socket_remote(id: u16) -> Option<([u8; 4], u16)> {
 
 // ---- capability-gated socket syscalls ----
 
+/// Phase F closure (master roadmap Phase E item 2, the gap this project's
+/// own honest-status notes flagged: "`sys_net_socket` has zero capability
+/// gating — any task can mint a socket to any host directly"). Grant the
+/// `NetRoot` capability that authorizes calling `sys_net_socket` at all.
+///
+/// This is deliberately **not** a syscall — there is no `dispatch` case
+/// that reaches it, and no task can call it on its own. It exists purely
+/// as kernel/boot-time policy: whoever wires up the boot sequence decides,
+/// once, which task (if any) is the trusted netstack owner allowed to open
+/// sockets to caller-chosen destinations, and installs `NetRoot` into that
+/// one task's CSpace before it starts running untrusted code. Every other
+/// task starts, and stays, with no way to reach `sys_net_socket`
+/// successfully — the only network capability an ordinary task can ever
+/// hold is one the kernel pre-binds for it, the way `role_grant`'s
+/// `query-advisor` path already works.
+///
+/// Returns `false` (no cap installed) if `task` or `slot` is out of range,
+/// or the slot is already occupied — the same "never silently overwrite a
+/// live capability" discipline every other mint path in this kernel
+/// follows.
+pub fn grant_net_root(task: usize, slot: usize) -> bool {
+    use crate::cap::{Cap, CapSlot, NET_ROOT_RIGHTS};
+    if task >= crate::tasks::MAX_TASKS || slot >= crate::tasks::MAX_CAPS {
+        return false;
+    }
+    if crate::tasks::task_cap(task, slot).cap != Cap::None {
+        return false;
+    }
+    crate::tasks::set_task_cap(
+        task,
+        slot,
+        CapSlot {
+            cap: Cap::NetRoot,
+            rights: NET_ROOT_RIGHTS,
+        },
+    );
+    true
+}
+
 /// `net_socket(kind, ip_packed, port) -> cap slot` — mint a NetEndpoint cap
 /// bound to one destination and install it in the caller's CSpace.
 /// `kind` 1 = TCP, 2 = UDP.
+///
+/// Gated on `Cap::NetRoot` with `NET_ROOT_RIGHTS` (CONTROL): the caller
+/// must hold that capability, in any slot, before it is allowed to name a
+/// destination at all. A task with none — the default for everything
+/// except whatever boot-time policy installed it via `grant_net_root` — is
+/// refused here, at the kernel gate, not by any convention the caller is
+/// trusted to follow. This is what closes the "ambient network access"
+/// gap: "no capability, no socket" is now enforced the same way "no
+/// capability, no IPC" and "no capability, no memory" already were.
+///
+/// Every attempt — granted or refused — is attributed in the kernel audit
+/// log (`OpKind::NetOpen`), target = the packed destination the caller
+/// asked for, so a denied mint is still traceable to what it tried to
+/// reach.
 ///
 /// # Safety
 ///
 /// Called from the syscall dispatcher with caller-controlled raw arguments.
 pub unsafe fn sys_net_socket(kind: u64, ip_packed: u64, port: u64) -> i64 {
-    use crate::cap::{Cap, CapSlot, NET_RIGHTS};
+    use crate::cap::{Cap, CapSlot, NET_RIGHTS, NET_ROOT_RIGHTS};
     let cur = crate::tasks::current_idx();
+    // Target attributed in the audit log: the destination the caller
+    // asked for, packed the same way `role::role_grant`'s network-scoped
+    // path attributes its own target — traceable even on denial.
+    let dest_target = (ip_packed as u32) ^ ((port as u32) << 16);
+    let record =
+        |ok: bool| crate::audit::record(cur, crate::audit::OpKind::NetOpen, Some(dest_target), ok);
+
     let kind = match kind {
         1 => SockKind::Tcp,
         2 => SockKind::Udp,
-        _ => return -1,
+        _ => {
+            record(false);
+            return -1;
+        }
     };
+    // The capability gate: the caller must hold Cap::NetRoot with CONTROL
+    // in *some* slot. Search, don't assume a fixed slot — the same pattern
+    // every other "does the caller hold X" check in this kernel uses.
+    let has_net_root = (0..crate::tasks::MAX_CAPS).any(|s| {
+        let cs = crate::tasks::task_cap(cur, s);
+        cs.cap == Cap::NetRoot && cs.rights.contains(NET_ROOT_RIGHTS)
+    });
+    if !has_net_root {
+        record(false);
+        return -1;
+    }
     let ip = [
         (ip_packed >> 24) as u8,
         (ip_packed >> 16) as u8,
@@ -1020,10 +1094,14 @@ pub unsafe fn sys_net_socket(kind: u64, ip_packed: u64, port: u64) -> i64 {
     ];
     let slot =
         (0..crate::tasks::MAX_CAPS).find(|&s| crate::tasks::task_cap(cur, s).cap == Cap::None);
-    let Some(slot) = slot else { return -1 };
+    let Some(slot) = slot else {
+        record(false);
+        return -1;
+    };
     let Some((id, _lp)) =
         unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_open(kind, ip, port as u16)
     else {
+        record(false);
         return -1;
     };
     crate::tasks::set_task_cap(
@@ -1034,6 +1112,7 @@ pub unsafe fn sys_net_socket(kind: u64, ip_packed: u64, port: u64) -> i64 {
             rights: NET_RIGHTS,
         },
     );
+    record(true);
     slot as i64
 }
 
@@ -1048,13 +1127,17 @@ pub unsafe fn sys_net_connect(slot: u64) -> i64 {
     let cur = crate::tasks::current_idx();
     let cap = crate::tasks::task_cap(cur, slot as usize);
     let Cap::NetEndpoint(id) = cap.cap else {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
         return -1;
     };
     if !cap.rights.contains(Rights::SEND) {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
         return -1;
     }
     let netif = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) };
-    if netif.tcp_connect(id as u16) {
+    let ok = netif.tcp_connect(id as u16);
+    crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), ok);
+    if ok {
         0
     } else {
         -1
@@ -1071,14 +1154,18 @@ pub unsafe fn sys_net_send(slot: u64, va: u64, len: u64) -> i64 {
     let cur = crate::tasks::current_idx();
     let cap = crate::tasks::task_cap(cur, slot as usize);
     let Cap::NetEndpoint(id) = cap.cap else {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
         return -1;
     };
     if !cap.rights.contains(Rights::SEND) {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
         return -1;
     }
     let len = core::cmp::min(len as usize, 2048);
     let data = core::slice::from_raw_parts(va as *const u8, len);
-    unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_send(id as u16, data) as i64
+    let n = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_send(id as u16, data);
+    crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), n > 0);
+    n as i64
 }
 
 /// `net_recv(slot, va, len) -> n/0/-1` — RECV-gated; drains the socket buffer.
@@ -1091,14 +1178,22 @@ pub unsafe fn sys_net_recv(slot: u64, va: u64, len: u64) -> i64 {
     let cur = crate::tasks::current_idx();
     let cap = crate::tasks::task_cap(cur, slot as usize);
     let Cap::NetEndpoint(id) = cap.cap else {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
         return -1;
     };
     if !cap.rights.contains(Rights::RECV) {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
         return -1;
     }
     let len = core::cmp::min(len as usize, 2048);
     let out = core::slice::from_raw_parts_mut(va as *mut u8, len);
-    match unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_recv(id as u16, out) {
+    let result = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_recv(id as u16, out);
+    // Both `Some(n)` and `None` (no bytes currently buffered) are an
+    // authorized, successful poll of a cap the caller legitimately holds —
+    // the syscall itself never returns an error code here, so the audit
+    // record agrees: `ok=true` whenever the capability gate above passed.
+    crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), true);
+    match result {
         Some(n) => n as i64,
         None => 0,
     }
@@ -1114,10 +1209,12 @@ pub unsafe fn sys_net_close(slot: u64) -> i64 {
     let cur = crate::tasks::current_idx();
     let cap = crate::tasks::task_cap(cur, slot as usize);
     let Cap::NetEndpoint(id) = cap.cap else {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
         return -1;
     };
     let ok = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_close(id as u16);
     crate::tasks::set_task_cap(cur, slot as usize, CapSlot::empty());
+    crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), ok);
     if ok {
         0
     } else {
@@ -1134,6 +1231,7 @@ static TEST_TX: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cap::Cap;
 
     /// Feed a crafted IPv4 packet to the stack as if it arrived on the wire.
     fn deliver_ipv4(net: &mut NetIf, src_ip: [u8; 4], protocol: u8, payload: &[u8]) {
@@ -1536,5 +1634,180 @@ mod tests {
             )
         };
         assert_eq!(denied, (-1, -1, -1, -1), "no cap -> every op denied");
+    }
+
+    /// Phase F / Phase E item 2 closure: a task holding zero capabilities —
+    /// the default for everything except whatever boot policy explicitly
+    /// calls `grant_net_root` — cannot mint a socket to ANY destination.
+    /// This is the actual headline result for this fix: "no ambient network
+    /// access" was previously false (any task could call `sys_net_socket`
+    /// directly); this test is what makes it true.
+    #[test]
+    fn net_socket_denies_task_without_net_root() {
+        let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        for s in 0..crate::tasks::MAX_CAPS {
+            crate::tasks::set_task_cap(4, s, crate::cap::CapSlot::empty());
+        }
+        crate::tasks::set_current_for_test(4);
+        let ip_packed: u64 = u32::from_be_bytes(GW_IP) as u64;
+        let slot = unsafe { sys_net_socket(1, ip_packed, 8080) };
+        assert_eq!(slot, -1, "no NetRoot cap -> sys_net_socket is refused");
+        // Nothing landed in the caller's CSpace: the refusal is total, not
+        // partial.
+        assert!(
+            (0..crate::tasks::MAX_CAPS).all(|s| crate::tasks::task_cap(4, s).cap == Cap::None),
+            "a denied mint must leave no trace of a capability in the caller's CSpace"
+        );
+        // The audit log attributes the attempt as a denial, not a silent
+        // no-op — this is the NetOpen record the honest-status note said
+        // did not exist.
+        assert_eq!(
+            crate::audit::op_counts(4)[crate::audit::OpKind::NetOpen.index()],
+            1,
+            "the refused mint is still an attributed audit record"
+        );
+        assert!(!crate::audit::ever_succeeded(
+            4,
+            crate::audit::OpKind::NetOpen,
+            (ip_packed as u32) ^ (8080u32 << 16)
+        ));
+    }
+
+    /// A task holding `Cap::NetRoot` with `NET_ROOT_RIGHTS` (the boot-time
+    /// "this task is the trusted netstack owner" grant) may open a socket to
+    /// a destination of its own choosing — the gate is about *authority to
+    /// choose a destination at all*, not about narrowing that choice the
+    /// way `query-advisor`'s kernel-only-bound mint does. This is the
+    /// positive case proving the gate isn't just a blanket denial.
+    #[test]
+    fn net_socket_allows_task_with_net_root() {
+        let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        for s in 0..crate::tasks::MAX_CAPS {
+            crate::tasks::set_task_cap(5, s, crate::cap::CapSlot::empty());
+        }
+        assert!(
+            grant_net_root(5, 0),
+            "boot-time policy installs NetRoot into slot 0"
+        );
+        crate::tasks::set_current_for_test(5);
+        let ip_packed: u64 = u32::from_be_bytes(GW_IP) as u64;
+        let slot = unsafe { sys_net_socket(1, ip_packed, 9090) };
+        assert!(slot >= 0, "a NetRoot holder may mint a socket");
+        // The new NetEndpoint landed in a *different* slot than NetRoot —
+        // NetRoot itself is never overwritten or consumed by a mint.
+        assert_ne!(slot, 0, "NetRoot's own slot is untouched by the mint");
+        let got = crate::tasks::task_cap(5, slot as usize);
+        assert!(matches!(got.cap, Cap::NetEndpoint(_)));
+        assert_eq!(got.rights.bits(), crate::cap::NET_RIGHTS.bits());
+        assert_eq!(
+            crate::tasks::task_cap(5, 0).cap,
+            Cap::NetRoot,
+            "NetRoot survives the mint it authorized"
+        );
+        assert!(crate::audit::ever_succeeded(
+            5,
+            crate::audit::OpKind::NetOpen,
+            (ip_packed as u32) ^ (9090u32 << 16)
+        ));
+    }
+
+    /// Holding `Cap::NetRoot` in a slot is not enough on its own — the
+    /// rights on that slot must actually contain `NET_ROOT_RIGHTS`
+    /// (CONTROL). A `NetRoot` cap installed with `Rights::NONE` (e.g. a
+    /// narrowed/miscopied reference, if some future path ever produces one)
+    /// must not authorize a mint. This is the same "cap kind is not enough,
+    /// rights matter too" discipline every other gate in this kernel
+    /// already follows (see `sys_net_connect`'s SEND check, etc.).
+    #[test]
+    fn net_socket_denies_net_root_without_control_right() {
+        let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        for s in 0..crate::tasks::MAX_CAPS {
+            crate::tasks::set_task_cap(6, s, crate::cap::CapSlot::empty());
+        }
+        crate::tasks::set_task_cap(
+            6,
+            0,
+            crate::cap::CapSlot {
+                cap: Cap::NetRoot,
+                rights: crate::cap::Rights::NONE,
+            },
+        );
+        crate::tasks::set_current_for_test(6);
+        let ip_packed: u64 = u32::from_be_bytes(GW_IP) as u64;
+        let slot = unsafe { sys_net_socket(1, ip_packed, 8080) };
+        assert_eq!(
+            slot, -1,
+            "NetRoot without CONTROL is not authority to open a socket"
+        );
+    }
+
+    /// `grant_net_root` itself follows the same "never silently overwrite a
+    /// live capability" discipline as every other mint path: bounds-checked
+    /// and refuses an occupied slot.
+    #[test]
+    fn grant_net_root_is_bounds_checked_and_never_clobbers() {
+        let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        for s in 0..crate::tasks::MAX_CAPS {
+            crate::tasks::set_task_cap(7, s, crate::cap::CapSlot::empty());
+        }
+        assert!(!grant_net_root(crate::tasks::MAX_TASKS + 1, 0));
+        assert!(!grant_net_root(7, crate::tasks::MAX_CAPS + 1));
+        assert!(grant_net_root(7, 0));
+        assert!(
+            !grant_net_root(7, 0),
+            "an occupied slot is refused, not silently overwritten"
+        );
+    }
+
+    /// End-to-end audit trail for the socket lifecycle (Phase F's other
+    /// named gap: "net syscalls 19-23 still don't write to the audit
+    /// log"). A NetRoot holder mints a socket, connects, sends, receives,
+    /// and closes it; every step lands exactly one attributed record.
+    #[test]
+    fn net_io_syscalls_are_all_attributed_in_the_audit_log() {
+        let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        for s in 0..crate::tasks::MAX_CAPS {
+            crate::tasks::set_task_cap(8, s, crate::cap::CapSlot::empty());
+        }
+        assert!(grant_net_root(8, 0));
+        crate::tasks::set_current_for_test(8);
+        // Pre-seed the shared static NETIF's ARP table for the destination,
+        // the same way `setup()` does for the local-`NetIf` tests above —
+        // otherwise `tcp_connect`'s `arp_resolve` falls through to
+        // `nic_mut()`, which panics in this host-test build (no real e1000
+        // device attached). Idempotent: harmless if another test already
+        // inserted it.
+        unsafe {
+            (&mut *core::ptr::addr_of_mut!(NETIF)).arp.insert(
+                GW_IP,
+                MacAddress::from_bytes(&GW_MAC),
+                0,
+            );
+        }
+        let ip_packed: u64 = u32::from_be_bytes(GW_IP) as u64;
+        let slot = unsafe { sys_net_socket(1, ip_packed, 8080) };
+        assert!(slot >= 0);
+        let ok = unsafe { sys_net_connect(slot as u64) };
+        assert_eq!(ok, 0);
+        let mut buf = [0u8; 4];
+        let _ = unsafe { sys_net_send(slot as u64, buf.as_ptr() as u64, 4) };
+        let _ = unsafe { sys_net_recv(slot as u64, buf.as_mut_ptr() as u64, 4) };
+        let _ = unsafe { sys_net_close(slot as u64) };
+        let counts = crate::audit::op_counts(8);
+        assert_eq!(
+            counts[crate::audit::OpKind::NetOpen.index()],
+            1,
+            "one attributed record for the mint"
+        );
+        assert_eq!(
+            counts[crate::audit::OpKind::NetIo.index()],
+            4,
+            "one attributed record each for connect/send/recv/close"
+        );
     }
 }

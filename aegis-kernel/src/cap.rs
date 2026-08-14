@@ -102,6 +102,23 @@ pub enum Cap {
     /// is bound to one destination at creation and the kernel refuses any
     /// operation outside it. No ambient "open any socket" authority.
     NetEndpoint(u32),
+    /// Phase F closure (master roadmap Phase E item 2): the single
+    /// capability that authorizes calling `sys_net_socket` (syscall 19) at
+    /// all — i.e. minting a *new* `NetEndpoint` bound to a caller-chosen
+    /// destination. A singleton object (id is always 0; there is exactly
+    /// one `NetRoot` in the system).
+    ///
+    /// This is what makes "no ambient network access" literally true: a
+    /// task with zero capabilities cannot open a socket to anywhere, full
+    /// stop. Only a task that was explicitly handed `NetRoot` (by
+    /// kernel/boot-time policy, via `netif::grant_net_root` — never by a
+    /// syscall a task can reach on its own) may choose a destination.
+    /// Every other task can only ever receive a `NetEndpoint` pre-bound by
+    /// the kernel itself, the way `role::role_grant`'s `query-advisor` path
+    /// already works (it never touches this gate at all — the kernel mints
+    /// the socket directly via `netif::open_advisor_endpoint`, so an
+    /// advisor-role agent needs no `NetRoot` and gets none).
+    NetRoot,
 }
 
 /// One occupied row of a capability table: the object and the rights held on it.
@@ -133,6 +150,7 @@ impl Cap {
             Cap::MemRegion(id) => Some(id),
             Cap::Channel(id) => Some(id),
             Cap::NetEndpoint(id) => Some(id),
+            Cap::NetRoot => Some(0),
         }
     }
 }
@@ -161,6 +179,17 @@ pub const CHANNEL_RIGHTS: Rights = Rights::SEND.union(Rights::RECV);
 /// to one destination and cannot be delegated onward (a socket holder cannot
 /// hand a third party the right to talk to that endpoint).
 pub const NET_RIGHTS: Rights = Rights::SEND.union(Rights::RECV);
+
+/// The right required on a `Cap::NetRoot` slot to call `sys_net_socket`
+/// (mint a fresh, caller-destination `NetEndpoint`). `CONTROL` is reused
+/// deliberately rather than adding a seventh bit: this is an
+/// administrative "may open sockets" authority, the same category of
+/// authority `CONTROL` already represents for tasks (restart/kill), not a
+/// per-message right like SEND/RECV. Never GRANT — `NetRoot` cannot be
+/// re-delegated by an ordinary `ipc_cap_grant` (see
+/// `netif::sys_net_socket`'s gate and `netif::grant_net_root`'s doc
+/// comment for why re-delegation must stay a kernel/boot-time decision).
+pub const NET_ROOT_RIGHTS: Rights = Rights::CONTROL;
 
 /// The rights a fresh memory-region capability grants its holder (READ/WRITE
 /// to touch the frames, GRANT to delegate it onward). Mirrors the model

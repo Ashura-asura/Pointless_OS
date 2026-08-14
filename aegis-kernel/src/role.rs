@@ -28,6 +28,16 @@
 //!   authorize anything on its own. Acting on the advice still requires
 //!   whatever capability that action already needed.
 //!
+//!   This role's isolation from `sys_net_socket` is now backed by two
+//!   independent gates, not one: even setting aside that `role_grant` mints
+//!   the socket directly (never through the syscall), an advisor-role agent
+//!   that somehow *did* reach `sys_net_socket` would still be refused there —
+//!   it holds no `Cap::NetRoot` (see `netif::sys_net_socket`'s gate, the
+//!   closure of the previously-open "any task can mint a socket to any host"
+//!   gap) and `NET_RIGHTS` never includes the `CONTROL` right `NetRoot`
+//!   requires. `advisor_cannot_escape_host_scope` below exercises this
+//!   directly.
+//!
 //! Every role is declared by the kernel, installs exactly its declared right
 //! set, and never carries GRANT: there is no syscall that mints GRANT onto a
 //! role cap, and `role_grant` installs exactly the role's declared set. This
@@ -748,6 +758,27 @@ mod tests {
                 crate::audit::OpKind::RoleGrant,
                 other as u32
             ));
+
+            // 6) Phase E item 2 closure, checked in the Phase F context
+            //    specifically: even setting aside that `role_grant` never
+            //    routes through `sys_net_socket` at all, the agent could
+            //    not have reached raw socket-minting authority even if it
+            //    tried directly — it holds no `Cap::NetRoot` anywhere in
+            //    its CSpace (its one cap is the granted `NetEndpoint`), so
+            //    the syscall-level gate refuses it independently of the
+            //    role system. Two gates, not one: this is what the
+            //    project's own honest-status note flagged as still open
+            //    ("any task can mint a socket to any host directly") and
+            //    what closes it.
+            assert_eq!(
+                crate::netif::sys_net_socket(1, 0x0A000202, 8080),
+                -1,
+                "no Cap::NetRoot anywhere in the agent's CSpace: sys_net_socket refuses it"
+            );
+            assert!(
+                (0..MAX_CAPS).all(|s| task_cap(agent, s).cap != Cap::NetRoot),
+                "the query-advisor grant never installs NetRoot"
+            );
         }
     }
 }

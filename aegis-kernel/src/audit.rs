@@ -44,11 +44,23 @@ pub enum OpKind {
     /// target task attributed; this is the append-only trail the Phase 6 grant
     /// flow is built on.
     RoleGrant,
+    /// `netif::sys_net_socket` (CONTROL on a `NetRoot` cap). Phase F
+    /// closure: minting a *new* socket to a caller-chosen destination is
+    /// itself an attributed, gated event — target is the destination IP's
+    /// low 32 bits packed the same way the syscall receives them, so a
+    /// refused mint is still traceable to what it tried to reach.
+    NetOpen,
+    /// `netif::sys_net_connect` / `sys_net_send` / `sys_net_recv` /
+    /// `sys_net_close` (SEND on connect/send, RECV on recv, cap-presence
+    /// only on close). Target is the `NetEndpoint` object id. This is what
+    /// makes the `query-advisor` "the audit log attributes everything"
+    /// claim actually true end to end, not just at the `RoleGrant` step.
+    NetIo,
 }
 
 impl OpKind {
     /// Count of variants — the histogram width.
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 12;
 
     /// Stable index for fixed-size histograms.
     pub fn index(self) -> usize {
@@ -63,6 +75,8 @@ impl OpKind {
             OpKind::Revoke => 7,
             OpKind::Grant => 8,
             OpKind::RoleGrant => 9,
+            OpKind::NetOpen => 10,
+            OpKind::NetIo => 11,
         }
     }
 
@@ -78,6 +92,8 @@ impl OpKind {
         OpKind::Revoke,
         OpKind::Grant,
         OpKind::RoleGrant,
+        OpKind::NetOpen,
+        OpKind::NetIo,
     ];
 }
 

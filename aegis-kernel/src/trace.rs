@@ -39,8 +39,16 @@ fn required(num: u64) -> Rights {
         // grant / revoke take GRANT (delegation and revocation are the same
         // right).
         9 | 17 => Rights::GRANT,
-        // endpoint create / mem create mint fresh caps and need no right on a
-        // pre-existing slot.
+        // net_socket takes CONTROL on a *different* slot (the NetRoot cap,
+        // not the slot this trace line's `k=/j=` columns resolve — those
+        // still show the newly-minted NetEndpoint on success, same as
+        // endpoint/mem). Advisory only, per the module doc above.
+        19 => Rights::CONTROL,
+        // net_connect / net_send are SEND-gated; net_recv is RECV-gated.
+        20 | 21 => Rights::SEND,
+        22 => Rights::RECV,
+        // endpoint create / mem create / net_close mint or clear caps and
+        // need no right on a pre-existing slot beyond holding the cap.
         _ => Rights::NONE,
     }
 }
@@ -70,6 +78,14 @@ pub fn op(num: u64, arg1: u64, arg2: u64, arg3: u64, _arg4: u64, result: i64) {
         // grantor's own copy of the source slot.
         9 => ("grant", arg2),
         17 => ("revoke", arg3),
+        // net_socket (Phase F closure) resolves the fresh NetEndpoint from
+        // the RETURNED slot, same idiom as endpoint/mem above — the
+        // syscall's own args (kind/ip/port) don't name a pre-existing slot.
+        19 => ("net_open", result.max(0) as u64),
+        20 => ("net_connect", arg1),
+        21 => ("net_send", arg1),
+        22 => ("net_recv", arg1),
+        23 => ("net_close", arg1),
         _ => return,
     };
     let slot = slot_arg as usize;
@@ -84,6 +100,8 @@ pub fn op(num: u64, arg1: u64, arg2: u64, arg3: u64, _arg4: u64, result: i64) {
         Cap::Task(i) => ("t", i),
         Cap::MemRegion(i) => ("m", i),
         Cap::Channel(i) => ("c", i),
+        Cap::NetEndpoint(i) => ("n", i),
+        Cap::NetRoot => ("r", 0),
     };
     let y = if result >= 0 { "ok" } else { "denied" };
     let req = required(num).bits();
