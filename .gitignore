@@ -9,3 +9,7 @@ target/
 # Debug artifacts
 Debug Files/
 qerr*.txt
+
+# Runtime-generated TLS test cert/key (listener regenerates its own at runtime)
+uefi-boot/server.crt
+uefi-boot/server.key

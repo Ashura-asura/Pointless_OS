@@ -1,5 +1,5 @@
 listener: waiting for QEMU on 127.0.0.1:45556 ...
-listener: QEMU connected from ('127.0.0.1', 55710)
+listener: QEMU connected from ('127.0.0.1', 50421)
 listener: frame 1, 86 bytes, proto 86dd
 listener: frame 2, 78 bytes, proto 86dd
 listener: ARP request from 52:54:00:12:34:56 10.0.2.15
@@ -9,12 +9,18 @@ listener: ACK received - handshake complete (port 8080)
 listener: port 8080 data segment (34 bytes): b'GET / HTTP/1.0\r\nHost: 10.0.2.2\r\n\r\n'
 listener: HTTP response sent (134 bytes)
 listener: FIN acknowledged (port 8080)
-listener: TCP SYN to 8443 (isn=2027808466) -> SYN-ACK
+listener: TCP SYN to 8443 (isn=3668340001) -> SYN-ACK
 listener: ACK received - handshake complete (port 8443)
 listener: port 8443 data segment (133 bytes): b'\x16\x03\x01\x00\x80\x01\x00\x00|\x03\x03\xa6\x07o>\x1b,M^op\x81\x92\xa3\xb4\xc5\xd6\xe7\xf8\t\x1a+<M^op\x81\x92\xa3\xb4\xc5\xd6\x00\x00\x02\x13\x01\x01\x00\x00Q\x00\x00\x00\n\x00\x08\x00\x00\x05aeg'
-listener: TLS server flight sent (1291 bytes)
-listener: ECDHE shared secret (host side): 2f146937b2d89afca8c38d212ed250d8d6f3b130c5e4df0405e931ae8e23114b
-listener: server keyshare: 63d4632e151d77f6c3ea911fe67f2eec3a4a421c4c8da18e6b243fb6cbd88703
+listener: TLS records from server sent (1291 bytes)
+listener: ECDHE shared secret (host side): 9a3e2dd5f5694aa5ae40525ac4c59cd28ae2ee8544b041e7a99b4604d819cf22
+listener: server keyshare: 4db135d15cfeb8100a2681cd6c225fdecfac11f81013dcf22f02cb916b596005
+listener: port 8443 data segment (58 bytes): b'\x17\x03\x03\x005\xc9w\x1fi\x9c{\x0f\xf9\x84\x88\xc0\x02\xa5.,\xd5P\xc1\xdd\x08\xcb\xff6\xe2\x0fR\xf9\xbd\xb2P\xa9\xd7>\x1bn<[\x9a\xbc\xa1\x95\x97#\xb6\xfe\xda\xa0\xe1\x86Tu\xa4\xe5'
+listener: TLS records from server sent (478 bytes)
+listener: port 8443 data segment (62 bytes): b'\x17\x03\x03\x009\x19\xac\xd2\xd9\xd1\xaf^\x02G\x95\x9a\xe62\xe7V\x1c\xb1"\xe8\xa5\x15\xb0\x1cy\xf8\xc1\x98*!\xf0\xb9\xc4\x02\xc5\xa2\xbb.%\xf8-\xd7tP\xd6sh^\xf5\xac\xfa\xaf\x03\xf9\xe5\xe1\xc5\xb8'
+listener: TLS server produced no output yet
+listener: TLS application data from kernel (40 bytes): b'GET /aegis-tls HTTP/1.0\r\nHost: aegis\r\n\r\n'
+listener: TLS HTTPS response sent (156 bytes)
 listener: FIN acknowledged (port 8443)
 listener: timeout waiting for frames
-listener: wrote 13 frame(s) to e1000-tls.pcap
+listener: wrote 17 frame(s) to e1000-tls.pcap

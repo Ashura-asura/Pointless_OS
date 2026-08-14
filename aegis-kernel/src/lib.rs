@@ -71,6 +71,8 @@ pub mod channel;
 pub mod netstack;
 pub mod role;
 
+pub mod aes;
+
 pub mod tls;
 
 /// Test-only: serialize tests that mutate the kernel's single global task /

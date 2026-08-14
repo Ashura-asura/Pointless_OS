@@ -24,6 +24,10 @@ Usage: python e1000_host_listener.py PORT OUTFILE.pcap
 """
 
 import os
+os.environ.setdefault(
+    "SSLKEYLOGFILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "tls-keylog.log"),
+)
 import socket
 import ssl
 import struct
@@ -458,14 +462,21 @@ def main() -> int:
                         st["server_seq"] = (st["server_seq"] + len(resp)) & 0xFFFFFFFF
                         st["served"] = True
                         print("listener: HTTP response sent (%d bytes)" % len(resp), flush=True)
-                    elif dst_port == TLS_PORT and not st["served"]:
-                        # The kernel's data is a TLS 1.3 ClientHello record.
+                    elif dst_port == TLS_PORT:
+                        # Feed the kernel's bytes into the real TLS 1.3 server
+                        # (ClientHello, then the encrypted Finished, then the
+                        # encrypted application request), driving the handshake
+                        # and draining whatever records OpenSSL emits.
                         tls_in.write(bytes(data))
-                        for _ in range(5):
+                        # Cross-check the ECDHE shared secret against the
+                        # ServerHello once we have produced it.
+                        for _ in range(20):
                             try:
                                 tls_server.do_handshake()
                             except ssl.SSLWantReadError:
-                                pass
+                                break
+                            except ssl.SSLError:
+                                break
                         flight = tls_out.read()
                         if flight:
                             send(
@@ -483,9 +494,8 @@ def main() -> int:
                                 )
                             )
                             st["server_seq"] = (st["server_seq"] + len(flight)) & 0xFFFFFFFF
-                            st["served"] = True
                             print(
-                                "listener: TLS server flight sent (%d bytes)" % len(flight),
+                                "listener: TLS records from server sent (%d bytes)" % len(flight),
                                 flush=True,
                             )
                             # Cross-check the ECDHE shared secret: extract the
@@ -495,9 +505,47 @@ def main() -> int:
                             _crosscheck_tls(flight)
                         else:
                             print(
-                                "listener: TLS handshake produced no output yet",
+                                "listener: TLS server produced no output yet",
                                 flush=True,
                             )
+                        # Read any decrypted application data the kernel has
+                        # sent (only valid once the handshake is complete).
+                        try:
+                            app = tls_server.read()
+                        except ssl.SSLWantReadError:
+                            app = None
+                        except ssl.SSLError:
+                            app = None
+                        if app:
+                            print(
+                                "listener: TLS application data from kernel (%d bytes): %r"
+                                % (len(app), app[:128]),
+                                flush=True,
+                            )
+                            # Serve a real HTTPS response over the same
+                            # encrypted connection.
+                            tls_server.write(HTTP_RESPONSE)
+                            resp_out = tls_out.read()
+                            if resp_out:
+                                send(
+                                    build_tcp_frame(
+                                        GATEWAY_MAC,
+                                        GUEST_MAC,
+                                        GATEWAY_IP,
+                                        GUEST_IP,
+                                        dst_port,
+                                        src_port,
+                                        st["server_seq"],
+                                        seq + len(data),
+                                        0x18,  # PSH|ACK
+                                        resp_out,
+                                    )
+                                )
+                                st["server_seq"] = (st["server_seq"] + len(resp_out)) & 0xFFFFFFFF
+                                print(
+                                    "listener: TLS HTTPS response sent (%d bytes)" % len(resp_out),
+                                    flush=True,
+                                )
                 elif flags & 0x01:  # FIN|ACK
                     send(
                         build_tcp_frame(
