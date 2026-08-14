@@ -1012,6 +1012,45 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         }
     }
 
+    // Guard the spawn-order contract the IDX_* constants document: the task
+    // table is built purely by spawn order, so a future task inserted out of
+    // line silently shifts every hardcoded index (the exact regression that
+    // broke the live demos before these constants existed). Assert both the
+    // order and the running count here, so a drift fails at boot instead of
+    // surfacing as a dead demo miles later.
+    {
+        const ORDER: [u64; 15] = [
+            IDX_ALPHA,
+            IDX_BETA,
+            IDX_INPUT,
+            IDX_SERVER,
+            IDX_CLIENT,
+            IDX_SUPERVISOR,
+            IDX_ISO_TEST,
+            IDX_NX_TEST,
+            IDX_DENIED,
+            IDX_AGENT,
+            IDX_SERVICE,
+            IDX_OBSERVER,
+            IDX_MEM_RM,
+            IDX_MEM_CLIENT,
+            IDX_PARENT_SUP,
+        ];
+        for (i, &idx) in ORDER.iter().enumerate() {
+            assert_eq!(
+                i as u64, idx,
+                "spawn-order constant drift at position {}",
+                i
+            );
+        }
+        let n = aegis_kernel::tasks::spawned_count();
+        assert_eq!(n, ORDER.len(), "task table count != documented spawn order");
+        sprintln!(
+            "Aegis: spawn-order contract guarded ({} tasks, constants in order)",
+            n
+        );
+    }
+
     // All boot/demo output has printed; put the composited desktop on the
     // real VGA display and freeze further console mirroring, so the VM
     // display settles on the GUI for the rest of the run.
