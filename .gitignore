@@ -13,3 +13,8 @@ qerr*.txt
 # Runtime-generated TLS test cert/key (listener regenerates its own at runtime)
 uefi-boot/server.crt
 uefi-boot/server.key
+
+# Ephemeral PID capture for the fleet node-A kill script — meaningless (and
+# actively misleading if stale) once the process exits; unlike the serial
+# logs, this is never evidence, just a runtime handle.
+uefi-boot/node-a.pid

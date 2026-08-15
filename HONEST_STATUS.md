@@ -475,3 +475,75 @@ The resource-manager and supervision-tree work is now delivered in **ring 3**, l
 - **New contract tests** (+2, 378 kernel total): `grant_use_revoke_deny_cycle_across_tasks` (`mem.rs`) and `parent_adopts_subsystem_with_fresh_budget_after_child_trip` (`supervisor.rs`). Workspace 125 + uefi-boot 13 unchanged; combined 503.
 - **Index-regression fix** shipped in the same commit: a prior commit inserted the `input` task at index 2 and shifted every later task index, silently breaking the live demos (the client's echo call never matched the server). All demo code now uses named `IDX_*` constants (single source of truth); `MAX_TASKS` 12→16. Live proof: `[client] echo reply: ping from client` returns in `serial-phase-b.log`.
 - Honest limits (kept): revoke is **instance-named** (flat per-task CSpace, no model-I4 grant-root derivation tree — a grantor must name recipient+slot and cannot reach copies in CSpaces it cannot name); budgets are restart-counts, not CPU/energy; the escalation hand-off relies on the child supervisor surrendering (it stops serving the single-slot NOTIFY_EP mailbox) before the parent serves it — one observer at a time, no double-serve.
+
+## Phase I: distributed extension over a real network — reduced, not closed
+
+The model-level `fleet` crate (locality, recipient binding, fail-closed
+`PeerStale`/`PeerUnreachable`) is proven at the model level (see §10 item 4
+above). This section is the separate, harder claim — two real kernel
+instances, two real QEMU processes, a real e1000-driven link between them.
+It closes as **reduced, not closed**: a real cross-machine capability use,
+proven live, with partition behavior fail-safe by construction. It does not
+"solve" distributed transparency itself — the CAP-level gap stays labeled
+inherent, per the design doc's own §10.
+
+**What's proven live:**
+- Node A and node B boot as two separate kernel images
+  (`aegis-boot-node-a.img`/`aegis-boot-node-b.img`, feature-gated
+  `fleet-node-a`/`fleet-node-b`), linked over a real QEMU socket netdev
+  (`-netdev socket`, node B `listen`, node A `connect` to 45560) carrying
+  real e1000e frames, not an in-process channel.
+- **Happy path:** node A mints a capability (object 42, Endpoint, RS),
+  binds it to node B, and transmits it once; node B receives the envelope
+  and `verify OK` repeatedly. Latest clean run: **4,683 `verify OK`** cycles
+  on node B, **~108k frames received**, RX `bad=0` in steady state,
+  `max_drain=10` (bursts drained fine), `sat=0` (ring never saturated).
+- **Fail-closed proof (the headline):** with the link live and node B
+  verifying, node A was killed **by exact PID** (kill-node-a.bat /
+  node-a.pid — the same-binary `taskkill /IM` mistake that killed both VMs
+  in a prior attempt is impossible now, because the PID is captured by
+  filtering on the unique `aegis-boot-node-a.img` substring in the command
+  line). Node B stayed up and its next `verify` flipped to
+  `verify DENIED (fail-closed): PeerStale — issuer reachable=false
+  stale=true` and held it (2,178 DENIED and counting in the same run).
+  The exact transition in `serial-fleet-b.log`: `verify OK` ... →
+  `verify DENIED (fail-closed): PeerStale` at the same point the kill's
+  `STALE_AFTER_TICKS` elapsed — no crash, no livelock.
+- **Root cause actually found (not guessed):** QEMU's e1000e emulation
+  delivers short, zero-padded frames (a 42-byte ARP padded to the 60-byte
+  Ethernet minimum) with the RX descriptor's **DD bit set but RX_EOP
+  clear**. `E1000::done()` correctly requires only DD (real-hardware
+  behavior for single-descriptor receives). The earlier working theory
+  ("RX ring too small") was wrong and was replaced by this measured one;
+  the delivery pattern is documented at the fix point in `e1000.rs`.
+- **Always-on diagnostics, committed (not one-off debug):** aggregate RX
+  counters on the NIC (`rx_packets`, `rx_polls`, `rx_empty`, `rx_saturated`,
+  `rx_bad_len`, `rx_max_drain`, plus `rx_bad_status`/`rx_bad_length` holding
+  the status byte and length of the most recently rejected descriptor) and
+  `NetIf::packets_received`, printed every `DIAG_EVERY` polls in both node
+  demos. Every future run of this same demo re-produces the evidence without
+  code changes.
+- **RX path hardening shipped in the same commit:** `RX_RING_LEN` 8→64;
+  Acquire/Release ordering fences around the descriptor re-arm ↔ `RDT`
+  hand-off and the device-writeback → payload read; volatile-safe
+  descriptor stores; malformed-descriptor skip loop in `receive()` so one
+  bad descriptor cannot stall the polled drain; RX length validation
+  (rejects DD-set zero-length / over-buffer lengths, counts them
+  separately).
+
+**Honest limits (kept, not glossed):**
+1. **Repeat-run reliability is not yet evidenced.** One strong run (4,683
+   verify OK, clean fail-closed transition) is one data point; the fix
+   needs several independent cold launches to claim robustness. That
+   evidence is the next step, not yet done.
+2. **`bad_length` = 1 in 310k frames** (a pre-fix run) is observed but
+   not yet explained; "benign so far" is not "understood." The latest run
+   after the fix shows `bad=0` across ~108k frames; the counter exists so
+   any future occurrence can be correlated with a specific frame.
+3. No consensus, replication, or split-brain handling — unchanged from the
+   model-level claim; partition behavior is fail-safe by construction
+   (verify DENIED on stale issuer) but nothing *recovers* automatically.
+4. The bridge-based frame capture used during diagnosis is not part of the
+   committed flow; node A now connects straight to node B's listen port
+   (45560), so a future debugging session needing the bridge must re-add
+   it deliberately (it is a diagnostics tool, not the demo).

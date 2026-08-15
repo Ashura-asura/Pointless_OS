@@ -57,7 +57,7 @@ pub const TX_RING_LEN: usize = 8;
 /// RX ring size in descriptors. QEMU's `E1000_XDLEN_MASK` (= 0xFFFF80)
 /// zeroes any RDLEN that is not a multiple of 128 bytes (8 descriptors),
 /// so a ring of fewer than 8 legacy descriptors is silently disabled.
-pub const RX_RING_LEN: usize = 8;
+pub const RX_RING_LEN: usize = 64;
 pub const DESC_BYTES: usize = 16;
 pub const RX_BUF_BYTES: usize = 2048;
 
@@ -107,6 +107,13 @@ impl LegacyDescriptor {
 /// `(high, low)` u32 halves of a 64-bit physical address.
 fn address_halves(addr: u64) -> (u32, u32) {
     ((addr >> 32) as u32, addr as u32)
+}
+
+/// Whether a RX descriptor length is usable: non-zero and within the buffer
+/// the driver hands the hardware. Zero lengths are malformed writebacks; a
+/// length larger than `RX_BUF_BYTES` would read out of bounds on the copy.
+pub fn rx_length_valid(len: u16) -> bool {
+    len != 0 && (len as usize) <= RX_BUF_BYTES
 }
 
 /// Encode a 48-bit MAC from the RAL0/RAH0 register pair.
@@ -233,6 +240,23 @@ pub struct E1000 {
     rx_buf: DmaFrame,
     pub tx_head: u16,
     pub rx_next: u16,
+    /// Aggregate RX accounting — proof of what actually happened at the NIC,
+    /// not an inference. `rx_packets` counts frames handed to the driver;
+    /// `rx_polls` counts every `receive()` call; `rx_empty` counts calls that
+    /// found no completed descriptor; `rx_saturated` counts poll cycles where
+    /// every ring slot was simultaneously DD (the ring was momentarily full).
+    pub rx_packets: u64,
+    pub rx_polls: u64,
+    pub rx_empty: u64,
+    pub rx_saturated: u64,
+    pub rx_bad_len: u64,
+    /// Longest run of consecutive DD descriptors drained in one poll cycle.
+    pub rx_max_drain: u64,
+    /// Status byte and length of the most recently *rejected* descriptor, kept
+    /// so the aggregate diagnostics can say *why* a frame was dropped instead
+    /// of just that one was.
+    pub rx_bad_status: u8,
+    pub rx_bad_length: u16,
 }
 
 impl E1000 {
@@ -270,6 +294,14 @@ impl E1000 {
             rx_buf,
             tx_head: 0,
             rx_next: 0,
+            rx_packets: 0,
+            rx_polls: 0,
+            rx_empty: 0,
+            rx_saturated: 0,
+            rx_bad_len: 0,
+            rx_max_drain: 0,
+            rx_bad_status: 0,
+            rx_bad_length: 0,
         })
     }
 
@@ -349,6 +381,10 @@ impl E1000 {
             }
         }
 
+        // Publish the fully initialized DMA descriptors before handing the RX
+        // ring to the device. The descriptor writes are ordinary memory stores;
+        // the RCTL MMIO write must not become visible before those stores.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         let rctl = RCTL_EN | RCTL_BAM | RCTL_LPE;
         wr32(self.base, RCTL, rctl);
         wr32(self.base, RXDCTL, 0x0100_0000); // enable + buffer threshold
@@ -391,39 +427,106 @@ impl E1000 {
     }
 
     /// Receive a frame if one has landed in the RX ring. Returns the byte
+    /// Snapshot of the RX ring state for periodic diagnostics: hardware head
+    /// and tail, our software cursor, and the aggregate counters.
+    pub fn rx_stats(&self) -> (u32, u32, u16, u64, u64, u64, u64, u64, u64, u8, u16) {
+        let rd_h = rd32(self.base, RDH);
+        let rd_t = rd32(self.base, RDT);
+        (
+            rd_h,
+            rd_t,
+            self.rx_next,
+            self.rx_packets,
+            self.rx_polls,
+            self.rx_empty,
+            self.rx_saturated,
+            self.rx_bad_len,
+            self.rx_max_drain,
+            self.rx_bad_status,
+            self.rx_bad_length,
+        )
+    }
+
     /// length written into `out`.
     pub fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
-        let slot = self.rx_next as usize % RX_RING_LEN;
-        let d = read_desc(self.rx.as_mut(), slot);
-        if !d.done() {
-            return None;
+        self.rx_polls = self.rx_polls.wrapping_add(1);
+        // A malformed RX descriptor must not stop the whole polled RX drain.
+        // Re-arm it and continue to the next descriptor instead. The loop is
+        // bounded by the ring size, because each iteration consumes one slot.
+        for _ in 0..RX_RING_LEN {
+            let slot = self.rx_next as usize % RX_RING_LEN;
+            let d = read_desc(self.rx.as_mut(), slot);
+            if !d.done() {
+                self.rx_empty = self.rx_empty.wrapping_add(1);
+                return None;
+            }
+
+            // The device has published the descriptor status/length and may
+            // have DMA-written the payload. Acquire ordering keeps subsequent
+            // CPU reads of the payload after the observed DD bit.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+
+            let len = d.length as usize;
+            // QEMU's e1000e writes back padded-to-minimum broadcast frames
+            // (e.g. 42-byte ARPs padded to 60) with the DD bit set but the EOP
+            // bit clear, so requiring EOP would drop every ARP. A complete
+            // frame is therefore judged on DD + a sane length alone; every
+            // real Ethernet frame fits one 2048-byte buffer, so EOP adds no
+            // information here.
+            let valid = rx_length_valid(d.length) && len <= out.len();
+            let buf_off = slot * RX_BUF_BYTES;
+
+            if valid {
+                self.rx_packets = self.rx_packets.wrapping_add(1);
+                let src = &self.rx_buf.as_mut()[buf_off..buf_off + len];
+                out[..len].copy_from_slice(src);
+            } else {
+                self.rx_bad_len = self.rx_bad_len.wrapping_add(1);
+                self.rx_bad_status = d.status;
+                self.rx_bad_length = d.length;
+            }
+
+            // Re-arm the descriptor and advance RDT. Translate before borrowing
+            // `self.rx` mutably, same reasoning as in `rx_enable`.
+            let rearm_addr = self.dma_addr(self.rx_buf.phys + (slot * RX_BUF_BYTES) as u64);
+            write_desc(self.rx.as_mut(), slot, &LegacyDescriptor::rx(rearm_addr));
+            // Publish the cleared status/address before returning ownership of
+            // this descriptor to hardware through RDT.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            wr32(self.base, RDT, slot as u32);
+            self.rx_next = (self.rx_next + 1) % RX_RING_LEN as u16;
+
+            if valid {
+                return Some(len);
+            }
         }
-        let len = d.length as usize;
-        let len = len.min(out.len());
-        let buf_off = slot * RX_BUF_BYTES;
-        let src = &self.rx_buf.as_mut()[buf_off..buf_off + len];
-        out[..len].copy_from_slice(src);
-        // Re-arm the descriptor and advance RDT. Translate before borrowing
-        // `self.rx` mutably, same reasoning as in `rx_enable`.
-        let rearm_addr = self.dma_addr(self.rx_buf.phys + (slot * RX_BUF_BYTES) as u64);
-        write_desc(self.rx.as_mut(), slot, &LegacyDescriptor::rx(rearm_addr));
-        wr32(self.base, RDT, slot as u32);
-        self.rx_next = (self.rx_next + 1) % RX_RING_LEN as u16;
-        Some(len)
+        None
     }
 }
 
+/// Program one legacy descriptor into the ring. The fields the device owns
+/// (or that hand ownership back to the device: status/DD) are written with
+/// volatile stores so the compiler cannot reorder or elide them relative to
+/// the MMIO tail writes (`RDT`/`TDT`) that publish them to the NIC.
 fn write_desc(ring: &mut [u8], index: usize, d: &LegacyDescriptor) {
     let off = index * DESC_BYTES;
     let (hi, lo) = address_halves(d.addr);
-    ring[off..off + 4].copy_from_slice(&lo.to_le_bytes());
-    ring[off + 4..off + 8].copy_from_slice(&hi.to_le_bytes());
-    ring[off + 8..off + 10].copy_from_slice(&d.length.to_le_bytes());
-    ring[off + 10] = d.cso;
-    ring[off + 11] = d.cmd;
-    ring[off + 12] = d.status;
-    ring[off + 13] = d.css;
-    ring[off + 14..off + 16].copy_from_slice(&d.special.to_le_bytes());
+    let ptr = unsafe { ring.as_mut_ptr().add(off) };
+
+    // Descriptor memory is shared with the NIC. Use volatile stores so the
+    // compiler cannot eliminate, merge, or otherwise treat ownership/status
+    // updates as ordinary dead data. A Release fence at the hand-off sites
+    // orders these stores before the corresponding MMIO doorbell.
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, lo.to_le());
+        core::ptr::write_volatile((ptr.add(4)) as *mut u32, hi.to_le());
+        core::ptr::write_volatile((ptr.add(8)) as *mut u16, d.length.to_le());
+        core::ptr::write_volatile(ptr.add(10), d.cso);
+        core::ptr::write_volatile(ptr.add(11), d.cmd);
+        core::ptr::write_volatile(ptr.add(12), d.status);
+        core::ptr::write_volatile(ptr.add(13), d.css);
+        core::ptr::write_volatile((ptr.add(14)) as *mut u16, d.special.to_le());
+    }
 }
 
 fn read_desc(ring: &[u8], index: usize) -> LegacyDescriptor {
@@ -536,6 +639,35 @@ mod tests {
     }
 
     #[test]
+    fn rx_length_validation() {
+        assert!(!rx_length_valid(0));
+        assert!(rx_length_valid(42));
+        assert!(rx_length_valid(RX_BUF_BYTES as u16));
+        assert!(!rx_length_valid((RX_BUF_BYTES + 1) as u16));
+        assert!(!rx_length_valid(u16::MAX));
+    }
+
+    #[test]
+    fn rx_rearm_clears_dd_and_resets_length() {
+        // Simulate a consumed descriptor: DD set + payload length written by
+        // the device. Rearming must clear DD and zero the length so the ring
+        // can be handed back to hardware for reuse.
+        let mut ring = [0u8; RX_RING_LEN * DESC_BYTES];
+        let mut d = LegacyDescriptor::rx(0x5000);
+        d.status = DESC_STATUS_DD;
+        d.length = 1500;
+        write_desc(&mut ring, 3, &d);
+        assert!(read_desc(&ring, 3).done());
+
+        let rearmed = LegacyDescriptor::rx(0x5000);
+        write_desc(&mut ring, 3, &rearmed);
+        let back = read_desc(&ring, 3);
+        assert!(!back.done());
+        assert_eq!(back.length, 0);
+        assert_eq!(back.addr, 0x5000);
+    }
+
+    #[test]
     fn send_rejects_oversized_frame() {
         let mut e = E1000 {
             base: core::ptr::null_mut(),
@@ -560,6 +692,14 @@ mod tests {
             },
             tx_head: 0,
             rx_next: 0,
+            rx_packets: 0,
+            rx_polls: 0,
+            rx_empty: 0,
+            rx_saturated: 0,
+            rx_bad_len: 0,
+            rx_max_drain: 0,
+            rx_bad_status: 0,
+            rx_bad_length: 0,
         };
         assert!(!e.send(&[0u8; 4096]));
         assert!(!e.send(&[]));

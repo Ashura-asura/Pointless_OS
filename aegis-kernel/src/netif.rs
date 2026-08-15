@@ -51,6 +51,10 @@ pub const SEND_BUFLEN: usize = 4096;
 pub const RECV_BUFLEN: usize = 8192;
 pub const FRAME_MAX: usize = 2048;
 
+/// How often `poll()` emits the aggregate RX diagnostics line (in poll
+/// ticks). Aggregate only — never per packet, so it can't perturb timing.
+pub const DIAG_EVERY: u64 = 200_000;
+
 /// Retransmission timeout, in poll-count units: if a segment goes unacked for
 /// this many `poll()`/`advance()` calls we retransmit. The live host peer
 /// answers in a tiny fraction of this; the contract tests advance the poll
@@ -287,10 +291,29 @@ impl NetIf {
     /// clock (running retransmission timers).
     pub fn poll(&mut self) {
         let mut buf = [0u8; FRAME_MAX];
+        let mut drained = 0u64;
         while let Some(n) = self.nic_mut().receive(&mut buf) {
             if n >= 14 {
                 self.handle_frame(&buf[..n]);
             }
+            drained += 1;
+        }
+        if drained > 0 {
+            let nic = self.nic.as_mut().unwrap();
+            if drained as usize == crate::e1000::RX_RING_LEN {
+                nic.rx_saturated = nic.rx_saturated.wrapping_add(1);
+            }
+            if drained > nic.rx_max_drain {
+                nic.rx_max_drain = drained;
+            }
+        }
+        if self.polls % DIAG_EVERY == 0 {
+            let (rd_h, rd_t, rx_next, p, pl, e, sat, bad, maxd, bs, bl) =
+                self.nic.as_ref().unwrap().rx_stats();
+            crate::sprintln!(
+                "Aegis: e1000 rx: rd_h={} rd_t={} next={} packets={} polls={} empty={} sat={} bad={} max_drain={} bad_status={:#x} bad_len={}",
+                rd_h, rd_t, rx_next, p, pl, e, sat, bad, maxd, bs, bl
+            );
         }
         self.advance(1);
     }
