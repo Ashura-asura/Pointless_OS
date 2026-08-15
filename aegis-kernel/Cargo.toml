@@ -18,6 +18,14 @@ fleet-node-b = []
 # transferred capability) instead of the Phase I transport demo. Combined
 # with exactly one of fleet-node-a / fleet-node-b.
 fleet-j3 = []
+# Phase K: wire the VT-x (VMX) bring-up demo into the END of boot. Off by
+# default — normal fleet/CI images compile zero VMX code. When enabled the
+# guarded call runs last (after every demo spawned and the desktop shown,
+# before interrupts turn on): on a CPU without VT-x it is a harmless no-op
+# that falls through to the idle loop, and on a VMX-capable CPU it launches
+# the real-mode guest and halts after the first real VM-exit (single round
+# trip, no vmresume yet — that halt is the demo's intended terminal state).
+vmx-demo = []
 
 [dependencies]
 

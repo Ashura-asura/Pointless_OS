@@ -1750,6 +1750,29 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         aegis_kernel::vga::vga_dump_buffer();
     }
 
+    // Phase K (feature-gated): VT-x bring-up demo. Last thing before
+    // interrupts turn on and the idle loop owns the machine. `vmx_supported()`
+    // is a cheap no-op CPUID check; `bringup_demo()` only runs when VT-x is
+    // actually present. On a CPU without VT-x this prints and falls through to
+    // the normal idle boot — one `if` branch, zero behavior change. On a
+    // VMX-capable CPU it launches the real-mode guest and HALTS after the
+    // first real VM-exit (single round trip, no vmresume) — that halt is the
+    // demo's terminal state, so this must sit after every boot demo a test
+    // image still needs, which it does.
+    #[cfg(feature = "vmx-demo")]
+    {
+        if aegis_kernel::vmx::vmx_supported() {
+            sprintln!("Aegis: [vmx] VT-x present — running bring-up demo");
+            unsafe {
+                let _ = aegis_kernel::vmx::bringup_demo();
+            }
+            // Only reached if bring-up failed before a successful VM-entry.
+            sprintln!("Aegis: [vmx] bring-up demo returned (pre-entry failure, see above)");
+        } else {
+            sprintln!("Aegis: [vmx] no VT-x on this CPU — skipping VMX bring-up demo");
+        }
+    }
+
     unsafe {
         core::arch::asm!("sti");
     }

@@ -33,6 +33,14 @@
 //! violations) is real future work this file does not attempt — this is
 //! DoD option (b) made concrete: the design *and* a first real
 //! implementation attempt of the ceiling primitive, not a working Windows VM.
+//!
+//! Wired into `main.rs` (Phase K, feature-gated): building with
+//! `--features kernel,vmx-demo` runs the guarded call (`vmx_supported()` then
+//! `bringup_demo()`) at the END of boot, after every other demo has spawned
+//! and the desktop is shown, before interrupts turn on and the idle loop owns
+//! the machine. On a CPU without VT-x it prints `no VT-x on this CPU —
+//! skipping VMX bring-up demo` and falls through to the normal boot. Normal
+//! builds (no `vmx-demo` feature) compile zero VMX code.
 
 use core::arch::{asm, global_asm};
 
