@@ -30,7 +30,7 @@ the docs' claims. Two numbers, honestly separated:
 | 5 — Networking as a service | 85% | Real capability-gated loopback `netstack.rs` (6 tests); real e1000e NIC driver (7 tests); **a full polled TCP/IP stack in the kernel (`netif.rs`, 9 tests) that drives a real three-way handshake, HTTP request/response and close over the wire under QEMU** — SYN→SYN-ACK→ACK→GET→HTTP response→FIN captured externally on the host (pcap), with the HTTP response body rendered by the kernel; **plus a real TLS 1.3 client on a second socket (`tls.rs`, 18 tests): the kernel sends a spec-correct ClientHello to an OpenSSL-backed server on 8443, parses the ServerHello, derives the X25519 ECDHE shared secret that matches the host byte-for-byte, runs the full RFC 8446 §7.1 key schedule (handshake + application traffic secrets, now byte-validated end-to-end against RFC 8448 §3's published trace), and uses AES-128-GCM record protection — encrypted server flight and client Finished verified against the live capture, externally captured** | No interrupts (polled only); QEMU socket netdev, not physical hardware; live app-data exchange verified under the fixed `s_ap` derivation (see Phase-E log); certificate chain not verified; fixed deterministic scalar (no CSPRNG in the guest); no outbound routing/NAT; single connection demo wired in `main.rs`, syscalls 19–23 provide the capability-scoped socket API for tasks |
 | 6 — AI orchestration layer (the §11.F target) | 85% | Zero-cap ring-3 agent, kernel-declared roles (`restart-service`/`observe-service`), RoleGrant syscall 18, adversarial self-escalation all refused at gates, audit log — live under QEMU | No real AI model (histogram profiler), no real-time integration; anomaly observer test-only (ledger wired) |
 | 7 — Native app model + shell | 55% | `shell.rs`/window/graph/input (model-tested); live VGA text compositor + PS/2 keyboard (Tab-focus/arrows); **live Bochs VBE framebuffer backend (Phase H, closed): composited desktop rendered to real 800x600 pixels** | Shell not wired into boot; no object/relationship-based UI |
-| 8 — Linux compat | 55% | Linux ABI translation + ELF loader + personality gating (32 tests), exercised live | No lightweight-VM vehicle (needs hypervisor), no ring-3 trap |
+| 8 — Linux compat | 55% | Linux ABI translation + ELF loader + personality gating (32 tests), exercised live | No lightweight-VM vehicle (needs hypervisor); the ring-3 trap now exists and runs a real Linux ELF (Phase J, closed) |
 | 9 — Windows compat | 45% | NT ABI translation + PE loader + personality gating (31 tests), exercised live | No VM full-fidelity path (design doc: unsolved anywhere by translation) |
 | 10 — Supervision hardening + chaos + formal ceiling | 60% | Ceiling property tests (14), model chaos tests (6), model supervision (10) | Ceiling checks are contract tests, not an inductive proof; no kernel chaos testing |
 | 11 — Distributed extension | 50% | `fleet` crate (22 tests): locality, recipient binding, fail-closed partition | Two-node in-process model; no sockets, no consensus; no real network |
@@ -270,7 +270,7 @@ A single-threaded, in-process capability kernel with:
 | ELF loader | 12 | ET_EXEC/ET_DYN header validation (magic/class/endian/type/machine), PT_LOAD parsing with bounds checks, interpreter detection, load-range computation, System V initial stack layout (argc/argv/envp/auxv) |
 | Compat personality | 8 | Linux contexts translate and gate operations on the capability scope; native personalities reject Linux syscalls; denials are counted |
 
-Honest limits for Phase 8: translation is model logic, not a real ring-3 syscall trap; the lightweight-VM execution vehicle (design doc §5, WSL2-lineage) is not built — it needs a hypervisor. The compat layer is an unprivileged capability-scoped service, matching the design doc's AI ceiling.
+Honest limits for Phase 8: translation is model logic, not a real ring-3 syscall trap; the lightweight-VM execution vehicle (design doc §5, WSL2-lineage) is not built — it needs a hypervisor. The ring-3 trap itself is now real (Phase J CLOSED): the kernel parses and runs a genuine static Linux ELF as a ring-3 task and gates its `int 0x80` syscalls through the personality — see the Phase J section. The compat layer remains an unprivileged capability-scoped service, matching the design doc's AI ceiling.
 
 ### Real Windows compat layer (aegis-kernel)
 | Component | Tests | What it proves |
@@ -433,6 +433,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | Phase E CLOSED (commit d1d7fa3) | **Live app-data exchange re-verified with the rebuilt kernel** — the exact failure from the old run (`app record auth failed`) is gone (0 occurrences in the new log) and the kernel decrypts the server's application records with the corrected `s_ap` key. Evidence (`uefi-boot/serial-tls.log`, truncated at the preempt-spam boundary): `tls: TCP handshake complete (Established)`, `tls: ClientHello sent (133 bytes)`, `tls: ServerHello: version 0x0304 cipher 0x1301 group 0x001D`, `tls: ECDHE shared secret (kernel side): D8A320BF…`, `tls: server Finished verified`, `tls: client Finished sent (58 bytes)`, `tls: encrypted HTTP request sent (62 bytes)`, `tls: HTTPS response body: HTTP/1.1 200 OK … Aegis kernel TCP demo`, `tls: socket closed (FIN sent)`. Listener log: TLS records from server sent (1291 + 478 B), TLS application data from kernel (40 B `GET /aegis-tls`), TLS HTTPS response sent (156 B), FIN acknowledged. New `e1000-tls.pcap` = 18 frames (was 17). Same boot re-verified the plaintext TCP demo. **Phase E Definition of Done met: a real TCP connection under QEMU completing a TLS 1.3 handshake and exchanging real application data, externally captured.** 424 kernel + 128 model + 13 uefi-boot tests pass clean, clippy/fmt/release-build clean |
 | Phase G CLOSED (commit c90acd2) | **Real VT-d IOMMU DMA isolation, live-verified.** `iommu.rs` (user-supplied, applied): `translate` is the real gate every NVMe/e1000 DMA address passes before a PRP/descriptor is written — page-number-keyed sparse table (fixes the old 512-slot masked-index collision), `MAX_MAPPINGS_PER_DOMAIN=64`, fault ring (16) with monotonic `fault_total`, three-way `IommuFault`, `provision_device` + `identity_map`, global `unsafe fn with`. `nvme.rs`/`e1000.rs`: per-device domains provisioned in `probe`, buffers identity-mapped before any address reaches hardware, `dma_addr` gate on every PRP/ring/descriptor. `main.rs`: live denial demo on the real NVMe bdf. Live QEMU/OVMF boot (`uefi-boot/serial-phase-g-clean.log`): NVMe identify + LBA0/1 (protective MBR / GPT header) and the full e1000 ARP→TCP→HTTP→TLS path all pass the gate, then `IOMMU: NVMe out-of-domain DMA to 0x100000000 denied at the IOMMU: true (AddressNotMapped) — fault_total = 1` and the kernel continues (FAT16 + NVMe-store + compat + all task demos to tick 6364). Honest limit kept: software gate mirroring VT-d, no real DMAR MMIO; identity-mapped IOVA space. 438 kernel + 128 model + 13 uefi-boot tests pass clean (579 total), clippy/fmt/release-build clean, raw output in commit |
 | Phase H CLOSED (this commit) | **Live Bochs VBE framebuffer backend** — Phase H's claim was a real linear-framebuffer graphics path under QEMU `-vga std`, previously "landed, not live-verified". Now verified live: probe finds the real PCI display (00:01.0, `Bochs VBE display found, id=0xb0c5 lfb=0x80000000`), sets 800x600x32 via the dispi ports (`mode set 800x600x32`, `set_mode = true`), and installs the framebuffer backend (`framebuffer backend installed (desktop -> pixels too)`) — all serial-asserted (`uefi-boot/serial-phase-h.log`). QEMU monitor `screendump` at the running desktop (`uefi-boot/phase-h-desktop.ppm`) is a true 800x600 PPM with 157,212 non-black pixels in the VGA palette (blue `0000aa` window bg + white `ffffff` text) — the composited shell/windows are painted as pixels, not text cells. **Input → pixels round-trip:** `sendkey x` changed exactly 45 pixels in a 15x8 bbox at the prompt ((168,137)-(183,145)) — one 8x16 glyph — and serial shows `shell-compositor@key: echo 'x' -> window id=3 line pos=0` (evidence pair `phase-h-pre.ppm`/`phase-h-post.ppm`). First screendump was black only because it was taken before the boot demos finished (desktop install/blit runs after the network poll loop); the mode surface was already live (800x600 geometry). Honest limits: framebuffer backend only (`gpu.rs` + `gpu_compositor.rs` `blit_cells`), no GPU command engine, no mouse, UNTESTED on real hardware. 471 kernel + 128 model + 13 uefi-boot tests pass clean, clippy/fmt clean, raw output in commit |
+| Phase J CLOSED (this commit) | **Real ring-3 Linux ELF execution vehicle, live** — a genuine static Linux ELF binary (`linux-hello.elf`, built from `linux-hello.ll` with the LLVM toolchain that ships in the pinned Rust toolchains: `llc` + `ld.lld`, script `link-hello.ld` forcing one R+E PT_LOAD at 0x400000, 91-byte segment = 42 code + 49 message bytes) is parsed by the kernel's own `elf_loader` (`linux_compat_elf.rs`, user-supplied, applied as submitted) and spawned as a real ring-3 task (`spawn_linux_hello` → `spawn_user("linux-hello", …)` at index 15, `IDX_LINUX_HELLO`, appended LAST so the IDX_* spawn-order contract stays intact). The code page is mapped executable at `LINUX_CODE_VADDR` (0x0000_7000_0000_0000) via the new `page_tables::map_user_code_page` (fresh PML4→PDPT→PD→PT USER chain, leaf R+X no-NX not-writable), and `syscall.rs` routes the task's `int 0x80` to `dispatch_linux_syscall`, gated by the `LinuxCompatLayer` personality with a restrictive scope (CAP_FILE + CAP_PROCESS). Live proof (`uefi-boot/serial-phase-j.log`): `spawned as ring-3 task 15`, `switch_frame from=14 to=15 rsp0=0x1C8000`, the binary's 49-byte message `Aegis: real Linux ELF binary executing in ring-3` delivered via `write(1,…)` → serial, `[linux-hello] real Linux binary called exit(0) via int 0x80 — syscall denials so far: 0`, no fault/panic after. Honest scoping kept: the trap reuses this kernel's existing `int 0x80` gate (no `syscall`/`sysret` MSR path); syscall *numbers* are the real Linux ABI but the argument-register mapping is the kernel gate's convention (a real 64-bit Linux `int 0x80` uses 32-bit compat registers); single R+E page, write→serial/VGA only, exit/1+ handled. 474 kernel + 128 model + 13 uefi-boot tests pass clean (raw output in commit), clippy/fmt/release-build clean, `uefi-boot/serial-phase-j.log` committed. Note: the ELF build tools are NOT in PATH (no GNU binutils on this host); `build-linux-hello.bat` documents the `llc`/`ld.lld` full paths. |
 
 ## §10 follow-on: two-role library (kernel-gated roles, same discipline)
 
@@ -650,3 +651,63 @@ and closed**:
   framebuffer. UNTESTED on real hardware (VMware/real VBE adapter is a
   separate, later item). The desktop paints only after the boot demos
   finish, so a pre-desktop screendump is black by design.
+
+## Phase J: real ring-3 Linux ELF execution vehicle — live-verified
+
+Phase J's first claim: the kernel closes the gap linux_compat.rs openly
+named ("no real ring-3 trap, no lightweight-VM execution vehicle") by
+running a **genuine static Linux ELF binary** — not a hand-built stub — as
+a real ring-3 task. Module `linux_compat_elf.rs` (user-supplied, applied as
+submitted) embeds `linux-hello.elf` via `include_bytes!` and `spawn_linux_hello`
+parses it with the kernel's own `elf_loader` (`parse_elf`), requires exactly
+one PT_LOAD segment, R+E flags, `memsz <= 4096`, allocates one global frame,
+zeroes + copies the segment, maps it executable at `LINUX_CODE_VADDR`
+(0x0000_7000_0000_0000, PML4 index 224) via the new
+`page_tables::map_user_code_page` (fresh PML4→PDPT→PD→PT chain, USER+PRESENT,
+leaf R+X no-NX, not writable), and `spawn_user("linux-hello", …)` with a
+restrictive `CapabilityScope` (CAP_FILE + CAP_PROCESS only). `syscall.rs`
+routes the task's `int 0x80` through `dispatch_linux_syscall` (Linux ABI
+registers r10/r9/r8/rdi/rsi/rdx + rax number), which translates via
+`linux_abi` and gates through the `LinuxCompatLayer` personality — `write(1,…)`
+→ serial + VGA, `exit` → `kill_current`, anything else → -1.
+
+The ELF is built on this host with the LLVM toolchain shipped inside the
+pinned Rust toolchains (`llc` + `ld.lld`; no GNU binutils installed) from
+`aegis-kernel/linux-hello.ll` via `aegis-kernel/build-linux-hello.bat`; a
+linker script (`link-hello.ld`) forces a single PT_LOAD R+E segment at
+0x400000, entry 0x400000, 91-byte segment (42 code bytes + 49 message
+bytes), total file 4672 bytes. The committed `linux-hello.elf` is that
+artifact. **Honest scoping kept:** this reuses the kernel's existing
+`int 0x80` gate as the trap (the `syscall`/`sysret` MSR path is not built),
+and the argument-register mapping is this kernel's gate convention — the
+syscall *numbers* (SYS_WRITE=1, SYS_EXIT=60) are the real Linux ABI; a true
+Linux `int 0x80` in 64-bit mode uses the 32-bit compat registers, so the
+binary is byte-identical to a real Linux binary only in its *system call
+numbers and the payload*, not in which registers Linux's own kernel would
+read. `map_user_code_page` docs state that a present-but-zeroed upper-level
+entry can remain if a later frame alloc fails (harmless; the chain stays
+uniformly empty).
+
+Live proof (`uefi-boot/serial-phase-j.log`), plain (non-fleet) image:
+- `Phase-J: real Linux ELF binary spawned as ring-3 task 15 (stack@0x1C0000) — syscalls will route via int 0x80 to the Linux capability gate`
+- `spawn-order contract guarded (16 tasks, constants in order)` — the new
+  `IDX_LINUX_HELLO = 15` task is appended LAST so every existing `IDX_*`
+  stays stable (the same drift the contract exists to catch).
+- `switch 14 -> 15`, `switch_frame from=14 to=15 rsp0=0x1C8000` — the real
+  scheduler context-switch into the Linux binary's ring-3 task.
+- `Aegis: real Linux ELF binary executing in ring-3` — the binary's 49-byte
+  message, delivered through `write(1, LINUX_CODE_VADDR+42, 49)` → serial.
+- `[linux-hello] real Linux binary called exit(0) via int 0x80 — syscall
+  denials so far: 0` — `SYS_EXIT` routed, task terminated, gate denied
+  nothing.
+- No fault/panic after the exit (boot continues, scheduler keeps running).
+
+Tests: kernel lib grows to 474 (2 new in `linux_compat_elf.rs` —
+`embedded_elf_parses_as_one_re_segment`, `embedded_elf_is_a_real_binary_not_a_stub`
+— plus `map_user_code_page_builds_executable_user_leaf`, which uses
+heap-backed 0x1000-aligned "frames" because the host test target has no real
+physical memory). 474 kernel + 128 model + 13 uefi-boot tests pass clean,
+clippy/fmt/release-build clean, raw output in commit. Honest limits kept:
+single R+E page, no bss/stack segment, write(1) → serial/VGA only (no real
+filesystem fd), exit/1+ handled, the gate traps `int 0x80` only for this one
+task, UNTESTED on real hardware.

@@ -419,6 +419,86 @@ pub unsafe fn create_user_pml4(stack_phys: u64) -> u64 {
     pml4_frame
 }
 
+/// Map one 4 KB executable page into a per-user address space at `vaddr`
+/// with USER access, backing it with physical frame `phys`. The page is
+/// executable (no NX) and not writable, so it is the kernel-side analog of
+/// an ELF R+E text page.
+///
+/// `vaddr` must sit in an otherwise-empty PML4 slot above the kernel's own
+/// tables (the Phase J Linux code page uses PML4 index 224). The PDPT/PD/PT
+/// chain is built fresh inside the user's own tables so no USER flag leaks
+/// into the shared kernel tables.
+///
+/// Returns false if any frame allocation fails. A present-but-zeroed upper
+/// entry can remain if a later frame alloc fails (the fresh chain is always
+/// zero-filled, so the leftover PDPT/PD/PT is uniformly empty and harmless);
+/// the leaf page is never installed on failure.
+///
+/// # Safety
+///
+/// `pml4_phys` must be the physical address of a per-user PML4 (as returned
+/// by `create_user_pml4`), `vaddr` must be page-aligned, and `phys` must be
+/// a free frame owned by the kernel.
+pub unsafe fn map_user_code_page(pml4_phys: u64, vaddr: u64, phys: u64) -> bool {
+    use crate::frame::alloc_global;
+
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    let pml4 = &mut *(pml4_phys as *mut PageTable);
+
+    // PML4 -> PDPT (fresh unless already present).
+    let pdpt_phys = if pml4.entries[pml4_idx] & PRESENT != 0 {
+        pml4.entries[pml4_idx] & !0xFFF
+    } else {
+        let f = match alloc_global() {
+            Some(f) => f,
+            None => return false,
+        };
+        core::ptr::write_bytes(f as *mut u8, 0, 4096);
+        pml4.entries[pml4_idx] = f | PRESENT | WRITABLE | USER;
+        f
+    };
+
+    let pdpt = &mut *(pdpt_phys as *mut PageTable);
+
+    // PDPT -> PD (fresh unless already present).
+    let pd_phys = if pdpt.entries[pdpt_idx] & PRESENT != 0 {
+        pdpt.entries[pdpt_idx] & !0xFFF
+    } else {
+        let f = match alloc_global() {
+            Some(f) => f,
+            None => return false,
+        };
+        core::ptr::write_bytes(f as *mut u8, 0, 4096);
+        pdpt.entries[pdpt_idx] = f | PRESENT | WRITABLE | USER;
+        f
+    };
+
+    let pd = &mut *(pd_phys as *mut PageTable);
+
+    // PD -> PT (fresh unless already present).
+    let pt_phys = if pd.entries[pd_idx] & PRESENT != 0 {
+        pd.entries[pd_idx] & !0xFFF
+    } else {
+        let f = match alloc_global() {
+            Some(f) => f,
+            None => return false,
+        };
+        core::ptr::write_bytes(f as *mut u8, 0, 4096);
+        pd.entries[pd_idx] = f | PRESENT | WRITABLE | USER;
+        f
+    };
+
+    let pt = &mut *(pt_phys as *mut PageTable);
+
+    // Leaf: present, USER, executable (no NX), NOT writable — an R+E page.
+    pt.entries[pt_idx] = phys | PRESENT | USER;
+    true
+}
+
 /// Switch to a different address space by writing CR3.
 ///
 /// # Safety
@@ -541,5 +621,48 @@ mod tests {
         // Corrupt e_phoff to point past the buffer.
         elf[32..40].copy_from_slice(&0xFFFFusize.to_le_bytes());
         assert!(text_window_from_elf(&elf).is_err());
+    }
+
+    #[test]
+    fn map_user_code_page_builds_executable_user_leaf() {
+        // Host-test environment: there is no real physical memory, so back
+        // the "frames" with heap memory and use their addresses as if they
+        // were physical — exactly the pattern the other page-table tests use.
+        // The buffer is padded and rounded up to 0x1000 so each 4 KiB
+        // "frame" satisfies PageTable's 4096-byte alignment.
+        let mut backing = vec![0u8; 4096 * 8];
+        let base = (backing.as_mut_ptr() as u64 + 0xFFF) & !0xFFF;
+        let pml4 = base;
+        let pdpt = base + 0x1000;
+        let pd = base + 0x2000;
+        let pt = base + 0x3000;
+        // Pre-wire a minimal chain so map_user_code_page only installs the
+        // leaf (it also handles building the chain, but a pre-wired chain
+        // isolates the leaf-bit assertions below).
+        let vaddr = 0x0000_7000_0000_0000u64; // Phase J Linux code VADDR
+        unsafe {
+            let pm = &mut *(pml4 as *mut crate::page_tables::PageTable);
+            pm.entries[((vaddr >> 39) & 0x1FF) as usize] = pdpt | PRESENT | WRITABLE | USER;
+            let pdpt_ref = &mut *(pdpt as *mut crate::page_tables::PageTable);
+            pdpt_ref.entries[((vaddr >> 30) & 0x1FF) as usize] = pd | PRESENT | WRITABLE | USER;
+            let pd_ref = &mut *(pd as *mut crate::page_tables::PageTable);
+            pd_ref.entries[((vaddr >> 21) & 0x1FF) as usize] = pt | PRESENT | WRITABLE | USER;
+
+            let phys = base + 0x9000;
+            assert!(map_user_code_page(pml4, vaddr, phys));
+        }
+        unsafe {
+            let pt_ref = &*(pt as *const crate::page_tables::PageTable);
+            let leaf = pt_ref.entries[((vaddr >> 12) & 0x1FF) as usize];
+            assert_ne!(leaf & PRESENT, 0, "leaf must be present");
+            assert_ne!(leaf & USER, 0, "leaf must be USER-accessible");
+            assert_eq!(leaf & NX, 0, "leaf must be executable (no NX)");
+            assert_eq!(leaf & WRITABLE, 0, "leaf must be read+execute only");
+            assert_eq!(
+                leaf & !0xFFF,
+                base + 0x9000,
+                "leaf must point at the backing frame"
+            );
+        }
     }
 }

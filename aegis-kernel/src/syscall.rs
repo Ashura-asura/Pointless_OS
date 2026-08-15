@@ -169,12 +169,20 @@ pub unsafe extern "sysv64" fn syscall_trap_rust(frame: *mut u64) {
     // then `sub rsp,8`. `rdi` (the frame base) points at the lowest address,
     // so the saved registers sit at: r11=1, r10=2, r9=3, r8=4, rdi=5,
     // rsi=6, rdx=7, rcx=8, rbx=9, rax=10, error-slot=11.
-    let num = unsafe { *frame.add(10) }; // rax
-    let arg1 = unsafe { *frame.add(6) }; // rsi
-    let arg2 = unsafe { *frame.add(8) }; // rcx
-    let arg3 = unsafe { *frame.add(7) }; // rdx
-    let arg4 = unsafe { *frame.add(4) }; // r8
-    let ret = dispatch(num, arg1, arg2, arg3, arg4);
+    // The Phase J Linux task runs a real Linux ELF that traps via int 0x80
+    // with the Linux register convention (rdi/rsi/rdx/r10/r8/r9) and Linux
+    // syscall numbers — a genuinely separate path from native dispatch, so
+    // it is routed before the native `dispatch` is ever reached.
+    let ret = if crate::linux_compat_elf::linux_task_idx() == crate::tasks::current_idx() {
+        crate::linux_compat_elf::dispatch_linux_syscall(frame)
+    } else {
+        let num = unsafe { *frame.add(10) }; // rax
+        let arg1 = unsafe { *frame.add(6) }; // rsi
+        let arg2 = unsafe { *frame.add(8) }; // rcx
+        let arg3 = unsafe { *frame.add(7) }; // rdx
+        let arg4 = unsafe { *frame.add(4) }; // r8
+        dispatch(num, arg1, arg2, arg3, arg4)
+    };
     unsafe { *frame.add(10) = ret as u64 }; // rax
 }
 

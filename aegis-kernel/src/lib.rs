@@ -55,6 +55,7 @@ pub mod window;
 pub mod elf_loader;
 pub mod linux_abi;
 pub mod linux_compat;
+pub mod linux_compat_elf;
 pub mod nt_abi;
 pub mod pe_loader;
 pub mod win_compat;

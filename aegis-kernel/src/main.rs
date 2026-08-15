@@ -32,6 +32,7 @@ const IDX_OBSERVER: u64 = 11;
 const IDX_MEM_RM: u64 = 12;
 const IDX_MEM_CLIENT: u64 = 13;
 const IDX_PARENT_SUP: u64 = 14;
+const IDX_LINUX_HELLO: u64 = 15;
 
 #[no_mangle]
 pub extern "sysv64" fn _start(handoff_addr: u64) -> ! {
@@ -1593,6 +1594,41 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         }
     }
 
+    // Phase J: the real ring-3 execution vehicle. A genuine static Linux
+    // ELF binary (linux-hello.elf, built from linux-hello.ll — see
+    // build-linux-hello.bat) is parsed by the kernel's own ELF loader,
+    // mapped as an executable R+E page in a fresh ring-3 task, and run.
+    // Its `int 0x80` syscalls (real Linux numbers + register convention)
+    // are routed by syscall.rs to the Linux personality's capability gate
+    // (linux_compat_elf.rs). Two 16 KiB regions — task stack + CPL0 stack —
+    // are allocated like every other ring-3 task's. Spawned last so the
+    // IDX_* spawn-order contract below stays intact.
+    {
+        let stk = unsafe {
+            aegis_kernel::frame::alloc_contiguous_global(
+                aegis_kernel::tasks::TASK_STACK_SIZE / 4096,
+            )
+        };
+        let cpl0 = unsafe {
+            aegis_kernel::frame::alloc_contiguous_global(
+                aegis_kernel::tasks::TASK_STACK_SIZE / 4096,
+            )
+        };
+        match (stk, cpl0) {
+            (Some(s), Some(c)) => {
+                let idx = unsafe { aegis_kernel::linux_compat_elf::spawn_linux_hello(s, c) };
+                match idx {
+                    Ok(i) => sprintln!(
+                        "Aegis: Phase-J: real Linux ELF binary spawned as ring-3 task {} (stack@0x{:X}) — syscalls will route via int 0x80 to the Linux capability gate",
+                        i, s
+                    ),
+                    Err(e) => sprintln!("Aegis: Phase-J: spawn failed: {}", e),
+                }
+            }
+            _ => sprintln!("Aegis: Phase-J: could not allocate task stacks"),
+        }
+    }
+
     // Guard the spawn-order contract the IDX_* constants document: the task
     // table is built purely by spawn order, so a future task inserted out of
     // line silently shifts every hardcoded index (the exact regression that
@@ -1600,7 +1636,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // order and the running count here, so a drift fails at boot instead of
     // surfacing as a dead demo miles later.
     {
-        const ORDER: [u64; 15] = [
+        const ORDER: [u64; 16] = [
             IDX_ALPHA,
             IDX_BETA,
             IDX_INPUT,
@@ -1616,6 +1652,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             IDX_MEM_RM,
             IDX_MEM_CLIENT,
             IDX_PARENT_SUP,
+            IDX_LINUX_HELLO,
         ];
         for (i, &idx) in ORDER.iter().enumerate() {
             assert_eq!(
