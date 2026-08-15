@@ -1,0 +1,10 @@
+[package]
+name = "phase-m-fuzz"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aegis-kernel = { path = "../aegis-kernel", features = ["kernel"] }
+
+[profile.release]
+panic = "unwind"

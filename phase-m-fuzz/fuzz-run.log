@@ -1,0 +1,17 @@
+=== REAL in-crate harness, seed 0xC0FFEE12345678 ===
+Phase M fuzz campaign (REAL in-crate functions) — seed=0xc0ffee12345678 iterations_per_target=30000000
+--- results ---
+[decode_entries] ran=30000000 panics=0
+[parse_elf] ran=30000000 panics=0
+[parse_pe] ran=30000000 panics=0
+TOTAL: 90000000 inputs across 3 targets, 0 panics, elapsed=114.0s
+RESULT: zero crashes across the full campaign
+
+=== REAL in-crate harness, seed 0x3ade68b1 ===
+Phase M fuzz campaign (REAL in-crate functions) — seed=0x3ade68b1 iterations_per_target=30000000
+--- results ---
+[decode_entries] ran=30000000 panics=0
+[parse_elf] ran=30000000 panics=0
+[parse_pe] ran=30000000 panics=0
+TOTAL: 90000000 inputs across 3 targets, 0 panics, elapsed=69.2s
+RESULT: zero crashes across the full campaign

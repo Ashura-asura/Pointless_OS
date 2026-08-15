@@ -402,7 +402,11 @@ pub(crate) fn encode_entries(entries: &[FileEntry]) -> Option<([u8; ENTRY_BUF], 
 }
 
 /// Decode at most `MAX_FILES` entries; returns how many were decoded.
-pub(crate) fn decode_entries(bytes: &[u8], out: &mut [FileEntry; MAX_FILES]) -> usize {
+///
+/// `pub` (was `pub(crate)`) so the Phase M host-side fuzz harness can run
+/// against the real in-crate function rather than an extracted copy — the
+/// reason elf_loader/pe_loader are already `pub`. Pure parser, no state.
+pub fn decode_entries(bytes: &[u8], out: &mut [FileEntry; MAX_FILES]) -> usize {
     let mut written = 0usize;
     if bytes.len() < 4 {
         return 0;
