@@ -274,16 +274,18 @@ pub fn poll_mesh(socket: u16) -> MeshEvent {
         let stream = &mut *core::ptr::addr_of_mut!(MESH_STREAM);
         let len = &mut *core::ptr::addr_of_mut!(MESH_STREAM_LEN);
 
-        // Append whatever the socket has buffered onto the stream.
+        // Append whatever the socket has buffered onto the stream. Ask for at
+        // most `room` bytes so the socket keeps any excess; draining into a
+        // full staging buffer and then copying only `room` bytes would
+        // silently drop the surplus and desynchronize the stream.
         if *len < MESH_STREAM_MAX {
             let mut tmp = [0u8; MESH_STREAM_MAX];
-            let got = crate::netif::NetIf::with(|net| net.socket_recv(socket, &mut tmp));
+            let room = MESH_STREAM_MAX - *len;
+            let got = crate::netif::NetIf::with(|net| net.socket_recv(socket, &mut tmp[..room]));
             if let Some(got) = got {
                 if got > 0 {
-                    let room = MESH_STREAM_MAX - *len;
-                    let n = got.min(room);
-                    stream[*len..*len + n].copy_from_slice(&tmp[..n]);
-                    *len += n;
+                    stream[*len..*len + got].copy_from_slice(&tmp[..got]);
+                    *len += got;
                 }
             }
         }
@@ -293,48 +295,108 @@ pub fn poll_mesh(socket: u16) -> MeshEvent {
         if buf.is_empty() {
             return MeshEvent::None;
         }
-        let Some(n) = msg_len(buf) else {
-            // Unknown leading code or truncated header — consume one byte and
+        match msg_len(buf) {
+            // Known message code whose header is not yet fully buffered (the
+            // tail of a split datagram has not arrived) — wait for it rather
+            // than consuming bytes, which would corrupt the stream alignment.
+            MsgLen::Pending => MeshEvent::None,
+            // Unknown leading byte — genuine garbage. Consume one byte and
             // resynchronize rather than dying or spinning.
-            stream.copy_within(1..*len, 0);
-            *len -= 1;
-            return MeshEvent::Malformed;
-        };
-        if *len < n {
-            // Incomplete message — wait for the rest of the datagram.
-            return MeshEvent::None;
+            MsgLen::Unknown => {
+                stream.copy_within(1..*len, 0);
+                *len -= 1;
+                MeshEvent::Malformed
+            }
+            MsgLen::Complete(n) => {
+                if *len < n {
+                    // Header is complete but the body is not yet buffered.
+                    return MeshEvent::None;
+                }
+                let ev = parse_mesh_msg(&stream[..n]);
+                stream.copy_within(n..*len, 0);
+                *len -= n;
+                ev
+            }
         }
-        let ev = parse_mesh_msg(&stream[..n]);
-        stream.copy_within(n..*len, 0);
-        *len -= n;
-        ev
     }
 }
 
-/// Length in bytes of the message whose code is `buf[0]`, or `None` when the
-/// code is unknown / the buffer is too short to contain the header the length
-/// depends on (the delegate's locality byte at envelope offset 64).
+/// Outcome of classifying the leading bytes of the mesh stream.
 #[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
-fn msg_len(buf: &[u8]) -> Option<usize> {
+enum MsgLen {
+    /// A complete message of `n` bytes is buffered (header and body present).
+    Complete(usize),
+    /// Recognized message code, but the header/body is not yet fully buffered
+    /// (the rest of a split datagram has not arrived). Wait, never consume.
+    Pending,
+    /// The leading byte is not a mesh message code — genuine garbage.
+    Unknown,
+}
+
+/// Classify the first message in `buf`. `Unknown` is returned only for bytes
+/// that are not a mesh message code; a recognized code whose header is
+/// truncated yields `Pending`, so a split datagram waits for its tail instead
+/// of consuming bytes and corrupting stream alignment.
+#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+fn msg_len(buf: &[u8]) -> MsgLen {
+    if buf.is_empty() {
+        return MsgLen::Pending;
+    }
     match buf[0] {
-        MSG_HEARTBEAT => Some(1),
-        MSG_PROPOSE if buf.len() >= 41 => Some(41),
-        MSG_PROPOSE_ACK if buf.len() >= 41 => Some(41),
-        MSG_DELEGATE if buf.len() >= 66 => {
+        MSG_HEARTBEAT => MsgLen::Complete(1),
+        MSG_PROPOSE => {
+            if buf.len() < 41 {
+                MsgLen::Pending
+            } else {
+                MsgLen::Complete(41)
+            }
+        }
+        MSG_PROPOSE_ACK => {
+            if buf.len() < 41 {
+                MsgLen::Pending
+            } else {
+                MsgLen::Complete(41)
+            }
+        }
+        MSG_DELEGATE => {
             // envelope starts at buf[1]; locality byte is envelope[64] = buf[65].
             // ENVELOPE_MAX = 32+32+1+32+TOKEN_FIXED_LEN, so a Remote-locality
             // envelope is ENVELOPE_MAX bytes and a Local one is ENVELOPE_MAX-32.
-            let ser = if buf[65] == 0 {
-                ENVELOPE_MAX - 32
+            if buf.len() < 66 {
+                MsgLen::Pending
             } else {
-                ENVELOPE_MAX
-            };
-            Some(1 + ser)
+                let ser = if buf[65] == 0 {
+                    ENVELOPE_MAX - 32
+                } else {
+                    ENVELOPE_MAX
+                };
+                MsgLen::Complete(1 + ser)
+            }
         }
-        MSG_INVOKE if buf.len() >= 1 + ENVELOPE_MAX + 1 + 8 => Some(1 + ENVELOPE_MAX + 1 + 8),
-        MSG_RESULT if buf.len() >= 1 + ENVELOPE_MAX + 8 => Some(1 + ENVELOPE_MAX + 8),
-        MSG_DENIED if buf.len() >= 2 => Some(2),
-        _ => None,
+        MSG_INVOKE => {
+            let n = 1 + ENVELOPE_MAX + 1 + 8;
+            if buf.len() < n {
+                MsgLen::Pending
+            } else {
+                MsgLen::Complete(n)
+            }
+        }
+        MSG_RESULT => {
+            let n = 1 + ENVELOPE_MAX + 8;
+            if buf.len() < n {
+                MsgLen::Pending
+            } else {
+                MsgLen::Complete(n)
+            }
+        }
+        MSG_DENIED => {
+            if buf.len() < 2 {
+                MsgLen::Pending
+            } else {
+                MsgLen::Complete(2)
+            }
+        }
+        _ => MsgLen::Unknown,
     }
 }
 
@@ -504,11 +566,32 @@ const DEMO_MAX_POLLS: u64 = 500_000_000;
 #[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
 const HEARTBEAT_EVERY: u64 = 2_000;
 #[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
-const STALE_AFTER_TICKS: u64 = 10_000;
+const STALE_AFTER_TICKS: u64 = 50_000;
 #[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
 const ELECT_EVERY: u64 = 5_000;
 #[cfg(feature = "fleet-node-b")]
-const INVOKE_EVERY: u64 = 20_000;
+const INVOKE_EVERY: u64 = 2_000;
+#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+const MESH_MAX_DRAIN: usize = 1_024;
+/// Scale the demo liveness clock from raw poll ticks to wall-time-ish ticks.
+/// The poll counter races at millions of ticks/sec (e.g. ~7.3M polls/sec under
+/// VMware), so a stale window expressed in raw poll ticks is only a few ms of
+/// wall time. Any serial-output stall or VM scheduling hiccup on the peer (a
+/// file-backed serial port blocks for ms per line) then makes our clock race
+/// past the window and falsely trips a PARTITION, which floods proposals/acks
+/// and self-sustains the flapping. Dividing the poll counter by CLOCK_SCALE
+/// makes each tick ≈ 0.56ms of wall time, so HEARTBEAT_EVERY=2000 ticks ≈ 1.1s
+/// and STALE_AFTER_TICKS=50000 ticks ≈ 28s — robust to ms-scale jitter while
+/// still detecting a real partition. Demo timing only; no transport, consensus,
+/// or fleet semantics change.
+#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+const CLOCK_SCALE: u64 = 4_096;
+/// Throttle hot-path per-invocation serial logging. With the liveness clock
+/// scaled, the loop runs lean; logging every Nth invocation keeps the peer
+/// heartbeat window intact without touching the transport, consensus, or fleet
+/// logic.
+#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+const LOG_EVERY: u64 = 128;
 
 /// Common one-loop body both nodes run: advance the fleet clock, poll the
 /// NIC, drain the mesh link, run the consensus state machine, and react to
@@ -532,6 +615,11 @@ fn run_mesh(
     let mut counter: u64 = 0;
     let mut i: u64 = 0;
     let mut was_reachable = true;
+    let mut was_converged = false;
+    #[cfg_attr(feature = "fleet-node-b", allow(unused_mut))]
+    let mut results_seen: u64 = 0;
+    #[cfg(feature = "fleet-node-b")]
+    let mut invokes_sent: u64 = 0;
     // True once the delegation has actually been handed to the peer. The
     // issuer grants the authority to execute invocations only after this.
     #[cfg_attr(feature = "fleet-node-b", allow(unused_mut))]
@@ -539,10 +627,16 @@ fn run_mesh(
 
     while i < DEMO_MAX_POLLS {
         unsafe { crate::netif::NetIf::with(|net| net.poll()) };
-        fleet.advance_time(i);
+        // Wall-time-ish liveness clock: scaled so the stale window covers
+        // real wall time, not a few ms of racing poll ticks.
+        let tick = i / CLOCK_SCALE;
+        fleet.advance_time(tick);
 
         let reachable = fleet.peer_reachable(peer_id);
         if reachable != was_reachable {
+            // Any reachability transition invalidates convergence; forget the
+            // previously-converged flag so the next ACK re-prints once.
+            was_converged = false;
             if reachable {
                 consensus.mark_reunited();
                 crate::sprintln!(
@@ -560,10 +654,10 @@ fn run_mesh(
             was_reachable = reachable;
         }
 
-        if i % HEARTBEAT_EVERY == 0 {
+        if tick % HEARTBEAT_EVERY == 0 {
             send_heartbeat(sock);
         }
-        if i % ELECT_EVERY == 0 && (!consensus.converged() || !reachable) {
+        if tick % ELECT_EVERY == 0 && (!consensus.converged() || !reachable) {
             send_propose(sock, my_id, consensus.propose_epoch());
         }
 
@@ -585,13 +679,28 @@ fn run_mesh(
             }
         }
 
-        match poll_mesh(sock) {
+        // Drain every pending mesh event this iteration, not just one. The
+        // NIC can deliver a burst of datagrams per `poll` (max_drain up to the
+        // ring size under VMware bursts), and the socket buffer is bounded;
+        // parsing a single message per loop tick would let the buffer fill and
+        // drop whole datagrams, starving heartbeats and falsely tripping the
+        // stale/partition logic. A bounded drain keeps up without starving the
+        // consensus liveness clock.
+        for _ in 0..MESH_MAX_DRAIN {
+            let Some(ev) = (match poll_mesh(sock) {
+                MeshEvent::None => None,
+                other => Some(other),
+            }) else {
+                break;
+            };
+            match ev {
             MeshEvent::Heartbeat => {
                 let _ = fleet.heartbeat(peer_id);
             }
             MeshEvent::Propose { node, epoch } => {
                 let (ne, nl, changed) = consensus.on_proposal(my_id, node, epoch);
                 if changed {
+                    was_converged = false;
                     crate::sprintln!(
                         "Aegis: mesh: proposal {} epoch={} -> adopt epoch={} leader={:?}",
                         node_id_tag(node),
@@ -603,13 +712,15 @@ fn run_mesh(
                 let _ = send_propose_ack(sock, ne, nl);
             }
             MeshEvent::ProposeAck { epoch, leader } => {
-                if consensus.on_ack(epoch, leader) {
+                let now_converged = consensus.on_ack(epoch, leader);
+                if now_converged && !was_converged {
                     crate::sprintln!(
                         "Aegis: mesh: CONSENSUS REACHED — epoch={} leader={:?}",
                         epoch,
                         leader
                     );
                 }
+                was_converged = now_converged;
             }            MeshEvent::Delegate(cap) => {
                 match fleet.verify(&cap) {
                     Ok(()) => {
@@ -658,12 +769,14 @@ fn run_mesh(
                     let _ = send_denied(sock, DENIED_BADOP);
                 } else {
                     counter = counter.wrapping_add(operand);
-                    crate::sprintln!(
-                        "Aegis: mesh: invoke EXECUTED — object {} op INCR += {} -> counter={}",
-                        OBJ_COUNTER,
-                        operand,
-                        counter
-                    );
+                    if counter % LOG_EVERY == 0 {
+                        crate::sprintln!(
+                            "Aegis: mesh: invoke EXECUTED — object {} op INCR += {} -> counter={}",
+                            OBJ_COUNTER,
+                            operand,
+                            counter
+                        );
+                    }
                     let chain = fleet.issue(
                         OBJ_COUNTER,
                         TokenObjectKind::Endpoint,
@@ -682,12 +795,17 @@ fn run_mesh(
                 }
             }
             MeshEvent::Result { token, value } => {
+                results_seen += 1;
                 match fleet.verify(&token) {
-                    Ok(()) => crate::sprintln!(
-                        "Aegis: mesh: result verified — object {} value={} (remote invocation round-trip OK)",
-                        token.chain.token.object_id,
-                        value
-                    ),
+                    Ok(()) => {
+                        if results_seen % LOG_EVERY == 0 {
+                            crate::sprintln!(
+                                "Aegis: mesh: result verified — object {} value={} (remote invocation round-trip OK)",
+                                token.chain.token.object_id,
+                                value
+                            );
+                        }
+                    }
                     Err(e) => crate::sprintln!(
                         "Aegis: mesh: result DENIED (fail-closed): {:?}",
                         e
@@ -705,11 +823,12 @@ fn run_mesh(
             }
             MeshEvent::None => {}
         }
+        }
 
         // Node B: once we hold a verified delegation and the issuer is
         // reachable, periodically invoke the remote counter.
         #[cfg(feature = "fleet-node-b")]
-        if i % INVOKE_EVERY == 0 && received_delegation.is_some() {
+        if tick % INVOKE_EVERY == 0 && received_delegation.is_some() {
             if fleet.peer_reachable(peer_id) {
                 let chain = fleet.issue(
                     OBJ_COUNTER,
@@ -720,11 +839,14 @@ fn run_mesh(
                 match fleet.send_to(chain, peer_id) {
                     Ok(token) => {
                         let sent = send_invoke(sock, &token, OP_INCR, 1);
-                        crate::sprintln!(
-                            "Aegis: mesh: invoke sent (object {}, INCR 1, sent={})",
-                            OBJ_COUNTER,
-                            sent
-                        );
+                        invokes_sent += 1;
+                        if invokes_sent % LOG_EVERY == 0 {
+                            crate::sprintln!(
+                                "Aegis: mesh: invoke sent (object {}, INCR 1, sent={})",
+                                OBJ_COUNTER,
+                                sent
+                            );
+                        }
                     }
                     Err(e) => {
                         crate::sprintln!("Aegis: mesh: could not mint invocation token: {:?}", e)

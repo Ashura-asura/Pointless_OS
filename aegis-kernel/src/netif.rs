@@ -416,9 +416,16 @@ impl NetIf {
         });
         if let Some(i) = slot {
             let sock = self.sockets[i].as_mut().unwrap();
-            let n = d.payload.len().min(RECV_BUFLEN - sock.rcv_len);
-            sock.rcv_buf[sock.rcv_len..sock.rcv_len + n].copy_from_slice(&d.payload[..n]);
-            sock.rcv_len += n;
+            // Deliver the datagram atomically: if it does not fit in the
+            // remaining receive buffer, drop it whole rather than appending a
+            // truncated prefix. A partial copy would splice garbage into the
+            // stream the consumer is framing (e.g. the mesh link), permanently
+            // desynchronizing message boundaries.
+            if d.payload.len() <= RECV_BUFLEN - sock.rcv_len {
+                let n = d.payload.len();
+                sock.rcv_buf[sock.rcv_len..sock.rcv_len + n].copy_from_slice(&d.payload[..n]);
+                sock.rcv_len += n;
+            }
         }
     }
 
