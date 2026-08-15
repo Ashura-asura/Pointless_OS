@@ -14,6 +14,10 @@ trace = []
 # fleet demo. Mutually exclusive — pick exactly one per build, never both.
 fleet-node-a = []
 fleet-node-b = []
+# Phase J-3: run the mesh demo (two-node consensus + remote invocation of a
+# transferred capability) instead of the Phase I transport demo. Combined
+# with exactly one of fleet-node-a / fleet-node-b.
+fleet-j3 = []
 
 [dependencies]
 

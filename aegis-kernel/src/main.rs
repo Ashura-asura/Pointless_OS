@@ -608,8 +608,19 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
 
     // Phase I: two-node fleet demo. Runs only when the image is built as
     // fleet node A or node B (mutually exclusive features); stripped out
-    // entirely on a normal build.
-    #[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+    // entirely on a normal build. When `fleet-j3` is also present, the
+    // Phase J-3 mesh demo (two-node consensus + remote invocation of a
+    // transferred capability) runs instead, still over the same two-node
+    // feature-gated images.
+    #[cfg(all(
+        any(feature = "fleet-node-a", feature = "fleet-node-b"),
+        feature = "fleet-j3"
+    ))]
+    aegis_kernel::mesh::run_boot_demo();
+    #[cfg(all(
+        any(feature = "fleet-node-a", feature = "fleet-node-b"),
+        not(feature = "fleet-j3")
+    ))]
     aegis_kernel::fleet::run_boot_demo();
 
     // Live NVMe demo: probe BAR0, reset, admin + IO queues, identify, read

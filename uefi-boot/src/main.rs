@@ -143,6 +143,23 @@ fn main() -> Status {
                 }
             }
             image_end = (image_end + 4095) & !4095;
+
+            // The image is linked at vaddr 0x0 and loaded into low memory.
+            // If it now ends at/above 0xA0000 (top of low conventional RAM),
+            // the first page above it is the VGA/ROM hole, which is not RAM —
+            // a handoff written there could not be read back by the kernel.
+            // Lift the handoff to the first conventional descriptor at/above
+            // `image_end` (0x100000 in the standard OVMF layout).
+            if image_end >= 0xA0000 {
+                image_end = final_map
+                    .entries()
+                    .filter(|d| {
+                        d.ty == uefi::boot::MemoryType::CONVENTIONAL && d.phys_start >= image_end
+                    })
+                    .map(|d| d.phys_start)
+                    .min()
+                    .unwrap_or(image_end);
+            }
             let handoff_addr = image_end;
 
             #[repr(C, packed)]
