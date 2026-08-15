@@ -1,0 +1,20 @@
+# Aegis fleet node configuration.
+# Read by the UEFI loader from the ESP root at boot; passed to the kernel
+# through the boot-info handoff (offset 5144). One kernel image serves any
+# node — only this file decides the role. Keys are `name = value`; lines
+# starting with # and blank lines are ignored; unknown keys are ignored for
+# forward compatibility.
+#
+# role      : issuer  = mints the object, delegates it, executes invocations
+#             invoker = holds the delegation, invokes the remote counter
+# my_ip     : this node's IP on the private mesh LAN
+# peer_ip   : the other node's IP
+# node_id   : (optional) first byte of this node's 32-byte NodeId, 2 hex
+#             chars. Defaults: issuer A1, invoker B2.
+# peer_node_id : (optional) peer's NodeId first byte, 2 hex chars.
+# stale_after  : (optional) stale window in scaled ticks (default 50000).
+# shared_key   : (optional) 64 hex chars (32 bytes); default = demo key.
+
+role = invoker
+my_ip = 10.0.3.2
+peer_ip = 10.0.3.1

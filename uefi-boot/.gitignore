@@ -24,3 +24,4 @@ vgamem.bin
 *.bak3
 BOOT_RESULT.txt
 PROGRESS*.txt
+FLEET.CFG

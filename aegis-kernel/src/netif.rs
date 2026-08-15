@@ -46,6 +46,28 @@ pub const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x02];
 pub const ADVISOR_HOST_IP: [u8; 4] = GW_IP;
 pub const ADVISOR_HOST_PORT: u16 = 443;
 
+/// Runtime override for `OUR_IP`, set from the boot-volume FLEET.CFG before
+/// `NetIf::init`. Zero (0.0.0.0) means "unset" — no real interface uses it.
+static OUR_IP_OVERRIDE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Point the interface at a runtime-configured IP (0.0.0.0 disables the
+/// override and restores the compile-time default).
+pub fn set_our_ip(ip: [u8; 4]) {
+    OUR_IP_OVERRIDE.store(
+        u32::from_le_bytes(ip),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn effective_our_ip() -> [u8; 4] {
+    let v = OUR_IP_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed);
+    if v == 0 {
+        OUR_IP
+    } else {
+        v.to_le_bytes()
+    }
+}
+
 pub const MAX_SOCKETS: usize = 4;
 pub const SEND_BUFLEN: usize = 4096;
 pub const RECV_BUFLEN: usize = 8192;
@@ -165,6 +187,7 @@ impl NetIf {
     pub fn init(pci: &crate::pci::PciDeviceList) -> bool {
         unsafe {
             NETIF = NetIf::new();
+            NETIF.our_ip = effective_our_ip();
             let mut nic = match crate::e1000::E1000::probe(pci) {
                 Some(n) => n,
                 None => return false,

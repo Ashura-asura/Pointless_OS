@@ -47,19 +47,20 @@
 //!   capability envelopes (no heap — the whole kernel is no_std/no-alloc).
 //! - The same `Fleet` identity/registration/verification machinery as
 //!   Phase I; the demo key is the fixed demo constant used there.
-//! - A live two-node demo (feature `fleet-j3`, mutually combined with
-//!   `fleet-node-a`/`fleet-node-b`) that performs one real mint + delegate,
-//!   one real remote invocation round-trip, one real deterministic election,
-//!   and — when node A's process is killed and relaunched — real
+//! - A live two-node demo (feature `fleet-j3`) that performs one real mint +
+//!   delegate, one real remote invocation round-trip, one real deterministic
+//!   election, and — when node A's process is killed and relaunched — real
 //!   fail-closed staleness and a real deterministic re-election that
-//!   resolves the split-brain. See the `run_boot_demo` gate and
-//!   `PHASE_J3_INTEGRATION.md` note in the module doc of `main.rs`.
+//!   resolves the split-brain. The two-node role comes from the runtime
+//!   FLEET.CFG (or the compile-time node feature as fallback). See the
+//!   `run_boot_demo` gate and `PHASE_J3_INTEGRATION.md` note in the module
+//!   doc of `main.rs`.
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 use crate::cap::Rights;
-#[cfg(not(any(feature = "fleet-node-a", feature = "fleet-node-b")))]
+#[cfg(not(feature = "fleet-j3"))]
 use crate::fleet::NodeId;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 use crate::fleet::{
     deserialize, serialize, Fleet, NodeId, RemoteCapability, TokenObjectKind, ENVELOPE_MAX,
 };
@@ -69,24 +70,24 @@ use crate::fleet::{
 /// socket collisions (UDP dispatch matches on `local_port == dst_port`).
 pub const MESH_PORT: u16 = 7778;
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const MSG_HEARTBEAT: u8 = 0x01;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const MSG_PROPOSE: u8 = 0x02;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const MSG_PROPOSE_ACK: u8 = 0x03;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const MSG_DELEGATE: u8 = 0x04;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const MSG_INVOKE: u8 = 0x05;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const MSG_RESULT: u8 = 0x06;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const MSG_DENIED: u8 = 0x07;
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const OP_INCR: u8 = 0x01;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const OBJ_COUNTER: u64 = 42;
 
 // ---- Deterministic election (pure, unit-tested) ----------------------------
@@ -118,7 +119,7 @@ pub fn elect(my_id: NodeId, my_epoch: u64, peer_id: NodeId, peer_epoch: u64) -> 
 
 /// Open a UDP socket to `peer_ip:MESH_PORT`, bound to `MESH_PORT` locally
 /// (so the peer's replies, addressed to `MESH_PORT`, match this socket).
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 pub fn open_mesh_link(peer_ip: [u8; 4]) -> Option<u16> {
     unsafe {
         crate::netif::NetIf::with(|net| {
@@ -133,7 +134,7 @@ pub fn open_mesh_link(peer_ip: [u8; 4]) -> Option<u16> {
     }
 }
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 pub fn close_mesh_link(socket: u16) {
     unsafe {
         crate::netif::NetIf::with(|net| {
@@ -142,24 +143,24 @@ pub fn close_mesh_link(socket: u16) {
     }
 }
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 fn send_msg(socket: u16, buf: &[u8]) -> bool {
     unsafe { crate::netif::NetIf::with(|net| net.socket_send(socket, buf) > 0) }
 }
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 pub fn send_heartbeat(socket: u16) -> bool {
     send_msg(socket, &[MSG_HEARTBEAT])
 }
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 fn serialize_env(cap: &RemoteCapability) -> ([u8; ENVELOPE_MAX], usize) {
     let mut env = [0u8; ENVELOPE_MAX];
     let n = serialize(cap, &mut env);
     (env, n)
 }
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 fn send_propose(socket: u16, my_id: NodeId, my_epoch: u64) -> bool {
     let mut buf = [0u8; 1 + 32 + 8];
     buf[0] = MSG_PROPOSE;
@@ -168,7 +169,7 @@ fn send_propose(socket: u16, my_id: NodeId, my_epoch: u64) -> bool {
     send_msg(socket, &buf)
 }
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 fn send_propose_ack(socket: u16, epoch: u64, leader: NodeId) -> bool {
     let mut buf = [0u8; 1 + 8 + 32];
     buf[0] = MSG_PROPOSE_ACK;
@@ -177,7 +178,7 @@ fn send_propose_ack(socket: u16, epoch: u64, leader: NodeId) -> bool {
     send_msg(socket, &buf)
 }
 
-#[cfg(feature = "fleet-node-a")]
+#[cfg(feature = "fleet-j3")]
 fn send_delegate(socket: u16, cap: &RemoteCapability) -> bool {
     let (env, n) = serialize_env(cap);
     let mut buf = [0u8; 1 + ENVELOPE_MAX];
@@ -186,7 +187,7 @@ fn send_delegate(socket: u16, cap: &RemoteCapability) -> bool {
     send_msg(socket, &buf[..1 + n])
 }
 
-#[cfg(feature = "fleet-node-b")]
+#[cfg(feature = "fleet-j3")]
 fn send_invoke(socket: u16, token: &RemoteCapability, op: u8, operand: u64) -> bool {
     let (env, n) = serialize_env(token);
     let mut buf = [0u8; 1 + ENVELOPE_MAX + 1 + 8];
@@ -197,7 +198,7 @@ fn send_invoke(socket: u16, token: &RemoteCapability, op: u8, operand: u64) -> b
     send_msg(socket, &buf[..1 + ENVELOPE_MAX + 9])
 }
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 fn send_result(socket: u16, token: &RemoteCapability, value: u64) -> bool {
     let (env, n) = serialize_env(token);
     let mut buf = [0u8; 1 + ENVELOPE_MAX + 8];
@@ -207,21 +208,21 @@ fn send_result(socket: u16, token: &RemoteCapability, value: u64) -> bool {
     send_msg(socket, &buf[..1 + ENVELOPE_MAX + 8])
 }
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 fn send_denied(socket: u16, reason: u8) -> bool {
     send_msg(socket, &[MSG_DENIED, reason])
 }
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const DENIED_NOTAUTH: u8 = 0x01;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const DENIED_NOTDELEGATED: u8 = 0x02;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const DENIED_BADOP: u8 = 0x03;
 
 /// One event drained from the mesh link. Fixed-width buffers only (no heap).
 #[allow(clippy::large_enum_variant)]
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 pub enum MeshEvent {
     None,
     Heartbeat,
@@ -259,16 +260,16 @@ pub enum MeshEvent {
 /// message boundaries. We instead keep a persistent stream buffer and consume
 /// exactly one message's bytes per call, using the message code (and, for
 /// the variable-length delegate, its locality byte) to know the exact length.
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const MESH_STREAM_MAX: usize = 2048;
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 static mut MESH_STREAM: [u8; MESH_STREAM_MAX] = [0; MESH_STREAM_MAX];
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 static mut MESH_STREAM_LEN: usize = 0;
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 pub fn poll_mesh(socket: u16) -> MeshEvent {
     unsafe {
         let stream = &mut *core::ptr::addr_of_mut!(MESH_STREAM);
@@ -322,7 +323,7 @@ pub fn poll_mesh(socket: u16) -> MeshEvent {
 }
 
 /// Outcome of classifying the leading bytes of the mesh stream.
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 enum MsgLen {
     /// A complete message of `n` bytes is buffered (header and body present).
     Complete(usize),
@@ -337,7 +338,7 @@ enum MsgLen {
 /// that are not a mesh message code; a recognized code whose header is
 /// truncated yields `Pending`, so a split datagram waits for its tail instead
 /// of consuming bytes and corrupting stream alignment.
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 fn msg_len(buf: &[u8]) -> MsgLen {
     if buf.is_empty() {
         return MsgLen::Pending;
@@ -401,7 +402,7 @@ fn msg_len(buf: &[u8]) -> MsgLen {
 }
 
 /// Classify one complete message (no coalescing involved).
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 fn parse_mesh_msg(buf: &[u8]) -> MeshEvent {
     let n = buf.len();
     match buf[0] {
@@ -541,37 +542,58 @@ impl Consensus {
 
 // ---- Boot demo --------------------------------------------------------------
 //
-// Gated by `fleet-j3` combined with `fleet-node-a` / `fleet-node-b`
-// (mutually exclusive roles). `main.rs` calls `mesh::run_boot_demo()` instead
-// of `fleet::run_boot_demo()` when `fleet-j3` is present. Demo-only key note:
-// the shared HMAC key is the same fixed constant Phase I's demo uses — real
-// key provisioning is a separate, unscoped bootstrapping problem.
+// Gated by `fleet-j3`. The two-node role (issuer vs invoker) is chosen at
+// *runtime*: if the bootloader handed us a FLEET.CFG-derived `FleetConfig`
+// block, it wins (role, NodeIds, IPs, stale window, shared key). Otherwise we
+// fall back to the compile-time `fleet-node-a`/`fleet-node-b` feature
+// defaults (the QEMU two-image flow), so both paths work unchanged. `main.rs`
+// calls `mesh::run_boot_demo()` instead of `fleet::run_boot_demo()` when
+// `fleet-j3` is present. Demo-only key note: the shared HMAC key is the same
+// fixed constant Phase I's demo uses — real key provisioning is a separate,
+// unscoped bootstrapping problem.
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const DEMO_SHARED_KEY: [u8; 32] = *b"aegis-phase-i-demo-shared-key!!Z";
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const NODE_A_ID: NodeId = NodeId([0xA1; 32]);
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const NODE_B_ID: NodeId = NodeId([0xB2; 32]);
 
+/// Runtime mesh role. Decided from the boot-volume FLEET.CFG when present,
+/// else from the compile-time `fleet-node-a`/`fleet-node-b` feature.
+#[cfg(feature = "fleet-j3")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MeshRole {
+    /// Mints the object, delegates it to the peer, and executes invocations.
+    Issuer,
+    /// Holds the delegated capability and invokes the remote counter.
+    Invoker,
+}
+
 /// Node A's static IP for the private mesh link (same private LAN as the
-/// Phase I demo — see `netif.rs`'s `OUR_IP` feature-gate patch).
+/// Phase I demo — see `netif.rs`'s `OUR_IP` feature-gate patch). Used only as
+/// a compile-time fallback when no FLEET.CFG is present.
 #[cfg(feature = "fleet-node-a")]
 const PEER_IP: [u8; 4] = [10, 0, 3, 2]; // node B
 #[cfg(feature = "fleet-node-b")]
 const PEER_IP: [u8; 4] = [10, 0, 3, 1]; // node A
+#[cfg(all(
+    feature = "fleet-j3",
+    not(any(feature = "fleet-node-a", feature = "fleet-node-b"))
+))]
+const PEER_IP: [u8; 4] = [10, 0, 3, 2]; // node B (feature-less fallback)
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const DEMO_MAX_POLLS: u64 = 500_000_000;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const HEARTBEAT_EVERY: u64 = 2_000;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const STALE_AFTER_TICKS: u64 = 50_000;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const ELECT_EVERY: u64 = 5_000;
-#[cfg(feature = "fleet-node-b")]
+#[cfg(feature = "fleet-j3")]
 const INVOKE_EVERY: u64 = 2_000;
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const MESH_MAX_DRAIN: usize = 1_024;
 /// Scale the demo liveness clock from raw poll ticks to wall-time-ish ticks.
 /// The poll counter races at millions of ticks/sec (e.g. ~7.3M polls/sec under
@@ -584,46 +606,55 @@ const MESH_MAX_DRAIN: usize = 1_024;
 /// and STALE_AFTER_TICKS=50000 ticks ≈ 28s — robust to ms-scale jitter while
 /// still detecting a real partition. Demo timing only; no transport, consensus,
 /// or fleet semantics change.
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const CLOCK_SCALE: u64 = 4_096;
 /// Throttle hot-path per-invocation serial logging. With the liveness clock
 /// scaled, the loop runs lean; logging every Nth invocation keeps the peer
 /// heartbeat window intact without touching the transport, consensus, or fleet
 /// logic.
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 const LOG_EVERY: u64 = 128;
+/// How often (scaled ticks) the issuer re-sends the delegation while it has no
+/// proof the invoker received it. Under VMware the peer's e1000 RX can sit
+/// idle (no descriptors written back) for hundreds of millions of polls while
+/// the peer's boot/demo loop is elsewhere, so a single-shot delegation is
+/// silently lost; a periodic re-send of the identical datagram until the peer
+/// demonstrates receipt is demo-loop resilience only — the transport, HMAC,
+/// and serialization are untouched.
+#[cfg(feature = "fleet-j3")]
+const DELEGATE_RETRY_EVERY: u64 = 2_000;
 
 /// Common one-loop body both nodes run: advance the fleet clock, poll the
 /// NIC, drain the mesh link, run the consensus state machine, and react to
-/// delegation/invocation events. Returns the received delegation capability
-/// the invoker needs (node B only).
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+/// delegation/invocation events. The role is runtime: the issuer mints +
+/// delegates + executes, the invoker holds + invokes.
+#[cfg(feature = "fleet-j3")]
 fn run_mesh(
     my_id: NodeId,
     peer_id: NodeId,
+    role: MeshRole,
     sock: u16,
     fleet: &mut Fleet,
     consensus: &mut Consensus,
-    #[cfg_attr(feature = "fleet-node-b", allow(unused_variables))] pending_delegate: Option<
-        RemoteCapability,
-    >,
+    pending_delegate: Option<RemoteCapability>,
 ) {
-    // B records the verified delegation it received (node A, the issuer,
-    // never receives one in this demo).
-    #[cfg(feature = "fleet-node-b")]
+    // The invoker records the verified delegation it received (the issuer,
+    // who never receives one in this demo, leaves it None).
     let mut received_delegation: Option<RemoteCapability> = None;
     let mut counter: u64 = 0;
     let mut i: u64 = 0;
     let mut was_reachable = true;
     let mut was_converged = false;
-    #[cfg_attr(feature = "fleet-node-b", allow(unused_mut))]
     let mut results_seen: u64 = 0;
-    #[cfg(feature = "fleet-node-b")]
     let mut invokes_sent: u64 = 0;
     // True once the delegation has actually been handed to the peer. The
     // issuer grants the authority to execute invocations only after this.
-    #[cfg_attr(feature = "fleet-node-b", allow(unused_mut))]
     let mut delegated_to_peer = false;
+    // True once the invoker has demonstrated it holds the delegation (a first
+    // invoke from the peer was executed). Until then the issuer re-sends the
+    // delegation periodically, since a single-shot send can be lost while the
+    // peer's NIC RX is not yet draining.
+    let mut delegation_confirmed = false;
 
     while i < DEMO_MAX_POLLS {
         unsafe { crate::netif::NetIf::with(|net| net.poll()) };
@@ -661,20 +692,28 @@ fn run_mesh(
             send_propose(sock, my_id, consensus.propose_epoch());
         }
 
-        // Node A hands the delegated capability to B exactly once, and only
-        // after both sides have converged on a leader and the peer is
-        // reachable (so B's verify has a live HMAC peer, not PeerStale).
-        #[cfg(feature = "fleet-node-a")]
-        if !delegated_to_peer && consensus.converged() && reachable {
+        // The issuer hands the delegated capability to the invoker only after
+        // both sides have converged on a leader and the peer is reachable (so
+        // the peer's verify has a live HMAC peer, not PeerStale). The first
+        // send grants the authority to execute invocations; while there is no
+        // proof the peer holds the delegation (a single-shot frame can be lost
+        // while the peer's NIC RX is idle), the issuer re-sends the identical
+        // datagram on a periodic cadence. Demo-loop resilience only.
+        if role == MeshRole::Issuer && !delegation_confirmed && consensus.converged() && reachable {
             if let Some(cap) = &pending_delegate {
-                let sent = send_delegate(sock, cap);
-                crate::sprintln!(
-                    "Aegis: mesh: delegated object {} (Endpoint, RS) to node B: sent={}",
-                    OBJ_COUNTER,
-                    sent
-                );
-                if sent {
-                    delegated_to_peer = true;
+                let first = !delegated_to_peer;
+                if first || tick % DELEGATE_RETRY_EVERY == 0 {
+                    let sent = send_delegate(sock, cap);
+                    if first {
+                        crate::sprintln!(
+                            "Aegis: mesh: delegated object {} (Endpoint, RS) to node B: sent={}",
+                            OBJ_COUNTER,
+                            sent
+                        );
+                    }
+                    if sent && !delegated_to_peer {
+                        delegated_to_peer = true;
+                    }
                 }
             }
         }
@@ -694,35 +733,35 @@ fn run_mesh(
                 break;
             };
             match ev {
-            MeshEvent::Heartbeat => {
-                let _ = fleet.heartbeat(peer_id);
-            }
-            MeshEvent::Propose { node, epoch } => {
-                let (ne, nl, changed) = consensus.on_proposal(my_id, node, epoch);
-                if changed {
-                    was_converged = false;
-                    crate::sprintln!(
-                        "Aegis: mesh: proposal {} epoch={} -> adopt epoch={} leader={:?}",
-                        node_id_tag(node),
-                        epoch,
-                        ne,
-                        nl
-                    );
+                MeshEvent::Heartbeat => {
+                    let _ = fleet.heartbeat(peer_id);
                 }
-                let _ = send_propose_ack(sock, ne, nl);
-            }
-            MeshEvent::ProposeAck { epoch, leader } => {
-                let now_converged = consensus.on_ack(epoch, leader);
-                if now_converged && !was_converged {
-                    crate::sprintln!(
-                        "Aegis: mesh: CONSENSUS REACHED — epoch={} leader={:?}",
-                        epoch,
-                        leader
-                    );
+                MeshEvent::Propose { node, epoch } => {
+                    let (ne, nl, changed) = consensus.on_proposal(my_id, node, epoch);
+                    if changed {
+                        was_converged = false;
+                        crate::sprintln!(
+                            "Aegis: mesh: proposal {} epoch={} -> adopt epoch={} leader={:?}",
+                            node_id_tag(node),
+                            epoch,
+                            ne,
+                            nl
+                        );
+                    }
+                    let _ = send_propose_ack(sock, ne, nl);
                 }
-                was_converged = now_converged;
-            }            MeshEvent::Delegate(cap) => {
-                match fleet.verify(&cap) {
+                MeshEvent::ProposeAck { epoch, leader } => {
+                    let now_converged = consensus.on_ack(epoch, leader);
+                    if now_converged && !was_converged {
+                        crate::sprintln!(
+                            "Aegis: mesh: CONSENSUS REACHED — epoch={} leader={:?}",
+                            epoch,
+                            leader
+                        );
+                    }
+                    was_converged = now_converged;
+                }
+                MeshEvent::Delegate(cap) => match fleet.verify(&cap) {
                     Ok(()) => {
                         crate::sprintln!(
                             "Aegis: mesh: delegation verified — object {} kind {:?} rights {:#04b} from node A, recipient-bound to us",
@@ -730,105 +769,100 @@ fn run_mesh(
                             cap.chain.token.kind,
                             cap.chain.token.rights
                         );
-                        #[cfg(feature = "fleet-node-b")]
-                        {
+                        if role == MeshRole::Invoker {
                             received_delegation = Some(cap);
                         }
                     }
-                    Err(e) => crate::sprintln!(
-                        "Aegis: mesh: delegation DENIED (fail-closed): {:?}",
-                        e
-                    ),
-                }
-            }
-            MeshEvent::Invoke { token, op, operand } => {
-                let ok = fleet.verify(&token).is_ok();
-                let object_ok = token.chain.token.object_id == OBJ_COUNTER;
-                let auth_ok = delegated_to_peer;
-                if !ok {
-                    crate::sprintln!(
-                        "Aegis: mesh: invoke DENIED (fail-closed): {:?}",
-                        fleet.verify(&token).err().unwrap()
-                    );
-                    let _ = send_denied(sock, DENIED_NOTAUTH);
-                } else if !auth_ok {
-                    crate::sprintln!(
+                    Err(e) => {
+                        crate::sprintln!("Aegis: mesh: delegation DENIED (fail-closed): {:?}", e)
+                    }
+                },
+                MeshEvent::Invoke { token, op, operand } => {
+                    let ok = fleet.verify(&token).is_ok();
+                    let object_ok = token.chain.token.object_id == OBJ_COUNTER;
+                    let auth_ok = delegated_to_peer;
+                    if !ok {
+                        crate::sprintln!(
+                            "Aegis: mesh: invoke DENIED (fail-closed): {:?}",
+                            fleet.verify(&token).err().unwrap()
+                        );
+                        let _ = send_denied(sock, DENIED_NOTAUTH);
+                    } else if !auth_ok {
+                        crate::sprintln!(
                         "Aegis: mesh: invoke DENIED — object {} was never delegated to this node",
                         token.chain.token.object_id
                     );
-                    let _ = send_denied(sock, DENIED_NOTDELEGATED);
-                } else if !object_ok {
-                    crate::sprintln!(
-                        "Aegis: mesh: invoke DENIED — token names object {} not {}",
-                        token.chain.token.object_id,
-                        OBJ_COUNTER
-                    );
-                    let _ = send_denied(sock, DENIED_NOTDELEGATED);
-                } else if op != OP_INCR {
-                    crate::sprintln!("Aegis: mesh: invoke DENIED — op {} not permitted", op);
-                    let _ = send_denied(sock, DENIED_BADOP);
-                } else {
-                    counter = counter.wrapping_add(operand);
-                    if counter % LOG_EVERY == 0 {
+                        let _ = send_denied(sock, DENIED_NOTDELEGATED);
+                    } else if !object_ok {
                         crate::sprintln!(
+                            "Aegis: mesh: invoke DENIED — token names object {} not {}",
+                            token.chain.token.object_id,
+                            OBJ_COUNTER
+                        );
+                        let _ = send_denied(sock, DENIED_NOTDELEGATED);
+                    } else if op != OP_INCR {
+                        crate::sprintln!("Aegis: mesh: invoke DENIED — op {} not permitted", op);
+                        let _ = send_denied(sock, DENIED_BADOP);
+                    } else {
+                        counter = counter.wrapping_add(operand);
+                        // A peer that invokes can only do so after verifying the
+                        // delegation it holds, so executing this invoke proves the
+                        // delegation landed; the issuer then stops re-sending it.
+                        delegation_confirmed = true;
+                        if counter % LOG_EVERY == 0 {
+                            crate::sprintln!(
                             "Aegis: mesh: invoke EXECUTED — object {} op INCR += {} -> counter={}",
                             OBJ_COUNTER,
                             operand,
                             counter
                         );
-                    }
-                    let chain = fleet.issue(
-                        OBJ_COUNTER,
-                        TokenObjectKind::Endpoint,
-                        Rights::READ,
-                        None,
-                    );
-                    match fleet.send_to(chain, peer_id) {
-                        Ok(result) => {
-                            let _ = send_result(sock, &result, counter);
                         }
-                        Err(e) => crate::sprintln!(
-                            "Aegis: mesh: could not mint result token: {:?}",
-                            e
-                        ),
+                        let chain =
+                            fleet.issue(OBJ_COUNTER, TokenObjectKind::Endpoint, Rights::READ, None);
+                        match fleet.send_to(chain, peer_id) {
+                            Ok(result) => {
+                                let _ = send_result(sock, &result, counter);
+                            }
+                            Err(e) => crate::sprintln!(
+                                "Aegis: mesh: could not mint result token: {:?}",
+                                e
+                            ),
+                        }
                     }
                 }
-            }
-            MeshEvent::Result { token, value } => {
-                results_seen += 1;
-                match fleet.verify(&token) {
-                    Ok(()) => {
-                        if results_seen % LOG_EVERY == 0 {
-                            crate::sprintln!(
+                MeshEvent::Result { token, value } => {
+                    results_seen += 1;
+                    match fleet.verify(&token) {
+                        Ok(()) => {
+                            if results_seen % LOG_EVERY == 0 {
+                                crate::sprintln!(
                                 "Aegis: mesh: result verified — object {} value={} (remote invocation round-trip OK)",
                                 token.chain.token.object_id,
                                 value
                             );
+                            }
+                        }
+                        Err(e) => {
+                            crate::sprintln!("Aegis: mesh: result DENIED (fail-closed): {:?}", e)
                         }
                     }
-                    Err(e) => crate::sprintln!(
-                        "Aegis: mesh: result DENIED (fail-closed): {:?}",
-                        e
-                    ),
                 }
+                MeshEvent::Denied { reason } => {
+                    crate::sprintln!(
+                        "Aegis: mesh: invocation DENIED by peer (reason {:#04b})",
+                        reason
+                    );
+                }
+                MeshEvent::Malformed => {
+                    crate::sprintln!("Aegis: mesh: malformed datagram on mesh link (ignored)");
+                }
+                MeshEvent::None => {}
             }
-            MeshEvent::Denied { reason } => {
-                crate::sprintln!(
-                    "Aegis: mesh: invocation DENIED by peer (reason {:#04b})",
-                    reason
-                );
-            }
-            MeshEvent::Malformed => {
-                crate::sprintln!("Aegis: mesh: malformed datagram on mesh link (ignored)");
-            }
-            MeshEvent::None => {}
-        }
         }
 
-        // Node B: once we hold a verified delegation and the issuer is
+        // The invoker: once it holds a verified delegation and the issuer is
         // reachable, periodically invoke the remote counter.
-        #[cfg(feature = "fleet-node-b")]
-        if tick % INVOKE_EVERY == 0 && received_delegation.is_some() {
+        if role == MeshRole::Invoker && tick % INVOKE_EVERY == 0 && received_delegation.is_some() {
             if fleet.peer_reachable(peer_id) {
                 let chain = fleet.issue(
                     OBJ_COUNTER,
@@ -865,7 +899,7 @@ fn run_mesh(
     }
 }
 
-#[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+#[cfg(feature = "fleet-j3")]
 fn node_id_tag(id: NodeId) -> &'static str {
     if id.0[0] == 0xA1 {
         "A"
@@ -876,94 +910,145 @@ fn node_id_tag(id: NodeId) -> &'static str {
     }
 }
 
-/// Node A (the service / issuer) entry point.
-#[cfg(feature = "fleet-node-a")]
+#[cfg(feature = "fleet-j3")]
+fn role_tag(id: NodeId) -> &'static str {
+    node_id_tag(id)
+}
+
+/// Resolve the runtime mesh role + identities. A FLEET.CFG-derived config
+/// (stashed by the bootloader handoff) wins; otherwise the compile-time
+/// `fleet-node-a`/`fleet-node-b` feature default decides.
+#[cfg(feature = "fleet-j3")]
+// The three `#[cfg]` fallback branches are mutually exclusive per build; the
+// `return`s are required when an earlier branch is compiled, so clippy's
+// needless_return lint is expected and allowed here.
+#[allow(clippy::needless_return)]
+fn resolve_role() -> (MeshRole, NodeId, NodeId, [u8; 4], [u8; 4], u64, [u8; 32]) {
+    if let Some(cfg) = crate::boot_info::fleet_config() {
+        let role = if cfg.role_is_issuer() {
+            MeshRole::Issuer
+        } else {
+            MeshRole::Invoker
+        };
+        let my_id = NodeId([cfg.my_id_byte; 32]);
+        let peer_id = NodeId([cfg.peer_id_byte; 32]);
+        let my_ip = cfg.my_ip;
+        let peer_ip = cfg.peer_ip;
+        let stale = if cfg.stale_after == 0 {
+            STALE_AFTER_TICKS
+        } else {
+            cfg.stale_after
+        };
+        let key = if cfg.shared_key == [0u8; 32] {
+            DEMO_SHARED_KEY
+        } else {
+            cfg.shared_key
+        };
+        return (role, my_id, peer_id, my_ip, peer_ip, stale, key);
+    }
+    // Compile-time feature fallback (QEMU two-image flow, no FLEET.CFG).
+    // Exactly one branch compiles (the features are mutually exclusive; with
+    // neither, a feature-less default issuer config applies).
+    #[cfg(feature = "fleet-node-a")]
+    {
+        return (
+            MeshRole::Issuer,
+            NODE_A_ID,
+            NODE_B_ID,
+            crate::netif::OUR_IP,
+            PEER_IP,
+            STALE_AFTER_TICKS,
+            DEMO_SHARED_KEY,
+        );
+    }
+    #[cfg(feature = "fleet-node-b")]
+    {
+        return (
+            MeshRole::Invoker,
+            NODE_B_ID,
+            NODE_A_ID,
+            crate::netif::OUR_IP,
+            PEER_IP,
+            STALE_AFTER_TICKS,
+            DEMO_SHARED_KEY,
+        );
+    }
+    #[cfg(not(any(feature = "fleet-node-a", feature = "fleet-node-b")))]
+    {
+        return (
+            MeshRole::Issuer,
+            NODE_A_ID,
+            NODE_B_ID,
+            crate::netif::OUR_IP,
+            PEER_IP,
+            STALE_AFTER_TICKS,
+            DEMO_SHARED_KEY,
+        );
+    }
+}
+
+/// Single boot entry point for the J-3 mesh demo. The two-node role, NodeIds,
+/// IPs, stale window, and shared key come from the boot-volume FLEET.CFG when
+/// present; otherwise they fall back to the compile-time feature defaults.
+#[cfg(feature = "fleet-j3")]
 pub fn run_boot_demo() {
+    let (role, my_id, peer_id, _my_ip, peer_ip, stale_after, shared_key) = resolve_role();
     crate::sprintln!(
-        "Aegis: mesh: node A (service/issuer) starting — J-3 consensus + remote invocation"
+        "Aegis: mesh: node {:?} ({:?}) starting — J-3 consensus + remote invocation",
+        role_tag(my_id),
+        role
     );
-    let mut fleet = Fleet::new(NODE_A_ID, DEMO_SHARED_KEY);
-    fleet.set_stale_after(STALE_AFTER_TICKS);
-    if fleet.register_peer(NODE_B_ID, DEMO_SHARED_KEY).is_err() {
+    let mut fleet = Fleet::new(my_id, shared_key);
+    fleet.set_stale_after(stale_after);
+    if fleet.register_peer(peer_id, shared_key).is_err() {
         crate::sprintln!("Aegis: mesh: register_peer failed — aborting demo");
         return;
     }
-    let peer_ip = PEER_IP;
     let Some(sock) = open_mesh_link(peer_ip) else {
         crate::sprintln!("Aegis: mesh: could not open mesh link — aborting demo");
         return;
     };
     crate::sprintln!(
-        "Aegis: mesh: mesh link to node B at {:?}:{} opened (socket {})",
+        "Aegis: mesh: mesh link to peer {:?} at {:?}:{} opened (socket {})",
+        peer_id,
         peer_ip,
         MESH_PORT,
         sock
     );
 
-    // Mint the object and delegate it to B exactly once — but only *send* it
-    // after consensus has converged and B is reachable (done in run_mesh).
-    let chain = fleet.issue(
-        OBJ_COUNTER,
-        TokenObjectKind::Endpoint,
-        Rights::READ.union(Rights::SEND),
-        None,
-    );
-    let pending_delegate = match fleet.send_to(chain, NODE_B_ID) {
-        Ok(cap) => Some(cap),
-        Err(e) => {
-            crate::sprintln!("Aegis: mesh: delegate bind failed: {:?}", e);
-            None
+    // The issuer mints the object and binds the delegation to the peer; the
+    // invoker holds it. Only the issuer hands it over (after consensus), so
+    // the invoker passes no pending delegate.
+    let pending_delegate = if role == MeshRole::Issuer {
+        let chain = fleet.issue(
+            OBJ_COUNTER,
+            TokenObjectKind::Endpoint,
+            Rights::READ.union(Rights::SEND),
+            None,
+        );
+        match fleet.send_to(chain, peer_id) {
+            Ok(cap) => Some(cap),
+            Err(e) => {
+                crate::sprintln!("Aegis: mesh: delegate bind failed: {:?}", e);
+                None
+            }
         }
+    } else {
+        None
     };
 
-    let mut consensus = Consensus::new(NODE_A_ID);
+    let mut consensus = Consensus::new(my_id);
     run_mesh(
-        NODE_A_ID,
-        NODE_B_ID,
+        my_id,
+        peer_id,
+        role,
         sock,
         &mut fleet,
         &mut consensus,
         pending_delegate,
     );
     close_mesh_link(sock);
-    crate::sprintln!("Aegis: mesh: node A demo loop finished");
-}
-
-/// Node B (the invoker / holder) entry point.
-#[cfg(feature = "fleet-node-b")]
-pub fn run_boot_demo() {
-    crate::sprintln!(
-        "Aegis: mesh: node B (invoker/holder) starting — J-3 consensus + remote invocation"
-    );
-    let mut fleet = Fleet::new(NODE_B_ID, DEMO_SHARED_KEY);
-    fleet.set_stale_after(STALE_AFTER_TICKS);
-    if fleet.register_peer(NODE_A_ID, DEMO_SHARED_KEY).is_err() {
-        crate::sprintln!("Aegis: mesh: register_peer failed — aborting demo");
-        return;
-    }
-    let peer_ip = PEER_IP;
-    let Some(sock) = open_mesh_link(peer_ip) else {
-        crate::sprintln!("Aegis: mesh: could not open mesh link — aborting demo");
-        return;
-    };
-    crate::sprintln!(
-        "Aegis: mesh: mesh link to node A at {:?}:{} opened (socket {})",
-        peer_ip,
-        MESH_PORT,
-        sock
-    );
-
-    let mut consensus = Consensus::new(NODE_B_ID);
-    run_mesh(
-        NODE_B_ID,
-        NODE_A_ID,
-        sock,
-        &mut fleet,
-        &mut consensus,
-        None, // B did not delegate; it holds the delegation
-    );
-    close_mesh_link(sock);
-    crate::sprintln!("Aegis: mesh: node B demo loop finished");
+    crate::sprintln!("Aegis: mesh: {:?} demo loop finished", role);
 }
 
 // ---- Tests (pure protocol logic — no netif/NIC required) ------------------

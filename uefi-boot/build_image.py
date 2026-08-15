@@ -37,7 +37,8 @@ DISK_GUID = (0x12345678ABCDEF00).to_bytes(8, "little") + (0x00FEDCBA98765432).to
 PART_GUID = (0x1122334455667788).to_bytes(8, "little") + (0x99AABBCCDDEEFF00).to_bytes(8, "little")
 
 
-def build_fat16(efi_data):
+def build_fat16(efi_data, fleet_cfg_data=None):
+    fleet_cfg_data = fleet_cfg_data or b""
     fs = bytearray(PART_SECTORS * BYTES_PER_SECTOR)
 
     # --- boot sector / BPB ---
@@ -65,10 +66,13 @@ def build_fat16(efi_data):
     fs[0:BYTES_PER_SECTOR] = bpb
 
     # --- cluster allocation ---
-    # cluster 2 = /EFI dir, cluster 3 = /EFI/BOOT dir, clusters 4.. = file
-    clusters_needed = (len(efi_data) + CLUSTER_SIZE - 1) // CLUSTER_SIZE
+    # cluster 2 = /EFI dir, cluster 3 = /EFI/BOOT dir, then file clusters.
+    efi_clusters = (len(efi_data) + CLUSTER_SIZE - 1) // CLUSTER_SIZE
     file_first_cluster = 4
-    file_last_cluster = file_first_cluster + clusters_needed - 1
+    file_last_cluster = file_first_cluster + efi_clusters - 1
+    cfg_first_cluster = file_last_cluster + 1
+    cfg_clusters = (len(fleet_cfg_data) + CLUSTER_SIZE - 1) // CLUSTER_SIZE
+    cfg_last_cluster = cfg_first_cluster + max(cfg_clusters, 1) - 1
 
     # --- FAT ---
     fat = bytearray(FAT_SECTORS * BYTES_PER_SECTOR)
@@ -79,6 +83,10 @@ def build_fat16(efi_data):
     for c in range(file_first_cluster, file_last_cluster):
         struct.pack_into("<H", fat, c * 2, c + 1)
     struct.pack_into("<H", fat, file_last_cluster * 2, 0xFFFF)
+    if fleet_cfg_data:
+        for c in range(cfg_first_cluster, cfg_last_cluster):
+            struct.pack_into("<H", fat, c * 2, c + 1)
+        struct.pack_into("<H", fat, cfg_last_cluster * 2, 0xFFFF)
     fat_off = RESERVED_SECTORS * BYTES_PER_SECTOR
     fs[fat_off:fat_off + len(fat)] = fat
 
@@ -94,6 +102,9 @@ def build_fat16(efi_data):
 
     root_off = (RESERVED_SECTORS + FAT_SECTORS) * BYTES_PER_SECTOR
     fs[root_off:root_off + 32] = dir_entry("EFI", "", 0x10, 2)
+    if fleet_cfg_data:
+        fs[root_off + 32:root_off + 64] = dir_entry(
+            "FLEET", "CFG", 0x20, cfg_first_cluster, len(fleet_cfg_data))
 
     efi_off = (DATA_START + (2 - 2) * SECTORS_PER_CLUSTER) * BYTES_PER_SECTOR
     fs[efi_off:efi_off + 32] = dir_entry("BOOT", "", 0x10, 3)
@@ -105,6 +116,9 @@ def build_fat16(efi_data):
     # --- file data ---
     data_off = (DATA_START + (file_first_cluster - 2) * SECTORS_PER_CLUSTER) * BYTES_PER_SECTOR
     fs[data_off:data_off + len(efi_data)] = efi_data
+    if fleet_cfg_data:
+        cfg_off = (DATA_START + (cfg_first_cluster - 2) * SECTORS_PER_CLUSTER) * BYTES_PER_SECTOR
+        fs[cfg_off:cfg_off + len(fleet_cfg_data)] = fleet_cfg_data
 
     return fs
 
@@ -178,7 +192,8 @@ def build_gpt(fs):
     return disk
 
 
-def verify(disk, efi_data):
+def verify(disk, efi_data, fleet_cfg_data=None):
+    fleet_cfg_data = fleet_cfg_data or b""
     errors = []
     if disk[510:512] != b"\x55\xAA":
         errors.append("MBR signature missing")
@@ -268,22 +283,42 @@ def verify(disk, efi_data):
     elif out != efi_data:
         errors.append("reconstructed file bytes differ from the EFI binary")
 
+    # root -> FLEET.CFG
+    cfg_cluster = u16(disk, root_off + 32 + 26)
+    cfg_size = u32(disk, root_off + 32 + 28)
+    cfg_out = bytearray()
+    cluster = cfg_cluster
+    while cluster >= 2 and cluster < 0xFFF8:
+        c_off = data_off + (cluster - 2) * CLUSTER_SIZE
+        chunk = disk[c_off:c_off + CLUSTER_SIZE]
+        cfg_out.extend(chunk)
+        cluster = u16(disk, fat_off + cluster * 2)
+    cfg_out = cfg_out[:cfg_size]
+    if cfg_size == 0:
+        errors.append("FLEET.CFG missing (size 0)")
+    elif cfg_out != fleet_cfg_data:
+        errors.append("reconstructed FLEET.CFG differs from source")
+
     if errors:
         print("VERIFY FAILED:")
         for e in errors:
             print(f"  - {e}")
         return False
-    print(f"VERIFY OK: reconstructed BOOTX64.EFI = {len(out)} bytes, matches source")
+    print(f"VERIFY OK: reconstructed BOOTX64.EFI = {len(out)} bytes, matches source; FLEET.CFG = {len(cfg_out)} bytes")
     return True
 
 
-def create_disk_image(efi_path, output_path):
+def create_disk_image(efi_path, output_path, fleet_cfg_path=None):
     with open(efi_path, "rb") as f:
         efi_data = f.read()
     if len(efi_data) == 0:
         print("ERROR: empty EFI binary")
         sys.exit(1)
-    fs = build_fat16(efi_data)
+    fleet_cfg_data = b""
+    if fleet_cfg_path and os.path.exists(fleet_cfg_path):
+        with open(fleet_cfg_path, "rb") as f:
+            fleet_cfg_data = f.read()
+    fs = build_fat16(efi_data, fleet_cfg_data)
     disk = build_gpt(fs)
     with open(output_path, "wb") as f:
         f.write(disk)
@@ -291,16 +326,21 @@ def create_disk_image(efi_path, output_path):
     print(f"  Size: {len(disk)} bytes ({len(disk) // (1024 * 1024)} MB)")
     print(f"  EFI binary: {efi_path} ({len(efi_data)} bytes)")
     print(f"  Boot path: /EFI/BOOT/BOOTX64.EFI")
-    if not verify(disk, efi_data):
+    if fleet_cfg_data:
+        print(f"  FLEET.CFG: {fleet_cfg_path} ({len(fleet_cfg_data)} bytes)")
+    else:
+        print(f"  FLEET.CFG: (none — compile-time defaults)")
+    if not verify(disk, efi_data, fleet_cfg_data):
         sys.exit(1)
 
 
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
     efi_path = os.path.join(script_dir, "target", "x86_64-unknown-uefi", "release", "uefi-boot.efi")
-    output_path = os.path.join(script_dir, "aegis-boot.img")
+    output_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(script_dir, "aegis-boot.img")
+    fleet_cfg_path = os.path.join(script_dir, "FLEET.CFG")
     if not os.path.exists(efi_path):
         print(f"ERROR: EFI binary not found at {efi_path}")
         print("Run 'cargo build --release' first")
         sys.exit(1)
-    create_disk_image(efi_path, output_path)
+    create_disk_image(efi_path, output_path, fleet_cfg_path)

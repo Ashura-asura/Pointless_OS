@@ -62,6 +62,34 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     );
 
     let boot_info = unsafe { aegis_kernel::boot_info::locate_at(handoff_addr) };
+    // Extract the runtime fleet config (FLEET.CFG on the boot volume) and
+    // point the interface at the configured IP before NetIf::init. Absent =>
+    // compile-time defaults apply.
+    let fleet_cfg = unsafe { aegis_kernel::boot_info::fleet_at(handoff_addr) };
+    unsafe {
+        aegis_kernel::boot_info::set_fleet_config(fleet_cfg);
+    }
+    if let Some(cfg) = fleet_cfg {
+        aegis_kernel::netif::set_our_ip(cfg.my_ip);
+        sprintln!(
+            "Aegis: fleet cfg: role={} my={}.{}.{}.{} peer={}.{}.{}.{}",
+            if cfg.role_is_issuer() {
+                "issuer"
+            } else {
+                "invoker"
+            },
+            cfg.my_ip[0],
+            cfg.my_ip[1],
+            cfg.my_ip[2],
+            cfg.my_ip[3],
+            cfg.peer_ip[0],
+            cfg.peer_ip[1],
+            cfg.peer_ip[2],
+            cfg.peer_ip[3],
+        );
+    } else {
+        sprintln!("Aegis: fleet cfg: absent — compile-time defaults");
+    }
     match boot_info.as_ref() {
         Some(info) => {
             let conv = aegis_kernel::boot_info::total_by_type(
@@ -611,11 +639,10 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // entirely on a normal build. When `fleet-j3` is also present, the
     // Phase J-3 mesh demo (two-node consensus + remote invocation of a
     // transferred capability) runs instead, still over the same two-node
-    // feature-gated images.
-    #[cfg(all(
-        any(feature = "fleet-node-a", feature = "fleet-node-b"),
-        feature = "fleet-j3"
-    ))]
+    // feature-gated images. The mesh demo is gated on `fleet-j3` alone: its
+    // two-node role comes from the runtime FLEET.CFG when present, else from
+    // the compile-time node feature.
+    #[cfg(feature = "fleet-j3")]
     aegis_kernel::mesh::run_boot_demo();
     #[cfg(all(
         any(feature = "fleet-node-a", feature = "fleet-node-b"),

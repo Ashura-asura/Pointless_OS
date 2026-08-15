@@ -2,12 +2,21 @@
 #![no_main]
 
 mod elf;
+mod fleet_cfg;
 mod memory_map;
 mod page_tables;
 mod serial;
 
 use uefi::mem::memory_map::MemoryMap;
 use uefi::prelude::*;
+
+extern crate alloc;
+use alloc::string::String;
+
+fn ip_str(ip: &[u8; 4]) -> String {
+    use alloc::format;
+    format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+}
 
 /// Embedded kernel binary — linked at build time by build_image.py.
 /// In a real boot chain, this would be read from the FAT16 partition.
@@ -108,6 +117,32 @@ fn main() -> Status {
                 }
             }
 
+            // Read \FLEET.CFG from the boot volume before firmware services
+            // disappear. It carries the runtime role/IP/node-id config that
+            // the kernel's fleet demo uses (see fleet_cfg module). Absent or
+            // unparsable => the kernel falls back to compile-time defaults.
+            let fleet_config = fleet_cfg::read_from_esp();
+            match &fleet_config {
+                Some(cfg) => {
+                    sprintln!(
+                        "Aegis: FLEET.CFG loaded (role={} my={} peer={})",
+                        if cfg.role == 0 { "issuer" } else { "invoker" },
+                        ip_str(&cfg.my_ip),
+                        ip_str(&cfg.peer_ip)
+                    );
+                    uefi::println!(
+                        "Aegis: FLEET.CFG loaded (role={} my={} peer={})",
+                        if cfg.role == 0 { "issuer" } else { "invoker" },
+                        ip_str(&cfg.my_ip),
+                        ip_str(&cfg.peer_ip)
+                    );
+                }
+                None => {
+                    sprintln!("Aegis: no FLEET.CFG — kernel uses compile-time defaults");
+                    uefi::println!("Aegis: no FLEET.CFG — kernel uses compile-time defaults");
+                }
+            }
+
             // Exit boot services: the kernel now owns the machine. The
             // firmware stops servicing events, its boot watchdog is
             // disarmed, and the memory map is finalized. From this point on
@@ -145,12 +180,15 @@ fn main() -> Status {
             image_end = (image_end + 4095) & !4095;
 
             // The image is linked at vaddr 0x0 and loaded into low memory.
-            // If it now ends at/above 0xA0000 (top of low conventional RAM),
-            // the first page above it is the VGA/ROM hole, which is not RAM —
-            // a handoff written there could not be read back by the kernel.
-            // Lift the handoff to the first conventional descriptor at/above
-            // `image_end` (0x100000 in the standard OVMF layout).
-            if image_end >= 0xA0000 {
+            // The handoff spans 2 pages (`HANDOFF_PAGES` in boot_info.rs). If
+            // the image now ends so close to 0xA0000 (top of low conventional
+            // RAM) that those pages would cross into the VGA/ROM hole — which
+            // is not RAM — a handoff written there could not be read back by
+            // the kernel. Lift the handoff to the first conventional
+            // descriptor at/above `image_end` (0x100000 in the standard OVMF
+            // layout).
+            const HANDOFF_PAGES: u64 = 2;
+            if image_end + HANDOFF_PAGES * 4096 >= 0xA0000 {
                 image_end = final_map
                     .entries()
                     .filter(|d| {
@@ -214,6 +252,28 @@ fn main() -> Status {
             }
             unsafe {
                 core::ptr::write_volatile(handoff_addr as *mut BootHandoff, handoff);
+            }
+            // Append the optional FleetConfig block right after the entries
+            // (offset 5144 = 24 + 256*20), matching boot_info.rs FLEET_OFFSET.
+            // Stack-only: the UEFI allocator is dead after ExitBootServices.
+            if let Some(fleet_bytes) = fleet_cfg::to_handoff_bytes(&fleet_config) {
+                unsafe {
+                    core::ptr::write_bytes(
+                        (handoff_addr as *mut u8).add(fleet_cfg::FLEET_OFFSET),
+                        0,
+                        fleet_bytes.len(),
+                    );
+                    core::ptr::copy_nonoverlapping(
+                        fleet_bytes.as_ptr(),
+                        (handoff_addr as *mut u8).add(fleet_cfg::FLEET_OFFSET),
+                        fleet_bytes.len(),
+                    );
+                }
+                sprintln!(
+                    "Aegis: fleet config block written at handoff+{} ({} bytes)",
+                    fleet_cfg::FLEET_OFFSET,
+                    fleet_bytes.len()
+                );
             }
             let written_count = handoff.entry_count;
             sprintln!(

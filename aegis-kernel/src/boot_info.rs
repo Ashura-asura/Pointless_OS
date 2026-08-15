@@ -22,9 +22,14 @@
 //!   offset 16: image_end u64 — first page above the loaded kernel image
 //!              (loader rounds max(segment vaddr+memsz) up to 4 KiB)
 //!   offset 24: entries, each 20 bytes (ty u32, base u64, pages u64)
+//!   offset 5144 (= 24 + 256*20): optional `FleetConfig` block. If
+//!              `present == 1` the block is valid and the kernel's fleet
+//!              demo is driven by it (role, NodeIds, IPs, stale window,
+//!              shared key) instead of the compile-time feature defaults.
 //!
 //! Only the first `entry_count` entries are valid; the loader zero-fills
-//! the page so stale entries read as ty=0 (reserved).
+//! the page so stale entries read as ty=0 (reserved). The FleetConfig block
+//! sits after the entries; `present == 0` means "no FLEET.CFG was found".
 
 use core::mem::size_of;
 
@@ -37,6 +42,78 @@ const MAGIC: u64 = 0x4145_4753_4841_4E44;
 const MAX_ENTRIES: usize = 256;
 
 pub const TYPE_CONVENTIONAL: u32 = 7;
+
+/// Byte offset of the optional `FleetConfig` block in the handoff page.
+pub const FLEET_OFFSET: usize = 24 + MapEntry::size() * MAX_ENTRIES;
+
+/// Runtime fleet configuration parsed from `\FLEET.CFG` on the boot volume.
+/// The loader writes this block at `FLEET_OFFSET`; `present == 0` means no
+/// FLEET.CFG was found and the kernel falls back to compile-time defaults.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FleetConfig {
+    /// 1 = block valid, 0 = absent.
+    pub present: u32,
+    /// 0 = issuer (mints/delegates/executes), 1 = invoker (verifies/invokes).
+    pub role: u8,
+    /// First byte of this node's 32-byte `NodeId` (replicated).
+    pub my_id_byte: u8,
+    /// First byte of the peer's 32-byte `NodeId` (replicated).
+    pub peer_id_byte: u8,
+    pub my_ip: [u8; 4],
+    pub peer_ip: [u8; 4],
+    /// Stale window in scaled ticks; 0 = use default.
+    pub stale_after: u64,
+    /// Shared key; all zero = use the demo default key.
+    pub shared_key: [u8; 32],
+}
+
+impl FleetConfig {
+    pub const fn size() -> usize {
+        size_of::<FleetConfig>()
+    }
+
+    pub const fn role_is_issuer(&self) -> bool {
+        self.role == 0
+    }
+}
+
+/// Parse the optional `FleetConfig` block from a raw handoff page. Pure and
+/// total: returns `None` if absent, truncated, or invalid.
+pub fn parse_fleet(raw: &[u8]) -> Option<FleetConfig> {
+    let off = FLEET_OFFSET;
+    if raw.len() < off + FleetConfig::size() {
+        return None;
+    }
+    let present = read_u32(raw, off)?;
+    if present != 1 {
+        return None;
+    }
+    let role = raw[off + 4];
+    if role > 1 {
+        return None;
+    }
+    let my_id_byte = raw[off + 5];
+    let peer_id_byte = raw[off + 6];
+    if my_id_byte == 0 || peer_id_byte == 0 {
+        return None;
+    }
+    let my_ip = [raw[off + 7], raw[off + 8], raw[off + 9], raw[off + 10]];
+    let peer_ip = [raw[off + 11], raw[off + 12], raw[off + 13], raw[off + 14]];
+    let stale_after = read_u64(raw, off + 15)?;
+    let mut shared_key = [0u8; 32];
+    shared_key.copy_from_slice(&raw[off + 23..off + 55]);
+    Some(FleetConfig {
+        present,
+        role,
+        my_id_byte,
+        peer_id_byte,
+        my_ip,
+        peer_ip,
+        stale_after,
+        shared_key,
+    })
+}
 
 /// One UEFI memory-map descriptor, flattened to the fields the kernel needs.
 #[repr(C, packed)]
@@ -109,8 +186,37 @@ pub fn total_by_type<'a>(info: &BootInfo<'a>, ty: u32) -> u64 {
 /// after the bootloader has actually written the handoff (or with a
 /// validated magic).
 pub unsafe fn locate_at(addr: u64) -> Option<BootInfo<'static>> {
-    let raw = core::slice::from_raw_parts(addr as *const u8, 24 + MapEntry::size() * MAX_ENTRIES);
+    let raw = core::slice::from_raw_parts(addr as *const u8, (HANDOFF_PAGES * 4096) as usize);
     parse(raw)
+}
+
+/// Read the optional `FleetConfig` block from a live handoff page.
+///
+/// # Safety
+/// Must be called after the bootloader has written the handoff, before
+/// anything repurposes the page.
+pub unsafe fn fleet_at(addr: u64) -> Option<FleetConfig> {
+    let raw = core::slice::from_raw_parts(addr as *const u8, (HANDOFF_PAGES * 4096) as usize);
+    parse_fleet(raw)
+}
+
+/// Stashed runtime fleet config, extracted from the handoff at boot and read
+/// later by the fleet demo. The kernel is single-threaded at boot (the same
+/// global-mut discipline as the rest of the kernel), so a `static mut` with
+/// unsafe access is safe here.
+static mut FLEET_CONFIG: Option<FleetConfig> = None;
+
+/// Record the fleet config (or `None`) for the boot demo to read later.
+///
+/// # Safety
+/// Single-threaded boot path only; must not run concurrently with reads.
+pub unsafe fn set_fleet_config(cfg: Option<FleetConfig>) {
+    FLEET_CONFIG = cfg;
+}
+
+/// The currently-stashed fleet config, if any.
+pub fn fleet_config() -> Option<FleetConfig> {
+    unsafe { FLEET_CONFIG }
 }
 
 fn read_u32(raw: &[u8], off: usize) -> Option<u32> {
@@ -153,6 +259,33 @@ pub fn build_image(
         img[base..base + 20].copy_from_slice(&src);
     }
     img
+}
+
+/// Build a handoff page image that additionally carries a `FleetConfig`
+/// block (used by tests; the bootloader writes its own at runtime).
+pub fn build_image_with_fleet(
+    entries: &[MapEntry],
+    image_end: u64,
+    fleet: &FleetConfig,
+) -> [u8; (HANDOFF_PAGES * 4096) as usize] {
+    let img = build_image(entries, image_end);
+    let mut out = [0u8; (HANDOFF_PAGES * 4096) as usize];
+    out[..img.len()].copy_from_slice(&img);
+    out[FLEET_OFFSET..FLEET_OFFSET + FleetConfig::size()].copy_from_slice(&fleet_to_bytes(fleet));
+    out
+}
+
+fn fleet_to_bytes(f: &FleetConfig) -> [u8; FleetConfig::size()] {
+    let mut b = [0u8; FleetConfig::size()];
+    b[0..4].copy_from_slice(&f.present.to_le_bytes());
+    b[4] = f.role;
+    b[5] = f.my_id_byte;
+    b[6] = f.peer_id_byte;
+    b[7..11].copy_from_slice(&f.my_ip);
+    b[11..15].copy_from_slice(&f.peer_ip);
+    b[15..23].copy_from_slice(&f.stale_after.to_le_bytes());
+    b[23..].copy_from_slice(&f.shared_key);
+    b
 }
 
 #[cfg(test)]
@@ -270,5 +403,79 @@ mod tests {
         assert_eq!(info.entries.len(), 3);
         assert_eq!(info.image_end, 0x5_2000);
         assert_eq!(total_by_type(&info, TYPE_CONVENTIONAL), 0x1000 * 4096);
+    }
+
+    fn sample_fleet() -> FleetConfig {
+        FleetConfig {
+            present: 1,
+            role: 0,
+            my_id_byte: 0xA1,
+            peer_id_byte: 0xB2,
+            my_ip: [10, 0, 3, 1],
+            peer_ip: [10, 0, 3, 2],
+            stale_after: 50000,
+            shared_key: [0u8; 32],
+        }
+    }
+
+    #[test]
+    fn fleet_block_roundtrips() {
+        let fleet = sample_fleet();
+        let img = build_image_with_fleet(&sample_entries(), 0x5_2000, &fleet);
+        let parsed = parse_fleet(&img).expect("fleet block must parse");
+        assert_eq!(parsed, fleet);
+        assert!(parsed.role_is_issuer());
+    }
+
+    #[test]
+    fn fleet_block_absent_when_present_zero() {
+        let entries = sample_entries();
+        let img = build_image(&entries, 0x5_2000).to_vec();
+        let parsed = parse_fleet(&img);
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn fleet_block_rejects_invalid_role() {
+        let mut fleet = sample_fleet();
+        fleet.role = 2;
+        let img = build_image_with_fleet(&sample_entries(), 0x5_2000, &fleet);
+        assert_eq!(parse_fleet(&img), None);
+    }
+
+    #[test]
+    fn fleet_block_rejects_zero_node_ids() {
+        let mut fleet = sample_fleet();
+        fleet.peer_id_byte = 0;
+        let img = build_image_with_fleet(&sample_entries(), 0x5_2000, &fleet);
+        assert_eq!(parse_fleet(&img), None);
+    }
+
+    #[test]
+    fn fleet_block_reads_invoker_role() {
+        let mut fleet = sample_fleet();
+        fleet.role = 1;
+        fleet.my_id_byte = 0xB2;
+        fleet.peer_id_byte = 0xA1;
+        fleet.my_ip = [10, 0, 3, 2];
+        fleet.peer_ip = [10, 0, 3, 1];
+        let img = build_image_with_fleet(&sample_entries(), 0x5_2000, &fleet);
+        let parsed = parse_fleet(&img).expect("fleet block must parse");
+        assert_eq!(parsed, fleet);
+        assert!(!parsed.role_is_issuer());
+    }
+
+    #[test]
+    fn fleet_block_fits_within_handoff_pages() {
+        let total = FLEET_OFFSET + FleetConfig::size();
+        assert!(total as u64 <= HANDOFF_PAGES * 4096);
+    }
+
+    #[test]
+    fn fleet_at_reads_from_live_page() {
+        let fleet = sample_fleet();
+        let img = build_image_with_fleet(&sample_entries(), 0x5_2000, &fleet);
+        let parsed = unsafe { fleet_at(&img[0] as *const u8 as u64) }.expect("fleet must locate");
+        assert_eq!(parsed, fleet);
     }
 }
