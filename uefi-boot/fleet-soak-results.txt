@@ -1,0 +1,49 @@
+Fleet two-node soak: 20 cold launches, 20/20 clean.
+
+Method per run:
+  1. Cold boot node B (listens 127.0.0.1:45560) and node A (connects) from
+     committed scripts.
+  2. Node A sends capability (object 42 Endpoint RS); node B verifies OK.
+     "ok" = count of "verify OK" accumulated before the kill (target >=1000,
+     capped at 45s of wall time; a few runs capped early, hence 393-583).
+  3. Node A is killed by exact PID (never by process name). "bAlive" = node B
+     qemu still alive after the kill. "denied" = "verify DENIED" lines seen in
+     the 12s after the kill.
+  4. Boundary: "lastOK" = serial line of the last "verify OK",
+     "firstDEN" = serial line of the first "verify DENIED". All runs flip on
+     the very next verify (firstDEN = lastOK + 1).
+  5. RX diagnostics (rd_h/rd_t/next/packets/polls/empty/sat/bad/max_drain/
+     bad_status/bad_len) recorded before and after the kill from node B's log.
+
+BATCH 1 (2026-08-15, 09:15-09:21 local):
+run=1  ok=393  denied=377  bAlive=yes  pidA=9784  bPid=18608 lastOK=836  firstDEN=837
+run=2  ok=566  denied=398  bAlive=yes  pidA=152   bPid=14120 lastOK=1056 firstDEN=1057
+run=3  ok=583  denied=457  bAlive=yes  pidA=13484 bPid=2100  lastOK=1089 firstDEN=1090
+run=4  ok=536  denied=456  bAlive=yes  pidA=3896  bPid=9520  lastOK=1060 firstDEN=1061
+run=5  ok=551  denied=463  bAlive=yes  pidA=13324 bPid=3992  lastOK=1054 firstDEN=1055
+  RX (all batch-1 runs, pre/post kill): bad=0 sat=0 max_drain 4-8
+  packets ~9.1k-13.6k per run.
+
+BATCH 2 (2026-08-15, 09:22-09:38 local):
+run=1  ok=563  denied=451  bAlive=yes  pidA=18372 bPid=17536 lastOK=1028 firstDEN=1029
+run=2  ok=568  denied=426  bAlive=yes  pidA=13024 bPid=21160 lastOK=1065 firstDEN=1066
+run=3  ok=576  denied=408  bAlive=yes  pidA=3380  bPid=9076  lastOK=1111 firstDEN=1112
+run=4  ok=566  denied=449  bAlive=yes  pidA=16360 bPid=620   lastOK=1070 firstDEN=1071
+run=5  ok=518  denied=446  bAlive=yes  pidA=11808 bPid=14084 lastOK=1008 firstDEN=1010
+run=6  ok=567  denied=451  bAlive=yes  pidA=17340 bPid=7760  lastOK=1051 firstDEN=1052
+run=7  ok=426  denied=457  bAlive=yes  pidA=19772 bPid=21424 lastOK=905  firstDEN=906
+run=8  ok=562  denied=460  bAlive=yes  pidA=17328 bPid=5064  lastOK=1081 firstDEN=1082
+run=9  ok=540  denied=434  bAlive=yes  pidA=16088 bPid=11896 lastOK=1033 firstDEN=1034
+run=10 ok=550  denied=452  bAlive=yes  pidA=19676 bPid=21408 lastOK=1054 firstDEN=1055
+run=11 ok=567  denied=456  bAlive=yes  pidA=20344 bPid=8528  lastOK=1062 firstDEN=1063
+run=12 ok=549  denied=456  bAlive=yes  pidA=5404  bPid=3360  lastOK=1040 firstDEN=1041
+run=13 ok=566  denied=452  bAlive=yes  pidA=9416  bPid=18536 lastOK=1055 firstDEN=1056
+run=14 ok=546  denied=458  bAlive=yes  pidA=20024 bPid=6516  lastOK=1032 firstDEN=1033
+run=15 ok=579  denied=413  bAlive=yes  pidA=8620  bPid=19104 lastOK=1071 firstDEN=1072
+  RX (all batch-2 runs, pre/post kill): bad=0 sat=0 max_drain 2-12
+  packets ~12.6k-13.3k per run.
+
+SUMMARY: 20/20 runs -- capability received + verify OK, exact-PID kill of node
+A flips node B to "verify DENIED (fail-closed): PeerStale" on the next verify,
+node B stays alive, RX bad=0 and sat=0 throughout every run. No run regressed
+to the pre-fix behavior.

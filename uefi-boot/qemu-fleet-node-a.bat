@@ -28,11 +28,15 @@ REM registering with WMI.
 set PIDFILE=%REPO_DIR%\uefi-boot\node-a.pid
 del "%PIDFILE%" >nul 2>&1
 for /l %%i in (1,1,20) do (
-  for /f "skip=1 tokens=1" %%p in ('wmic process where "name='qemu-system-x86_64.exe' and commandline like '%%aegis-boot-node-a.img%%'" get processid 2^>nul') do (
-    if not "%%p"=="" echo %%p> "%PIDFILE%"
-  )
+  REM wmic was removed on modern Windows (that is exactly why the PID capture
+  REM silently failed during the first fail-closed test — the loop polled a
+  REM missing binary and never wrote the file). PowerShell's Get-CimInstance
+  REM is the supported equivalent; the LIKE is done in the WMI query itself so
+  REM the shell passes no pipe characters, and the %% doubles are the batch
+  REM escape for the literal % wildcards PowerShell needs.
+  powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"Name='qemu-system-x86_64.exe' and CommandLine LIKE '%%aegis-boot-node-a.img%%'\" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty ProcessId) | Set-Content -NoNewline '%PIDFILE%'"
   if exist "%PIDFILE%" goto :found_a
-  timeout /t 1 /nobreak >nul
+  powershell -NoProfile -Command "Start-Sleep -Milliseconds 500"
 )
 :found_a
 if exist "%PIDFILE%" (

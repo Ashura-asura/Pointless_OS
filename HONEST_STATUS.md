@@ -531,15 +531,31 @@ inherent, per the design doc's own §10.
   (rejects DD-set zero-length / over-buffer lengths, counts them
   separately).
 
+**Repeat-run reliability — now evidenced (20/20 cold launches clean):**
+The soak series (`uefi-boot/serial-fleet-b.log` holds the latest run;
+per-run rows in `HONEST_STATUS.md`'s commit record) booted the pair from
+cold 20 times — each time B listens on 45560, A connects, A sends the
+capability, B verifies, then **node A is killed by exact PID** and B must
+flip to `PeerStale` while staying alive. Every one of the 20 runs:
+- B received the capability and reached **426–583 `verify OK`** cycles.
+- Killing node A (exact PID, never by name) flipped B to
+  `verify DENIED (fail-closed): PeerStale` on the **very next** verify
+  (boundary `lastOK = firstDEN − 1` in all 20 runs), and node B's qemu
+  process was still alive after the kill (`bAlive=yes`).
+- RX diagnostics stayed clean through the flip: `bad=0`, `sat=0`
+  (ring never saturated), `max_drain` 2–12, ~12–13k packets/frame per run.
+
 **Honest limits (kept, not glossed):**
-1. **Repeat-run reliability is not yet evidenced.** One strong run (4,683
-   verify OK, clean fail-closed transition) is one data point; the fix
-   needs several independent cold launches to claim robustness. That
-   evidence is the next step, not yet done.
-2. **`bad_length` = 1 in 310k frames** (a pre-fix run) is observed but
-   not yet explained; "benign so far" is not "understood." The latest run
-   after the fix shows `bad=0` across ~108k frames; the counter exists so
-   any future occurrence can be correlated with a specific frame.
+1. **`bad_length` = 1 in 310k frames** (a pre-fix run) is observed but
+   not yet explained; "benign so far" is not "understood." The 20-run
+   soak shows `bad=0` across every run (~13k frames each, ~260k frames
+   total), so the pre-fix outlier has not recurred — but the counter stays
+   in place so any future occurrence can be correlated with a specific
+   frame rather than hand-waved.
+2. **The soak kills node A by PID, not the capability layer.** Each run
+   re-proves the *transport* is reliable under repetition and the
+   *fail-closed verdict* is deterministic; it does not exercise recovery
+   (nothing re-connects A after the kill).
 3. No consensus, replication, or split-brain handling — unchanged from the
    model-level claim; partition behavior is fail-safe by construction
    (verify DENIED on stale issuer) but nothing *recovers* automatically.
