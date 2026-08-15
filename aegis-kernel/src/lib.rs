@@ -64,6 +64,10 @@ pub mod win_compat;
 // Phase K (VT-x bring-up primitive — see module docs for honest scope)
 pub mod vmx;
 
+// Phase L (chaos testing — see module docs for the fail-open definitions
+// and the honest "iteration count, not wall-clock duration" scoping)
+pub mod chaos;
+
 pub mod ceiling;
 
 pub mod hardening;

@@ -1750,6 +1750,31 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         aegis_kernel::vga::vga_dump_buffer();
     }
 
+    // Phase L (feature-gated): chaos-testing harness against the real live
+    // supervisor/fleet/frame-allocator. Off by default (chaos-demo feature).
+    // Runs BEFORE the vmx-demo block below, since a VT-x bring-up halts forever
+    // on its first VM-exit and chaos needs the system still running. Reuses
+    // IDX_SERVICE, the same already-spawned, already-crash-tested task the
+    // restart-service/observe-service demo above uses — see chaos.rs module
+    // docs for why a synthetic task index isn't safe here. Iteration count is
+    // a placeholder; raise it for a real soak run and report the actual number
+    // used, per Ground Rule 4 — don't round up what you didn't actually run.
+    #[cfg(feature = "chaos-demo")]
+    {
+        const CHAOS_ITERATIONS: u32 = 2000;
+        const CHAOS_SEED: u64 = 0xC0FF_EE00_1234_5678;
+        let ok =
+            unsafe { aegis_kernel::chaos::run(CHAOS_ITERATIONS, CHAOS_SEED, IDX_SERVICE as usize) };
+        if ok {
+            sprintln!(
+                "Aegis: [chaos] {} iterations, zero fail-open",
+                CHAOS_ITERATIONS
+            );
+        } else {
+            sprintln!("Aegis: [chaos] FAIL-OPEN DETECTED — see log above for iteration/seed");
+        }
+    }
+
     // Phase K (feature-gated): VT-x bring-up demo. Last thing before
     // interrupts turn on and the idle loop owns the machine. `vmx_supported()`
     // is a cheap no-op CPUID check; `bringup_demo()` only runs when VT-x is

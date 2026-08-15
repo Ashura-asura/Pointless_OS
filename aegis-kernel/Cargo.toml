@@ -18,6 +18,12 @@ fleet-node-b = []
 # transferred capability) instead of the Phase I transport demo. Combined
 # with exactly one of fleet-node-a / fleet-node-b.
 fleet-j3 = []
+# Phase L: run the chaos-testing harness (randomized task-crash,
+# network-partition, resource-exhaustion fault injection against the real
+# supervisor/fleet/frame-allocator) as part of boot. Off by default —
+# normal fleet/CI/vmx images compile zero chaos code. See chaos.rs module
+# docs for the fail-open definition each scenario checks.
+chaos-demo = []
 # Phase K: wire the VT-x (VMX) bring-up demo into the END of boot. Off by
 # default — normal fleet/CI images compile zero VMX code. When enabled the
 # guarded call runs last (after every demo spawned and the desktop shown,
