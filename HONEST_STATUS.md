@@ -586,13 +586,20 @@ changes; the model's `heartbeat`-restores-verify path, exercised live):
   partition rather than silent acceptance.
 
 **Honest limits (kept, not glossed):**
-1. **`bad_length` = 1 in 310k frames** (a pre-fix, uncommitted run) is
-   observed but not reproduced; "benign so far" is not "understood." All
-   committed evidence — the fix run (108k frames) and the 20-run soak
-   (~260k frames) — shows `bad=0`. The counter stays in place as a
-   tripwire so any future occurrence is correlated with a specific frame
-   rather than hand-waved. The single observation predates the committed
-   hardening and has never recurred since.
+1. **`bad_length` = 1 in 310k frames** (a pre-fix, uncommitted run) is now
+   *root-caused*, not just observed. The device writes `length` (offset 8)
+   *before* `status`/DD (offset 12) on RX descriptor writeback; the driver
+   previously read `length` first (in `read_desc`), then checked DD — so a
+   CPU read racing between the two device writebacks could capture a
+   pre-writeback `length` (0) alongside a fresh DD bit, producing a
+   "DD-set, length 0" descriptor that never existed. `receive()` now reads
+   `status` first, returns early if DD is clear, Acquire-fences, and only
+   then reads `length` — the one point where the hardware guarantees it is
+   the post-writeback value. The `bad_length` counter stays in place as a
+   tripwire, and each rejection now also records a diagnostic re-read
+   (`recheck_valid`/`recheck_total` in the `e1000 rx` line): a torn read
+   re-reads clean, a genuinely malformed writeback re-reads bad, so any
+   future occurrence is diagnosed rather than guessed.
 2. **Recovery is demonstrated; consensus is not, and is out of scope.**
    Recovery = the issuing node's *return* restores verification (proven
    live above). Nothing here claims split-brain resolution, quorum, or

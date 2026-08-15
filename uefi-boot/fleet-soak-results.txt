@@ -47,3 +47,13 @@ SUMMARY: 20/20 runs -- capability received + verify OK, exact-PID kill of node
 A flips node B to "verify DENIED (fail-closed): PeerStale" on the next verify,
 node B stays alive, RX bad=0 and sat=0 throughout every run. No run regressed
 to the pre-fix behavior.
+
+=== POST-FIX VALIDATION (read-order hardening + recheck diagnostic): 3 cold runs ===
+soak started 2026-08-15T18:15:26+05:45  finished 2026-08-15T18:18:45+05:45
+run=1 ok=576 denied=463 bAlive=yes pidA=8808 bPid=11048 lastOK=1081 firstDEN=1082
+run=2 ok=581 denied=451 bAlive=yes pidA=16380 bPid=4516 lastOK=1052 firstDEN=1054
+run=3 ok=593 denied=448 bAlive=yes pidA=4600 bPid=14748 lastOK=1004 firstDEN=1005
+  RX (all runs, pre/post kill, both nodes): bad=0 sat=0 max_drain 4-10,
+  recheck_valid=0/0 (no rejected descriptors -> no re-checks). B packets
+  14.6k-15.9k per run. Boundary exact in raw log run 3: line 1004 last OK,
+  line 1005 first DENIED.

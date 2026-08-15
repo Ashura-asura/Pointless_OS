@@ -33,8 +33,12 @@ for /l %%i in (1,1,20) do (
   REM missing binary and never wrote the file). PowerShell's Get-CimInstance
   REM is the supported equivalent; the LIKE is done in the WMI query itself so
   REM the shell passes no pipe characters, and the %% doubles are the batch
-  REM escape for the literal % wildcards PowerShell needs.
-  powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"Name='qemu-system-x86_64.exe' and CommandLine LIKE '%%aegis-boot-node-a.img%%'\" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty ProcessId) | Set-Content -NoNewline '%PIDFILE%'"
+  REM escape for the literal % wildcards PowerShell needs. The capture goes to
+  REM a variable first and Set-Content only runs when a PID was actually
+  REM found: even though an empty pipeline does not create the file on PS 5.1,
+  REM this is defensive against PowerShell versions that do truncate/create on
+  REM an empty -Value, which would otherwise trip the `if exist` below.
+  powershell -NoProfile -Command "$procId = (Get-CimInstance Win32_Process -Filter \"Name='qemu-system-x86_64.exe' and CommandLine LIKE '%%aegis-boot-node-a.img%%'\" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty ProcessId); if ($procId) { Set-Content -NoNewline -Path '%PIDFILE%' -Value $procId }"
   if exist "%PIDFILE%" goto :found_a
   powershell -NoProfile -Command "Start-Sleep -Milliseconds 500"
 )

@@ -308,11 +308,11 @@ impl NetIf {
             }
         }
         if self.polls % DIAG_EVERY == 0 {
-            let (rd_h, rd_t, rx_next, p, pl, e, sat, bad, maxd, bs, bl) =
+            let (rd_h, rd_t, rx_next, p, pl, e, sat, bad, maxd, bs, bl, rcv, rct) =
                 self.nic.as_ref().unwrap().rx_stats();
             crate::sprintln!(
-                "Aegis: e1000 rx: rd_h={} rd_t={} next={} packets={} polls={} empty={} sat={} bad={} max_drain={} bad_status={:#x} bad_len={}",
-                rd_h, rd_t, rx_next, p, pl, e, sat, bad, maxd, bs, bl
+                "Aegis: e1000 rx: rd_h={} rd_t={} next={} packets={} polls={} empty={} sat={} bad={} max_drain={} bad_status={:#x} bad_len={} recheck_valid={}/{}",
+                rd_h, rd_t, rx_next, p, pl, e, sat, bad, maxd, bs, bl, rcv, rct
             );
         }
         self.advance(1);

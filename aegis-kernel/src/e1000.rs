@@ -257,6 +257,14 @@ pub struct E1000 {
     /// of just that one was.
     pub rx_bad_status: u8,
     pub rx_bad_length: u16,
+    /// Of the rejected descriptors, how many showed a *valid* status+length on
+    /// an immediate re-read. A transient torn read (length captured before the
+    /// device's writeback, DD after) re-reads clean; a genuinely malformed
+    /// writeback from the device re-reads bad. Counts every re-read, so a
+    /// recurrence becomes direct confirmation instead of another unexplained
+    /// blip.
+    pub rx_bad_recheck_valid: u64,
+    pub rx_bad_recheck_total: u64,
 }
 
 impl E1000 {
@@ -302,6 +310,8 @@ impl E1000 {
             rx_max_drain: 0,
             rx_bad_status: 0,
             rx_bad_length: 0,
+            rx_bad_recheck_valid: 0,
+            rx_bad_recheck_total: 0,
         })
     }
 
@@ -429,7 +439,24 @@ impl E1000 {
     /// Receive a frame if one has landed in the RX ring. Returns the byte
     /// Snapshot of the RX ring state for periodic diagnostics: hardware head
     /// and tail, our software cursor, and the aggregate counters.
-    pub fn rx_stats(&self) -> (u32, u32, u16, u64, u64, u64, u64, u64, u64, u8, u16) {
+    #[allow(clippy::type_complexity)] // 13 flat diagnostics values; a struct would churn netif.rs
+    pub fn rx_stats(
+        &self,
+    ) -> (
+        u32,
+        u32,
+        u16,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u8,
+        u16,
+        u64,
+        u64,
+    ) {
         let rd_h = rd32(self.base, RDH);
         let rd_t = rd32(self.base, RDT);
         (
@@ -444,6 +471,8 @@ impl E1000 {
             self.rx_max_drain,
             self.rx_bad_status,
             self.rx_bad_length,
+            self.rx_bad_recheck_valid,
+            self.rx_bad_recheck_total,
         )
     }
 
@@ -455,25 +484,33 @@ impl E1000 {
         // bounded by the ring size, because each iteration consumes one slot.
         for _ in 0..RX_RING_LEN {
             let slot = self.rx_next as usize % RX_RING_LEN;
-            let d = read_desc(self.rx.as_mut(), slot);
-            if !d.done() {
+            // Read the status/DD byte FIRST. The device publishes `length`
+            // before `status` on writeback, so DD=1 is the completion marker:
+            // only after observing it (and the Acquire fence below) is the
+            // `length` read guaranteed to be the post-writeback value. Reading
+            // length first could capture a pre-writeback 0 alongside a fresh
+            // DD, i.e. a "DD-set, length 0" frame that never existed.
+            let status = rx_status(self.rx.as_mut(), slot);
+            if status & DESC_STATUS_DD == 0 {
                 self.rx_empty = self.rx_empty.wrapping_add(1);
                 return None;
             }
 
             // The device has published the descriptor status/length and may
             // have DMA-written the payload. Acquire ordering keeps subsequent
-            // CPU reads of the payload after the observed DD bit.
+            // CPU reads of the payload (and the post-DD `length` read) after
+            // the observed DD bit.
             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
-            let len = d.length as usize;
+            let length = rx_length(self.rx.as_mut(), slot);
+            let len = length as usize;
             // QEMU's e1000e writes back padded-to-minimum broadcast frames
             // (e.g. 42-byte ARPs padded to 60) with the DD bit set but the EOP
             // bit clear, so requiring EOP would drop every ARP. A complete
             // frame is therefore judged on DD + a sane length alone; every
             // real Ethernet frame fits one 2048-byte buffer, so EOP adds no
             // information here.
-            let valid = rx_length_valid(d.length) && len <= out.len();
+            let valid = rx_length_valid(length) && len <= out.len();
             let buf_off = slot * RX_BUF_BYTES;
 
             if valid {
@@ -482,8 +519,18 @@ impl E1000 {
                 out[..len].copy_from_slice(src);
             } else {
                 self.rx_bad_len = self.rx_bad_len.wrapping_add(1);
-                self.rx_bad_status = d.status;
-                self.rx_bad_length = d.length;
+                self.rx_bad_status = status;
+                self.rx_bad_length = length;
+                // Diagnostic re-read: if the descriptor reads valid now, the
+                // rejection was a torn read racing the device's writeback,
+                // not a genuinely malformed writeback. Records direct evidence
+                // either way so a future recurrence is diagnosed, not guessed.
+                self.rx_bad_recheck_total = self.rx_bad_recheck_total.wrapping_add(1);
+                let rstatus = rx_status(self.rx.as_mut(), slot);
+                let rlength = rx_length(self.rx.as_mut(), slot);
+                if rstatus & DESC_STATUS_DD != 0 && rx_length_valid(rlength) {
+                    self.rx_bad_recheck_valid = self.rx_bad_recheck_valid.wrapping_add(1);
+                }
             }
 
             // Re-arm the descriptor and advance RDT. Translate before borrowing
@@ -527,6 +574,27 @@ fn write_desc(ring: &mut [u8], index: usize, d: &LegacyDescriptor) {
         core::ptr::write_volatile(ptr.add(13), d.css);
         core::ptr::write_volatile((ptr.add(14)) as *mut u16, d.special.to_le());
     }
+}
+
+/// Read the RX descriptor status byte only. The device publishes `length`
+/// (offset 8) *before* `status`/DD (offset 12) on writeback, so the DD bit is
+/// the completion marker: observing DD=1 guarantees the `length` field is
+/// already valid. Reading `length` first (as a full-struct read does) inverts
+/// that guarantee — the CPU can capture a pre-writeback `length` (0) and then
+/// a post-writeback DD, producing a "DD-set, length 0" frame that never
+/// existed. `receive()` therefore polls status first and only reads `length`
+/// after DD is observed (and the Acquire fence). Volatile: the device writes
+/// these bytes via DMA, and a plain read could be hoisted past the poll.
+fn rx_status(ring: &[u8], index: usize) -> u8 {
+    let off = index * DESC_BYTES;
+    unsafe { core::ptr::read_volatile(ring.as_ptr().add(off + 12)) }
+}
+
+/// Read the RX descriptor length after DD has been observed and fenced — the
+/// only point at which the hardware guarantees it is the post-writeback value.
+fn rx_length(ring: &[u8], index: usize) -> u16 {
+    let off = index * DESC_BYTES;
+    unsafe { core::ptr::read_volatile(ring.as_ptr().add(off + 8) as *const u16) }
 }
 
 fn read_desc(ring: &[u8], index: usize) -> LegacyDescriptor {
@@ -648,6 +716,27 @@ mod tests {
     }
 
     #[test]
+    fn rx_status_reads_dd_byte() {
+        // The device publishes length (offset 8) before status (offset 12);
+        // rx_status is the completion poll and must observe DD alone, while
+        // rx_length is only valid once DD is seen. Verify both offsets and
+        // that a not-done descriptor reports DD clear.
+        let mut ring = [0u8; RX_RING_LEN * DESC_BYTES];
+        let mut d = LegacyDescriptor::rx(0x6000);
+        d.length = 1500;
+        d.status = DESC_STATUS_DD | DESC_STATUS_RX_EOP;
+        write_desc(&mut ring, 1, &d);
+        assert_eq!(rx_status(&ring, 1) & DESC_STATUS_DD, DESC_STATUS_DD);
+        assert_eq!(rx_length(&ring, 1), 1500);
+        // Not-done: DD clear even though other status bits could be set.
+        let mut idle = LegacyDescriptor::rx(0x6000);
+        idle.status = DESC_STATUS_RX_EOP; // EOP alone must NOT read as done
+        write_desc(&mut ring, 1, &idle);
+        assert_eq!(rx_status(&ring, 1) & DESC_STATUS_DD, 0);
+        assert_eq!(rx_length(&ring, 1), 0);
+    }
+
+    #[test]
     fn rx_rearm_clears_dd_and_resets_length() {
         // Simulate a consumed descriptor: DD set + payload length written by
         // the device. Rearming must clear DD and zero the length so the ring
@@ -700,6 +789,8 @@ mod tests {
             rx_max_drain: 0,
             rx_bad_status: 0,
             rx_bad_length: 0,
+            rx_bad_recheck_valid: 0,
+            rx_bad_recheck_total: 0,
         };
         assert!(!e.send(&[0u8; 4096]));
         assert!(!e.send(&[]));
