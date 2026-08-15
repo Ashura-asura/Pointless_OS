@@ -211,6 +211,13 @@ pub unsafe fn dispatch_linux_syscall(frame: *mut u64) -> i64 {
                 denials
             );
             crate::tasks::kill_current();
+            // The task is now Zombie: returning to the syscall stub would
+            // iretq the dead Linux task back into ring-3 (VMware observed a
+            // #GP at its resumed RIP after exit(0)). Switch away to the next
+            // context instead — the same primitive the blocking IPC path
+            // uses; the zombie frame is never scheduled again, so this call
+            // chain is abandoned for good.
+            crate::tasks::switch_away_from(crate::tasks::current_idx());
             0
         }
         _ => -1, // translated and allowed, but this demo doesn't execute it

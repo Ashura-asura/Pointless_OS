@@ -155,6 +155,12 @@ macro_rules! exception_handler_stub {
 // the tail then switches the scheduler to the next context (same primitive
 // the timer stub uses — the saved dead task's frame is never resumed). If
 // a KERNEL fault occurs, `exception_trap_rust` never returns (it halts).
+//
+// A stale-frame resume (a task preempted by the timer while parked inside
+// this handler and switched away via `switch_frame`) returns here through
+// `timer_preempt`'s tail; the pop/iretq epilogue then resumes the task's
+// original faulted ring-3 context instead of falling through into the int3
+// alignment padding that used to follow this stub (#BP, RIP=0xB102).
 macro_rules! exception_handler_stub_page_fault {
     () => {
         #[unsafe(naked)]
@@ -171,6 +177,13 @@ macro_rules! exception_handler_stub_page_fault {
                 "mov rdx, rsp",
                 "call {trap}",
                 "call {preempt}",
+                "add rsp, 8",
+                "pop r11", "pop r10", "pop r9", "pop r8",
+                "pop rdi", "pop rsi", "pop rdx", "pop rcx",
+                "pop rbx", "pop rax",
+                "add rsp, 8",
+                "add rsp, 8",
+                "iretq",
                 trap = sym crate::cpu::exception_trap_rust,
                 preempt = sym crate::tasks::timer_preempt,
             )
