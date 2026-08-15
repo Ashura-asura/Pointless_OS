@@ -247,6 +247,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                     aegis_kernel::netif::SockKind::Tcp,
                     aegis_kernel::netif::GW_IP,
                     8080,
+                    None,
                 ) else {
                     sprintln!("Aegis: netif: no free socket slot");
                     return;
@@ -332,6 +333,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                     aegis_kernel::netif::SockKind::Tcp,
                     aegis_kernel::netif::GW_IP,
                     8443,
+                    None,
                 ) else {
                     sprintln!("Aegis: tls: no free socket slot");
                     return;
@@ -601,6 +603,12 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     } else {
         sprintln!("Aegis: e1000: no NIC found - driver skipped");
     }
+
+    // Phase I: two-node fleet demo. Runs only when the image is built as
+    // fleet node A or node B (mutually exclusive features); stripped out
+    // entirely on a normal build.
+    #[cfg(any(feature = "fleet-node-a", feature = "fleet-node-b"))]
+    aegis_kernel::fleet::run_boot_demo();
 
     // Live NVMe demo: probe BAR0, reset, admin + IO queues, identify, read
     // LBA 0/1 and check the GPT signature (disk image is GPT-partitioned).

@@ -10,6 +10,10 @@ kernel = []
 # the syscall dispatch choke point. Off by default; the shipped image carries
 # no trace state and no extra output.
 trace = []
+# Phase I: build this kernel image as node A or node B of a two-instance
+# fleet demo. Mutually exclusive — pick exactly one per build, never both.
+fleet-node-a = []
+fleet-node-b = []
 
 [dependencies]
 

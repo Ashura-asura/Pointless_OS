@@ -24,6 +24,11 @@ use crate::net::MacAddress;
 use crate::tcp::{TcpFlags, TcpSegment};
 use crate::udp::UdpDatagram;
 
+#[cfg(feature = "fleet-node-a")]
+pub const OUR_IP: [u8; 4] = [10, 0, 3, 1];
+#[cfg(feature = "fleet-node-b")]
+pub const OUR_IP: [u8; 4] = [10, 0, 3, 2];
+#[cfg(not(any(feature = "fleet-node-a", feature = "fleet-node-b")))]
 pub const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 pub const GW_IP: [u8; 4] = [10, 0, 2, 2];
 pub const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x02];
@@ -735,17 +740,28 @@ impl NetIf {
 
     /// Mint a new socket bound to exactly one destination. Returns
     /// `(socket_id, local_port)`.
+    /// Open a socket bound to exactly one destination. `local_port` lets the
+    /// caller bind a fixed local port (used by the Phase I fleet link, where
+    /// two peers rendezvous on a well-known port without a control channel);
+    /// `None` auto-assigns the next ephemeral port as before.
     pub fn socket_open(
         &mut self,
         kind: SockKind,
         remote_ip: [u8; 4],
         remote_port: u16,
+        local_port: Option<u16>,
     ) -> Option<(u16, u16)> {
         let i = self.sockets.iter().position(|s| s.is_none())?;
         let id = self.next_socket;
         self.next_socket = self.next_socket.wrapping_add(1);
-        let local_port = self.next_local_port;
-        self.next_local_port = self.next_local_port.wrapping_add(1);
+        let local_port = match local_port {
+            Some(p) => p,
+            None => {
+                let p = self.next_local_port;
+                self.next_local_port = self.next_local_port.wrapping_add(1);
+                p
+            }
+        };
         self.sockets[i] = Some(Socket {
             id,
             kind,
@@ -984,7 +1000,7 @@ fn seq_ge(a: u32, b: u32) -> bool {
 /// socket id, or `None` if the socket table is full.
 pub fn open_advisor_endpoint() -> Option<u16> {
     unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }
-        .socket_open(SockKind::Tcp, ADVISOR_HOST_IP, ADVISOR_HOST_PORT)
+        .socket_open(SockKind::Tcp, ADVISOR_HOST_IP, ADVISOR_HOST_PORT, None)
         .map(|(id, _local_port)| id)
 }
 
@@ -1099,7 +1115,7 @@ pub unsafe fn sys_net_socket(kind: u64, ip_packed: u64, port: u64) -> i64 {
         return -1;
     };
     let Some((id, _lp)) =
-        unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_open(kind, ip, port as u16)
+        unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_open(kind, ip, port as u16, None)
     else {
         record(false);
         return -1;
@@ -1393,7 +1409,7 @@ mod tests {
         let _g = crate::kernel_state_guard();
         clear_tx();
         let mut net = setup();
-        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080).unwrap();
+        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
         assert!(net.tcp_connect(id));
         assert_eq!(net.sockets[0].as_ref().unwrap().state, TcpState::SynSent);
         // The SYN went out: eth + ipv4 + tcp, SYN set, ACK clear.
@@ -1431,7 +1447,7 @@ mod tests {
         let _g = crate::kernel_state_guard();
         clear_tx();
         let mut net = setup();
-        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080).unwrap();
+        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
         assert!(net.tcp_connect(id));
         assert_eq!(tx_log().len(), 1);
         net.advance(RTO_POLLS - 1);
@@ -1446,7 +1462,7 @@ mod tests {
         let _g = crate::kernel_state_guard();
         clear_tx();
         let mut net = setup();
-        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080).unwrap();
+        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
         assert!(net.tcp_connect(id));
         let frames = tx_log();
         let seg = TcpSegment::parse(&frames[0][34..], None, None).unwrap();
@@ -1497,7 +1513,7 @@ mod tests {
         let _g = crate::kernel_state_guard();
         clear_tx();
         let mut net = setup();
-        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080).unwrap();
+        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
         assert!(net.tcp_connect(id));
         let frames = tx_log();
         let seg = TcpSegment::parse(&frames[0][34..], None, None).unwrap();
@@ -1544,7 +1560,7 @@ mod tests {
         let _g = crate::kernel_state_guard();
         clear_tx();
         let mut net = setup();
-        let (id, _lp) = net.socket_open(SockKind::Udp, GW_IP, 9999).unwrap();
+        let (id, _lp) = net.socket_open(SockKind::Udp, GW_IP, 9999, None).unwrap();
         assert_eq!(net.socket_send(id, b"ping"), 4);
         let frames = tx_log();
         let d = UdpDatagram::parse(&frames[0][34..], None, None).unwrap();
@@ -1582,7 +1598,7 @@ mod tests {
         let _g = crate::kernel_state_guard();
         clear_tx();
         let mut net = setup();
-        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080).unwrap();
+        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
         assert!(net.tcp_connect(id));
         let frames = tx_log();
         let seg = TcpSegment::parse(&frames[0][34..], None, None).unwrap();
