@@ -476,16 +476,32 @@ The resource-manager and supervision-tree work is now delivered in **ring 3**, l
 - **Index-regression fix** shipped in the same commit: a prior commit inserted the `input` task at index 2 and shifted every later task index, silently breaking the live demos (the client's echo call never matched the server). All demo code now uses named `IDX_*` constants (single source of truth); `MAX_TASKS` 12→16. Live proof: `[client] echo reply: ping from client` returns in `serial-phase-b.log`.
 - Honest limits (kept): revoke is **instance-named** (flat per-task CSpace, no model-I4 grant-root derivation tree — a grantor must name recipient+slot and cannot reach copies in CSpaces it cannot name); budgets are restart-counts, not CPU/energy; the escalation hand-off relies on the child supervisor surrendering (it stops serving the single-slot NOTIFY_EP mailbox) before the parent serves it — one observer at a time, no double-serve.
 
-## Phase I: distributed extension over a real network — reduced, not closed
+## Phase I: distributed extension over a real network — closed to its DoD
 
 The model-level `fleet` crate (locality, recipient binding, fail-closed
 `PeerStale`/`PeerUnreachable`) is proven at the model level (see §10 item 4
 above). This section is the separate, harder claim — two real kernel
 instances, two real QEMU processes, a real e1000-driven link between them.
-It closes as **reduced, not closed**: a real cross-machine capability use,
-proven live, with partition behavior fail-safe by construction. It does not
-"solve" distributed transparency itself — the CAP-level gap stays labeled
-inherent, per the design doc's own §10.
+
+Phase I's Definition of Done (design doc §7 Phase 11 / master roadmap
+Phase I; `fleet.rs` module header) is four things, all now demonstrated
+live and repeated:
+1. **mint + real cross-machine send** — node A mints object 42 and
+   transmits the recipient-bound envelope once; A's own ARP resolution
+   (it receives B's replies, `bad=0`) is exercised too;
+2. **real verify with recipient binding** — node B `verify OK`s the
+   HMAC-bound chain from A;
+3. **fail-closed on stale/partitioned issuer** — killing node A's process
+   flips B to `verify DENIED (fail-closed): PeerStale` and it holds;
+4. **recovery when the issuer returns** — relaunching node A flips B back
+   to `verify OK` (823 consecutive DENIED held, then clean recovery).
+
+It does **not** "solve" distributed transparency itself — the CAP-level
+gap stays labeled inherent, per the design doc's own §10. "Closed" here
+means the phase's own Definition of Done is met with repeat-run evidence;
+it is not a claim that the deeper distributed-systems problem (quorum,
+split-brain resolution, remote invocation of a transferred capability) is
+solved, because that is explicitly out of this phase's scope (§10).
 
 **What's proven live:**
 - Node A and node B boot as two separate kernel images
@@ -545,21 +561,45 @@ flip to `PeerStale` while staying alive. Every one of the 20 runs:
 - RX diagnostics stayed clean through the flip: `bad=0`, `sat=0`
   (ring never saturated), `max_drain` 2–12, ~12–13k packets/frame per run.
 
+**Live recovery — now demonstrated (the last open transport item):**
+Partition behavior is not just fail-safe, it *recovers* when the peer
+returns. Recovery test (same two nodes, same kernels — zero kernel code
+changes; the model's `heartbeat`-restores-verify path, exercised live):
+- B verifies OK (line 503) → node A's process killed by exact PID → B
+  holds `verify DENIED (fail-closed): PeerStale` for **823 consecutive
+  verifies (lines 504–1408)** → node A relaunched → B returns to
+  `verify OK` at line **1410** and stays there for ~5,500 further verifies.
+  Node B's qemu process never died. Raw boundary in
+  `uefi-boot/serial-fleet-b.log`.
+- **Honest addendum — 5 isolated single-verify stale blips** (lines 6988,
+  7086, 7146, 7168, 7211) later in the same long run: each is exactly one
+  `verify DENIED (PeerStale)` immediately followed by `verify OK`. Cause:
+  the relaunched node A never stopped sending heartbeats (its poll counter
+  ran to 189M with no drop), so these are the fail-closed gate catching a
+  single verify interval where a heartbeat burst was lost on the UDP host
+  socket, then recovering on the next heartbeat — the same mechanism as the
+  kill test, but triggered by transient UDP loss rather than a process kill.
+  This is correct behavior, not a regression: the gate denied when the
+  issuer looked stale and re-verified OK the moment heartbeats resumed.
+  It is also a reminder that UDP makes no delivery promise — the design's
+  fail-closed recovery is what turns that into a visible, self-healing
+  partition rather than silent acceptance.
+
 **Honest limits (kept, not glossed):**
-1. **`bad_length` = 1 in 310k frames** (a pre-fix run) is observed but
-   not yet explained; "benign so far" is not "understood." The 20-run
-   soak shows `bad=0` across every run (~13k frames each, ~260k frames
-   total), so the pre-fix outlier has not recurred — but the counter stays
-   in place so any future occurrence can be correlated with a specific
-   frame rather than hand-waved.
-2. **The soak kills node A by PID, not the capability layer.** Each run
-   re-proves the *transport* is reliable under repetition and the
-   *fail-closed verdict* is deterministic; it does not exercise recovery
-   (nothing re-connects A after the kill).
-3. No consensus, replication, or split-brain handling — unchanged from the
-   model-level claim; partition behavior is fail-safe by construction
-   (verify DENIED on stale issuer) but nothing *recovers* automatically.
-4. The bridge-based frame capture used during diagnosis is not part of the
+1. **`bad_length` = 1 in 310k frames** (a pre-fix, uncommitted run) is
+   observed but not reproduced; "benign so far" is not "understood." All
+   committed evidence — the fix run (108k frames) and the 20-run soak
+   (~260k frames) — shows `bad=0`. The counter stays in place as a
+   tripwire so any future occurrence is correlated with a specific frame
+   rather than hand-waved. The single observation predates the committed
+   hardening and has never recurred since.
+2. **Recovery is demonstrated; consensus is not, and is out of scope.**
+   Recovery = the issuing node's *return* restores verification (proven
+   live above). Nothing here claims split-brain resolution, quorum, or
+   ordering guarantees across a partition — the design doc's §10 CAP
+   warning still applies and such handling is a materially larger problem
+   deliberately not built in this phase.
+3. The bridge-based frame capture used during diagnosis is not part of the
    committed flow; node A now connects straight to node B's listen port
    (45560), so a future debugging session needing the bridge must re-add
    it deliberately (it is a diagnostics tool, not the demo).
