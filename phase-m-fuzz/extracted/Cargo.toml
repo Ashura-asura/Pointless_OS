@@ -1,17 +1,19 @@
 [package]
-name = "fuzzcheck"
+name = "phase-m-fuzz-extracted"
 version = "0.1.0"
 edition = "2021"
 
 # Rust 1.75-compatible (pre-1.82) standalone harness over the three parsers
-# extracted verbatim from aegis-kernel. This reproduces the `new_hypo` sandbox
-# campaign (90M inputs, 2 seeds, 0 panics). It exists as a provenance baseline
-# and for use on toolchains below the kernel's 1.82 MSRV; the repo's
-# authoritative Phase M harness is the sibling `../` crate which fuzzes the
-# REAL in-crate functions directly.
+# extracted verbatim from aegis-kernel (elf_loader.rs / pe_loader.rs /
+# store_decode.rs below, renamed from the sandbox's *_extracted.rs copies but
+# byte-identical). This reproduces the `new_hypo` sandbox campaign (90M inputs,
+# 2 seeds, 0 panics). It exists as a provenance baseline and for use on
+# toolchains below the kernel's 1.82 MSRV; the repo's authoritative Phase M
+# harness is the sibling `../` crate which fuzzes the REAL in-crate functions
+# directly.
 [[bin]]
-name = "fuzzcheck"
-path = "src/main.rs"
+name = "phase-m-fuzz-extracted"
+path = "main.rs"
 
 [profile.release]
 panic = "unwind"

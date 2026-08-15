@@ -99,11 +99,14 @@ seeds; both hit 0 panics.)
 
 - `phase-m-fuzz/` — the real-crate harness (`Cargo.toml`, `src/main.rs`,
   `fuzz-run.log` evidence). `cargo run --release -- <seed> <iterations>`.
-- `phase-m-fuzz/extracted/` — the sandbox's standalone extracted-copy harness
-  (its `Cargo.toml` was fixed to actually build: original pointed at a
-  nonexistent `src/lib.rs` and the `mod elf_loader;` names didn't match the
-  `*_extracted.rs` filenames). `cargo run --release -- <seed> <iterations>`.
-  The `*_extracted.rs` files are preserved verbatim.
+- `phase-m-fuzz/README.md` — explains the two harnesses and how they relate.
+- `phase-m-fuzz/extracted/` — the sandbox's standalone extracted-copy harness,
+  consolidated to a single set of source files at the crate root (crate
+  `phase-m-fuzz-extracted`; the redundant `src/` duplicate copies were removed).
+  The four sources (`main.rs`, `elf_loader.rs`, `pe_loader.rs`,
+  `store_decode.rs`) are the sandbox's verbatim originals — byte-identical to
+  what `new_hypo` ran, renamed only (`fuzz_main.rs` → `main.rs`,
+  `*_extracted.rs` → the parser names). `cargo run --release -- <seed> <iterations>`.
 - `SECURITY_AUDIT.md` — fuzzing row and non-certification #4 updated with the
   real numbers; ceiling row added for `AegisCeiling.tla`.
 - `aegis-kernel/src/store.rs` — `decode_entries` widened `pub(crate)` → `pub`.
