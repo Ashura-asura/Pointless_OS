@@ -33,6 +33,7 @@ const IDX_MEM_RM: u64 = 12;
 const IDX_MEM_CLIENT: u64 = 13;
 const IDX_PARENT_SUP: u64 = 14;
 const IDX_LINUX_HELLO: u64 = 15;
+const IDX_ADVISOR: u64 = 16;
 
 #[no_mangle]
 pub extern "sysv64" fn _start(handoff_addr: u64) -> ! {
@@ -1629,6 +1630,39 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         }
     }
 
+    // Phase F / J-2: the `query-advisor` role's live wiring. The advisor
+    // task is a zero-capability ring-3 task at birth; it only gains a cap
+    // when the supervisor grants it the `query-advisor` role (role id 2)
+    // over the watched service during its escalation branch. That grant
+    // mints a NetEndpoint bound to the kernel-declared advisor host
+    // (netif.rs `open_advisor_endpoint`), so the advisor never names a
+    // destination — it can only ever talk to the host the kernel declares.
+    // Spawned last so the IDX_* spawn-order contract stays intact.
+    {
+        let stk = unsafe {
+            aegis_kernel::frame::alloc_contiguous_global(
+                aegis_kernel::tasks::TASK_STACK_SIZE / 4096,
+            )
+        };
+        let cpl0 = unsafe {
+            aegis_kernel::frame::alloc_contiguous_global(
+                aegis_kernel::tasks::TASK_STACK_SIZE / 4096,
+            )
+        };
+        match (stk, cpl0) {
+            (Some(s), Some(c)) => {
+                unsafe {
+                    aegis_kernel::tasks::spawn_user("advisor", task_advisor, s, c);
+                }
+                sprintln!(
+                    "Aegis: Phase-F J-2: advisor task spawned ({} tasks total)",
+                    aegis_kernel::tasks::spawned_count()
+                );
+            }
+            _ => sprintln!("Aegis: Phase-F J-2: could not allocate advisor task stacks"),
+        }
+    }
+
     // Guard the spawn-order contract the IDX_* constants document: the task
     // table is built purely by spawn order, so a future task inserted out of
     // line silently shifts every hardcoded index (the exact regression that
@@ -1636,7 +1670,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // order and the running count here, so a drift fails at boot instead of
     // surfacing as a dead demo miles later.
     {
-        const ORDER: [u64; 16] = [
+        const ORDER: [u64; 17] = [
             IDX_ALPHA,
             IDX_BETA,
             IDX_INPUT,
@@ -1653,6 +1687,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             IDX_MEM_CLIENT,
             IDX_PARENT_SUP,
             IDX_LINUX_HELLO,
+            IDX_ADVISOR,
         ];
         for (i, &idx) in ORDER.iter().enumerate() {
             assert_eq!(
@@ -1759,6 +1794,18 @@ extern "sysv64" fn task_input() -> ! {
             }
         }
         core::hint::spin_loop();
+        // Service the NIC's RX ring when present: the boot demos self-poll,
+        // but once they return nothing else would drain frames — and the
+        // Phase F/J-2 advisor task's TCP exchange over the kernel-minted
+        // endpoint needs that drain to keep making progress. Guarded so the
+        // fleet build (no NIC) and a headless probe are unaffected.
+        unsafe {
+            aegis_kernel::netif::NetIf::with(|net| {
+                if net.nic.is_some() {
+                    net.poll();
+                }
+            });
+        }
     }
 }
 static ALPHA_NEXT: AtomicU64 = AtomicU64::new(2048);
@@ -1989,6 +2036,22 @@ extern "sysv64" fn task_supervisor() -> ! {
             // endpoint at slot 3 at its startup; call it to adopt the
             // subsystem, then stop serving the notification channel so the
             // parent becomes its sole observer under a fresh budget.
+            // Phase F / J-2: before surrendering the subsystem upward, consult
+            // the advisor. This is advice only — it cannot change whether the
+            // restart is allowed (that gate is the supervisor's own
+            // `restart-service` capability, untouched). Grant the
+            // `query-advisor` role (id 2) to the zero-cap advisor task over
+            // the watched service, through the same audited RoleGrant syscall
+            // (18) every other role in this demo uses. The kernel mints the
+            // NetEndpoint bound to the declared advisor host; the advisor
+            // task then runs its own send/recv once it sees the grant land.
+            let ag = user_syscall5(18, 2, IDX_ADVISOR, IDX_SERVICE, 0); // RoleGrant(query-advisor, advisor, service, slot 0)
+            user_print(b"Aegis: [supervisor] role grant query-advisor -> advisor over service: ");
+            user_print(if ag == u64::MAX {
+                b"DENIED\r\n"
+            } else {
+                b"OK\r\n"
+            });
             user_print(
                 b"Aegis: [supervisor] ESCALATION: child restart budget exhausted, \
 leaving child dead\r\n",
@@ -2290,6 +2353,75 @@ extern "sysv64" fn task_observer() -> ! {
         b"UNEXPECTED SUCCESS\r\n"
     });
     user_print(b"Aegis: [observer] watch-only role held; observation never became control\r\n");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Phase F / J-2: the `query-advisor` task. It starts with ZERO capabilities
+/// and cannot mint its own socket — it can only ever use whatever the kernel
+/// grants it. When the supervisor's escalation branch grants it the
+/// `query-advisor` role (id 2, syscall 18), the kernel mints a NetEndpoint
+/// bound to the one kernel-declared advisor host (netif.rs
+/// `open_advisor_endpoint`) into its slot 0. This task then polls that slot
+/// until the grant lands, sends its advisory query over the (already-open)
+/// TCP endpoint, and reads the response. Everything it can do is gated on
+/// SEND|RECV over that one host; it holds no Task cap, so it can never
+/// restart or kill anything — advice is read, never authority.
+extern "sysv64" fn task_advisor() -> ! {
+    user_print(b"Aegis: [advisor] online with zero capabilities\r\n");
+    // Poll slot 0 until the supervisor's RoleGrant lands the NetEndpoint.
+    // Until then every net syscall on the empty slot is refused (-1).
+    let mut granted = false;
+    for _ in 0..5_000_000u64 {
+        let c = user_syscall5(20, 0, 0, 0, 0); // net_connect(slot 0)
+        if c != u64::MAX {
+            granted = true;
+            break;
+        }
+        user_syscall5(3, 0, 0, 0, 0); // yield so the grantor can run
+    }
+    if !granted {
+        user_print(b"Aegis: [advisor] role grant never arrived\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    user_print(b"Aegis: [advisor] query-advisor role received; endpoint ready\r\n");
+    // Send the advisory query over the kernel-minted endpoint.
+    let q = b"restart? y/n";
+    let sent = user_syscall5(21, 0, q.as_ptr() as u64, q.len() as u64, 0); // net_send
+    user_print(b"Aegis: [advisor] query sent (");
+    print_dec(sent as u64);
+    user_print(b" bytes)\r\n");
+    // Read the response (TCP echo reply from the host listener). The kernel
+    // drains the NIC in task_input's round-robin slice, so poll the socket
+    // until bytes arrive (bounded), yielding between attempts — the same
+    // pattern the boot network demos use.
+    let mut resp = [0u8; 64];
+    let mut n: u64 = 0;
+    let mut polls = 0u64;
+    while polls < 50_000_000 {
+        let r = user_syscall5(22, 0, resp.as_mut_ptr() as u64, resp.len() as u64, 0); // net_recv
+        if r > 0 {
+            n = r;
+            break;
+        }
+        user_syscall5(3, 0, 0, 0, 0); // yield so the NIC drainer can run
+        polls += 1;
+    }
+    user_print(b"Aegis: [advisor] response received (");
+    print_dec(n);
+    user_print(b" bytes): ");
+    if n > 0 {
+        let n = core::cmp::min(n as usize, resp.len());
+        user_print(&resp[..n]);
+    }
+    user_print(b"\r\n");
+    user_print(
+        b"Aegis: [advisor] advice read, never authority - no Task cap held; nothing restarted\r\n",
+    );
+    let _ = user_syscall5(23, 0, 0, 0, 0); // net_close
     loop {
         core::hint::spin_loop();
     }

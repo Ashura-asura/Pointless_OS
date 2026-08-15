@@ -434,6 +434,7 @@ The TLA+ model-check covers 331k states with 2 tasks and 3 capability slots. Thi
 | Phase G CLOSED (commit c90acd2) | **Real VT-d IOMMU DMA isolation, live-verified.** `iommu.rs` (user-supplied, applied): `translate` is the real gate every NVMe/e1000 DMA address passes before a PRP/descriptor is written — page-number-keyed sparse table (fixes the old 512-slot masked-index collision), `MAX_MAPPINGS_PER_DOMAIN=64`, fault ring (16) with monotonic `fault_total`, three-way `IommuFault`, `provision_device` + `identity_map`, global `unsafe fn with`. `nvme.rs`/`e1000.rs`: per-device domains provisioned in `probe`, buffers identity-mapped before any address reaches hardware, `dma_addr` gate on every PRP/ring/descriptor. `main.rs`: live denial demo on the real NVMe bdf. Live QEMU/OVMF boot (`uefi-boot/serial-phase-g-clean.log`): NVMe identify + LBA0/1 (protective MBR / GPT header) and the full e1000 ARP→TCP→HTTP→TLS path all pass the gate, then `IOMMU: NVMe out-of-domain DMA to 0x100000000 denied at the IOMMU: true (AddressNotMapped) — fault_total = 1` and the kernel continues (FAT16 + NVMe-store + compat + all task demos to tick 6364). Honest limit kept: software gate mirroring VT-d, no real DMAR MMIO; identity-mapped IOVA space. 438 kernel + 128 model + 13 uefi-boot tests pass clean (579 total), clippy/fmt/release-build clean, raw output in commit |
 | Phase H CLOSED (this commit) | **Live Bochs VBE framebuffer backend** — Phase H's claim was a real linear-framebuffer graphics path under QEMU `-vga std`, previously "landed, not live-verified". Now verified live: probe finds the real PCI display (00:01.0, `Bochs VBE display found, id=0xb0c5 lfb=0x80000000`), sets 800x600x32 via the dispi ports (`mode set 800x600x32`, `set_mode = true`), and installs the framebuffer backend (`framebuffer backend installed (desktop -> pixels too)`) — all serial-asserted (`uefi-boot/serial-phase-h.log`). QEMU monitor `screendump` at the running desktop (`uefi-boot/phase-h-desktop.ppm`) is a true 800x600 PPM with 157,212 non-black pixels in the VGA palette (blue `0000aa` window bg + white `ffffff` text) — the composited shell/windows are painted as pixels, not text cells. **Input → pixels round-trip:** `sendkey x` changed exactly 45 pixels in a 15x8 bbox at the prompt ((168,137)-(183,145)) — one 8x16 glyph — and serial shows `shell-compositor@key: echo 'x' -> window id=3 line pos=0` (evidence pair `phase-h-pre.ppm`/`phase-h-post.ppm`). First screendump was black only because it was taken before the boot demos finished (desktop install/blit runs after the network poll loop); the mode surface was already live (800x600 geometry). Honest limits: framebuffer backend only (`gpu.rs` + `gpu_compositor.rs` `blit_cells`), no GPU command engine, no mouse, UNTESTED on real hardware. 471 kernel + 128 model + 13 uefi-boot tests pass clean, clippy/fmt clean, raw output in commit |
 | Phase J CLOSED (this commit) | **Real ring-3 Linux ELF execution vehicle, live** — a genuine static Linux ELF binary (`linux-hello.elf`, built from `linux-hello.ll` with the LLVM toolchain that ships in the pinned Rust toolchains: `llc` + `ld.lld`, script `link-hello.ld` forcing one R+E PT_LOAD at 0x400000, 91-byte segment = 42 code + 49 message bytes) is parsed by the kernel's own `elf_loader` (`linux_compat_elf.rs`, user-supplied, applied as submitted) and spawned as a real ring-3 task (`spawn_linux_hello` → `spawn_user("linux-hello", …)` at index 15, `IDX_LINUX_HELLO`, appended LAST so the IDX_* spawn-order contract stays intact). The code page is mapped executable at `LINUX_CODE_VADDR` (0x0000_7000_0000_0000) via the new `page_tables::map_user_code_page` (fresh PML4→PDPT→PD→PT USER chain, leaf R+X no-NX not-writable), and `syscall.rs` routes the task's `int 0x80` to `dispatch_linux_syscall`, gated by the `LinuxCompatLayer` personality with a restrictive scope (CAP_FILE + CAP_PROCESS). Live proof (`uefi-boot/serial-phase-j.log`): `spawned as ring-3 task 15`, `switch_frame from=14 to=15 rsp0=0x1C8000`, the binary's 49-byte message `Aegis: real Linux ELF binary executing in ring-3` delivered via `write(1,…)` → serial, `[linux-hello] real Linux binary called exit(0) via int 0x80 — syscall denials so far: 0`, no fault/panic after. Honest scoping kept: the trap reuses this kernel's existing `int 0x80` gate (no `syscall`/`sysret` MSR path); syscall *numbers* are the real Linux ABI but the argument-register mapping is the kernel gate's convention (a real 64-bit Linux `int 0x80` uses 32-bit compat registers); single R+E page, write→serial/VGA only, exit/1+ handled. 474 kernel + 128 model + 13 uefi-boot tests pass clean (raw output in commit), clippy/fmt/release-build clean, `uefi-boot/serial-phase-j.log` committed. Note: the ELF build tools are NOT in PATH (no GNU binutils on this host); `build-linux-hello.bat` documents the `llc`/`ld.lld` full paths. |
+| Phase J-2 CLOSED (this commit) | **`query-advisor` role wired live — Phase F DoD met.** The role existed (`role.rs`, id 2, unit-tested) but main.rs never granted it. Now the supervisor's escalation branch (fires live after the 3rd child crash, budget 2→0) grants `query-advisor` to a zero-cap `advisor` task over the watched service via the same audited syscall 18; the grant mints a NetEndpoint bound to the kernel-declared advisor host (`netif::open_advisor_endpoint` → TCP 10.0.2.2:443) — the advisor never names a destination. `task_advisor` sends the query (`query sent (12 bytes)`), bounded-polls `net_recv` (yielding between attempts), prints the echo (`response received (2 bytes): y`), and holds NO Task cap (`advice read, never authority`). `MAX_TASKS` 16→17, `IDX_ADVISOR=16` appended last (spawn-order contract intact, 17 tasks); `task_input` now drains the NIC RX ring (guarded `net.poll()` when present) so the post-boot TCP exchange progresses. Live proof: `uefi-boot/serial-phase-j2.log` + host echo listener `uefi-boot/advisor-echo-j2.log` (recv `b'restart? y/n'` twice, echo `y\n`). Restart path untouched: `restart-service -> agent: OK`, `restarting child, budget left 1 -> OK`, parent adoption still runs; no panic. Honest limits: the "advisor" is a host-side TCP echo listener (real wire bytes, canned `y` reply — not an AI service); post-boot NIC servicing lives in task_input's round-robin slice; UNTESTED on real hardware. 474 kernel + 128 model + 13 uefi-boot tests pass clean (raw output in commit), clippy/fmt/release-build clean. |
 
 ## §10 follow-on: two-role library (kernel-gated roles, same discipline)
 
@@ -711,3 +712,61 @@ clippy/fmt/release-build clean, raw output in commit. Honest limits kept:
 single R+E page, no bss/stack segment, write(1) → serial/VGA only (no real
 filesystem fd), exit/1+ handled, the gate traps `int 0x80` only for this one
 task, UNTESTED on real hardware.
+
+## Phase J-2: `query-advisor` role live wiring — Phase F DoD met
+
+Phase F's role library (`role.rs`) already declared `query-advisor` (id 2)
+with unit tests (`query_advisor_role`, `advisor_cannot_escape_host_scope`),
+but `main.rs` never granted it — grep confirmed zero hits. J-2 wires it into
+the existing supervisor/observer boot demo exactly where Phase F's DoD
+wants: the anomaly (child restart budget exhausted) → advisor queried →
+advice read, never authority; the restart path stays on its own
+pre-existing `restart-service` capability, unchanged.
+
+What was added (`aegis-kernel/src/main.rs`, `tasks.rs`):
+- `MAX_TASKS` 16 → 17 (index 15 was taken by `IDX_LINUX_HELLO`); the new
+  zero-cap ring-3 `advisor` task is spawned LAST as `IDX_ADVISOR = 16`, so
+  the `IDX_*` spawn-order contract stays intact (guard asserts 17 tasks).
+- `task_advisor`: polls its slot 0 until the supervisor's RoleGrant lands
+  the kernel-minted NetEndpoint, then `net_send` the query, bounded-poll
+  `net_recv` for the echo (yielding between attempts so the NIC drainer
+  runs), `net_close`, and spins down. It holds NO Task cap — nothing to
+  restart, ever.
+- Supervisor escalation branch: before surrendering the subsystem upward
+  (the branch that fires live after the 3rd child crash, budget 2 → 0), it
+  grants `query-advisor` to the advisor over the watched service through the
+  same audited syscall 18 every other role uses. The grant mints the
+  NetEndpoint bound to the kernel-declared advisor host
+  (`netif::open_advisor_endpoint` → TCP to `ADVISOR_HOST_IP:443`); the
+  advisor never names a destination and never calls `sys_net_socket`.
+- `task_input` now also drains the NIC RX ring (guarded `net.poll()` when
+  the NIC is present) so the advisor's post-boot TCP exchange makes
+  progress — the boot demos self-poll but nothing did afterward.
+
+Live proof (`uefi-boot/serial-phase-j2.log` + host-side echo listener log
+`uefi-boot/advisor-echo-j2.log`):
+- `Phase-F J-2: advisor task spawned (17 tasks total)`, `spawn-order
+  contract guarded (17 tasks, constants in order)`
+- `[advisor] online with zero capabilities`
+- `[supervisor] role grant query-advisor -> advisor over service: OK`
+- `[supervisor] ESCALATION: child restart budget exhausted` — the advisor
+  consult happens at the real anomaly, before the parent adoption.
+- `[advisor] query-advisor role received; endpoint ready`, `query sent (12
+  bytes)` → the host listener (`advisor_echo.py` on 127.0.0.1:443, QEMU
+  user-net maps guest `10.0.2.2` → host loopback) logged `recv 12 bytes:
+  b'restart? y/n'` and echoed `y\n`.
+- `[advisor] response received (2 bytes): y` — the wire round-trip.
+- `[advisor] advice read, never authority - no Task cap held; nothing
+  restarted`
+- The restart path is untouched: `role grant restart-service -> agent over
+  service: OK`, `[supervisor] restarting child, budget left 1 -> OK`, parent
+  adoption still runs. No panic (boot continues).
+
+Tests: kernel lib still 474 (no new unit tests — this phase wires an
+already-tested role; the run adds no test count), model 128, uefi-boot 13.
+clippy/fmt/release-build clean, raw output in commit. Honest limits kept:
+the "advisor" is the QEMU user-net gateway → a host-side TCP echo listener
+on 443 (real bytes both ways, but a canned `y` reply — not an AI service);
+the demo exercises the capability path and the wire, not a real advisor
+model; post-boot NIC servicing lives in the input task's round-robin slice;
+UNTESTED on real hardware.

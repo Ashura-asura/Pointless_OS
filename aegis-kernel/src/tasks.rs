@@ -16,7 +16,7 @@ pub const TASK_STACK_SIZE: u64 = 16384;
 /// Task table capacity. Bumped to 12 in Phase 6: the Phase-6 demo adds a
 /// zero-capability agent task and a crashable service task on top of the
 /// Phase-5 set (alpha/beta/server/client/supervisor/iso/nx/denied).
-pub const MAX_TASKS: usize = 16;
+pub const MAX_TASKS: usize = 17;
 /// Slots in each task's capability table.
 pub const MAX_CAPS: usize = 16;
 
