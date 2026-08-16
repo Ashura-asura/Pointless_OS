@@ -55,6 +55,7 @@ pub mod object_graph;
 pub mod ps2;
 pub mod ps2_mouse;
 pub mod shell;
+pub mod terminal;
 pub mod window;
 
 pub mod elf_loader;

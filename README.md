@@ -35,10 +35,10 @@ engineering experimentation.
 An active research prototype. **All 12 phases of the design-doc roadmap are
 implemented and closed**, with the core architectural claim — a role-granted,
 zero-capability AI agent that provably cannot self-escalate, running one real
-task — verified live under QEMU. The **full live test suite is 687 tests**:
-**537 in `aegis-kernel`** (contract tests over the real kernel), **128 in the
-`aegis` model crates**, and **22 in `uefi-boot`** (loader + ELF parsing),
-fmt/clippy-clean.
+task — verified live under QEMU. The **full live test suite is 718 tests**:
+**568 in `aegis-kernel`** (contract tests over the real kernel,
+`cargo test --features chaos-demo`), **128 in the `aegis` model crates**, and
+**22 in `uefi-boot`** (loader + ELF parsing), fmt/clippy-clean.
 
 What is real and live-verified (all under QEMU/OVMF, evidence committed as
 serial logs + framebuffer captures):
@@ -101,7 +101,7 @@ Limits section, split into *closed / reduced / inherent*):
 ## Repository layout
 - `aegis-kernel/` — the real kernel: boot, drivers, netstack, TLS, store,
   scheduler, supervision, desktop/compositor/editor, compat layers
-  (`cargo test --features chaos-demo` = 537 tests)
+  (`cargo test --features chaos-demo` = 568 tests)
 - `aegis/` — model crates mirroring the kernel (capability-core, store,
   net, fleet, etc.; 128 tests)
 - `uefi-boot/` — UEFI loader + image build + QEMU demo scripts (22 tests)

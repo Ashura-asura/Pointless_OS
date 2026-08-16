@@ -12,10 +12,10 @@
 //! that mirrors the echoed character into the composited screen). The shell
 //! window is the default post-boot surface — there are no demo windows.
 //!
-//! Honest limit: the shell echoes a single command line (no scrollback yet),
-//! and only characters the PS/2 driver can translate (letters, digits,
-//! Space) reach the line; punctuation has no `Key` variant in the input
-//! model and is dropped upstream.
+//! Honest limit: only characters the PS/2 driver can translate (letters,
+//! digits, Space) reach the line; punctuation has no `Key` variant in the
+//! input model and is dropped upstream (Phase R's `terminal` module works
+//! around this for file names specifically — see its module docs).
 //!
 //! Phase O adds window chrome: the shell window now has a title bar (drag
 //! to move), a bottom-right resize handle, and a close button; `apply_mouse`
@@ -46,12 +46,29 @@
 //! empty `fileN.txt` (first unused N) in the durable view. Without a durable
 //! store the browser lists nothing honestly — the same in-memory fallback
 //! scope the editor already documents.
+//!
+//! Phase R upgrades the shell window (id 3, the one that has been present
+//! since before Phase O) from a single echoed line into a real command
+//! interpreter over the same boot view the editor and browser already use
+//! (see `terminal`). Enter now parses the submitted line
+//! (`terminal::Command::parse`) and runs it: `ls` lists every name in the
+//! boot view, numbered; `open <n>` / `cat <n>` print the n-th listed name's
+//! content; `new` creates the next unused `fileN.txt` (and refreshes the
+//! browser too, so a file created from either app shows up in both); `clear`
+//! empties the scrollback; `help` lists the commands. Output accumulates in
+//! a bounded scrollback (`terminal::Terminal`) rendered above the prompt,
+//! which has moved to the window's last row to make room for it. Honest
+//! limit, inherited from `input.rs`: there is no `Key` for `.` or any other
+//! punctuation, so a file name can never be typed directly — `ls` + a
+//! numbered `open`/`cat` is the keyboard-only equivalent of the browser's
+//! click-to-open gesture.
 
 use crate::browser::FileBrowser;
 use crate::compositor::{self, Cell, MAX_WINDOWS};
 use crate::editor::{self, Editor, EDITOR_BUF_MAX};
 use crate::input::{Key, KeyEvent, MouseEvent};
 use crate::store::Name;
+use crate::terminal::{Command, Terminal};
 use crate::update::VIEW_MAX_FILES;
 use crate::window::{Region, WindowManager};
 
@@ -90,6 +107,54 @@ const PROMPT: &[u8] = b"aegis:~$ ";
 /// shell window width).
 const LINE_MAX: usize = (SHELL_W as usize) - PROMPT.len();
 
+/// Text printed by the shell's `help` command (Phase R).
+const HELP_LINES: [&[u8]; 5] = [
+    b"commands: help ls clear new open <n>",
+    b"  ls        - list files, numbered",
+    b"  open <n>  - print listing entry n (cat works too)",
+    b"  new       - create the next fileN.txt",
+    b"  clear     - clear this scrollback",
+];
+
+/// Render one `ls` row as `"<n> <name>"` into `out`, truncated to `out`'s
+/// length (never panics on an oversized name). Mirrors
+/// `browser::format_file_n`'s allocation-free decimal formatting, just for
+/// a listing row instead of a generated file name.
+fn format_listing_row(
+    n: usize,
+    name: &Name,
+    out: &mut [u8; crate::terminal::OUT_LINE_MAX],
+) -> usize {
+    let mut at = 0usize;
+    let mut digits = [0u8; 6];
+    let mut d = 0usize;
+    let mut v = n;
+    if v == 0 {
+        digits[0] = b'0';
+        d = 1;
+    }
+    while v > 0 {
+        digits[d] = b'0' + (v % 10) as u8;
+        v /= 10;
+        d += 1;
+    }
+    for i in (0..d).rev() {
+        if at < out.len() {
+            out[at] = digits[i];
+            at += 1;
+        }
+    }
+    if at < out.len() {
+        out[at] = b' ';
+        at += 1;
+    }
+    let bytes = name.as_slice();
+    let take = bytes.len().min(out.len().saturating_sub(at));
+    out[at..at + take].copy_from_slice(&bytes[..take]);
+    at += take;
+    at
+}
+
 /// What a keypress did to the live desktop. The caller (input task) prints
 /// it over serial as the keypress-driven analogue of the boot-time shell
 /// assertion: the echoed character is visible in the composited screen.
@@ -99,8 +164,16 @@ pub enum KeyOutcome {
     Echoed { window_id: u32, ch: u8, pos: usize },
     /// Backspace removed the last character; the line now has `pos` chars.
     Backspace { window_id: u32, pos: usize },
-    /// Enter submitted (cleared) a `len`-character line.
-    Enter { window_id: u32, len: usize },
+    /// Enter, with the shell focused, submitted a `len`-character command
+    /// line (Phase R): the line was parsed and run (`ls`/`open`/`cat`/
+    /// `new` touch the boot view; `help`/`clear` are local), appending
+    /// `lines` output lines to the shell's scrollback (0 for an empty line
+    /// or `clear`).
+    Enter {
+        window_id: u32,
+        len: usize,
+        lines: usize,
+    },
     /// An arrow key moved the shell window; it is now at `(x, y)` (clamped
     /// to stay fully on screen and below the title / above the status bar
     /// — see `MOVE_MIN_X`..`MOVE_MAX_Y`).
@@ -218,6 +291,7 @@ pub struct Desktop {
     editor: Editor,
     editor_name: Name,
     browser: FileBrowser,
+    terminal: Terminal,
     focus: AppFocus,
     line: [u8; LINE_MAX],
     line_len: usize,
@@ -329,6 +403,7 @@ impl Desktop {
             editor: Desktop::editor_initial(),
             editor_name: Name::from_slice(editor::FILE_NAME).unwrap(),
             browser: FileBrowser::new(),
+            terminal: Terminal::new(),
             focus: AppFocus::Shell,
             line: [0u8; LINE_MAX],
             line_len: 0,
@@ -365,10 +440,16 @@ impl Desktop {
     }
 
     /// Render the shell window's framebuffer from its current size: row 0 is
-    /// the title bar ("Shell" + a close button at the last cell), row 1 holds
-    /// the prompt + echoed line + cursor. Re-rendered on every resize so the
-    /// title bar and prompt stay aligned with the window's current width (the
-    /// compositor indexes framebuffers by the window's current region width).
+    /// the title bar ("Shell" + a close button at the last cell); the prompt,
+    /// typed line, and cursor now sit on the LAST row (Phase R); the rows in
+    /// between (row 1 through h-2) show scrollback output, growing top-down
+    /// as commands run.
+    ///
+    /// Once output exceeds the visible rows, only the most recent ones are
+    /// shown. Re-rendered on every resize or command so the title bar,
+    /// scrollback, and prompt stay aligned with the window's current width
+    /// and height (the compositor indexes framebuffers by the window's
+    /// current region size).
     fn render_shell(&mut self) {
         let (w, h) = self
             .wm
@@ -391,23 +472,149 @@ impl Desktop {
         if w > 0 {
             self.fb_shell[w - 1] = 0x4F00 | b'X' as u16;
         }
-        // Prompt + line + cursor on content row 1.
+        if w == 0 || h < 2 {
+            // Too small to hold even a prompt row below the title bar;
+            // nothing further to paint (same "stay total, never panic"
+            // discipline the resize-clamping tests already exercise).
+            return;
+        }
+        // Scrollback: rows 1..h-1, growing top-down from row 1 like a
+        // normal terminal's history; once more lines exist than fit, only
+        // the most recent `scroll_rows` are shown (oldest dropped off the
+        // top of the visible window, not out of the buffer itself).
+        let scroll_rows = h - 2;
+        let lines = self.terminal.lines();
+        let start = lines.len().saturating_sub(scroll_rows);
+        for (row_i, line) in lines[start..].iter().enumerate() {
+            let row_base = (1 + row_i) * w;
+            for (i, &b) in line.as_bytes().iter().enumerate() {
+                if i < w {
+                    self.fb_shell[row_base + i] = 0x0F00 | b as u16;
+                }
+            }
+        }
+        // Prompt row (the last row): prompt text + typed line + cursor.
+        let prompt_row = h - 1;
+        let row_base = prompt_row * w;
         let mut col = 0usize;
         for &b in PROMPT.iter() {
             if col < w {
-                self.fb_shell[w + col] = 0x0F00 | b as u16;
+                self.fb_shell[row_base + col] = 0x0F00 | b as u16;
             }
             col += 1;
         }
         for (i, &b) in self.line[..self.line_len].iter().enumerate() {
-            let idx = w + col + i;
-            if idx < total {
-                self.fb_shell[idx] = 0x0F00 | b as u16;
+            let idx = col + i;
+            if idx < w {
+                self.fb_shell[row_base + idx] = 0x0F00 | b as u16;
             }
         }
-        let cur = w + col + self.line_len;
-        if cur < total {
-            self.fb_shell[cur] = 0x0F00 | b'_' as u16;
+        let cur_col = col + self.line_len;
+        if cur_col < w {
+            self.fb_shell[row_base + cur_col] = 0x0F00 | b'_' as u16;
+        }
+    }
+
+    /// Run a parsed shell command (Phase R) against the same boot-time
+    /// filesystem the editor and file browser already use, appending any
+    /// resulting text to the shell's scrollback. Returns how many lines
+    /// were appended (0 for an empty line or `clear`). Filesystem access
+    /// goes through `editor::with`, the exact pattern the file browser's F3
+    /// ("new file") gesture already uses — this adds a new caller, not a
+    /// new I/O path.
+    fn execute_shell_command(&mut self, cmd: Command) -> usize {
+        match cmd {
+            Command::Empty => 0,
+            Command::Help => {
+                for line in HELP_LINES {
+                    self.terminal.push_line(line);
+                }
+                HELP_LINES.len()
+            }
+            Command::Clear => {
+                self.terminal.clear();
+                0
+            }
+            Command::Ls => {
+                let mut names = [Name::default(); VIEW_MAX_FILES];
+                let n = editor::with(|fs| fs.list(&mut names)).unwrap_or(0);
+                self.terminal.set_listing(&names[..n]);
+                if n == 0 {
+                    self.terminal.push_line(b"(no files)");
+                    1
+                } else {
+                    for (i, entry) in names[..n].iter().enumerate() {
+                        let mut line = [0u8; crate::terminal::OUT_LINE_MAX];
+                        let len = format_listing_row(i + 1, entry, &mut line);
+                        self.terminal.push_line(&line[..len]);
+                    }
+                    n
+                }
+            }
+            Command::New => {
+                // Reuse the browser's own free-name search so a file
+                // created from the shell can never collide with one the
+                // browser's F3 gesture would have picked next.
+                self.refresh_browser_listing();
+                let (name_bytes, name_len) = self.browser.next_free_name();
+                let created =
+                    editor::with(|fs| fs.create_empty(&name_bytes[..name_len])).unwrap_or(false);
+                if created {
+                    self.refresh_browser_listing();
+                    self.render_browser();
+                    let mut line = [0u8; crate::terminal::OUT_LINE_MAX];
+                    let prefix = b"created ";
+                    let mut at = prefix.len().min(line.len());
+                    line[..at].copy_from_slice(&prefix[..at]);
+                    let take = name_len.min(line.len() - at);
+                    line[at..at + take].copy_from_slice(&name_bytes[..take]);
+                    at += take;
+                    self.terminal.push_line(&line[..at]);
+                } else {
+                    self.terminal
+                        .push_line(b"could not create file (no durable store?)");
+                }
+                1
+            }
+            Command::Open(None) => {
+                self.terminal.push_line(b"usage: open <n> (run ls first)");
+                1
+            }
+            Command::Open(Some(idx)) => {
+                let Some(name) = self.terminal.resolve(idx) else {
+                    self.terminal
+                        .push_line(b"no such listing entry - run ls first");
+                    return 1;
+                };
+                let mut buf = [0u8; EDITOR_BUF_MAX];
+                let read = editor::with(|fs| fs.open(name.as_slice(), &mut buf)).flatten();
+                match read {
+                    Some(n) if n > 0 => {
+                        let mut printed = 0usize;
+                        for line in buf[..n].split(|&b| b == b'\n') {
+                            if line.is_empty() {
+                                continue;
+                            }
+                            self.terminal.push_line(line);
+                            printed += 1;
+                        }
+                        if printed == 0 {
+                            self.terminal.push_line(b"(empty file)");
+                            printed = 1;
+                        }
+                        printed
+                    }
+                    _ => {
+                        self.terminal
+                            .push_line(b"could not read file (no durable store?)");
+                        1
+                    }
+                }
+            }
+            Command::Unknown => {
+                self.terminal.push_line(b"unknown command - try 'help'");
+                1
+            }
         }
     }
 
@@ -626,12 +833,15 @@ impl Desktop {
             }
             Key::Enter => {
                 let len = self.line_len;
+                let cmd = Command::parse(&self.line[..len]);
                 self.line_len = 0;
+                let lines = self.execute_shell_command(cmd);
                 self.render_shell();
                 self.composite();
                 Some(KeyOutcome::Enter {
                     window_id: self.shell_id,
                     len,
+                    lines,
                 })
             }
             Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight => {
@@ -679,8 +889,8 @@ impl Desktop {
     /// Backspace deletes the previous byte, arrows move the cursor, and F2
     /// saves the buffer to `memo.txt` through the boot-time editor file
     /// handle (the Phase P save gesture).
-    fn apply_key_editor(&mut self, ke: KeyEvent) -> Option<KeyOutcome> {
-        match ke.key {
+    fn apply_key_editor(&mut self, key: KeyEvent) -> Option<KeyOutcome> {
+        match key.key {
             Key::Backspace => {
                 if self.editor.backspace() {
                     self.render_editor();
@@ -708,7 +918,7 @@ impl Desktop {
             }
             Key::F2 => Some(self.save_editor()),
             Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight => {
-                let moved = match ke.key {
+                let moved = match key.key {
                     Key::ArrowUp => self.editor.cursor_up(),
                     Key::ArrowDown => self.editor.cursor_down(),
                     Key::ArrowLeft => self.editor.cursor_left(),
@@ -727,7 +937,7 @@ impl Desktop {
                 }
             }
             _ => {
-                let ch = key_to_char(ke.key, ke.modifiers.shift)?;
+                let ch = key_to_char(key.key, key.modifiers.shift)?;
                 if self.editor.insert(ch) {
                     self.render_editor();
                     self.composite();
@@ -1378,18 +1588,22 @@ mod tests {
     use crate::input::{InputBuffer, InputEvent};
     use crate::ps2::Ps2State;
 
-    /// Screen index of the first character cell after the shell prompt.
+    /// Screen index of the first character cell after the shell prompt
+    /// (Phase R: the prompt now sits on the window's LAST row, to make
+    /// room for scrollback above it).
     fn echo_base() -> usize {
-        (SHELL_Y + 1) as usize * SW + SHELL_X as usize + PROMPT.len()
+        (SHELL_Y + SHELL_H as i16 - 1) as usize * SW + SHELL_X as usize + PROMPT.len()
     }
 
     #[test]
     fn boot_shell_surface_is_default() {
         let d = Desktop::new();
-        // Title bar first cell is 'S' (of "Shell"); the prompt moved to row 1.
+        // Title bar first cell is 'S' (of "Shell"); the prompt is on the
+        // window's last row (Phase R), leaving room for scrollback above.
         let title_cell = (d.screen()[SHELL_Y as usize * SW + SHELL_X as usize] & 0xFF) as u8;
         assert_eq!(title_cell, b'S');
-        let prompt_cell = (d.screen()[(SHELL_Y + 1) as usize * SW + SHELL_X as usize] & 0xFF) as u8;
+        let prompt_row = (SHELL_Y + SHELL_H as i16 - 1) as usize;
+        let prompt_cell = (d.screen()[prompt_row * SW + SHELL_X as usize] & 0xFF) as u8;
         assert_eq!(prompt_cell, b'a');
         // Close button at the title bar's last cell.
         let close_cell = (d.screen()
@@ -1529,11 +1743,13 @@ mod tests {
             _ => panic!("expected a move"),
         }
         // The prompt now renders one cell to the right of its original
-        // origin; the old origin cell is back to desktop background.
-        let moved_cell =
-            (d.screen()[(SHELL_Y + 1) as usize * SW + SHELL_X as usize + 1] & 0xFF) as u8;
+        // origin; the old origin cell is back to desktop background. The
+        // window only moved horizontally, so the prompt row (the window's
+        // last row) is unchanged.
+        let prompt_row = (SHELL_Y + SHELL_H as i16 - 1) as usize;
+        let moved_cell = (d.screen()[prompt_row * SW + SHELL_X as usize + 1] & 0xFF) as u8;
         assert_eq!(moved_cell, b'a');
-        let old_cell = d.screen()[(SHELL_Y + 1) as usize * SW + SHELL_X as usize];
+        let old_cell = d.screen()[prompt_row * SW + SHELL_X as usize];
         assert_ne!((old_cell & 0xFF) as u8, b'a');
     }
 
@@ -2085,5 +2301,194 @@ mod tests {
             MouseOutcome::Moved { .. } => {}
             _ => panic!("expected a position report"),
         }
+    }
+
+    // --- Phase R: the shell window's command interpreter -------------------
+
+    /// Type `word` (lowercase ASCII letters/digits only) into the focused
+    /// shell line via individual keypresses, matching how a real keyboard
+    /// would submit it. Panics on any byte outside a-z/0-9/space, since no
+    /// other character is typable per `input.rs`'s `Key` set.
+    fn type_word(d: &mut Desktop, word: &[u8]) {
+        for &b in word {
+            let k = match b {
+                b'a' => Key::A,
+                b'b' => Key::B,
+                b'c' => Key::C,
+                b'd' => Key::D,
+                b'e' => Key::E,
+                b'f' => Key::F,
+                b'g' => Key::G,
+                b'h' => Key::H,
+                b'i' => Key::I,
+                b'j' => Key::J,
+                b'k' => Key::K,
+                b'l' => Key::L,
+                b'm' => Key::M,
+                b'n' => Key::N,
+                b'o' => Key::O,
+                b'p' => Key::P,
+                b'q' => Key::Q,
+                b'r' => Key::R,
+                b's' => Key::S,
+                b't' => Key::T,
+                b'u' => Key::U,
+                b'v' => Key::V,
+                b'w' => Key::W,
+                b'x' => Key::X,
+                b'y' => Key::Y,
+                b'z' => Key::Z,
+                b'0' => Key::Zero,
+                b'1' => Key::One,
+                b'2' => Key::Two,
+                b'3' => Key::Three,
+                b'4' => Key::Four,
+                b'5' => Key::Five,
+                b'6' => Key::Six,
+                b'7' => Key::Seven,
+                b'8' => Key::Eight,
+                b'9' => Key::Nine,
+                b' ' => Key::Space,
+                _ => panic!("no Key variant can type {b}"),
+            };
+            d.apply_key(key(k)).unwrap();
+        }
+    }
+
+    /// Type `word` then Enter, returning the `KeyOutcome`.
+    fn run_shell_command(d: &mut Desktop, word: &[u8]) -> KeyOutcome {
+        type_word(d, word);
+        d.apply_key(key(Key::Enter)).unwrap()
+    }
+
+    #[test]
+    fn help_command_lists_every_command() {
+        let mut d = Desktop::new();
+        let out = run_shell_command(&mut d, b"help");
+        match out {
+            KeyOutcome::Enter {
+                window_id, lines, ..
+            } => {
+                assert_eq!(window_id, d.shell_id());
+                assert_eq!(lines, HELP_LINES.len());
+            }
+            _ => panic!("expected an enter"),
+        }
+        assert_eq!(d.terminal.lines().len(), HELP_LINES.len());
+        assert_eq!(d.terminal.lines()[0].as_bytes(), HELP_LINES[0]);
+    }
+
+    #[test]
+    fn ls_without_a_durable_store_reports_honestly_empty() {
+        // No NVMe store is installed in tests (same honest degrade the
+        // browser's F3 test above already exercises) — `ls` must say so
+        // rather than fabricating rows.
+        let mut d = Desktop::new();
+        let out = run_shell_command(&mut d, b"ls");
+        match out {
+            KeyOutcome::Enter { lines, .. } => assert_eq!(lines, 1),
+            _ => panic!("expected an enter"),
+        }
+        assert_eq!(d.terminal.lines()[0].as_bytes(), b"(no files)");
+    }
+
+    #[test]
+    fn open_without_a_prior_listing_is_a_usage_error_not_a_panic() {
+        let mut d = Desktop::new();
+        let out = run_shell_command(&mut d, b"open 1");
+        match out {
+            KeyOutcome::Enter { lines, .. } => assert_eq!(lines, 1),
+            _ => panic!("expected an enter"),
+        }
+        assert_eq!(
+            d.terminal.lines()[0].as_bytes(),
+            b"no such listing entry - run ls first"
+        );
+    }
+
+    #[test]
+    fn open_with_no_argument_is_a_usage_error() {
+        let mut d = Desktop::new();
+        let out = run_shell_command(&mut d, b"open");
+        match out {
+            KeyOutcome::Enter { lines, .. } => assert_eq!(lines, 1),
+            _ => panic!("expected an enter"),
+        }
+        assert_eq!(
+            d.terminal.lines()[0].as_bytes(),
+            b"usage: open <n> (run ls first)"
+        );
+    }
+
+    #[test]
+    fn new_without_a_durable_store_reports_honestly() {
+        let mut d = Desktop::new();
+        let out = run_shell_command(&mut d, b"new");
+        match out {
+            KeyOutcome::Enter { lines, .. } => assert_eq!(lines, 1),
+            _ => panic!("expected an enter"),
+        }
+        assert_eq!(
+            d.terminal.lines()[0].as_bytes(),
+            b"could not create file (no durable store?)"
+        );
+    }
+
+    #[test]
+    fn clear_empties_the_scrollback() {
+        let mut d = Desktop::new();
+        run_shell_command(&mut d, b"help");
+        assert!(!d.terminal.lines().is_empty());
+        let out = run_shell_command(&mut d, b"clear");
+        match out {
+            KeyOutcome::Enter { lines, .. } => assert_eq!(lines, 0),
+            _ => panic!("expected an enter"),
+        }
+        assert!(d.terminal.lines().is_empty());
+    }
+
+    #[test]
+    fn unknown_command_reports_without_panicking() {
+        let mut d = Desktop::new();
+        let out = run_shell_command(&mut d, b"frobnicate");
+        match out {
+            KeyOutcome::Enter { lines, .. } => assert_eq!(lines, 1),
+            _ => panic!("expected an enter"),
+        }
+        assert_eq!(
+            d.terminal.lines()[0].as_bytes(),
+            b"unknown command - try 'help'"
+        );
+    }
+
+    #[test]
+    fn empty_line_produces_no_output() {
+        let mut d = Desktop::new();
+        let out = d.apply_key(key(Key::Enter)).unwrap();
+        match out {
+            KeyOutcome::Enter { len, lines, .. } => {
+                assert_eq!(len, 0);
+                assert_eq!(lines, 0);
+            }
+            _ => panic!("expected an enter"),
+        }
+        assert!(d.terminal.lines().is_empty());
+    }
+
+    #[test]
+    fn scrollback_renders_top_down_from_row_one() {
+        // After `help`, the composited screen should show the first help
+        // line directly below the title bar (row 1), proving render_shell
+        // actually paints scrollback rather than just tracking it
+        // internally. Output grows top-down; with only 5 lines against a
+        // 10-row scrollback area, row 1 holds the FIRST (not last) line.
+        let mut d = Desktop::new();
+        run_shell_command(&mut d, b"help");
+        let first_output_row = (SHELL_Y + 1) as usize;
+        let cell = (d.screen()[first_output_row * SW + SHELL_X as usize] & 0xFF) as u8;
+        // HELP_LINES[0] is "commands: help ls clear new open <n>".
+        assert_eq!(cell, b'c');
+        let cell2 = (d.screen()[first_output_row * SW + SHELL_X as usize + 1] & 0xFF) as u8;
+        assert_eq!(cell2, b'o');
     }
 }

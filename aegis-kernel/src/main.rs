@@ -2035,11 +2035,16 @@ extern "sysv64" fn task_input() -> ! {
                                     pos
                                 );
                             }
-                            aegis_kernel::desktop::KeyOutcome::Enter { window_id, len } => {
+                            aegis_kernel::desktop::KeyOutcome::Enter {
+                                window_id,
+                                len,
+                                lines,
+                            } => {
                                 sprintln!(
-                                    "Aegis: shell-compositor@key: enter -> window id={} submitted {} char(s)",
+                                    "Aegis: shell-compositor@key: enter -> window id={} submitted {} char(s) -> {} line(s) of output",
                                     window_id,
-                                    len
+                                    len,
+                                    lines
                                 );
                             }
                             aegis_kernel::desktop::KeyOutcome::Moved { window_id, x, y } => {
