@@ -46,6 +46,13 @@ pub const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x02];
 pub const ADVISOR_HOST_IP: [u8; 4] = GW_IP;
 pub const ADVISOR_HOST_PORT: u16 = 443;
 
+/// Net-syscall error for "the stack has no NIC". Distinct from the generic
+/// `-1` capability/argument denial so ring-3 can tell "I lack the
+/// capability" (retrying is pointless) apart from "there is no wire at all"
+/// (the whole network demo should be skipped immediately). Returned by every
+/// `sys_net_*` gate when `NetIf::is_online()` is false.
+pub const ERR_NET_OFFLINE: i64 = -2;
+
 /// Runtime override for `OUR_IP`, set from the boot-volume FLEET.CFG before
 /// `NetIf::init`. Zero (0.0.0.0) means "unset" — no real interface uses it.
 static OUR_IP_OVERRIDE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -1179,10 +1186,12 @@ pub unsafe fn sys_net_socket(kind: u64, ip_packed: u64, port: u64) -> i64 {
     // Fail closed when the stack has no NIC: ring-3 can never mint an
     // endpoint for a wire that isn't there, and never reach `nic_mut()`'s
     // panic. Still attributed in the audit log so the attempt is traceable.
+    // The distinct `ERR_NET_OFFLINE` lets callers skip the whole demo
+    // immediately instead of retrying against a wire that can never appear.
     let netif = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) };
     if !netif.is_online() {
         record(false);
-        return -1;
+        return ERR_NET_OFFLINE;
     }
     let ip = [
         (ip_packed >> 24) as u8,
@@ -1232,10 +1241,11 @@ pub unsafe fn sys_net_connect(slot: u64) -> i64 {
     }
     let netif = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) };
     // Fail closed with no NIC: connecting would hit `nic_mut()`'s panic
-    // (SYN goes out over the wire), and no NIC means no wire.
+    // (SYN goes out over the wire), and no NIC means no wire. The distinct
+    // error lets a caller treat "offline" differently from "denied".
     if !netif.is_online() {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
-        return -1;
+        return ERR_NET_OFFLINE;
     }
     let ok = netif.tcp_connect(id as u16);
     crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), ok);
@@ -1264,10 +1274,11 @@ pub unsafe fn sys_net_send(slot: u64, va: u64, len: u64) -> i64 {
         return -1;
     }
     // Fail closed with no NIC: `socket_send` transmits immediately (TCP flush
-    // / UDP datagram) and would hit `nic_mut()`'s panic.
+    // / UDP datagram) and would hit `nic_mut()`'s panic. Distinct offline
+    // error, same as every other gate.
     if !unsafe { &*core::ptr::addr_of!(NETIF) }.is_online() {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
-        return -1;
+        return ERR_NET_OFFLINE;
     }
     let len = core::cmp::min(len as usize, 2048);
     let data = core::slice::from_raw_parts(va as *const u8, len);
@@ -1294,11 +1305,11 @@ pub unsafe fn sys_net_recv(slot: u64, va: u64, len: u64) -> i64 {
         return -1;
     }
     // Fail closed with no NIC: there is no wire to receive from, so an
-    // authorized poll on a live NIC-less stack returns an error instead of a
-    // spurious 0/empty read.
+    // authorized poll on a live NIC-less stack returns a distinct offline
+    // error instead of a spurious 0/empty read.
     if !unsafe { &*core::ptr::addr_of!(NETIF) }.is_online() {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
-        return -1;
+        return ERR_NET_OFFLINE;
     }
     let len = core::cmp::min(len as usize, 2048);
     let out = core::slice::from_raw_parts_mut(va as *mut u8, len);
@@ -1328,10 +1339,10 @@ pub unsafe fn sys_net_close(slot: u64) -> i64 {
         return -1;
     };
     // Fail closed with no NIC, same as every other net gate: nothing to close
-    // on a wire that doesn't exist.
+    // on a wire that doesn't exist. Distinct offline error.
     if !unsafe { &*core::ptr::addr_of!(NETIF) }.is_online() {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
-        return -1;
+        return ERR_NET_OFFLINE;
     }
     let ok = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_close(id as u16);
     crate::tasks::set_task_cap(cur, slot as usize, CapSlot::empty());
@@ -1854,7 +1865,10 @@ mod tests {
     /// the host-test build), every net syscall is refused even for a task that
     /// holds every relevant capability — the stack degrades to a clean denial,
     /// never a `nic_mut()` panic reachable from a userspace syscall. Each
-    /// refusal is still attributed in the audit log.
+    /// refusal is still attributed in the audit log, and the error code is the
+    /// distinct `ERR_NET_OFFLINE` — not the generic `-1` a capability denial
+    /// returns — so a caller can tell "no wire" (skip the whole demo) from
+    /// "not authorized" (this call, specifically, was refused).
     #[test]
     fn net_syscalls_fail_closed_when_stack_offline() {
         let _g = crate::kernel_state_guard();
@@ -1870,8 +1884,8 @@ mod tests {
         let ip_packed: u64 = u32::from_be_bytes(GW_IP) as u64;
         let slot = unsafe { sys_net_socket(1, ip_packed, 8080) };
         assert_eq!(
-            slot, -1,
-            "offline stack refuses to mint even for a NetRoot holder"
+            slot, ERR_NET_OFFLINE,
+            "an authorized-but-offline mint returns the distinct offline error, not a generic denial"
         );
         assert!(
             (0..crate::tasks::MAX_CAPS)
@@ -1882,6 +1896,15 @@ mod tests {
         assert!(
             crate::audit::op_counts(9)[crate::audit::OpKind::NetOpen.index()] >= 1,
             "the offline refusal is still an attributed audit record"
+        );
+        // Contrast: the *same* call from a task without NetRoot is refused at
+        // the capability gate with the generic -1 — the two failure modes are
+        // distinguishable by a caller that checks the error code.
+        crate::tasks::set_current_for_test(10);
+        assert_eq!(
+            unsafe { sys_net_socket(1, ip_packed, 8080) },
+            -1,
+            "a capability denial stays the generic -1, distinct from ERR_NET_OFFLINE"
         );
     }
 

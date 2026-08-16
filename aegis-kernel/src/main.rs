@@ -2459,19 +2459,30 @@ extern "sysv64" fn task_advisor() -> ! {
     // Poll slot 0 until the supervisor's RoleGrant lands the NetEndpoint.
     // Until then every net syscall on the empty slot is refused (-1).
     let mut granted = false;
+    let mut offline = false;
     for _ in 0..5_000_000u64 {
         let c = user_syscall5(20, 0, 0, 0, 0); // net_connect(slot 0)
+        if c == aegis_kernel::netif::ERR_NET_OFFLINE as u64 {
+            // Distinct fail-close code: the stack has no NIC, so no grant
+            // will ever make the wire appear. Skip the whole network demo
+            // immediately instead of burning the poll budget.
+            offline = true;
+            break;
+        }
         if c != u64::MAX {
             granted = true;
             break;
         }
         user_syscall5(3, 0, 0, 0, 0); // yield so the grantor can run
     }
+    if offline {
+        user_print(b"Aegis: [advisor] no NIC present - network demo skipped\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
     if !granted {
-        // Either the RoleGrant never landed, or the kernel has no NIC and
-        // net_connect fails closed (see netif::sys_net_connect). Both degrade
-        // the network demo to a clean skip — never a crash.
-        user_print(b"Aegis: [advisor] role grant never arrived / NIC unavailable - network demo skipped\r\n");
+        user_print(b"Aegis: [advisor] role grant never arrived - network demo skipped\r\n");
         loop {
             core::hint::spin_loop();
         }
