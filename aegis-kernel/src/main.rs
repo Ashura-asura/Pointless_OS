@@ -1357,8 +1357,10 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         // Render a few rows of the composited screen as characters so the
         // result is visible in the serial log (shell window is 60x12 @ 2,2;
         // the Phase P editor window is 56x14 @ 10,6 — row 6 is its title
-        // bar when it is not occluded by the focused shell).
-        for sy in [2usize, 3, 4, 6] {
+        // bar when it is not occluded by the focused shell; the Phase Q
+        // file-browser window is 30x12 @ 44,13 — rows 13..15 are its title
+        // bar and first listing rows, only visible after they are raised).
+        for sy in [2usize, 3, 4, 6, 13, 14, 15] {
             let mut rowbuf = [0u8; SW];
             for (sx, cell) in rowbuf.iter_mut().enumerate() {
                 *cell = (screen[sy * SW + sx] & 0xFF) as u8;
@@ -1367,7 +1369,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             sprintln!("Aegis: shell-compositor: row{}: |{}|", sy, rowstr);
         }
         sprintln!(
-            "Aegis: shell-compositor: composited {}x{} screen from {} windows (shell window {}x{} @ ({},{}), editor window {}x{} @ ({},{}); VGA text substrate; compositor is ordinary userspace-style UI work, per roadmap §10 item 3)",
+            "Aegis: shell-compositor: composited {}x{} screen from {} windows (shell window {}x{} @ ({},{}), editor window {}x{} @ ({},{}), browser window {}x{} @ ({},{}); VGA text substrate; compositor is ordinary userspace-style UI work, per roadmap §10 item 3)",
             SW,
             SH,
             d.window_count(),
@@ -1378,7 +1380,39 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             aegis_kernel::desktop::EDITOR_W,
             aegis_kernel::desktop::EDITOR_H,
             aegis_kernel::desktop::EDITOR_X,
-            aegis_kernel::desktop::EDITOR_Y
+            aegis_kernel::desktop::EDITOR_Y,
+            aegis_kernel::desktop::BROWSER_W,
+            aegis_kernel::desktop::BROWSER_H,
+            aegis_kernel::desktop::BROWSER_X,
+            aegis_kernel::desktop::BROWSER_Y
+        );
+
+        // Phase Q: report the file browser's listing as it was populated at
+        // boot from the durable boot view. Honest — the browser never
+        // fabricates rows; without a store it prints none. The names prove
+        // the listing across a power cycle (boot 2 lists the file F3 created
+        // in boot 1).
+        let mut listing = [0u8; 128];
+        let mut llen = 0;
+        for i in 0..d.browser_count() {
+            if let Some(name) = d.browser_entry(i) {
+                let n = name.as_slice().len();
+                if llen + n + 1 > listing.len() {
+                    break;
+                }
+                if i > 0 {
+                    listing[llen] = b',';
+                    llen += 1;
+                }
+                listing[llen..llen + n].copy_from_slice(name.as_slice());
+                llen += n;
+            }
+        }
+        sprintln!(
+            "Aegis: browser@boot listing [{}] ({} entries, window id={})",
+            core::str::from_utf8(&listing[..llen]).unwrap_or("<non-utf8>"),
+            d.browser_count(),
+            d.browser_id()
         );
         unsafe {
             aegis_kernel::desktop::install(d);
@@ -2055,6 +2089,22 @@ extern "sysv64" fn task_input() -> ! {
                                     window_id
                                 );
                             }
+                            aegis_kernel::desktop::KeyOutcome::Opened { window_id } => {
+                                sprintln!(
+                                    "Aegis: browser@open -> file opened into editor, focus window id={}",
+                                    window_id
+                                );
+                            }
+                            aegis_kernel::desktop::KeyOutcome::Created {
+                                window_id,
+                                name_len,
+                            } => {
+                                sprintln!(
+                                    "Aegis: browser@create -> window id={} created file ({} name bytes)",
+                                    window_id,
+                                    name_len
+                                );
+                            }
                         }
                     }
                 }
@@ -2097,6 +2147,16 @@ extern "sysv64" fn task_input() -> ! {
                             sprintln!(
                                 "Aegis: shell-compositor@mouse: close -> window id={} destroyed",
                                 window_id
+                            );
+                        }
+                        aegis_kernel::desktop::MouseOutcome::Opened {
+                            editor_id,
+                            browser_id,
+                        } => {
+                            sprintln!(
+                                "Aegis: browser@open -> row clicked, editor id={} browser id={}",
+                                editor_id,
+                                browser_id
                             );
                         }
                     }

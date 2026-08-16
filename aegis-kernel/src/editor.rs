@@ -25,8 +25,8 @@
 
 use crate::nvme::NvmeController;
 use crate::nvme_store::{BlockIo, Store};
-use crate::store::BlockId;
-use crate::update::BootView;
+use crate::store::{BlockId, Name};
+use crate::update::{BootView, VIEW_MAX_FILES};
 
 /// Maximum editor buffer bytes — one store block, so a save is exactly one
 /// content-addressed sector (matching `nvme_store`'s single-512-B-block limit).
@@ -304,6 +304,48 @@ pub fn write_memo<IO: BlockIo>(
     view.write_file(store, io, FILE_NAME, bytes)
 }
 
+// --- Phase Q: file browser support (any name in the view, not just memo.txt) ----
+
+/// Names currently in `view` (Phase Q: the file browser's listing).
+pub fn list_names<IO: BlockIo>(
+    store: &mut Store,
+    io: &mut IO,
+    view: &BootView,
+    out: &mut [Name; VIEW_MAX_FILES],
+) -> usize {
+    view.list(store, io, out)
+}
+
+/// Read `name` from `view` into `out` (Phase Q's "open" action: unlike
+/// `read_memo`, `name` can be any file the view holds).
+pub fn open_file<IO: BlockIo>(
+    store: &mut Store,
+    io: &mut IO,
+    view: &mut BootView,
+    name: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    view.read_file(store, io, name, out)
+}
+
+/// Create a new file named `name` in `view` if no entry of that name exists
+/// yet (Phase Q's "new file" gesture). `false` if the name is already taken
+/// or the view is full — never overwrites an existing file. A brand-new
+/// file holds a single `\n` byte: the store refuses zero-length blocks (see
+/// `Store::put`), so the newline is the honest minimum representable
+/// "blank file" — the same single-block scope the editor documents.
+pub fn create_empty<IO: BlockIo>(
+    store: &mut Store,
+    io: &mut IO,
+    view: &mut BootView,
+    name: &[u8],
+) -> bool {
+    if view.get(store, io, name).is_some() {
+        return false;
+    }
+    view.write_file(store, io, name, b"\n").is_some()
+}
+
 /// The concrete boot-time editor file handle: the live NVMe controller + the
 /// store + the anchored boot view. Installed once as the global below; the
 /// desktop reads the file at `Desktop::new()` and writes it on F2.
@@ -331,6 +373,29 @@ impl EditorFs {
         } else {
             None
         }
+    }
+
+    /// Names currently in the boot view (Phase Q: file browser listing).
+    pub fn list(&mut self, out: &mut [Name; VIEW_MAX_FILES]) -> usize {
+        list_names(&mut self.store, &mut self.ctrl, &self.view, out)
+    }
+
+    /// Read the named file through this handle (Phase Q: any name in the
+    /// view, not just `memo.txt` — the file browser's "open" action).
+    pub fn open(&mut self, name: &[u8], out: &mut [u8]) -> Option<usize> {
+        open_file(&mut self.store, &mut self.ctrl, &mut self.view, name, out)
+    }
+
+    /// Create a new file named `name` if absent (Phase Q's "new file"
+    /// gesture). Re-anchors the store header the same way `write_memo`
+    /// does, so the new file survives a reboot. `false` if the name is
+    /// taken, the view is full, or the anchor write fails.
+    pub fn create_empty(&mut self, name: &[u8]) -> bool {
+        if !create_empty(&mut self.store, &mut self.ctrl, &mut self.view, name) {
+            return false;
+        }
+        let dir = self.view.dir_id();
+        self.store.set_anchor(&mut self.ctrl, &dir)
     }
 }
 
@@ -580,5 +645,34 @@ mod tests {
         let mut out2 = [0u8; 512];
         let n = read_memo(&mut store, &mut disk, &mut view, &mut out2).unwrap();
         assert_eq!(&out2[..n], SEED);
+    }
+
+    #[test]
+    fn list_open_and_create_empty_support_the_file_browser() {
+        let (mut disk, mut store, mut view) = world();
+        let mut out = [0u8; 512];
+        seed_if_absent(&mut store, &mut disk, &mut view, &mut out).unwrap();
+
+        let mut names = [Name::default(); VIEW_MAX_FILES];
+        let n = list_names(&mut store, &mut disk, &view, &mut names);
+        assert_eq!(n, 1);
+        assert_eq!(names[0].as_slice(), FILE_NAME);
+
+        // Create a second, empty file; it shows up in the listing.
+        assert!(create_empty(&mut store, &mut disk, &mut view, b"notes.txt"));
+        let n2 = list_names(&mut store, &mut disk, &view, &mut names);
+        assert_eq!(n2, 2);
+        assert!(names[..n2].iter().any(|nm| nm.as_slice() == b"notes.txt"));
+
+        // Creating over an existing name is refused, not an overwrite.
+        assert!(!create_empty(&mut store, &mut disk, &mut view, FILE_NAME));
+
+        // open() reads any named file, not just memo.txt.
+        let mut ob = [0u8; 512];
+        let on = open_file(&mut store, &mut disk, &mut view, b"notes.txt", &mut ob).unwrap();
+        assert_eq!(on, 1, "a brand-new file holds the single newline");
+        assert_eq!(&ob[..on], b"\n");
+        let om = open_file(&mut store, &mut disk, &mut view, FILE_NAME, &mut ob).unwrap();
+        assert_eq!(&ob[..om], SEED);
     }
 }

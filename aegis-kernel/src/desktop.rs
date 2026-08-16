@@ -35,10 +35,24 @@
 //! through the boot-time `editor::EditorFs`. The editor starts from the
 //! seeded file when durable storage is present, else from the seed bytes
 //! in memory (UI only).
+//!
+//! Phase Q adds the kernel's third real application window — a file browser
+//! over the same boot view (see `browser`). Three app windows now exist: the
+//! shell (id 3), the editor (id 4, [`EDITOR_X`]..), and the browser (id 5,
+//! [`BROWSER_X`]..). Tab cycles focus shell -> editor -> browser -> shell and
+//! raises the newly-focused window; the browser lists every name in the boot
+//! view (`editor::EditorFs::list`), arrow keys move its selection, Enter (or
+//! a click on a row) opens that file into the editor, and F3 creates a new
+//! empty `fileN.txt` (first unused N) in the durable view. Without a durable
+//! store the browser lists nothing honestly — the same in-memory fallback
+//! scope the editor already documents.
 
+use crate::browser::FileBrowser;
 use crate::compositor::{self, Cell, MAX_WINDOWS};
 use crate::editor::{self, Editor, EDITOR_BUF_MAX};
 use crate::input::{Key, KeyEvent, MouseEvent};
+use crate::store::Name;
+use crate::update::VIEW_MAX_FILES;
 use crate::window::{Region, WindowManager};
 
 /// Screen size in VGA text cells.
@@ -60,6 +74,14 @@ pub const EDITOR_X: i16 = 10;
 pub const EDITOR_Y: i16 = 6;
 pub const EDITOR_W: u16 = 56;
 pub const EDITOR_H: u16 = 14;
+
+/// File browser window geometry (Phase Q: the third real app window).
+/// Overlaps the editor (columns 44..66, rows 13..20), so raising it does
+/// real occlusion work too, same as the editor/shell overlap above.
+pub const BROWSER_X: i16 = 44;
+pub const BROWSER_Y: i16 = 13;
+pub const BROWSER_W: u16 = 34;
+pub const BROWSER_H: u16 = 10;
 
 /// The shell prompt rendered at the start of the shell line.
 const PROMPT: &[u8] = b"aegis:~$ ";
@@ -99,6 +121,15 @@ pub enum KeyOutcome {
         len: usize,
         block: [u8; 4],
     },
+    /// Enter, with the file browser focused, opened the selected file into
+    /// the editor and moved focus there (the keyboard equivalent of
+    /// clicking a browser row).
+    Opened { window_id: u32 },
+    /// F3, with the file browser focused, created a new blank file
+    /// (`fileN.txt`, first unused N) and selected it in the listing.
+    /// `name_len` is 0 when no durable store is present — the honest
+    /// degrade (no boot view to create a file in).
+    Created { window_id: u32, name_len: usize },
 }
 
 /// Which app window owns keyboard input. Tab cycles this; a mouse press on
@@ -109,6 +140,7 @@ pub enum KeyOutcome {
 enum AppFocus {
     Shell,
     Editor,
+    Browser,
 }
 
 /// What a mouse event did to the live desktop. The caller (input task)
@@ -133,6 +165,10 @@ pub enum MouseOutcome {
     },
     /// The close button was released: the window is destroyed.
     Closed { window_id: u32 },
+    /// A click on a file browser row opened that file in the editor and
+    /// moved focus there — the file browser's headline "click to open"
+    /// proof point.
+    Opened { editor_id: u32, browser_id: u32 },
 }
 
 /// Minimum window size a corner drag can shrink an app window to.
@@ -174,10 +210,14 @@ pub struct Desktop {
     fb_status: [Cell; SW],
     fb_shell: [Cell; (SHELL_W as usize) * (SHELL_H as usize)],
     fb_editor: [Cell; (EDITOR_W as usize) * (EDITOR_H as usize)],
+    fb_browser: [Cell; (BROWSER_W as usize) * (BROWSER_H as usize)],
     screen: [Cell; SW * SH],
     shell_id: u32,
     editor_id: u32,
+    browser_id: u32,
     editor: Editor,
+    editor_name: Name,
+    browser: FileBrowser,
     focus: AppFocus,
     line: [u8; LINE_MAX],
     line_len: usize,
@@ -243,6 +283,18 @@ impl Desktop {
                 },
             )
             .unwrap();
+        let browser = wm
+            .create_window(
+                5,
+                b"browser",
+                Region {
+                    x: BROWSER_X,
+                    y: BROWSER_Y,
+                    width: BROWSER_W,
+                    height: BROWSER_H,
+                },
+            )
+            .unwrap();
         // The shell is the default post-boot surface: focused AND raised, so
         // it occludes the editor across their overlap until the editor is
         // focused (Tab or a click on its content).
@@ -269,10 +321,14 @@ impl Desktop {
             fb_status,
             fb_shell: [0u16; (SHELL_W as usize) * (SHELL_H as usize)],
             fb_editor: [0u16; (EDITOR_W as usize) * (EDITOR_H as usize)],
+            fb_browser: [0u16; (BROWSER_W as usize) * (BROWSER_H as usize)],
             screen: [compositor::TRANSPARENT; SW * SH],
             shell_id: shell,
             editor_id: editor,
+            browser_id: browser,
             editor: Desktop::editor_initial(),
+            editor_name: Name::from_slice(editor::FILE_NAME).unwrap(),
+            browser: FileBrowser::new(),
             focus: AppFocus::Shell,
             line: [0u8; LINE_MAX],
             line_len: 0,
@@ -280,8 +336,19 @@ impl Desktop {
         };
         d.render_shell();
         d.render_editor();
+        d.refresh_browser_listing();
+        d.render_browser();
         d.composite();
         d
+    }
+
+    /// Refresh the file browser's listing from the durable boot view
+    /// (Phase Q). An empty listing when no NVMe store is present — the
+    /// browser then honestly shows nothing rather than fabricating rows.
+    fn refresh_browser_listing(&mut self) {
+        let mut names = [Name::default(); VIEW_MAX_FILES];
+        let n = editor::with(|fs| fs.list(&mut names)).unwrap_or(0);
+        self.browser.set_entries(&names[..n]);
     }
 
     /// The editor's initial buffer: the saved `memo.txt` when a durable
@@ -345,7 +412,7 @@ impl Desktop {
     }
 
     /// Render the editor window's framebuffer from its current size: row 0
-    /// is the title bar ("Editor: memo.txt" + a close button at the last
+    /// is the title bar ("Editor: <name>" + a close button at the last
     /// cell); the rows below paint the wrapped buffer via
     /// `Editor::visual_row` (the pure line-wrapping math), one visual row
     /// per window row, with the cursor drawn as `_` where it sits. Cells
@@ -360,11 +427,18 @@ impl Desktop {
         for c in self.fb_editor[..total].iter_mut() {
             *c = 0x0F00 | b'.' as u16;
         }
-        // Title bar (row 0): "Editor: memo.txt" + close button at the last cell.
+        // Title bar (row 0): "Editor: <name>" — Phase Q: the open file can
+        // now be anything the browser opened, not just memo.txt — plus a
+        // close button at the last cell.
         for i in 0..w {
             self.fb_editor[i] = 0x1F00 | b' ' as u16;
         }
-        for (i, t) in b"Editor: memo.txt".iter().enumerate() {
+        let title_prefix: &[u8] = b"Editor: ";
+        for (i, t) in title_prefix
+            .iter()
+            .chain(self.editor_name.as_slice().iter())
+            .enumerate()
+        {
             if i + 1 < w {
                 self.fb_editor[i] = 0x1F00 | *t as u16;
             }
@@ -392,6 +466,54 @@ impl Desktop {
         }
     }
 
+    /// Render the file browser window's framebuffer: row 0 is the title bar
+    /// ("Files" + a close button at the last cell); each content row shows
+    /// one file name, the selected row marked with a leading '>'. Rows past
+    /// the listing keep the dotted fill (same convention `render_editor`
+    /// uses for rows past its content).
+    fn render_browser(&mut self) {
+        let (w, h) = self
+            .wm
+            .window(self.browser_id)
+            .map(|w| (w.region.width as usize, w.region.height as usize))
+            .unwrap_or((BROWSER_W as usize, BROWSER_H as usize));
+        let total = w * h;
+        for c in self.fb_browser[..total].iter_mut() {
+            *c = 0x0F00 | b'.' as u16;
+        }
+        for i in 0..w {
+            self.fb_browser[i] = 0x1F00 | b' ' as u16;
+        }
+        for (i, t) in b"Files".iter().enumerate() {
+            if i + 1 < w {
+                self.fb_browser[i] = 0x1F00 | *t as u16;
+            }
+        }
+        if w > 0 {
+            self.fb_browser[w - 1] = 0x4F00 | b'X' as u16;
+        }
+        for row in 0..h.saturating_sub(1) {
+            let Some(name) = self.browser.entry(row) else {
+                break;
+            };
+            let row_base = (row + 1) * w;
+            let marker = if row == self.browser.selected() {
+                b'>'
+            } else {
+                b' '
+            };
+            if row_base < total {
+                self.fb_browser[row_base] = 0x0F00 | marker as u16;
+            }
+            for (i, &b) in name.as_slice().iter().enumerate() {
+                let idx = row_base + 1 + i;
+                if idx < total && idx < row_base + w {
+                    self.fb_browser[idx] = 0x0F00 | b as u16;
+                }
+            }
+        }
+    }
+
     /// Re-composite the window manager + framebuffers into `screen`, then
     /// paint the desktop background over any cell the compositor left
     /// transparent (so the whole screen is the blue desktop, not a void).
@@ -401,6 +523,7 @@ impl Desktop {
         fbs[1] = Some(&self.fb_status);
         fbs[2] = Some(&self.fb_shell);
         fbs[3] = Some(&self.fb_editor);
+        fbs[4] = Some(&self.fb_browser);
         compositor::composite(&self.wm, &fbs, &mut self.screen).unwrap();
         let desktop_bg: Cell = 0x1000 | b' ' as u16;
         for c in self.screen.iter_mut() {
@@ -441,11 +564,13 @@ impl Desktop {
         match self.focus {
             AppFocus::Shell => self.apply_key_shell(ke),
             AppFocus::Editor => self.apply_key_editor(ke),
+            AppFocus::Browser => self.apply_key_browser(ke),
         }
     }
 
-    /// Cycle keyboard focus between the shell and the editor, raising the
-    /// newly-focused window's z-order so it occludes the other in overlap.
+    /// Cycle keyboard focus between the shell, the editor and the file
+    /// browser, raising the newly-focused window's z-order so it occludes
+    /// the others in overlap (Phase Q: three app windows, Tab walks them).
     fn cycle_focus(&mut self) -> KeyOutcome {
         match self.focus {
             AppFocus::Shell => {
@@ -459,6 +584,16 @@ impl Desktop {
                 }
             }
             AppFocus::Editor => {
+                self.focus = AppFocus::Browser;
+                let _ = self.wm.focus_window(self.browser_id);
+                self.render_browser();
+                self.composite();
+                KeyOutcome::Focused {
+                    window_id: self.browser_id,
+                    editor: false,
+                }
+            }
+            AppFocus::Browser => {
                 self.focus = AppFocus::Shell;
                 let _ = self.wm.focus_window(self.shell_id);
                 self.render_shell();
@@ -629,6 +764,97 @@ impl Desktop {
         }
     }
 
+    /// Browser-focused keys: arrows move the selection, Enter opens the
+    /// selected file into the editor and moves focus there (the keyboard
+    /// equivalent of clicking a row), F3 creates a new blank file
+    /// (`fileN.txt`, first unused N) and selects it.
+    fn apply_key_browser(&mut self, ke: KeyEvent) -> Option<KeyOutcome> {
+        match ke.key {
+            Key::ArrowUp => {
+                if self.browser.move_up() {
+                    self.render_browser();
+                    self.composite();
+                    Some(KeyOutcome::CursorMoved {
+                        window_id: self.browser_id,
+                        pos: self.browser.selected(),
+                    })
+                } else {
+                    None
+                }
+            }
+            Key::ArrowDown => {
+                if self.browser.move_down() {
+                    self.render_browser();
+                    self.composite();
+                    Some(KeyOutcome::CursorMoved {
+                        window_id: self.browser_id,
+                        pos: self.browser.selected(),
+                    })
+                } else {
+                    None
+                }
+            }
+            Key::Enter => {
+                self.browser.selected_name()?;
+                self.open_selected_in_editor();
+                Some(KeyOutcome::Opened {
+                    window_id: self.editor_id,
+                })
+            }
+            Key::F3 => Some(self.create_new_file()),
+            _ => None,
+        }
+    }
+
+    /// Open the browser's currently selected file into the editor: load its
+    /// bytes as the editor buffer, rename the editor window's title to that
+    /// file, focus the editor, and raise it. A no-op if nothing is selected
+    /// or no durable store is present (the browser is empty in that case,
+    /// so `selected_name` already returns `None`).
+    fn open_selected_in_editor(&mut self) {
+        let Some(name) = self.browser.selected_name() else {
+            return;
+        };
+        let mut buf = [0u8; EDITOR_BUF_MAX];
+        let Some(n) = editor::with(|fs| fs.open(name.as_slice(), &mut buf)).flatten() else {
+            return;
+        };
+        self.editor = Editor::from_bytes(&buf[..n]);
+        self.editor_name = name;
+        self.focus = AppFocus::Editor;
+        let _ = self.wm.focus_window(self.editor_id);
+        self.render_editor();
+        self.render_browser();
+        self.composite();
+    }
+
+    /// F3 gesture: create `fileN.txt` (first unused N) as a blank file (a
+    /// single newline — the store's minimum block) in the durable boot
+    /// view, refresh the listing, and select the new entry. Reports
+    /// `name_len = 0` when no durable store is present — the same honest
+    /// degrade `save_editor` already reports for the digest.
+    fn create_new_file(&mut self) -> KeyOutcome {
+        let (name_bytes, name_len) = self.browser.next_free_name();
+        let created = editor::with(|fs| fs.create_empty(&name_bytes[..name_len])).unwrap_or(false);
+        if created {
+            self.refresh_browser_listing();
+            for i in 0..self.browser.count() {
+                if let Some(e) = self.browser.entry(i) {
+                    if e.as_slice() == &name_bytes[..name_len] {
+                        self.browser.select(i);
+                        break;
+                    }
+                }
+            }
+        }
+        self.render_browser();
+        self.composite();
+        KeyOutcome::Created {
+            window_id: self.browser_id,
+            name_len: if created { name_len } else { 0 },
+        }
+    }
+
     /// Apply one mouse event to the live desktop. A left press on the
     /// topmost app window's chrome starts a drag (title bar = move, bottom-
     /// right corner = resize, close button = close on release); during a
@@ -699,6 +925,12 @@ impl Desktop {
         } else if me.left_button {
             if let Some(id) = self.wm.hit_test(cx, cy) {
                 if self.is_app_window(id) {
+                    // Phase Q: a content click on a browser row is captured
+                    // here (while `wy` is still in scope) but acted on
+                    // after the window borrow ends below, the same
+                    // deferred-action shape `focus_content_press` already
+                    // uses for the generic content-focus case.
+                    let mut browser_click_row: Option<usize> = None;
                     if let Some(w) = self.wm.window(id) {
                         let (wx, wy, ww, wh) = (
                             w.region.x,
@@ -721,6 +953,18 @@ impl Desktop {
                                 grab_dy: cy - wy,
                             });
                             return None;
+                        }
+                        if id == self.browser_id {
+                            browser_click_row = Some((cy - wy - 1).max(0) as usize);
+                        }
+                    }
+                    if let Some(row) = browser_click_row {
+                        if self.browser.select(row) {
+                            self.open_selected_in_editor();
+                            return Some(MouseOutcome::Opened {
+                                editor_id: self.editor_id,
+                                browser_id: self.browser_id,
+                            });
                         }
                     }
                     // A press on an app window's content (not its chrome)
@@ -755,12 +999,30 @@ impl Desktop {
         self.editor_id
     }
 
+    /// Window id of the file browser window.
+    pub fn browser_id(&self) -> u32 {
+        self.browser_id
+    }
+
+    /// Number of entries currently listed in the file browser (the boot
+    /// log reports it so the listing is provable across a power cycle).
+    pub fn browser_count(&self) -> usize {
+        self.browser.count()
+    }
+
+    /// The file browser's `idx`-th listed entry name, if any.
+    pub fn browser_entry(&self, idx: usize) -> Option<Name> {
+        self.browser.entry(idx)
+    }
+
     /// Re-render the app window `id` from its current size.
     fn render_window(&mut self, id: u32) {
         if id == self.shell_id {
             self.render_shell();
         } else if id == self.editor_id {
             self.render_editor();
+        } else if id == self.browser_id {
+            self.render_browser();
         }
     }
 
@@ -770,6 +1032,8 @@ impl Desktop {
     fn focus_content_press(&mut self, id: u32) {
         let next = if id == self.editor_id {
             AppFocus::Editor
+        } else if id == self.browser_id {
+            AppFocus::Browser
         } else {
             AppFocus::Shell
         };
@@ -781,10 +1045,10 @@ impl Desktop {
         }
     }
 
-    /// True if `id` is a draggable app window (Phase O/P: the shell window
-    /// and the editor window).
+    /// True if `id` is a draggable app window (Phase O/P/Q: the shell
+    /// window, the editor window and the file browser window).
     fn is_app_window(&self, id: u32) -> bool {
-        id == self.shell_id || id == self.editor_id
+        id == self.shell_id || id == self.editor_id || id == self.browser_id
     }
 
     /// The framebuffer dimensions backing an app window (the ceiling a corner
@@ -794,6 +1058,8 @@ impl Desktop {
             (SHELL_W as i16, SHELL_H as i16)
         } else if id == self.editor_id {
             (EDITOR_W as i16, EDITOR_H as i16)
+        } else if id == self.browser_id {
+            (BROWSER_W as i16, BROWSER_H as i16)
         } else {
             (0, 0)
         }
@@ -1132,8 +1398,8 @@ mod tests {
         assert_eq!(close_cell, b'X');
         let status_ok = (d.screen()[(SH - 1) * SW] & 0xFF) as u8 == b'-';
         assert!(status_ok);
-        // Title + status + shell + editor: no demo windows.
-        assert_eq!(d.window_count(), 4);
+        // Title + status + shell + editor + browser: no demo windows.
+        assert_eq!(d.window_count(), 5);
     }
 
     #[test]
@@ -1511,7 +1777,7 @@ mod tests {
     #[test]
     fn mouse_close_destroys_window() {
         let mut d = Desktop::new();
-        assert_eq!(d.window_count(), 4);
+        assert_eq!(d.window_count(), 5);
         // Press the close button (cell (61,2) -> pixel (488,32)).
         d.apply_mouse(MouseEvent {
             x: 488,
@@ -1534,7 +1800,7 @@ mod tests {
             MouseOutcome::Closed { window_id } => assert_eq!(window_id, d.shell_id()),
             _ => panic!("expected a close"),
         }
-        assert_eq!(d.window_count(), 3);
+        assert_eq!(d.window_count(), 4);
         assert!(d.wm.window(d.shell_id()).is_none());
     }
 
@@ -1591,7 +1857,7 @@ mod tests {
     #[test]
     fn editor_window_is_second_app_window() {
         let d = Desktop::new();
-        assert_eq!(d.window_count(), 4);
+        assert_eq!(d.window_count(), 5);
         let w = d.wm.window(d.editor_id()).unwrap();
         assert_eq!(
             (w.region.x, w.region.y, w.region.width, w.region.height),
@@ -1616,7 +1882,21 @@ mod tests {
             (d.screen()[EDITOR_Y as usize * SW + EDITOR_X as usize] & 0xFF) as u8,
             b'E'
         );
-        // Tab -> shell refocused and raised: the shell occludes (10,6) again.
+        // Tab -> browser focused and raised: its title 'F' is now the topmost
+        // cell at (44,13) (the editor occluded that cell).
+        let out = d.apply_key(key(Key::Tab)).unwrap();
+        match out {
+            KeyOutcome::Focused {
+                window_id,
+                editor: false,
+            } => assert_eq!(window_id, d.browser_id()),
+            _ => panic!("expected focus on the browser"),
+        }
+        assert_eq!(
+            (d.screen()[BROWSER_Y as usize * SW + BROWSER_X as usize] & 0xFF) as u8,
+            b'F'
+        );
+        // Tab -> shell refocused and raised: the shell occludes (44,13) again.
         let out = d.apply_key(key(Key::Tab)).unwrap();
         match out {
             KeyOutcome::Focused {
@@ -1626,8 +1906,8 @@ mod tests {
             _ => panic!("expected focus back on the shell"),
         }
         assert_ne!(
-            (d.screen()[EDITOR_Y as usize * SW + EDITOR_X as usize] & 0xFF) as u8,
-            b'E'
+            (d.screen()[BROWSER_Y as usize * SW + BROWSER_X as usize] & 0xFF) as u8,
+            b'F'
         );
     }
 
@@ -1730,6 +2010,80 @@ mod tests {
                 assert_eq!(block, [0u8; 4]);
             }
             _ => panic!("expected a save"),
+        }
+    }
+
+    #[test]
+    fn browser_window_is_third_app_window() {
+        let mut d = Desktop::new();
+        assert_eq!(d.window_count(), 5);
+        let w = d.wm.window(d.browser_id()).unwrap();
+        assert_eq!(
+            (w.region.x, w.region.y, w.region.width, w.region.height),
+            (BROWSER_X, BROWSER_Y, BROWSER_W, BROWSER_H)
+        );
+        // The browser lists nothing without a durable store — honest, not a
+        // fabricated row: no entry and nothing rendered below the title bar.
+        assert_eq!(d.browser.count(), 0);
+        // Raise the browser (Tab twice) so its title is the topmost cell at
+        // (44,13) — otherwise the editor/shell occlude it.
+        d.apply_key(key(Key::Tab)).unwrap();
+        d.apply_key(key(Key::Tab)).unwrap();
+        let cell = (d.screen()[BROWSER_Y as usize * SW + BROWSER_X as usize] & 0xFF) as u8;
+        assert_eq!(cell, b'F');
+    }
+
+    #[test]
+    fn tab_cycles_focus_through_browser_to_shell() {
+        let mut d = Desktop::new();
+        // Shell -> editor -> browser -> shell: the full three-app cycle.
+        d.apply_key(key(Key::Tab)).unwrap(); // -> editor
+        let out = d.apply_key(key(Key::Tab)).unwrap(); // -> browser
+        match out {
+            KeyOutcome::Focused { window_id, .. } => assert_eq!(window_id, d.browser_id()),
+            _ => panic!("expected focus on the browser"),
+        }
+        // Browser-focused: an empty listing refuses arrow moves and Enter
+        // (no selection), but F3 reports the honest no-store degrade.
+        assert_eq!(d.apply_key(key(Key::ArrowDown)), None);
+        assert_eq!(d.apply_key(key(Key::Enter)), None);
+        let f3 = d.apply_key(key(Key::F3)).unwrap();
+        match f3 {
+            KeyOutcome::Created {
+                window_id,
+                name_len,
+            } => {
+                assert_eq!(window_id, d.browser_id());
+                assert_eq!(name_len, 0, "no durable store: honest empty report");
+            }
+            _ => panic!("expected a create report"),
+        }
+        d.apply_key(key(Key::Tab)).unwrap(); // -> shell, back to the start
+    }
+
+    #[test]
+    fn browser_mouse_click_without_store_does_not_open() {
+        // No durable store is installed in tests, so the listing is empty: a
+        // content click on the browser must NOT fabricate an open — it falls
+        // through to the generic content-focus path and reports the position.
+        let mut d = Desktop::new();
+        d.apply_key(key(Key::Tab)).unwrap(); // -> editor
+        d.apply_key(key(Key::Tab)).unwrap(); // -> browser (raised)
+                                             // Browser content row 0 at cell (45,14) -> pixel (360, 224): inside
+                                             // the window, not the title bar / close button / resize corner.
+        let out = d
+            .apply_mouse(MouseEvent {
+                x: 360,
+                y: 224,
+                left_button: true,
+                right_button: false,
+                scroll: 0,
+            })
+            .unwrap();
+        match out {
+            MouseOutcome::Opened { .. } => panic!("empty listing must not open"),
+            MouseOutcome::Moved { .. } => {}
+            _ => panic!("expected a position report"),
         }
     }
 }
