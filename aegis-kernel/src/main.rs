@@ -432,13 +432,13 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 // reentrant and not meant to be — this demo runs once,
                 // synchronously, during boot, same as everything else in this
                 // function.
-                let rbuf_phys = unsafe { aegis_kernel::frame::alloc_contiguous_global(2) };
-                let plain_phys = unsafe { aegis_kernel::frame::alloc_contiguous_global(2) };
-                let ascii_phys = unsafe { aegis_kernel::frame::alloc_contiguous_global(2) };
+                let rbuf_phys = aegis_kernel::frame::alloc_contiguous_global(2);
+                let plain_phys = aegis_kernel::frame::alloc_contiguous_global(2);
+                let ascii_phys = aegis_kernel::frame::alloc_contiguous_global(2);
                 let (Some(rbuf), Some(plain), Some(ascii)) = (
-                    rbuf_phys.map(|p| unsafe { &mut *(p as *mut [u8; 8192]) }),
-                    plain_phys.map(|p| unsafe { &mut *(p as *mut [u8; 8192]) }),
-                    ascii_phys.map(|p| unsafe { &mut *(p as *mut [u8; 8192]) }),
+                    rbuf_phys.map(|p| &mut *(p as *mut [u8; 8192])),
+                    plain_phys.map(|p| &mut *(p as *mut [u8; 8192])),
+                    ascii_phys.map(|p| &mut *(p as *mut [u8; 8192])),
                 ) else {
                     sprintln!("Aegis: tls: scratch frame allocation failed");
                     return;
@@ -667,11 +667,9 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 if net.socket_close(tid) {
                     sprintln!("Aegis: tls: socket closed (FIN sent)");
                 }
-                unsafe {
-                    aegis_kernel::frame::free_global(rbuf_phys.unwrap());
-                    aegis_kernel::frame::free_global(plain_phys.unwrap());
-                    aegis_kernel::frame::free_global(ascii_phys.unwrap());
-                }
+                aegis_kernel::frame::free_global(rbuf_phys.unwrap());
+                aegis_kernel::frame::free_global(plain_phys.unwrap());
+                aegis_kernel::frame::free_global(ascii_phys.unwrap());
             });
         }
     } else {
