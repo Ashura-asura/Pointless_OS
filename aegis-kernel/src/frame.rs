@@ -1,12 +1,12 @@
 //! Physical frame allocator, fed by the boot-info memory map.
 //!
-//! A single bitmap covers the whole 4 GiB address space (1 MiB frames,
-//! 128 KiB of BSS). Every frame starts "used"; `init` clears the bits for
-//! CONVENTIONAL ranges from the boot-info handoff, then re-sets the
-//! reserved regions. Allocation hands out the lowest free frame; freeing
-//! returns it to the pool.
+//! A single bitmap covers the first 2 GiB of the address space (512 Ki
+//! frames, 64 KiB of BSS). Every frame starts "used"; `init` clears the
+//! bits for CONVENTIONAL ranges from the boot-info handoff, then re-sets
+//! the reserved regions. Allocation hands out the lowest free frame;
+//! freeing returns it to the pool.
 //!
-//! Honest limits: the bitmap only covers the first 4 GiB (frames above
+//! Honest limits: the bitmap only covers the first 2 GiB (frames above
 //! are never handed out); only UEFI CONVENTIONAL memory is considered
 //! usable (bootloader/firmware regions are not reclaimed yet); and the
 //! kernel-image + boot-info-handoff reservation comes from the
@@ -17,8 +17,8 @@
 use crate::boot_info::{BootInfo, TYPE_CONVENTIONAL};
 
 pub const PAGE_SIZE: u64 = 4096;
-/// Frames in the address space we cover (4 GiB / 4 KiB).
-pub const MAX_FRAMES: u64 = 1 << 20;
+/// Frames in the address space we cover (2 GiB / 4 KiB).
+pub const MAX_FRAMES: u64 = 1 << 19;
 pub const FRAME_WORDS: usize = (MAX_FRAMES / 64) as usize;
 
 /// The boot-info handoff is written by the loader on the first page(s)

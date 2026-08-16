@@ -409,7 +409,40 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 // Receive and parse the server flight. The first record is the
                 // plaintext ServerHello; everything after it is encrypted with
                 // the server handshake traffic key.
-                let mut rbuf = [0u8; 8192];
+                //
+                // The 8 KiB scratch buffers for this demo used to be
+                // stack-locals (5 of them across this function: rbuf, plain x2,
+                // resp_buf, ascii). With the BSS layout that landed alongside
+                // the N/O/P desktop work, frame.rs's FREE/TOTAL statics ended
+                // up placed immediately below the kernel boot stack this whole
+                // function runs on — five 8 KiB stack arrays in one call chain
+                // (worst case ~40 KiB before anything else on the stack) blew
+                // past the 64 KiB stack and corrupted them, which surfaced as
+                // "no frame for DMA buffer" in the NVMe path. Moving them to
+                // static storage fixed the stack but put the buffers in the
+                // VGA hole (0xA0000..0xBFFFF) once the image end crossed
+                // 0xA0000 — reads return 0xFF and vga_upload_font writes over
+                // part of the range. So they're allocated here from the frame
+                // allocator instead: identity-mapped conventional RAM, zero
+                // stack cost, zero BSS cost. Single-threaded, sequential-phase
+                // use only (handshake phase fully completes before the
+                // app-data phase starts) — the rbuf and plain allocations are
+                // each reused across both phases; ascii stays distinct because
+                // it's live at the same time as the app-data plain. Not
+                // reentrant and not meant to be — this demo runs once,
+                // synchronously, during boot, same as everything else in this
+                // function.
+                let rbuf_phys = unsafe { aegis_kernel::frame::alloc_contiguous_global(2) };
+                let plain_phys = unsafe { aegis_kernel::frame::alloc_contiguous_global(2) };
+                let ascii_phys = unsafe { aegis_kernel::frame::alloc_contiguous_global(2) };
+                let (Some(rbuf), Some(plain), Some(ascii)) = (
+                    rbuf_phys.map(|p| unsafe { &mut *(p as *mut [u8; 8192]) }),
+                    plain_phys.map(|p| unsafe { &mut *(p as *mut [u8; 8192]) }),
+                    ascii_phys.map(|p| unsafe { &mut *(p as *mut [u8; 8192]) }),
+                ) else {
+                    sprintln!("Aegis: tls: scratch frame allocation failed");
+                    return;
+                };
                 let mut rlen = 0usize;
                 let mut tls: Option<aegis_kernel::tls::Tls13Client> = None;
                 let mut flight_done = false;
@@ -497,8 +530,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                             // Encrypted flight: unprotect with the server
                             // handshake key.
                             let client = tls.as_mut().unwrap();
-                            let mut plain = [0u8; 8192];
-                            match client.unprotect_server_hs(&rbuf[..rec_len], &mut plain) {
+                            match client.unprotect_server_hs(&rbuf[..rec_len], plain) {
                                 Some((inner_ct, payload)) => {
                                     if inner_ct == aegis_kernel::tls::CT_HANDSHAKE {
                                         if !client.on_server_handshake_payload(payload) {
@@ -565,7 +597,10 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
 
                 // Receive the encrypted response, unprotect with the server
                 // application key, and print the plaintext.
-                let mut resp_buf = [0u8; 8192];
+                // Handshake phase is fully done by this point (we're past the
+                // flight_done loop above) — safe to reuse rbuf's storage
+                // rather than declare a second stack/static buffer.
+                let resp_buf = rbuf;
                 let mut got = 0usize;
                 let mut app_done = false;
                 spins = 0;
@@ -581,12 +616,16 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                         if pos + rec_len > got {
                             break;
                         }
-                        let mut plain = [0u8; 8192];
-                        match tls.unprotect_server_app(&resp_buf[pos..pos + rec_len], &mut plain) {
+                        // Handshake-phase plain borrow is long since
+                        // ended (that loop finished before resp_buf/app_done
+                        // even started) — safe to reuse here.
+                        match tls.unprotect_server_app(&resp_buf[pos..pos + rec_len], plain) {
                             Some((inner_ct, payload))
                                 if inner_ct == aegis_kernel::tls::CT_APPLICATION_DATA =>
                             {
-                                let mut ascii = [0u8; 8192];
+                                // Distinct from resp_buf (still needed for the
+                                // outer loop's next record) and from plain
+                                // (payload borrows out of it right here).
                                 let pl = payload.len().min(8192);
                                 for i in 0..pl {
                                     let b = payload[i];
@@ -627,6 +666,11 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 // Close: sends a real FIN.
                 if net.socket_close(tid) {
                     sprintln!("Aegis: tls: socket closed (FIN sent)");
+                }
+                unsafe {
+                    aegis_kernel::frame::free_global(rbuf_phys.unwrap());
+                    aegis_kernel::frame::free_global(plain_phys.unwrap());
+                    aegis_kernel::frame::free_global(ascii_phys.unwrap());
                 }
             });
         }
