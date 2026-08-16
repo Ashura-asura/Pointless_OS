@@ -49,7 +49,6 @@ pub extern "sysv64" fn _start(handoff_addr: u64) -> ! {
 extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     aegis_kernel::serial::SerialWriter::init();
     aegis_kernel::vga::vga_init();
-
     sprintln!("=== Aegis Phase 2: Bare-Metal Kernel ===");
     sprintln!("Aegis: kernel started (loader handed off at entry)");
 
@@ -57,8 +56,9 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         aegis_kernel::cpu::disable_smep_smap();
     }
     sprintln!(
-        "Aegis: kernel stack 0x{:016X} (16 KiB, dedicated BSS region)",
-        aegis_kernel::cpu::stack_top()
+        "Aegis: kernel stack 0x{:016X} ({} KiB, dedicated BSS region)",
+        aegis_kernel::cpu::stack_top(),
+        aegis_kernel::cpu::stack_size() / 1024
     );
 
     let boot_info = unsafe { aegis_kernel::boot_info::locate_at(handoff_addr) };
@@ -652,6 +652,17 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
 
     // Live NVMe demo: probe BAR0, reset, admin + IO queues, identify, read
     // LBA 0/1 and check the GPT signature (disk image is GPT-partitioned).
+    {
+        let (total, free) = unsafe { aegis_kernel::frame::stats_global() };
+        let rsp: u64;
+        unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp) };
+        sprintln!(
+            "Aegis: frame allocator before NVMe: total={} free={} rsp={:#x}",
+            total,
+            free,
+            rsp
+        );
+    }
     if let Some(mut ctrl) = aegis_kernel::nvme::NvmeController::probe(&pci) {
         sprintln!(
             "Aegis: NVMe: BAR {:x} CAP=0x{:08X} VS=0x{:08X}",
@@ -979,6 +990,77 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                     );
                     sprintln!("Aegis: system-update: full install -> stage -> health-gated activate -> rollback cycle persisted to the boot device");
                 }
+
+                // Phase P: the first real app window — a text editor whose
+                // buffer lives in THIS store. On first boot the editor writes
+                // the seed memo.txt into a fresh boot view and anchors the
+                // view's dir id in the store header; on a reboot it re-attaches
+                // to the anchored dir and reopens the SAME memo.txt, so a
+                // typed + F2-saved edit survives a power cycle. The store's
+                // hello block was deliberately corrupted above (data slot 0),
+                // so this seed runs AFTER that demo — its blocks always land
+                // strictly above the corrupted slot by construction.
+                use aegis_kernel::editor::{seed_if_absent, EditorFs};
+                let anchor = st.anchor(&mut ctrl);
+                let mut eout = [0u8; 512];
+                match anchor {
+                    Some(a) if a != [0u8; 32] => {
+                        // A reboot: reopen the anchored boot view and read the
+                        // file; `still edited` proves the F2-saved edit is the
+                        // content on disk, not the original seed.
+                        let mut view = BootView::at(a);
+                        let (n, created) = seed_if_absent(&mut st, &mut ctrl, &mut view, &mut eout)
+                            .unwrap_or((0, false));
+                        let still_edited = !created && &eout[..n] != aegis_kernel::editor::SEED;
+                        let mut hex = [0u8; 4];
+                        hex_bytes(&a, &mut hex);
+                        sprintln!(
+                            "Aegis: editor@reopen memo.txt ({} bytes, view {:02X}{:02X}{:02X}{:02X}) still edited = {}",
+                            n,
+                            hex[0],
+                            hex[1],
+                            hex[2],
+                            hex[3],
+                            still_edited
+                        );
+                        unsafe {
+                            aegis_kernel::editor::install(EditorFs {
+                                ctrl,
+                                store: st,
+                                view,
+                            });
+                        }
+                    }
+                    _ => {
+                        // First boot: a fresh boot view + the seed file, then
+                        // anchor the view's dir id so reboots reopen it.
+                        let mut view =
+                            BootView::create(&mut st, &mut ctrl).expect("editor boot view");
+                        let (n, created) =
+                            seed_if_absent(&mut st, &mut ctrl, &mut view, &mut eout).unwrap();
+                        let dir = view.dir_id();
+                        let anchored = st.set_anchor(&mut ctrl, &dir);
+                        let mut hex = [0u8; 4];
+                        hex_bytes(&dir, &mut hex);
+                        sprintln!(
+                            "Aegis: editor@seed memo.txt ({} bytes, view {:02X}{:02X}{:02X}{:02X}) anchored = {}, created = {}",
+                            n,
+                            hex[0],
+                            hex[1],
+                            hex[2],
+                            hex[3],
+                            anchored,
+                            created
+                        );
+                        unsafe {
+                            aegis_kernel::editor::install(EditorFs {
+                                ctrl,
+                                store: st,
+                                view,
+                            });
+                        }
+                    }
+                }
             }
             None => {
                 sprintln!("Aegis: NVMe-store: corrupt or unreadable store region");
@@ -1210,23 +1292,29 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         let d = Desktop::new();
         let screen = d.screen();
 
-        // The default post-boot surface: the focused shell window renders the
-        // prompt `aegis:~$ ` at its origin, and the status bar spans the
-        // bottom row. Verify the composited screen shows them.
-        let prompt_cell = (screen[SHELL_Y as usize * SW + SHELL_X as usize] & 0xFF) as u8;
+        // The default post-boot surface: the focused shell window renders
+        // its title bar (row 0) and the prompt `aegis:~$ ` on row 1, and the
+        // status bar spans the bottom row. Verify the composited screen.
+        let title_cell = (screen[SHELL_Y as usize * SW + SHELL_X as usize] & 0xFF) as u8;
+        let prompt_cell = (screen[(SHELL_Y as usize + 1) * SW + SHELL_X as usize] & 0xFF) as u8;
         let status_ok = (screen[(SH - 1) * SW] & 0xFF) as u8 == b'-';
         sprintln!(
-            "Aegis: shell-compositor: boot shell surface: prompt first cell '{}' @ ({},{}), status bar = {}, {} windows",
-            prompt_cell as char,
+            "Aegis: shell-compositor: boot shell surface: title bar first cell '{}' @ ({},{}), prompt first cell '{}' @ ({},{}), status bar = {}, {} windows",
+            title_cell as char,
             SHELL_X,
             SHELL_Y,
+            prompt_cell as char,
+            SHELL_X,
+            SHELL_Y + 1,
             status_ok,
             d.window_count()
         );
 
-        // Render three rows of the composited screen as characters so the
-        // result is visible in the serial log (shell window is 60x12 @ 2,2).
-        for sy in [2usize, 3, 4] {
+        // Render a few rows of the composited screen as characters so the
+        // result is visible in the serial log (shell window is 60x12 @ 2,2;
+        // the Phase P editor window is 56x14 @ 10,6 — row 6 is its title
+        // bar when it is not occluded by the focused shell).
+        for sy in [2usize, 3, 4, 6] {
             let mut rowbuf = [0u8; SW];
             for (sx, cell) in rowbuf.iter_mut().enumerate() {
                 *cell = (screen[sy * SW + sx] & 0xFF) as u8;
@@ -1235,14 +1323,18 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             sprintln!("Aegis: shell-compositor: row{}: |{}|", sy, rowstr);
         }
         sprintln!(
-            "Aegis: shell-compositor: composited {}x{} screen from {} windows (shell window {}x{} @ ({},{}); VGA text substrate; compositor is ordinary userspace-style UI work, per roadmap §10 item 3)",
+            "Aegis: shell-compositor: composited {}x{} screen from {} windows (shell window {}x{} @ ({},{}), editor window {}x{} @ ({},{}); VGA text substrate; compositor is ordinary userspace-style UI work, per roadmap §10 item 3)",
             SW,
             SH,
             d.window_count(),
             SHELL_W,
             aegis_kernel::desktop::SHELL_H,
             SHELL_X,
-            SHELL_Y
+            SHELL_Y,
+            aegis_kernel::desktop::EDITOR_W,
+            aegis_kernel::desktop::EDITOR_H,
+            aegis_kernel::desktop::EDITOR_X,
+            aegis_kernel::desktop::EDITOR_Y
         );
         unsafe {
             aegis_kernel::desktop::install(d);
@@ -1261,8 +1353,16 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         aegis_kernel::cpu::init_legacy_pic_irq1();
     }
     sprintln!("Aegis: legacy PIC remapped; IRQ1 (keyboard) -> 0x21 via LAPIC LVT0 ExtINT");
+    // NOTE(experiment): mouse IRQ12 setup disabled to bisect the LAPIC timer.
+    // unsafe {
+    //     aegis_kernel::cpu::init_legacy_pic_irq12();
+    // }
+    // sprintln!("Aegis: legacy PIC IRQ12 (mouse) unmasked on the slave; IRQ2 cascade unmasked on the master");
     unsafe {
         aegis_kernel::ps2::init();
+    }
+    unsafe {
+        aegis_kernel::ps2_mouse::init();
     }
 
     // Two kernel tasks, each on a 16 KiB stack carved from the frame
@@ -1874,6 +1974,86 @@ extern "sysv64" fn task_input() -> ! {
                                     y
                                 );
                             }
+                            aegis_kernel::desktop::KeyOutcome::Focused { window_id, editor } => {
+                                sprintln!(
+                                    "Aegis: shell-compositor@key: tab -> focus window id={} (editor={})",
+                                    window_id,
+                                    editor
+                                );
+                            }
+                            aegis_kernel::desktop::KeyOutcome::Edited { window_id, ch, pos } => {
+                                sprintln!(
+                                    "Aegis: editor@key: '{}' inserted into window id={} at pos={}",
+                                    ch as char,
+                                    window_id,
+                                    pos
+                                );
+                            }
+                            aegis_kernel::desktop::KeyOutcome::CursorMoved { window_id, pos } => {
+                                sprintln!(
+                                    "Aegis: editor@key: cursor moved in window id={} to pos={}",
+                                    window_id,
+                                    pos
+                                );
+                            }
+                            aegis_kernel::desktop::KeyOutcome::Saved {
+                                window_id,
+                                len,
+                                block,
+                            } => {
+                                sprintln!(
+                                    "Aegis: editor@save memo.txt ({} bytes, block {:02X}{:02X}{:02X}{:02X}) window id={}",
+                                    len,
+                                    block[0],
+                                    block[1],
+                                    block[2],
+                                    block[3],
+                                    window_id
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        while let Some(ev) = aegis_kernel::ps2_mouse::pop_event() {
+            if let aegis_kernel::input::InputEvent::Mouse(me) = ev {
+                if let Some(out) = aegis_kernel::desktop::handle_mouse(me) {
+                    match out {
+                        aegis_kernel::desktop::MouseOutcome::Moved { x, y, left, right } => {
+                            sprintln!(
+                                "Aegis: shell-compositor@mouse: pos=({},{}) left={} right={}",
+                                x,
+                                y,
+                                left,
+                                right
+                            );
+                        }
+                        aegis_kernel::desktop::MouseOutcome::DragMoved { window_id, x, y } => {
+                            sprintln!(
+                            "Aegis: shell-compositor@mouse: drag -> window id={} moved to ({},{})",
+                            window_id,
+                            x,
+                            y
+                        );
+                        }
+                        aegis_kernel::desktop::MouseOutcome::Resized {
+                            window_id,
+                            width,
+                            height,
+                        } => {
+                            sprintln!(
+                                "Aegis: shell-compositor@mouse: resize -> window id={} now {}x{}",
+                                window_id,
+                                width,
+                                height
+                            );
+                        }
+                        aegis_kernel::desktop::MouseOutcome::Closed { window_id } => {
+                            sprintln!(
+                                "Aegis: shell-compositor@mouse: close -> window id={} destroyed",
+                                window_id
+                            );
                         }
                     }
                 }

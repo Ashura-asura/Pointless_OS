@@ -16,6 +16,8 @@
 //! Honest limits: scancode set 1 only (the default on QEMU/VMware); left
 //! Shift and left Ctrl are tracked, right Ctrl/Alt are not; punctuation
 //! keys have no `Key` variant in the `input` model, so they are dropped.
+//! Function keys (F1-F12, set-1 make codes 0x3B-0x44 / 0x57-0x58) are
+//! translated — Phase P's editor uses F2 as its save gesture.
 //! The translation is pure and unit-tested; the port I/O paths are
 //! exercised live under QEMU/VMware.
 
@@ -159,6 +161,18 @@ fn translate(extended: bool, code: u8) -> Option<Key> {
         0x30 => Some(Key::B),
         0x31 => Some(Key::N),
         0x32 => Some(Key::M),
+        0x3B => Some(Key::F1),
+        0x3C => Some(Key::F2),
+        0x3D => Some(Key::F3),
+        0x3E => Some(Key::F4),
+        0x3F => Some(Key::F5),
+        0x40 => Some(Key::F6),
+        0x41 => Some(Key::F7),
+        0x42 => Some(Key::F8),
+        0x43 => Some(Key::F9),
+        0x44 => Some(Key::F10),
+        0x57 => Some(Key::F11),
+        0x58 => Some(Key::F12),
         _ => None,
     }
 }
@@ -381,6 +395,23 @@ mod tests {
                                                     // The stray E0 prefix must not corrupt the next plain key.
         st.feed(&mut buf, 0x1E);
         assert_eq!(buf.pop(), Some(ev(Key::A, true, false, false)));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn function_keys_map_to_f_variants() {
+        let mut st = Ps2State::new();
+        let mut buf = InputBuffer::new();
+        // F2 make (0x3C) / break (0xBC): the editor's save gesture.
+        st.feed(&mut buf, 0x3C);
+        assert_eq!(buf.pop(), Some(ev(Key::F2, true, false, false)));
+        st.feed(&mut buf, 0xBC);
+        assert_eq!(buf.pop(), Some(ev(Key::F2, false, false, false)));
+        // F1 (0x3B) and F12 (0x58) round out the row.
+        st.feed(&mut buf, 0x3B);
+        assert_eq!(buf.pop(), Some(ev(Key::F1, true, false, false)));
+        st.feed(&mut buf, 0x58);
+        assert_eq!(buf.pop(), Some(ev(Key::F12, true, false, false)));
         assert!(buf.is_empty());
     }
 

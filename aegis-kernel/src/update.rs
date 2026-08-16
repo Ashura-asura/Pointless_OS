@@ -199,6 +199,13 @@ impl BootView {
         Some(BootView { dir })
     }
 
+    /// Attach to an existing boot view by its durable dir id (Phase P: the
+    /// editor anchors this id in the store header on first boot, then
+    /// re-attaches to it after a reboot to reopen the same directory).
+    pub fn at(dir: BlockId) -> BootView {
+        BootView { dir }
+    }
+
     pub fn dir_id(&self) -> BlockId {
         self.dir
     }
@@ -776,7 +783,7 @@ mod tests {
         // bytes are still one block, no new data block is written.
         let boot_dir = um.view_id();
         let mut store2 = Store::open(&mut disk).unwrap();
-        let mut um2 = UpdateManager::attach(&mut store2, &mut disk, BootView { dir: boot_dir });
+        let mut um2 = UpdateManager::attach(&mut store2, &mut disk, BootView::at(boot_dir));
         // Numbering continues past generation 1.
         assert_eq!(um2.next_n, 2, "attach resumes gen numbering from the dir");
         let count_before = store2.count();

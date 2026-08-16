@@ -50,6 +50,11 @@ pub fn stack_top() -> u64 {
     top & !15
 }
 
+/// Size of the dedicated kernel stack, in bytes.
+pub const fn stack_size() -> usize {
+    KERNEL_STACK_SIZE
+}
+
 /// Top (highest address) of the idle stack, 16-aligned downwards. Returns 0
 /// before the idle stack has been allocated.
 pub fn idle_stack_top() -> u64 {
@@ -175,6 +180,24 @@ pub unsafe fn init_legacy_pic_irq1() {
     lapic_write(0x350, (lvt0 | 0x700) & !0x1_0000);
 }
 
+/// Unmask IRQ12 (PS/2 mouse) on the slave 8259A: IRQ12 maps to vector
+/// 0x2C (slave base 0x28 plus 4) and arrives through the IRQ2 cascade,
+/// which is unmasked on the master here too. Everything else on both PICs
+/// stays masked; the LAPIC timer remains the only tick source.
+///
+/// # Safety
+///
+/// Must run after `init_legacy_pic_irq1` (the PICs are already remapped
+/// there, with the slave fully masked) and after `init_idt` (the 0x2C gate
+/// must be live). Boot-time, single-threaded.
+pub unsafe fn init_legacy_pic_irq12() {
+    // Master IMR: 0xF9 = 1111 1001 — IRQ2 (the slave cascade) unmasked, all
+    // else (including IRQ1) masked. Slave IMR: 0xEF = 1110 1111 — IRQ12
+    // unmasked, all else masked.
+    asm!("out dx, al", in("dx") 0x21u16, in("al") 0xF9u8, options(nomem, preserves_flags));
+    asm!("out dx, al", in("dx") 0xA1u16, in("al") 0xEFu8, options(nomem, preserves_flags));
+}
+
 static mut KERNEL_GDT: crate::gdt::Gdt = crate::gdt::Gdt::new();
 
 /// Load the kernel GDT (and TSS).
@@ -251,6 +274,10 @@ pub unsafe fn init_idt() {
     idt.set_irq_handler(
         crate::ps2::KEYBOARD_VECTOR as usize,
         crate::ps2::keyboard_stub as *const () as u64,
+    );
+    idt.set_irq_handler(
+        crate::ps2_mouse::MOUSE_VECTOR as usize,
+        crate::ps2_mouse::mouse_stub as *const () as u64,
     );
     idt.set_handler(
         crate::syscall::SYS_VECTOR as usize,
@@ -449,7 +476,6 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
 /// Rust side of the LAPIC timer stub: count the tick and send the EOI.
 #[no_mangle]
 pub extern "sysv64" fn timer_trap_rust() {
-    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
     unsafe {
         lapic_write(0xB0, 0);
     }

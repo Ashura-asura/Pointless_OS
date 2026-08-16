@@ -44,12 +44,15 @@ pub mod policy_engine;
 pub mod profiler;
 
 pub mod compositor;
+pub mod cursor;
 pub mod desktop;
+pub mod editor;
 pub mod gpu;
 pub mod gpu_compositor;
 pub mod input;
 pub mod object_graph;
 pub mod ps2;
+pub mod ps2_mouse;
 pub mod shell;
 pub mod window;
 

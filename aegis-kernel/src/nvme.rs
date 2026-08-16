@@ -198,7 +198,13 @@ pub fn gpt_signature_ok(lba1: &[u8]) -> bool {
 fn alloc_dma_frame() -> &'static mut [u64] {
     match unsafe { crate::frame::alloc_contiguous_global(1) } {
         Some(phys) => unsafe { core::slice::from_raw_parts_mut(phys as *mut u64, 512) },
-        None => panic!("NVMe: no frame for DMA buffer"),
+        None => {
+            let (total, free) = unsafe { crate::frame::stats_global() };
+            panic!(
+                "NVMe: no frame for DMA buffer (total={} free={})",
+                total, free
+            );
+        }
     }
 }
 

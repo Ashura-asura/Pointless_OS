@@ -24,10 +24,17 @@
 //!
 //! Disk layout (same image the kernel boots from; the store region sits far
 //! past the FAT16 ESP's metadata and file data — see the constants):
-//!   LBA 8192            header: magic + u16 LE block count
+//!   LBA 8192            header: magic + u16 LE block count + 32-byte view anchor
 //!   LBA 8193..8208      index: 16 sectors x 512 B = 256 index slots? no —
 //!                       16 sectors hold 170 entries of 48 bytes
 //!   LBA 8209 ..         data: one 512 B sector per immutable block
+//!
+//! The header's 32-byte anchor (bytes 10..42) is Phase P's durable pointer:
+//! `set_anchor` writes the boot view's dir id there once, and `anchor` reads
+//! it back after any reboot, so the editor reopens the SAME directory (and
+//! the same memo.txt) it seeded on first boot. `write_header` preserves the
+//! whole tail of the header sector, so a count bump on a later `put` never
+//! wipes an anchor that was already set.
 //!
 //! Honest limits (documented, not hidden): blocks are single 512 B sectors
 //! (a content block is one LBA; bigger blocks are out of scope for the
@@ -61,6 +68,13 @@ pub const DATA_BASE_LBA: u64 = STORE_START_LBA + INDEX_SECTORS;
 const HEADER_MAGIC: [u8; 8] = *b"AEGISSTO";
 const ENTRY_BYTES: usize = 48; // id[32] + lba[8] + len[2] + reserved[6]
 const SECTOR: usize = 512;
+
+/// Byte offset of the 32-byte view anchor within the header sector (immediately
+/// after magic[8] + count[2]). Phase P stores the editor's boot-view dir id
+/// here so a reboot reopens the same directory.
+const ANCHOR_OFFSET: usize = 10;
+/// Length of the durable view anchor.
+const ANCHOR_BYTES: usize = 32;
 
 /// Minimal synchronous sector I/O. The live kernel implementation is the NVMe
 /// controller; tests use `MemDisk`, so the whole store (index handling,
@@ -188,9 +202,41 @@ impl Store {
     }
 
     fn write_header(&mut self, io: &mut impl BlockIo) -> bool {
+        // Read the current header first and overwrite only the magic + count,
+        // so the 32-byte view anchor (and any future header fields) survive
+        // every count bump. On a fresh disk the read yields zeros.
         let mut sec = [0u8; SECTOR];
+        let _ = io.read_sector(STORE_START_LBA, &mut sec);
         sec[..8].copy_from_slice(&HEADER_MAGIC);
         sec[8..10].copy_from_slice(&self.count.to_le_bytes());
+        io.write_sector(STORE_START_LBA, &sec)
+    }
+
+    /// The durable view anchor (the editor's boot-view dir id), or all-zero
+    /// bytes on a fresh region that has never been anchored.
+    pub fn anchor(&mut self, io: &mut impl BlockIo) -> Option<[u8; 32]> {
+        let mut sec = [0u8; SECTOR];
+        if !io.read_sector(STORE_START_LBA, &mut sec) {
+            return None;
+        }
+        let mut out = [0u8; ANCHOR_BYTES];
+        if sec[..8] != HEADER_MAGIC {
+            return Some(out); // fresh region: zero anchor, never anchored
+        }
+        out.copy_from_slice(&sec[ANCHOR_OFFSET..ANCHOR_OFFSET + ANCHOR_BYTES]);
+        Some(out)
+    }
+
+    /// Persist `anchor` into the header sector (magic + count + anchor in one
+    /// write). Returns false if the sector could not be written.
+    pub fn set_anchor(&mut self, io: &mut impl BlockIo, anchor: &[u8; 32]) -> bool {
+        let mut sec = [0u8; SECTOR];
+        if !io.read_sector(STORE_START_LBA, &mut sec) {
+            return false;
+        }
+        sec[..8].copy_from_slice(&HEADER_MAGIC);
+        sec[8..10].copy_from_slice(&self.count.to_le_bytes());
+        sec[ANCHOR_OFFSET..ANCHOR_OFFSET + ANCHOR_BYTES].copy_from_slice(anchor);
         io.write_sector(STORE_START_LBA, &sec)
     }
 
@@ -382,6 +428,41 @@ mod tests {
         // A second handle sees the durable count (index lives on the disk).
         let s2 = Store::open(&mut disk).unwrap();
         assert_eq!(s2.count(), 1);
+    }
+
+    #[test]
+    fn fresh_region_anchor_is_zero() {
+        let mut disk = MemDisk::new(9000);
+        let mut s = Store::open(&mut disk).unwrap();
+        let a = s.anchor(&mut disk).unwrap();
+        assert_eq!(a, [0u8; 32], "a fresh region has never been anchored");
+    }
+
+    #[test]
+    fn anchor_roundtrips_and_survives_reopen() {
+        let mut disk = MemDisk::new(9000);
+        let mut s = Store::open(&mut disk).unwrap();
+        let mut anchor = [0u8; 32];
+        anchor[0] = 0xDE;
+        anchor[31] = 0xAD;
+        assert!(s.set_anchor(&mut disk, &anchor));
+        // A second handle (a reboot) reads the anchor back unchanged.
+        let mut s2 = Store::open(&mut disk).unwrap();
+        assert_eq!(s2.anchor(&mut disk).unwrap(), anchor);
+    }
+
+    #[test]
+    fn write_header_preserves_anchor_across_puts() {
+        let mut disk = MemDisk::new(9000);
+        let mut s = Store::open(&mut disk).unwrap();
+        let mut anchor = [0u8; 32];
+        anchor[7] = 0x77;
+        assert!(s.set_anchor(&mut disk, &anchor));
+        // A later put bumps the header count via write_header; the anchor must
+        // survive that rewrite, not be zeroed back.
+        s.put(&mut disk, b"hello after anchor").unwrap();
+        assert_eq!(s.anchor(&mut disk).unwrap(), anchor);
+        assert_eq!(s.count(), 1);
     }
 
     #[test]

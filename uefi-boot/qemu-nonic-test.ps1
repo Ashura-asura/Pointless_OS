@@ -1,0 +1,3 @@
+$qemu = 'C:\Program Files\qemu\qemu-system-x86_64.exe'
+$A = '-machine q35 -m 512 -cpu max -drive if=pflash,format=raw,readonly=on,file="C:\Program Files\qemu\share\edk2-x86_64-code.fd" -drive if=pflash,format=raw,file="C:\Users\bisha\Desktop\Pointless_OS\uefi-boot\OVMF_VARS.fd" -drive file="C:\Users\bisha\Desktop\Pointless_OS\uefi-boot\aegis-boot-now.img",format=raw,if=ide,index=0,media=disk -serial file:"C:\Users\bisha\Desktop\Pointless_OS\uefi-boot\serial-nonic-test.log" -display none -net none -no-reboot'
+Start-Process -FilePath $qemu -ArgumentList $A -WindowStyle Hidden
