@@ -812,6 +812,12 @@ const MSG_CAPABILITY: u8 = 0x02;
 pub fn open_link(peer_ip: [u8; 4]) -> Option<u16> {
     unsafe {
         crate::netif::NetIf::with(|net| {
+            // Fail closed with no NIC: `socket_send` (UDP) would transmit
+            // over `nic_mut()` and panic. A fleet image booted NIC-less simply
+            // aborts the demo loop cleanly instead.
+            if !net.is_online() {
+                return None;
+            }
             // Bind the well-known FLEET_PORT as our local port so the peer's
             // datagrams (addressed to FLEET_PORT, per socket_send's use of
             // remote_port as dst_port) match our socket: netif's UDP receive
@@ -985,7 +991,13 @@ pub fn run_boot_demo() {
 
     let mut i: u64 = 0;
     while i < DEMO_MAX_POLLS {
-        unsafe { crate::netif::NetIf::with(|net| net.poll()) };
+        unsafe {
+            crate::netif::NetIf::with(|net| {
+                if net.is_online() {
+                    net.poll();
+                }
+            })
+        };
         fleet.advance_time(i);
         if i % HEARTBEAT_EVERY == 0 {
             send_heartbeat(sock);
@@ -1024,7 +1036,13 @@ pub fn run_boot_demo() {
     let mut received: Option<RemoteCapability> = None;
     let mut i: u64 = 0;
     while i < DEMO_MAX_POLLS {
-        unsafe { crate::netif::NetIf::with(|net| net.poll()) };
+        unsafe {
+            crate::netif::NetIf::with(|net| {
+                if net.is_online() {
+                    net.poll();
+                }
+            })
+        };
         fleet.advance_time(i);
 
         match poll_link(sock) {

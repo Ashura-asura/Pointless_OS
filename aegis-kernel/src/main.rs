@@ -2468,7 +2468,10 @@ extern "sysv64" fn task_advisor() -> ! {
         user_syscall5(3, 0, 0, 0, 0); // yield so the grantor can run
     }
     if !granted {
-        user_print(b"Aegis: [advisor] role grant never arrived\r\n");
+        // Either the RoleGrant never landed, or the kernel has no NIC and
+        // net_connect fails closed (see netif::sys_net_connect). Both degrade
+        // the network demo to a clean skip — never a crash.
+        user_print(b"Aegis: [advisor] role grant never arrived / NIC unavailable - network demo skipped\r\n");
         loop {
             core::hint::spin_loop();
         }

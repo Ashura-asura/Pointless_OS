@@ -258,6 +258,27 @@ impl NetIf {
         self.nic.as_mut().expect("netif not initialized")
     }
 
+    /// Whether the stack has a live NIC to transmit/receive on. `false` when
+    /// no PCI network device was probed at boot (e.g. a VM configured without
+    /// an NIC, or a headless/no-network image). Every syscall gate checks this
+    /// first and fails closed, so ring-3 can never reach `nic_mut()`'s panic —
+    /// a missing NIC degrades the network demos to a clean skip, never a
+    /// kernel crash.
+    #[cfg(not(test))]
+    pub fn is_online(&self) -> bool {
+        self.nic.is_some()
+    }
+
+    /// Test-only override: the host-test build has no real e1000, so tests
+    /// that drive the syscall layer against the shared static `NETIF` model
+    /// an online wire via `TEST_NET_ONLINE` (set with `set_test_net_online`).
+    /// The production `is_online` above is the sole definition outside
+    /// `#[cfg(test)]` — a kernel build never sees this one.
+    #[cfg(test)]
+    pub fn is_online(&self) -> bool {
+        self.nic.is_some() || TEST_NET_ONLINE.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Transmit one IPv4 packet to `dst_ip`, the transport bytes already
     /// assembled in `payload`. Resolves `dst_ip` via ARP first.
     fn tx_ipv4(&mut self, dst_ip: [u8; 4], protocol: u8, payload: &[u8]) -> bool {
@@ -1155,6 +1176,14 @@ pub unsafe fn sys_net_socket(kind: u64, ip_packed: u64, port: u64) -> i64 {
         record(false);
         return -1;
     }
+    // Fail closed when the stack has no NIC: ring-3 can never mint an
+    // endpoint for a wire that isn't there, and never reach `nic_mut()`'s
+    // panic. Still attributed in the audit log so the attempt is traceable.
+    let netif = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) };
+    if !netif.is_online() {
+        record(false);
+        return -1;
+    }
     let ip = [
         (ip_packed >> 24) as u8,
         (ip_packed >> 16) as u8,
@@ -1167,9 +1196,7 @@ pub unsafe fn sys_net_socket(kind: u64, ip_packed: u64, port: u64) -> i64 {
         record(false);
         return -1;
     };
-    let Some((id, _lp)) =
-        unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_open(kind, ip, port as u16, None)
-    else {
+    let Some((id, _lp)) = netif.socket_open(kind, ip, port as u16, None) else {
         record(false);
         return -1;
     };
@@ -1204,6 +1231,12 @@ pub unsafe fn sys_net_connect(slot: u64) -> i64 {
         return -1;
     }
     let netif = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) };
+    // Fail closed with no NIC: connecting would hit `nic_mut()`'s panic
+    // (SYN goes out over the wire), and no NIC means no wire.
+    if !netif.is_online() {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
+        return -1;
+    }
     let ok = netif.tcp_connect(id as u16);
     crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), ok);
     if ok {
@@ -1230,6 +1263,12 @@ pub unsafe fn sys_net_send(slot: u64, va: u64, len: u64) -> i64 {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
         return -1;
     }
+    // Fail closed with no NIC: `socket_send` transmits immediately (TCP flush
+    // / UDP datagram) and would hit `nic_mut()`'s panic.
+    if !unsafe { &*core::ptr::addr_of!(NETIF) }.is_online() {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
+        return -1;
+    }
     let len = core::cmp::min(len as usize, 2048);
     let data = core::slice::from_raw_parts(va as *const u8, len);
     let n = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_send(id as u16, data);
@@ -1251,6 +1290,13 @@ pub unsafe fn sys_net_recv(slot: u64, va: u64, len: u64) -> i64 {
         return -1;
     };
     if !cap.rights.contains(Rights::RECV) {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
+        return -1;
+    }
+    // Fail closed with no NIC: there is no wire to receive from, so an
+    // authorized poll on a live NIC-less stack returns an error instead of a
+    // spurious 0/empty read.
+    if !unsafe { &*core::ptr::addr_of!(NETIF) }.is_online() {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
         return -1;
     }
@@ -1281,6 +1327,12 @@ pub unsafe fn sys_net_close(slot: u64) -> i64 {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
         return -1;
     };
+    // Fail closed with no NIC, same as every other net gate: nothing to close
+    // on a wire that doesn't exist.
+    if !unsafe { &*core::ptr::addr_of!(NETIF) }.is_online() {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
+        return -1;
+    }
     let ok = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_close(id as u16);
     crate::tasks::set_task_cap(cur, slot as usize, CapSlot::empty());
     crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), ok);
@@ -1296,6 +1348,19 @@ pub unsafe fn sys_net_close(slot: u64) -> i64 {
 /// clear and then assert on its own transmissions.
 #[cfg(test)]
 static TEST_TX: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+/// Test-only: models "the stack has an online NIC" for syscall-layer tests
+/// that run against the shared static `NETIF` (which has `nic == None` in the
+/// host-test build). Off by default — syscall-layer fail-close behavior is
+/// itself tested, so only tests that deliberately exercise the authorized
+/// path flip this on.
+#[cfg(test)]
+static TEST_NET_ONLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn set_test_net_online(online: bool) {
+    TEST_NET_ONLINE.store(online, core::sync::atomic::Ordering::Relaxed);
+}
 
 #[cfg(test)]
 mod tests {
@@ -1754,6 +1819,7 @@ mod tests {
     fn net_socket_allows_task_with_net_root() {
         let _g = crate::kernel_state_guard();
         crate::tasks::reset_table_for_test();
+        set_test_net_online(true);
         for s in 0..crate::tasks::MAX_CAPS {
             crate::tasks::set_task_cap(5, s, crate::cap::CapSlot::empty());
         }
@@ -1781,6 +1847,42 @@ mod tests {
             crate::audit::OpKind::NetOpen,
             (ip_packed as u32) ^ (9090u32 << 16)
         ));
+    }
+
+    /// The fail-close contract that makes ring-3 unable to panic the kernel:
+    /// with the stack offline (`TEST_NET_ONLINE` left false, `nic == None` in
+    /// the host-test build), every net syscall is refused even for a task that
+    /// holds every relevant capability — the stack degrades to a clean denial,
+    /// never a `nic_mut()` panic reachable from a userspace syscall. Each
+    /// refusal is still attributed in the audit log.
+    #[test]
+    fn net_syscalls_fail_closed_when_stack_offline() {
+        let _g = crate::kernel_state_guard();
+        crate::tasks::reset_table_for_test();
+        // Explicitly offline: independent of any other test's `TEST_NET_ONLINE`
+        // state, so this runs correctly regardless of test order/parallelism.
+        set_test_net_online(false);
+        for s in 0..crate::tasks::MAX_CAPS {
+            crate::tasks::set_task_cap(9, s, crate::cap::CapSlot::empty());
+        }
+        assert!(grant_net_root(9, 0));
+        crate::tasks::set_current_for_test(9);
+        let ip_packed: u64 = u32::from_be_bytes(GW_IP) as u64;
+        let slot = unsafe { sys_net_socket(1, ip_packed, 8080) };
+        assert_eq!(
+            slot, -1,
+            "offline stack refuses to mint even for a NetRoot holder"
+        );
+        assert!(
+            (0..crate::tasks::MAX_CAPS)
+                .filter(|&s| s != 0)
+                .all(|s| crate::tasks::task_cap(9, s).cap == Cap::None),
+            "a refused offline mint leaves no capability behind (NetRoot itself untouched)"
+        );
+        assert!(
+            crate::audit::op_counts(9)[crate::audit::OpKind::NetOpen.index()] >= 1,
+            "the offline refusal is still an attributed audit record"
+        );
     }
 
     /// Holding `Cap::NetRoot` in a slot is not enough on its own — the
@@ -1841,6 +1943,7 @@ mod tests {
     fn net_io_syscalls_are_all_attributed_in_the_audit_log() {
         let _g = crate::kernel_state_guard();
         crate::tasks::reset_table_for_test();
+        set_test_net_online(true);
         for s in 0..crate::tasks::MAX_CAPS {
             crate::tasks::set_task_cap(8, s, crate::cap::CapSlot::empty());
         }
