@@ -31,8 +31,10 @@
 //! content focuses that window too. Keyboard routing is per-focus: in the
 //! shell, printable keys echo / Backspace / Enter / arrows move the window;
 //! in the editor, printable keys and Enter insert at the cursor, Backspace
-//! deletes, arrows move the cursor, and F2 saves the buffer to `memo.txt`
-//! through the boot-time `editor::EditorFs`. The editor starts from the
+//! deletes, arrows move the cursor, and F2 saves the buffer to whichever
+//! file is currently open (`memo.txt` at boot; see Phase Q below for how
+//! that changes once the browser can open other files) through the
+//! boot-time `editor::EditorFs`. The editor starts from the
 //! seeded file when durable storage is present, else from the seed bytes
 //! in memory (UI only).
 //!
@@ -40,12 +42,14 @@
 //! over the same boot view (see `browser`). Three app windows now exist: the
 //! shell (id 3), the editor (id 4, [`EDITOR_X`]..), and the browser (id 5,
 //! [`BROWSER_X`]..). Tab cycles focus shell -> editor -> browser -> shell and
-//! raises the newly-focused window; the browser lists every name in the boot
-//! view (`editor::EditorFs::list`), arrow keys move its selection, Enter (or
-//! a click on a row) opens that file into the editor, and F3 creates a new
-//! empty `fileN.txt` (first unused N) in the durable view. Without a durable
-//! store the browser lists nothing honestly — the same in-memory fallback
-//! scope the editor already documents.
+//! raises the newly-focused window; the browser lists every entry in the
+//! current directory of the hierarchical boot view (`editor::EditorFs::browser_list`),
+//! arrow keys move its selection, Enter (or a click on a row) opens a file
+//! into the editor or descends into a directory (Backspace / a `..` row goes
+//! up), F3 creates a new empty `fileN.txt` and F4 a new `dirN` directory, and
+//! the browser's action bar creates both by mouse click (Phase Q completion).
+//! Without a durable store the browser lists nothing honestly — the same
+//! in-memory fallback scope the editor already documents.
 //!
 //! Phase R upgrades the shell window (id 3, the one that has been present
 //! since before Phase O) from a single echoed line into a real command
@@ -67,9 +71,9 @@ use crate::browser::FileBrowser;
 use crate::compositor::{self, Cell, MAX_WINDOWS};
 use crate::editor::{self, Editor, EDITOR_BUF_MAX};
 use crate::input::{Key, KeyEvent, MouseEvent};
-use crate::store::Name;
+use crate::store::{Name, MAX_DEPTH};
 use crate::terminal::{Command, Terminal};
-use crate::update::VIEW_MAX_FILES;
+use crate::update::{KIND_DIR, VIEW_MAX_FILES};
 use crate::window::{Region, WindowManager};
 
 /// Screen size in VGA text cells.
@@ -203,6 +207,16 @@ pub enum KeyOutcome {
     /// `name_len` is 0 when no durable store is present — the honest
     /// degrade (no boot view to create a file in).
     Created { window_id: u32, name_len: usize },
+    /// Backspace, or Enter on the `..` row, with the file browser focused,
+    /// moved up one directory (a no-op at the root).
+    Up { window_id: u32 },
+    /// Enter, with the file browser focused, descended into a selected
+    /// directory and listed its entries (Phase Q completion: hierarchical).
+    EnteredDir { window_id: u32 },
+    /// F4, with the file browser focused, created a new directory (`dirN`,
+    /// first unused N) in the current directory. `name_len` is 0 when no
+    /// durable store is present.
+    CreatedDir { window_id: u32, name_len: usize },
 }
 
 /// Which app window owns keyboard input. Tab cycles this; a mouse press on
@@ -242,6 +256,17 @@ pub enum MouseOutcome {
     /// moved focus there — the file browser's headline "click to open"
     /// proof point.
     Opened { editor_id: u32, browser_id: u32 },
+    /// A click on a directory row (or the `..` affordance) navigated the
+    /// browser into it (Phase Q completion: hierarchical readdir/stat).
+    EnteredDir { browser_id: u32 },
+    /// A click on the `..` affordance moved the browser up one level.
+    Up { browser_id: u32 },
+    /// A click on the browser's "new file" affordance created a blank
+    /// `fileN.txt`. `name_len` is 0 when no durable store is present.
+    CreatedFile { browser_id: u32, name_len: usize },
+    /// A click on the browser's "new dir" affordance created a `dirN`
+    /// directory. `name_len` is 0 when no durable store is present.
+    CreatedDir { browser_id: u32, name_len: usize },
 }
 
 /// Minimum window size a corner drag can shrink an app window to.
@@ -290,6 +315,13 @@ pub struct Desktop {
     browser_id: u32,
     editor: Editor,
     editor_name: Name,
+    /// The directory path the editor's open file lives in (empty = root).
+    /// Set when the browser opens a file; the boot-time `memo.txt` starts at
+    /// the root. `save_editor` writes through this path so a file opened
+    /// from a subdirectory saves back to that subdirectory (Phase Q
+    /// completion), not to the root.
+    editor_path: [Name; MAX_DEPTH],
+    editor_depth: usize,
     browser: FileBrowser,
     terminal: Terminal,
     focus: AppFocus,
@@ -402,6 +434,8 @@ impl Desktop {
             browser_id: browser,
             editor: Desktop::editor_initial(),
             editor_name: Name::from_slice(editor::FILE_NAME).unwrap(),
+            editor_path: [Name::default(); MAX_DEPTH],
+            editor_depth: 0,
             browser: FileBrowser::new(),
             terminal: Terminal::new(),
             focus: AppFocus::Shell,
@@ -417,13 +451,73 @@ impl Desktop {
         d
     }
 
-    /// Refresh the file browser's listing from the durable boot view
-    /// (Phase Q). An empty listing when no NVMe store is present — the
-    /// browser then honestly shows nothing rather than fabricating rows.
+    /// Refresh the file browser's listing from the durable boot view at the
+    /// browser's current path (Phase Q completion: hierarchical readdir).
+    /// An empty listing when no NVMe store is present — the browser then
+    /// honestly shows nothing rather than fabricating rows. When not at the
+    /// root, a `..` up-entry leads the listing.
     fn refresh_browser_listing(&mut self) {
-        let mut names = [Name::default(); VIEW_MAX_FILES];
-        let n = editor::with(|fs| fs.list(&mut names)).unwrap_or(0);
-        self.browser.set_entries(&names[..n]);
+        let mut raw = [(Name::default(), 0u8); VIEW_MAX_FILES];
+        let n = editor::with(|fs| {
+            let path = self.browser.path();
+            fs.browser_list(path, &mut raw)
+        })
+        .unwrap_or(0);
+        let mut entries = [(Name::default(), 0u8); VIEW_MAX_FILES + 1];
+        let mut m = 0usize;
+        if !self.browser.at_root() {
+            entries[m] = (Name::from_slice(b"..").unwrap(), KIND_DIR);
+            m += 1;
+        }
+        for e in raw[..n].iter().take(VIEW_MAX_FILES) {
+            entries[m] = *e;
+            m += 1;
+        }
+        self.browser.set_entries(&entries[..m]);
+        // Report the refreshed listing over serial so navigation is provable
+        // live (the boot log separately reports the first listing). Dirs are
+        // marked with a trailing '/' so the hierarchy is explicit.
+        let mut listing = [0u8; 128];
+        let mut llen = 0usize;
+        for i in 0..self.browser.count() {
+            if let Some((name, kind)) = self.browser.entry(i) {
+                let n = name.as_slice().len();
+                if llen + n + 2 > listing.len() {
+                    break;
+                }
+                if i > 0 {
+                    listing[llen] = b',';
+                    llen += 1;
+                }
+                listing[llen..llen + n].copy_from_slice(name.as_slice());
+                llen += n;
+                if kind == KIND_DIR {
+                    listing[llen] = b'/';
+                    llen += 1;
+                }
+            }
+        }
+        let mut path = [0u8; 128];
+        let mut plen = 0usize;
+        path[plen] = b'/';
+        plen += 1;
+        for name in self.browser.path() {
+            let n = name.as_slice().len();
+            if plen + n + 1 > path.len() {
+                break;
+            }
+            path[plen..plen + n].copy_from_slice(name.as_slice());
+            plen += n;
+            path[plen] = b'/';
+            plen += 1;
+        }
+        crate::sprintln!(
+            "Aegis: browser@listing [{}] at {} ({} entries, window id={})",
+            core::str::from_utf8(&listing[..llen]).unwrap_or("<non-utf8>"),
+            core::str::from_utf8(&path[..plen]).unwrap_or("<non-utf8>"),
+            self.browser.count(),
+            self.browser_id
+        );
     }
 
     /// The editor's initial buffer: the saved `memo.txt` when a durable
@@ -674,10 +768,12 @@ impl Desktop {
     }
 
     /// Render the file browser window's framebuffer: row 0 is the title bar
-    /// ("Files" + a close button at the last cell); each content row shows
-    /// one file name, the selected row marked with a leading '>'. Rows past
-    /// the listing keep the dotted fill (same convention `render_editor`
-    /// uses for rows past its content).
+    /// ("Files: <path>" + a close button at the last cell); each content row
+    /// shows one entry (directories marked with a trailing '/', the
+    /// selected row with a leading '>'); the last row is an action bar with
+    /// the `..` up, new-file and new-dir affordances (Phase Q completion:
+    /// mouse-click navigation and creation). Rows past the listing keep the
+    /// dotted fill (same convention `render_editor` uses).
     fn render_browser(&mut self) {
         let (w, h) = self
             .wm
@@ -691,16 +787,39 @@ impl Desktop {
         for i in 0..w {
             self.fb_browser[i] = 0x1F00 | b' ' as u16;
         }
-        for (i, t) in b"Files".iter().enumerate() {
-            if i + 1 < w {
+        // Title: "Files: " + the current path (or "/" for the root).
+        let mut title_at = 0usize;
+        for (i, t) in b"Files:".iter().enumerate() {
+            if i < w {
                 self.fb_browser[i] = 0x1F00 | *t as u16;
+            }
+            title_at = i + 1;
+        }
+        if self.browser.at_root() {
+            if title_at < w {
+                self.fb_browser[title_at] = 0x1F00 | b'/' as u16;
+            }
+        } else {
+            for name in self.browser.path().iter() {
+                for (i, &b) in name.as_slice().iter().enumerate() {
+                    if title_at + i < w {
+                        self.fb_browser[title_at + i] = 0x1F00 | b as u16;
+                    }
+                }
+                title_at += name.as_slice().len();
+                if title_at < w {
+                    self.fb_browser[title_at] = 0x1F00 | b'/' as u16;
+                }
+                title_at += 1;
             }
         }
         if w > 0 {
             self.fb_browser[w - 1] = 0x4F00 | b'X' as u16;
         }
-        for row in 0..h.saturating_sub(1) {
-            let Some(name) = self.browser.entry(row) else {
+        // Listing rows: rows 1..h-2 (the last row is the action bar).
+        let listing_rows = h.saturating_sub(2);
+        for row in 0..listing_rows {
+            let Some((name, kind)) = self.browser.entry(row) else {
                 break;
             };
             let row_base = (row + 1) * w;
@@ -712,11 +831,38 @@ impl Desktop {
             if row_base < total {
                 self.fb_browser[row_base] = 0x0F00 | marker as u16;
             }
+            let is_dir = kind == KIND_DIR;
             for (i, &b) in name.as_slice().iter().enumerate() {
                 let idx = row_base + 1 + i;
                 if idx < total && idx < row_base + w {
                     self.fb_browser[idx] = 0x0F00 | b as u16;
                 }
+            }
+            if is_dir {
+                let idx = row_base + 1 + name.as_slice().len();
+                if idx < total && idx < row_base + w {
+                    self.fb_browser[idx] = 0x0F00 | b'/' as u16;
+                }
+            }
+        }
+        // Action bar (last row): `..` up, new file, new dir.
+        if h > 1 {
+            let base = (h - 1) * w;
+            for i in 0..w {
+                if base + i < total {
+                    self.fb_browser[base + i] = 0x1F00 | b' ' as u16;
+                }
+            }
+            let actions: [&[u8]; 3] = [b"[..] up", b"[+ f]", b"[+ d]"];
+            let mut at = 0usize;
+            for act in actions {
+                for (i, &b) in act.iter().enumerate() {
+                    let idx = base + at + i;
+                    if idx < total && idx < base + w {
+                        self.fb_browser[idx] = 0x1F00 | b as u16;
+                    }
+                }
+                at += act.len() + 2;
             }
         }
     }
@@ -953,16 +1099,30 @@ impl Desktop {
         }
     }
 
-    /// F2: write the editor buffer to `memo.txt` in the boot view. With a
+    /// F2: write the editor buffer to `self.editor_name` (the file actually
+    /// open — `memo.txt` at boot, or whatever the browser last opened into
+    /// this window) in the boot view, through `self.editor_path` so a file
+    /// opened from a subdirectory saves back to that subdirectory. With a
     /// durable handle this commits a new content block (+ COW dir block) to
     /// the NVMe store; without one (tests, no NVMe) the buffer is unchanged
     /// and the outcome reports the digest as all-zero — honest about the
     /// in-memory fallback.
+    ///
+    /// Fixed this session: this used to call `fs.write_memo(..)`
+    /// unconditionally, so a file opened from the browser (e.g.
+    /// `notes.txt`) would display and edit correctly but F2 silently wrote
+    /// the edit to `memo.txt` instead — the title bar said `notes.txt`,
+    /// the disk said otherwise. Routing the save through `editor_name`
+    /// closes that gap: "open a browser file, edit it, save" now saves
+    /// that file, not memo.txt, and `editor::EditorFs::write_named` is the
+    /// name-aware save path `write_memo` now delegates to.
     fn save_editor(&mut self) -> KeyOutcome {
         let len = self.editor.len();
         let mut bytes = [0u8; EDITOR_BUF_MAX];
         bytes[..len].copy_from_slice(self.editor.as_bytes());
-        let block = editor::with(|fs| fs.write_memo(&bytes[..len]))
+        let name = self.editor_name;
+        let path = &self.editor_path[..self.editor_depth];
+        let block = editor::with(|fs| fs.write_named_at(path, name.as_slice(), &bytes[..len]))
             .flatten()
             .unwrap_or([0u8; 32]);
         self.render_editor();
@@ -975,9 +1135,10 @@ impl Desktop {
     }
 
     /// Browser-focused keys: arrows move the selection, Enter opens the
-    /// selected file into the editor and moves focus there (the keyboard
-    /// equivalent of clicking a row), F3 creates a new blank file
-    /// (`fileN.txt`, first unused N) and selects it.
+    /// selected file into the editor (or descends into a selected
+    /// directory — Phase Q completion: hierarchical), Backspace ascends,
+    /// F3 creates a new blank file (`fileN.txt`, first unused N) and
+    /// selects it, F4 creates a new directory (`dirN`).
     fn apply_key_browser(&mut self, ke: KeyEvent) -> Option<KeyOutcome> {
         match ke.key {
             Key::ArrowUp => {
@@ -1004,33 +1165,77 @@ impl Desktop {
                     None
                 }
             }
+            Key::Backspace => {
+                if self.browser.pop_dir() {
+                    self.refresh_browser_listing();
+                    self.render_browser();
+                    self.composite();
+                    Some(KeyOutcome::Up {
+                        window_id: self.browser_id,
+                    })
+                } else {
+                    None
+                }
+            }
             Key::Enter => {
-                self.browser.selected_name()?;
-                self.open_selected_in_editor();
-                Some(KeyOutcome::Opened {
-                    window_id: self.editor_id,
-                })
+                let (name, kind) = self.browser.selected_entry()?;
+                if name.as_slice() == b".." {
+                    self.browser.pop_dir();
+                    self.refresh_browser_listing();
+                    self.render_browser();
+                    self.composite();
+                    Some(KeyOutcome::Up {
+                        window_id: self.browser_id,
+                    })
+                } else if kind == KIND_DIR {
+                    self.browser.push_dir(name);
+                    self.refresh_browser_listing();
+                    self.render_browser();
+                    self.composite();
+                    Some(KeyOutcome::EnteredDir {
+                        window_id: self.browser_id,
+                    })
+                } else {
+                    self.open_selected_in_editor();
+                    Some(KeyOutcome::Opened {
+                        window_id: self.editor_id,
+                    })
+                }
             }
             Key::F3 => Some(self.create_new_file()),
+            Key::F4 => Some(self.create_new_dir()),
             _ => None,
         }
     }
 
     /// Open the browser's currently selected file into the editor: load its
-    /// bytes as the editor buffer, rename the editor window's title to that
+    /// bytes as the editor buffer (through the browser's current path —
+    /// Phase Q completion), rename the editor window's title to that
     /// file, focus the editor, and raise it. A no-op if nothing is selected
     /// or no durable store is present (the browser is empty in that case,
-    /// so `selected_name` already returns `None`).
+    /// so `selected_entry` already returns `None`). A directory selection
+    /// is not opened (the caller descends into it instead).
     fn open_selected_in_editor(&mut self) {
-        let Some(name) = self.browser.selected_name() else {
+        let Some((name, kind)) = self.browser.selected_entry() else {
             return;
         };
+        if kind == KIND_DIR {
+            return;
+        }
+        let path = self.browser.path();
+        let mut path_buf = [Name::default(); MAX_DEPTH];
+        path_buf[..path.len()].copy_from_slice(path);
         let mut buf = [0u8; EDITOR_BUF_MAX];
-        let Some(n) = editor::with(|fs| fs.open(name.as_slice(), &mut buf)).flatten() else {
+        let Some(n) =
+            editor::with(|fs| fs.browser_open(&path_buf[..path.len()], name.as_slice(), &mut buf))
+                .flatten()
+        else {
             return;
         };
         self.editor = Editor::from_bytes(&buf[..n]);
         self.editor_name = name;
+        self.editor_path = path_buf;
+        self.editor_depth = path.len();
         self.focus = AppFocus::Editor;
         let _ = self.wm.focus_window(self.editor_id);
         self.render_editor();
@@ -1039,17 +1244,22 @@ impl Desktop {
     }
 
     /// F3 gesture: create `fileN.txt` (first unused N) as a blank file (a
-    /// single newline — the store's minimum block) in the durable boot
-    /// view, refresh the listing, and select the new entry. Reports
-    /// `name_len = 0` when no durable store is present — the same honest
-    /// degrade `save_editor` already reports for the digest.
+    /// single newline — the store's minimum block) in the current directory
+    /// of the durable boot view, refresh the listing, and select the new
+    /// entry. Reports `name_len = 0` when no durable store is present — the
+    /// same honest degrade `save_editor` already reports for the digest.
     fn create_new_file(&mut self) -> KeyOutcome {
+        let path = self.browser.path();
+        let mut path_buf = [Name::default(); MAX_DEPTH];
+        path_buf[..path.len()].copy_from_slice(path);
         let (name_bytes, name_len) = self.browser.next_free_name();
-        let created = editor::with(|fs| fs.create_empty(&name_bytes[..name_len])).unwrap_or(false);
+        let created =
+            editor::with(|fs| fs.browser_create(&path_buf[..path.len()], &name_bytes[..name_len]))
+                .unwrap_or(false);
         if created {
             self.refresh_browser_listing();
             for i in 0..self.browser.count() {
-                if let Some(e) = self.browser.entry(i) {
+                if let Some((e, _)) = self.browser.entry(i) {
                     if e.as_slice() == &name_bytes[..name_len] {
                         self.browser.select(i);
                         break;
@@ -1062,6 +1272,67 @@ impl Desktop {
         KeyOutcome::Created {
             window_id: self.browser_id,
             name_len: if created { name_len } else { 0 },
+        }
+    }
+
+    /// F4 gesture: create `dirN` (first unused N) as an empty directory in
+    /// the current directory of the durable boot view, refresh the listing,
+    /// and select the new entry. Reports `name_len = 0` when no durable
+    /// store is present.
+    fn create_new_dir(&mut self) -> KeyOutcome {
+        let path = self.browser.path();
+        let mut path_buf = [Name::default(); MAX_DEPTH];
+        path_buf[..path.len()].copy_from_slice(path);
+        let (name_bytes, name_len) = self.browser.next_free_dir_name();
+        let created =
+            editor::with(|fs| fs.browser_mkdir(&path_buf[..path.len()], &name_bytes[..name_len]))
+                .unwrap_or(false);
+        if created {
+            self.refresh_browser_listing();
+            for i in 0..self.browser.count() {
+                if let Some((e, _)) = self.browser.entry(i) {
+                    if e.as_slice() == &name_bytes[..name_len] {
+                        self.browser.select(i);
+                        break;
+                    }
+                }
+            }
+        }
+        self.render_browser();
+        self.composite();
+        KeyOutcome::CreatedDir {
+            window_id: self.browser_id,
+            name_len: if created { name_len } else { 0 },
+        }
+    }
+
+    /// Mouse equivalent of [`Self::create_new_file`]: clicking the action
+    /// bar's new-file cell creates a blank `fileN.txt` in the current
+    /// directory and reports the `MouseOutcome`.
+    fn create_new_file_mouse(&mut self) -> MouseOutcome {
+        let out = self.create_new_file();
+        let name_len = match out {
+            KeyOutcome::Created { name_len, .. } => name_len,
+            _ => 0,
+        };
+        MouseOutcome::CreatedFile {
+            browser_id: self.browser_id,
+            name_len,
+        }
+    }
+
+    /// Mouse equivalent of [`Self::create_new_dir`]: clicking the action
+    /// bar's new-dir cell creates a `dirN` directory in the current
+    /// directory and reports the `MouseOutcome`.
+    fn create_new_dir_mouse(&mut self) -> MouseOutcome {
+        let out = self.create_new_dir();
+        let name_len = match out {
+            KeyOutcome::CreatedDir { name_len, .. } => name_len,
+            _ => 0,
+        };
+        MouseOutcome::CreatedDir {
+            browser_id: self.browser_id,
+            name_len,
         }
     }
 
@@ -1135,12 +1406,10 @@ impl Desktop {
         } else if me.left_button {
             if let Some(id) = self.wm.hit_test(cx, cy) {
                 if self.is_app_window(id) {
-                    // Phase Q: a content click on a browser row is captured
-                    // here (while `wy` is still in scope) but acted on
-                    // after the window borrow ends below, the same
-                    // deferred-action shape `focus_content_press` already
-                    // uses for the generic content-focus case.
-                    let mut browser_click_row: Option<usize> = None;
+                    // Phase Q completion: a content click on a browser row is
+                    // acted on here — descend into directories, open files,
+                    // and the action bar creates. The `wy`/`ww`/`wh` window
+                    // geometry is captured while the window borrow is live.
                     if let Some(w) = self.wm.window(id) {
                         let (wx, wy, ww, wh) = (
                             w.region.x,
@@ -1164,17 +1433,73 @@ impl Desktop {
                             });
                             return None;
                         }
-                        if id == self.browser_id {
-                            browser_click_row = Some((cy - wy - 1).max(0) as usize);
-                        }
-                    }
-                    if let Some(row) = browser_click_row {
-                        if self.browser.select(row) {
-                            self.open_selected_in_editor();
-                            return Some(MouseOutcome::Opened {
-                                editor_id: self.editor_id,
-                                browser_id: self.browser_id,
-                            });
+                        if id == self.browser_id && cy > wy {
+                            let click_row = (cy - wy - 1).max(0) as usize;
+                            // The action bar is the last window row (local
+                            // row wh-1 -> click_row wh-2); the +2 keeps the
+                            // content rows (click_row <= wh-3) out of it.
+                            let is_action = click_row + 2 >= wh as usize;
+                            let click_col = (cx - wx - 1).max(0) as usize;
+                            if is_action {
+                                let seg = click_col / 7;
+                                return match seg {
+                                    0 => {
+                                        if self.browser.pop_dir() {
+                                            self.refresh_browser_listing();
+                                            self.render_browser();
+                                            self.composite();
+                                            Some(MouseOutcome::Up {
+                                                browser_id: self.browser_id,
+                                            })
+                                        } else {
+                                            self.focus_content_press(id);
+                                            Some(MouseOutcome::Moved {
+                                                x: me.x,
+                                                y: me.y,
+                                                left: true,
+                                                right: me.right_button,
+                                            })
+                                        }
+                                    }
+                                    1 => Some(self.create_new_file_mouse()),
+                                    2 => Some(self.create_new_dir_mouse()),
+                                    _ => {
+                                        self.focus_content_press(id);
+                                        Some(MouseOutcome::Moved {
+                                            x: me.x,
+                                            y: me.y,
+                                            left: true,
+                                            right: me.right_button,
+                                        })
+                                    }
+                                };
+                            }
+                            if self.browser.select(click_row) {
+                                let (name, kind) = self.browser.selected_entry().unwrap();
+                                if kind == KIND_DIR {
+                                    if name.as_slice() == b".." {
+                                        self.browser.pop_dir();
+                                        self.refresh_browser_listing();
+                                        self.render_browser();
+                                        self.composite();
+                                        return Some(MouseOutcome::Up {
+                                            browser_id: self.browser_id,
+                                        });
+                                    }
+                                    self.browser.push_dir(name);
+                                    self.refresh_browser_listing();
+                                    self.render_browser();
+                                    self.composite();
+                                    return Some(MouseOutcome::EnteredDir {
+                                        browser_id: self.browser_id,
+                                    });
+                                }
+                                self.open_selected_in_editor();
+                                return Some(MouseOutcome::Opened {
+                                    editor_id: self.editor_id,
+                                    browser_id: self.browser_id,
+                                });
+                            }
                         }
                     }
                     // A press on an app window's content (not its chrome)
@@ -1222,7 +1547,14 @@ impl Desktop {
 
     /// The file browser's `idx`-th listed entry name, if any.
     pub fn browser_entry(&self, idx: usize) -> Option<Name> {
-        self.browser.entry(idx)
+        self.browser.entry(idx).map(|(name, _)| name)
+    }
+
+    /// True when the file browser's `idx`-th listed entry is a directory
+    /// (Phase Q completion: the boot log marks dirs so the hierarchical
+    /// listing is provable across a power cycle).
+    pub fn browser_is_dir(&self, idx: usize) -> bool {
+        self.browser.is_dir(idx)
     }
 
     /// Re-render the app window `id` from its current size.
@@ -2229,6 +2561,45 @@ mod tests {
         }
     }
 
+    /// Regression for the P/Q caveat this session closed: `save_editor`
+    /// must read `self.editor_name`, not a hardcoded `memo.txt`. There is
+    /// no durable store in host tests (so the actual disk write can't be
+    /// observed here — that round trip is `editor.rs`'s
+    /// `write_file_saves_the_named_file_and_leaves_memo_untouched`), but
+    /// this proves the wiring itself: changing `editor_name` (the same
+    /// field `open_selected_in_editor` sets on a browser open) changes
+    /// which name the save call targets, by checking the title bar it
+    /// renders — a stand-in for the disk write host tests can't see.
+    #[test]
+    fn f2_save_targets_the_currently_open_file_not_always_memo() {
+        let mut d = Desktop::new();
+        assert_eq!(d.editor_name.as_slice(), editor::FILE_NAME);
+
+        // Simulate what `open_selected_in_editor` does on a browser open:
+        // it sets `editor_name` to whatever was opened.
+        d.editor_name = Name::from_slice(b"notes.txt").unwrap();
+        d.render_editor();
+        // The editor window's title bar reflects the open file, proving
+        // `editor_name` — the same field `save_editor` now reads — is the
+        // single source of truth for "what file is this window editing".
+        let mut title = [0u8; 8 + 9];
+        for (i, c) in d.fb_editor[..title.len()].iter().enumerate() {
+            title[i] = (*c & 0xFF) as u8;
+        }
+        assert_eq!(&title[..], b"Editor: notes.txt");
+
+        // F2 still returns a well-formed Saved outcome (no durable store
+        // in tests, so the digest is honestly all-zero either way) — the
+        // name change doesn't break the save gesture itself.
+        d.focus = AppFocus::Editor;
+        let _ = d.wm.focus_window(d.editor_id);
+        let s = d.apply_key(key(Key::F2)).unwrap();
+        match s {
+            KeyOutcome::Saved { block, .. } => assert_eq!(block, [0u8; 4]),
+            _ => panic!("expected a save"),
+        }
+    }
+
     #[test]
     fn browser_window_is_third_app_window() {
         let mut d = Desktop::new();
@@ -2300,6 +2671,62 @@ mod tests {
             MouseOutcome::Opened { .. } => panic!("empty listing must not open"),
             MouseOutcome::Moved { .. } => {}
             _ => panic!("expected a position report"),
+        }
+    }
+
+    #[test]
+    fn browser_mouse_action_bar_reaches_create_cells() {
+        // The browser's last row is the action bar (local row wh-1 ->
+        // click_row wh-2). Regression: the is_action gate used to be
+        // `click_row + 1 >= wh`, which the action bar never satisfied, so
+        // clicking `[+ f]` / `[+ d]` fell into the listing path instead of
+        // creating. Without a store both honest-report a 0 name_len (same
+        // convention the F3/F4 keys use) but must return the Created* /
+        // CreatedDir outcomes, not a position report.
+        let mut d = Desktop::new();
+        d.apply_key(key(Key::Tab)).unwrap(); // -> editor
+        d.apply_key(key(Key::Tab)).unwrap(); // -> browser (raised)
+                                             // Browser at (44,13) 34x10; action bar is row y=22. `[+ f]` sits in
+                                             // seg 1 (click_col 7..13 -> cell x 52..58), `[+ d]` in seg 2
+                                             // (click_col 14..20 -> cell x 59..65). Pick cell (55,22) and
+                                             // (62,22); pixel_to_cell with CELL_OFFSET (0,0) is x*8, y*16.
+        let out = d
+            .apply_mouse(MouseEvent {
+                x: 55 * 8,
+                y: 22 * 16,
+                left_button: true,
+                right_button: false,
+                scroll: 0,
+            })
+            .unwrap();
+        match out {
+            MouseOutcome::CreatedFile {
+                browser_id,
+                name_len,
+            } => {
+                assert_eq!(browser_id, d.browser_id());
+                assert_eq!(name_len, 0, "no durable store: honest empty report");
+            }
+            _ => panic!("expected a new-file create report from the action bar"),
+        }
+        let out = d
+            .apply_mouse(MouseEvent {
+                x: 62 * 8,
+                y: 22 * 16,
+                left_button: true,
+                right_button: false,
+                scroll: 0,
+            })
+            .unwrap();
+        match out {
+            MouseOutcome::CreatedDir {
+                browser_id,
+                name_len,
+            } => {
+                assert_eq!(browser_id, d.browser_id());
+                assert_eq!(name_len, 0, "no durable store: honest empty report");
+            }
+            _ => panic!("expected a new-dir create report from the action bar"),
         }
     }
 

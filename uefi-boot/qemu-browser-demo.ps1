@@ -1,19 +1,25 @@
 $ErrorActionPreference = "Stop"
 
-# Live file-browser demo (Phase Q): boot the kernel with the boot image on a
-# SATA volume (EDK2 cannot map the NVMe controller BAR, so the boot volume can
-# never live on NVMe) and a real emulated NVMe (PCI 00:03.0, 16 MB namespace)
-# as the Phase-7 object store backing the editor's memo.txt and the browser's
-# listing. The host listener is required so the netif/TLS demos complete on
-# schedule. Two boots prove the DoD:
+# Live file-browser demo (Phase Q completion): boot the kernel with the boot
+# image on a SATA volume (EDK2 cannot map the NVMe controller BAR, so the boot
+# volume can never live on NVMe) and a real emulated NVMe (PCI 00:03.0, 16 MB
+# namespace) as the Phase-7 object store backing the editor's memo.txt and the
+# browser's hierarchical listing. The host listener is required so the
+# netif/TLS demos complete on schedule. Two boots prove the DoD:
 #   boot 1: the browser window is the third app window (id 5), the boot log
 #           reports its listing from the durable store, Tab cycles focus onto
-#           it, F3 creates `file1.txt` (a blank file), and the serial log
-#           records browser@create; screendumps capture the browser raised.
+#           it. F4 creates `dir1` (browser@mkdir), Enter descends into it
+#           (browser@enter, listing [../]), F3 creates `file1.txt` inside it
+#           (browser@create — a NESTED file), Backspace ascends (browser@up),
+#           and the action bar's mouse cells create `dir2` (new-dir cell) and
+#           `file1.txt` (new-file cell) at the root (browser@mkdir / 
+#           browser@create, "cell clicked"). Screendumps capture each step.
 #   boot 2: the same image reboots against the same NVMe file; the browser
-#           re-lists the durable boot view and the boot log shows the
-#           `file1.txt` created in boot 1 — the listing survived the power
-#           cycle (browser@boot listing [memo.txt,file1.txt]).
+#           re-lists the durable boot view and the boot log shows the root
+#           listing with directories marked `/` — `[memo.txt,dir1/,dir2/]`
+#           plus the root-level `file1.txt` — and descending into `dir1` shows
+#           the nested `file1.txt` still there: the whole hierarchy survived
+#           the power cycle (browser@listing [../,file1.txt] at /dir1/).
 
 $qemu = 'C:\Program Files\qemu\qemu-system-x86_64.exe'
 $workdir = 'C:\Users\bisha\Desktop\Pointless_OS\uefi-boot'
@@ -80,7 +86,7 @@ function Connect-Monitor([int]$monPort) {
 }
 
 try {
-  # ---------------- boot 1: browser listing, focus, F3 create ----------------
+  # ---------------- boot 1: listing, focus, F4 dir, nested F3, mouse cells ----------------
   $log1 = Join-Path $workdir 'serial-browser-boot1.log'
   Start-Boot $log1 45461 'e1000-browser-boot1.pcap'
   if (-not (Wait-Log $log1 'compositor desktop shown' 160)) {
@@ -103,37 +109,111 @@ try {
   Send-Monitor 'sendkey tab' 400
   Send-Monitor 'screendump scr-browser-2.ppm' 600
 
-  # F3 creates file1.txt (first unused N) in the durable store.
-  Send-Monitor 'sendkey f3' 400
+  # F4 creates dir1 (first unused N) in the durable store at the root.
+  Send-Monitor 'sendkey f4' 400
   Start-Sleep -Milliseconds 500
   Send-Monitor 'screendump scr-browser-3.ppm' 600
 
+  if (-not (Select-String -Path $log1 -Pattern 'browser@mkdir -> window id=5 created directory \(4 name bytes\)' -Quiet)) {
+    Write-Error "boot 1 did not record the F4 dir create ('browser@mkdir ... 4 name bytes' missing)"
+  }
+
+  # Enter descends into dir1: the listing re-reads the subdirectory (a
+  # `..` up-entry leads it, so `[..]` — an empty dir).
+  Send-Monitor 'sendkey ret' 400
+  Start-Sleep -Milliseconds 500
+  Send-Monitor 'screendump scr-browser-4.ppm' 600
+
+  if (-not (Select-String -Path $log1 -Pattern 'browser@listing \[\.\./\] at /dir1/' -Quiet)) {
+    Write-Error "boot 1 did not descend into dir1 ('browser@listing [../] at /dir1/' missing)"
+  }
+
+  # F3 inside dir1 creates a NESTED file1.txt (first unused N in dir1). The
+  # create is NVMe-backed (block write + COW + anchor), so give it generous
+  # time before the assertion.
+  Send-Monitor 'sendkey f3' 400
+  Start-Sleep -Milliseconds 2500
+  Send-Monitor 'screendump scr-browser-5.ppm' 600
+
   if (-not (Select-String -Path $log1 -Pattern 'browser@create -> window id=5 created file \(9 name bytes\)' -Quiet)) {
-    Write-Error "boot 1 did not record the F3 create ('browser@create ... 9 name bytes' missing)"
+    Write-Error "boot 1 did not record the nested F3 create ('browser@create ... 9 name bytes' missing)"
+  }
+  if (-not (Select-String -Path $log1 -Pattern 'browser@listing \[\.\./,file1\.txt\] at /dir1/' -Quiet)) {
+    Write-Error "boot 1 nested listing did not show file1.txt ('browser@listing [../,file1.txt] at /dir1/' missing)"
+  }
+
+  # Backspace ascends to the root.
+  Send-Monitor 'sendkey backspace' 400
+  Start-Sleep -Milliseconds 500
+  Send-Monitor 'screendump scr-browser-6.ppm' 600
+
+  if (-not (Select-String -Path $log1 -Pattern 'browser@up -> window id=5 moved to parent dir' -Quiet)) {
+    Write-Error "boot 1 did not record the Backspace up ('browser@up ...' missing)"
+  }
+
+  # Mouse click: the action bar's last row. Browser is 34x10 at (44,13), so
+  # the action bar row is screen row 22; cell (62,22) is the `[+ d]` new-dir
+  # cell (seg = click_col/7 with click_col = 62-44-1 = 17 -> seg 2) and cell
+  # (55,22) is the `[+ f]` new-file cell (click_col 10 -> seg 1). With the
+  # centered 800x600 GPU image (offset (80,100)) those are pixels (576,452)
+  # and (520,452). The cursor starts centered (400,300). NOTE: the emulated
+  # PS/2 mouse reports Y inverted vs the monitor's mouse_move (as the chrome
+  # demo documents), so the dy sign is flipped from the naive math: the
+  # kernel's cursor y = 300 - monitor_dy, so reaching 452 needs dy = -152.
+  Send-Monitor 'mouse_move 176 -152' 800
+  Send-Monitor 'mouse_button 1' 300
+  Send-Monitor 'mouse_button 0' 300
+  Start-Sleep -Milliseconds 500
+  Send-Monitor 'screendump scr-browser-7.ppm' 600
+
+  if (-not (Select-String -Path $log1 -Pattern 'browser@mkdir -> new-dir cell clicked, browser id=5 \(4 name bytes\)' -Quiet)) {
+    Write-Error "boot 1 did not record the new-dir cell click ('browser@mkdir ... new-dir cell clicked' missing)"
+  }
+
+  # Move from (576,452) to the `[+ f]` cell (520,452) = (-56,0) and click.
+  Send-Monitor 'mouse_move -56 0' 800
+  Send-Monitor 'mouse_button 1' 300
+  Send-Monitor 'mouse_button 0' 300
+  Start-Sleep -Milliseconds 500
+  Send-Monitor 'screendump scr-browser-8.ppm' 600
+
+  if (-not (Select-String -Path $log1 -Pattern 'browser@create -> new-file cell clicked, browser id=5 \(9 name bytes\)' -Quiet)) {
+    Write-Error "boot 1 did not record the new-file cell click ('browser@create ... new-file cell clicked' missing)"
   }
 
   Send-Monitor 'quit' 500
   $script:MonStream.Close()
   Stop-Process -Id $script:Listener.Id -Force -ErrorAction SilentlyContinue
 
-  # ---------------- boot 2: the created file persisted in the listing ----------------
+  # ---------------- boot 2: the hierarchy persisted ----------------
   $log2 = Join-Path $workdir 'serial-browser-boot2.log'
   Start-Boot $log2 45462 'e1000-browser-boot2.pcap'
   if (-not (Wait-Log $log2 'compositor desktop shown' 160)) {
     Write-Error "boot 2 did not reach 'compositor desktop shown'"
   }
-  # The browser re-lists the durable boot view: file1.txt from boot 1 must be
-  # present alongside memo.txt.
-  if (-not (Wait-Log $log2 'browser@boot listing \[memo\.txt,file1\.txt\]' 160)) {
-    Write-Error "boot 2 browser listing did not include file1.txt from boot 1 ('browser@boot listing [memo.txt,file1.txt]' missing)"
+  # The browser re-lists the durable boot view root: dir1/ and dir2/ (the
+  # dirs boot 1 created) plus memo.txt and the root-level file1.txt.
+  if (-not (Wait-Log $log2 'browser@boot listing \[memo\.txt,dir1/,dir2/,file1\.txt\]' 160)) {
+    Write-Error "boot 2 root listing did not include dir1/, dir2/ and file1.txt ('browser@boot listing [memo.txt,dir1/,dir2/,file1.txt]' missing)"
   }
 
   Connect-Monitor 45462
 
-  # Tab, Tab -> the browser raised again: the listing now shows both files.
+  # Tab, Tab -> the browser raised again: the listing shows the hierarchy.
   Send-Monitor 'sendkey tab' 400
   Send-Monitor 'sendkey tab' 400
-  Send-Monitor 'screendump scr-browser-4.ppm' 600
+  Send-Monitor 'screendump scr-browser-9.ppm' 600
+
+  # ArrowDown selects dir1 (row 1 under memo.txt), Enter descends: the
+  # NESTED file1.txt from boot 1 must still be there.
+  Send-Monitor 'sendkey down' 400
+  Send-Monitor 'sendkey ret' 400
+  Start-Sleep -Milliseconds 500
+  Send-Monitor 'screendump scr-browser-10.ppm' 600
+
+  if (-not (Select-String -Path $log2 -Pattern 'browser@listing \[\.\./,file1\.txt\] at /dir1/' -Quiet)) {
+    Write-Error "boot 2 nested file1.txt did not survive ('browser@listing [../,file1.txt] at /dir1/' missing)"
+  }
 
   Send-Monitor 'quit' 500
   $script:MonStream.Close()

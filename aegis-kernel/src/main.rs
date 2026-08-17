@@ -1395,7 +1395,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         for i in 0..d.browser_count() {
             if let Some(name) = d.browser_entry(i) {
                 let n = name.as_slice().len();
-                if llen + n + 1 > listing.len() {
+                if llen + n + 2 > listing.len() {
                     break;
                 }
                 if i > 0 {
@@ -1404,6 +1404,12 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 }
                 listing[llen..llen + n].copy_from_slice(name.as_slice());
                 llen += n;
+                // Mark directories with a trailing '/' (Phase Q completion:
+                // the listing's kinds are part of the durable evidence).
+                if d.browser_is_dir(i) {
+                    listing[llen] = b'/';
+                    llen += 1;
+                }
             }
         }
         sprintln!(
@@ -1429,11 +1435,10 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         aegis_kernel::cpu::init_legacy_pic_irq1();
     }
     sprintln!("Aegis: legacy PIC remapped; IRQ1 (keyboard) -> 0x21 via LAPIC LVT0 ExtINT");
-    // NOTE(experiment): mouse IRQ12 setup disabled to bisect the LAPIC timer.
-    // unsafe {
-    //     aegis_kernel::cpu::init_legacy_pic_irq12();
-    // }
-    // sprintln!("Aegis: legacy PIC IRQ12 (mouse) unmasked on the slave; IRQ2 cascade unmasked on the master");
+    unsafe {
+        aegis_kernel::cpu::init_legacy_pic_irq12();
+    }
+    sprintln!("Aegis: legacy PIC IRQ12 (mouse) unmasked on the slave; IRQ2 cascade unmasked on the master");
     unsafe {
         aegis_kernel::ps2::init();
     }
@@ -2108,6 +2113,28 @@ extern "sysv64" fn task_input() -> ! {
                                     name_len
                                 );
                             }
+                            aegis_kernel::desktop::KeyOutcome::Up { window_id } => {
+                                sprintln!(
+                                    "Aegis: browser@up -> window id={} moved to parent dir",
+                                    window_id
+                                );
+                            }
+                            aegis_kernel::desktop::KeyOutcome::EnteredDir { window_id } => {
+                                sprintln!(
+                                    "Aegis: browser@enter -> window id={} entered subdirectory",
+                                    window_id
+                                );
+                            }
+                            aegis_kernel::desktop::KeyOutcome::CreatedDir {
+                                window_id,
+                                name_len,
+                            } => {
+                                sprintln!(
+                                    "Aegis: browser@mkdir -> window id={} created directory ({} name bytes)",
+                                    window_id,
+                                    name_len
+                                );
+                            }
                         }
                     }
                 }
@@ -2160,6 +2187,38 @@ extern "sysv64" fn task_input() -> ! {
                                 "Aegis: browser@open -> row clicked, editor id={} browser id={}",
                                 editor_id,
                                 browser_id
+                            );
+                        }
+                        aegis_kernel::desktop::MouseOutcome::EnteredDir { browser_id } => {
+                            sprintln!(
+                                "Aegis: browser@enter -> dir row clicked, browser id={}",
+                                browser_id
+                            );
+                        }
+                        aegis_kernel::desktop::MouseOutcome::Up { browser_id } => {
+                            sprintln!(
+                                "Aegis: browser@up -> up affordance clicked, browser id={}",
+                                browser_id
+                            );
+                        }
+                        aegis_kernel::desktop::MouseOutcome::CreatedFile {
+                            browser_id,
+                            name_len,
+                        } => {
+                            sprintln!(
+                                "Aegis: browser@create -> new-file cell clicked, browser id={} ({} name bytes)",
+                                browser_id,
+                                name_len
+                            );
+                        }
+                        aegis_kernel::desktop::MouseOutcome::CreatedDir {
+                            browser_id,
+                            name_len,
+                        } => {
+                            sprintln!(
+                                "Aegis: browser@mkdir -> new-dir cell clicked, browser id={} ({} name bytes)",
+                                browser_id,
+                                name_len
                             );
                         }
                     }

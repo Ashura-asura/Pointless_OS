@@ -16,12 +16,16 @@
 //!   [`EditorFs`] is the concrete boot-time handle installed as the global
 //!   the desktop reads on `Desktop::new()` and writes on the F2 gesture.
 //!
-//! Honest limits (kept visible, not hidden): one file, one name (`memo.txt`),
-//! one 512 B block (a content block is a single store sector); the buffer is
-//! fixed [`EDITOR_BUF_MAX`] bytes; single-line cursor math is byte-based (no
-//! wide-glyph / UTF-8 awareness); when no NVMe store is present the editor
-//! degrades to an in-memory buffer (UI only, edits are lost on reboot) — the
-//! same write-through discipline `nvme_store` itself documents.
+//! Honest limits (kept visible, not hidden): one 512 B block per file (a
+//! content block is a single store sector), so the buffer is fixed
+//! [`EDITOR_BUF_MAX`] bytes regardless of which file is open; single-line
+//! cursor math is byte-based (no wide-glyph / UTF-8 awareness); when no NVMe
+//! store is present the editor degrades to an in-memory buffer (UI only,
+//! edits are lost on reboot) — the same write-through discipline
+//! `nvme_store` itself documents. Fixed this session: saving used to always
+//! write `memo.txt` even when the browser had opened a different file
+//! ([`write_file`]/[`EditorFs::write_named`] closed that gap — see
+//! `desktop::Desktop::save_editor`).
 
 use crate::nvme::NvmeController;
 use crate::nvme_store::{BlockIo, Store};
@@ -292,16 +296,33 @@ pub fn read_memo<IO: BlockIo>(
     view.read_file(store, io, FILE_NAME, out)
 }
 
-/// Write `bytes` as `memo.txt` in `view` (COW: a new content block + a new
-/// dir block; nothing in place is mutated). Returns the new content block id
-/// for the save report.
+/// Write `bytes` as `name` in `view` (COW: a new content block + a new dir
+/// block; nothing in place is mutated). Returns the new content block id
+/// for the save report. Phase Q/P-caveat fix: generalizes the old
+/// `write_memo`-only save path to any name the boot view holds, so
+/// "open a browser file, edit it, save" writes back to that file instead
+/// of always clobbering `memo.txt` regardless of what was open.
+pub fn write_file<IO: BlockIo>(
+    store: &mut Store,
+    io: &mut IO,
+    view: &mut BootView,
+    name: &[u8],
+    bytes: &[u8],
+) -> Option<BlockId> {
+    view.write_file(store, io, name, bytes)
+}
+
+/// Write `bytes` as `memo.txt` in `view`. Kept as its own name-fixed
+/// entry point — [`seed_if_absent`], [`read_memo`], and the Phase P tests
+/// all key off the one well-known seed file — now implemented as a thin
+/// call into the general [`write_file`].
 pub fn write_memo<IO: BlockIo>(
     store: &mut Store,
     io: &mut IO,
     view: &mut BootView,
     bytes: &[u8],
 ) -> Option<BlockId> {
-    view.write_file(store, io, FILE_NAME, bytes)
+    write_file(store, io, view, FILE_NAME, bytes)
 }
 
 // --- Phase Q: file browser support (any name in the view, not just memo.txt) ----
@@ -361,12 +382,43 @@ impl EditorFs {
         read_memo(&mut self.store, &mut self.ctrl, &mut self.view, out)
     }
 
-    /// Write `bytes` through this handle (see [`write_memo`]). After the COW
-    /// commit the boot view's dir block is a NEW immutable block, so the store
-    /// header anchor is re-persisted to that id — otherwise a reboot would
-    /// re-attach to the previous (seed) dir block and lose the save.
+    /// Write `bytes` to `memo.txt` through this handle (see [`write_memo`]).
+    /// Now a thin call into [`Self::write_named`] fixed to [`FILE_NAME`].
     pub fn write_memo(&mut self, bytes: &[u8]) -> Option<BlockId> {
-        let id = write_memo(&mut self.store, &mut self.ctrl, &mut self.view, bytes)?;
+        self.write_named(FILE_NAME, bytes)
+    }
+
+    /// Write `bytes` to `name` through this handle (see [`write_file`]) —
+    /// the save half of Phase Q's "open any file, edit it, save it back to
+    /// itself" fix. After the COW commit the boot view's dir block is a NEW
+    /// immutable block, so the store header anchor is re-persisted to that
+    /// id — otherwise a reboot would re-attach to the previous dir block
+    /// and lose the save, the same durability discipline `write_memo`
+    /// always had.
+    pub fn write_named(&mut self, name: &[u8], bytes: &[u8]) -> Option<BlockId> {
+        let id = write_file(&mut self.store, &mut self.ctrl, &mut self.view, name, bytes)?;
+        let dir = self.view.dir_id();
+        if self.store.set_anchor(&mut self.ctrl, &dir) {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Write `bytes` to the file `name` inside the directory at `path`
+    /// through this handle (Phase Q completion: the hierarchical save — a
+    /// file the browser opened from a subdirectory must save back to that
+    /// subdirectory, not the root). COW-commits and re-anchors exactly like
+    /// [`Self::write_named`].
+    pub fn write_named_at(&mut self, path: &[Name], name: &[u8], bytes: &[u8]) -> Option<BlockId> {
+        let id = crate::update::write_file_at(
+            &mut self.view,
+            &mut self.store,
+            &mut self.ctrl,
+            path,
+            name,
+            bytes,
+        )?;
         let dir = self.view.dir_id();
         if self.store.set_anchor(&mut self.ctrl, &dir) {
             Some(id)
@@ -392,6 +444,49 @@ impl EditorFs {
     /// taken, the view is full, or the anchor write fails.
     pub fn create_empty(&mut self, name: &[u8]) -> bool {
         if !create_empty(&mut self.store, &mut self.ctrl, &mut self.view, name) {
+            return false;
+        }
+        let dir = self.view.dir_id();
+        self.store.set_anchor(&mut self.ctrl, &dir)
+    }
+
+    /// The entries of the directory at `path` as `(name, kind)` pairs
+    /// (Phase Q completion: the browser walks the hierarchical view; `kind`
+    /// is 0 for a file, 1 for a directory — see `update::KIND_*`).
+    pub fn browser_list(&mut self, path: &[Name], out: &mut [(Name, u8); VIEW_MAX_FILES]) -> usize {
+        self.view
+            .list_entries(&mut self.store, &mut self.ctrl, path, out)
+    }
+
+    /// Read the file `name` inside the directory at `path` (Phase Q
+    /// completion: "open" from anywhere in the tree).
+    pub fn browser_open(&mut self, path: &[Name], name: &[u8], out: &mut [u8]) -> Option<usize> {
+        self.view
+            .read_file_at(&mut self.store, &mut self.ctrl, path, name, out)
+    }
+
+    /// Create an empty directory `name` inside the directory at `path`
+    /// (Phase Q completion: directory creation). Re-anchors the store header
+    /// like `create_empty`, so the new dir survives a reboot.
+    pub fn browser_mkdir(&mut self, path: &[Name], name: &[u8]) -> bool {
+        if !self
+            .view
+            .mkdir_at(&mut self.store, &mut self.ctrl, path, name)
+        {
+            return false;
+        }
+        let dir = self.view.dir_id();
+        self.store.set_anchor(&mut self.ctrl, &dir)
+    }
+
+    /// Create a new file `name` holding a single `\n` inside the directory at
+    /// `path` (Phase Q completion: create from a subdir). Re-anchors.
+    pub fn browser_create(&mut self, path: &[Name], name: &[u8]) -> bool {
+        if self
+            .view
+            .create_file_at(&mut self.store, &mut self.ctrl, path, name, b"\n")
+            .is_none()
+        {
             return false;
         }
         let dir = self.view.dir_id();
@@ -674,5 +769,87 @@ mod tests {
         assert_eq!(&ob[..on], b"\n");
         let om = open_file(&mut store, &mut disk, &mut view, FILE_NAME, &mut ob).unwrap();
         assert_eq!(&ob[..om], SEED);
+    }
+
+    /// Regression for the "save always clobbers memo.txt" caveat: opening
+    /// `notes.txt` from the browser and saving through the named path
+    /// must write `notes.txt`, and `memo.txt` must be completely
+    /// untouched — not the old `write_memo`-only behavior a browser-driven
+    /// save used to silently fall back to.
+    #[test]
+    fn write_file_saves_the_named_file_and_leaves_memo_untouched() {
+        let (mut disk, mut store, mut view) = world();
+        let mut out = [0u8; 512];
+        seed_if_absent(&mut store, &mut disk, &mut view, &mut out).unwrap();
+        assert!(create_empty(&mut store, &mut disk, &mut view, b"notes.txt"));
+
+        // "Open notes.txt in the editor, type something, save" — the
+        // browser -> editor -> F2 path, driven at the free-function level.
+        let edited_notes = b"typed into notes, not memo";
+        let id = write_file(&mut store, &mut disk, &mut view, b"notes.txt", edited_notes).unwrap();
+        assert_eq!(id, crate::store::sha256(edited_notes));
+
+        let mut nout = [0u8; 512];
+        let nn = open_file(&mut store, &mut disk, &mut view, b"notes.txt", &mut nout).unwrap();
+        assert_eq!(&nout[..nn], edited_notes, "notes.txt holds the edit");
+
+        // memo.txt must still be exactly the seed — untouched by the
+        // notes.txt save. This is the assertion that would have failed
+        // under the old always-write-memo.txt save path.
+        let mut mout = [0u8; 512];
+        let mn = read_memo(&mut store, &mut disk, &mut view, &mut mout).unwrap();
+        assert_eq!(
+            &mout[..mn],
+            SEED,
+            "memo.txt must not be clobbered by a notes.txt save"
+        );
+
+        // The listing still shows exactly the two files, and memo.txt's
+        // dir entry didn't move to point at the notes.txt content.
+        let mut names = [Name::default(); VIEW_MAX_FILES];
+        let n = list_names(&mut store, &mut disk, &view, &mut names);
+        assert_eq!(n, 2);
+    }
+
+    /// Phase Q completion: a save through `write_file_at` to a file inside
+    /// a subdirectory must land in that subdirectory and leave the root's
+    /// entries untouched — the hierarchical analogue of the root-level
+    /// regression above.
+    #[test]
+    fn write_file_at_saves_into_a_subdirectory_and_leaves_root_alone() {
+        let (mut disk, mut store, mut view) = world();
+        let mut out = [0u8; 512];
+        seed_if_absent(&mut store, &mut disk, &mut view, &mut out).unwrap();
+
+        // docs/readme.txt, created through the path API.
+        let docs = [Name::from_slice(b"docs").unwrap()];
+        assert!(view.mkdir_at(&mut store, &mut disk, &[], b"docs"));
+        assert!(view
+            .create_file_at(&mut store, &mut disk, &docs, b"readme.txt", b"v1")
+            .is_some());
+
+        // Edit + save it in place through the path-aware writer.
+        let edited = b"v2 saved in place";
+        let id = crate::update::write_file_at(
+            &mut view,
+            &mut store,
+            &mut disk,
+            &docs,
+            b"readme.txt",
+            edited,
+        )
+        .unwrap();
+        assert_eq!(id, crate::store::sha256(edited));
+
+        // docs/readme.txt now holds the edit; the root is untouched.
+        let mut b2 = [0u8; 512];
+        let n2 = view
+            .read_file_at(&mut store, &mut disk, &docs, b"readme.txt", &mut b2)
+            .unwrap();
+        assert_eq!(&b2[..n2], edited);
+        let mut root = [(Name::default(), 0u8); VIEW_MAX_FILES];
+        assert_eq!(view.list_entries(&mut store, &mut disk, &[], &mut root), 2);
+        assert!(root.iter().any(|(nm, _)| nm.as_slice() == b"docs"));
+        assert!(root.iter().any(|(nm, _)| nm.as_slice() == FILE_NAME));
     }
 }

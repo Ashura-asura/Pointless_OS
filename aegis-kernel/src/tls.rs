@@ -591,9 +591,17 @@ pub fn protect_record(
     }
     // Inner content type is the real record content type (RFC 8446 §5.4):
     // a bare inner plaintext must append the real content type byte and a
-    // 2-byte zero padding length.
-    let mut inner = [0u8; 16384];
-    debug_assert!(plaintext.len() + 3 <= inner.len());
+    // 2-byte zero padding length. The scratch is capped at 4 KiB: this kernel
+    // only ever protects small handshake/app-data records, and keeping the
+    // buffer at 16 KiB put the single biggest stack frame of the TLS demo on
+    // the 64 KiB boot stack (overflowing it by ~40 bytes once the frame.rs
+    // statics moved to just below the stack base). Larger plaintexts are
+    // rejected rather than silently truncated.
+    const MAX_INNER: usize = 4096;
+    if plaintext.len() + 1 > MAX_INNER {
+        return None;
+    }
+    let mut inner = [0u8; MAX_INNER];
     inner[..plaintext.len()].copy_from_slice(plaintext);
     inner[plaintext.len()] = ct;
     let inner_len = plaintext.len() + 1;

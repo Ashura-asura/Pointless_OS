@@ -65,9 +65,10 @@ serial logs + framebuffer captures):
 - **Interactive desktop**: a live compositor desktop rendered to real 800x600
   pixels through a Bochs VBE framebuffer backend, PS/2 keyboard (Tab focus,
   arrow-move), a **PS/2 mouse driver** with a trail-free cursor, window chrome
-  (drag/resize/close), and a **text editor over the NVMe-backed store** — a
-  two-boot demo proves the edited memo.txt survives a power cycle
-  (`still edited = true` on reboot).
+  (drag/resize/close), a **text editor over the NVMe-backed store**, and a
+  **hierarchical file browser** (nested dirs, `.`/`..`, mouse-click
+  create-dir/file via its action bar) — a two-boot demo proves edited and
+  created files and directories survive a power cycle.
 - **Fleet / distributed**: a two-node link over real e1000e/socket-netdev
   frames — capability envelopes, consensus re-election, split-brain resolution,
   and remote invocation of a transferred capability.
@@ -131,7 +132,8 @@ loader respectively.
   powershell -NoProfile -ExecutionPolicy Bypass -File qemu-editor-demo.ps1
   # then check serial-editor-boot2.log for "editor@reopen ... still edited = true"
   ```
-- Other live demos: `qemu-mouse-demo.ps1`, `qemu-chrome-demo.ps1`,
+- Other live demos: `qemu-browser-demo.ps1` (hierarchical browser with
+  mouse-click create, two-boot), `qemu-mouse-demo.ps1`, `qemu-chrome-demo.ps1`,
   `qemu-live-demo.ps1`, `qemu-nonic-test.ps1`.
 
 Exact per-component build/run instructions live in the component READMEs and
@@ -146,7 +148,8 @@ the demo scripts' headers.
 1. Real-hardware certification (the single largest remaining gap).
 2. Real DMAR IOMMU programming and interrupt-driven (MSI-X) NIC paths.
 3. Hypervisor-based compat vehicles (VMX bring-up primitive exists).
-4. Phase Q onward: more desktop apps on the live desktop (file browser, etc.).
+4. Phase S onward: more desktop apps on the live desktop (app launcher /
+   taskbar is the last unimplemented desktop phase).
 
 ## License
 Refer to the repository LICENSE file for licensing terms.

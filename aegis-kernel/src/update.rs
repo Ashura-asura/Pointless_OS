@@ -21,19 +21,37 @@
 //!   * `rollback` flips `current` back to the last applied generation that
 //!     passed health at activation, and drops the dethroned generation.
 //! - The **boot view** is a COW directory held as one content-addressed block:
-//!   entries `(name -> block id)`. Every mutation appends a NEW dir block; an
-//!   id you already hold (a pre-activation `current`) reads the old target
-//!   forever. Same semantics as the model's `FlatView`.
+//!   entries `(name -> kind -> block id)`. Every mutation appends a NEW dir
+//!   block; an id you already hold (a pre-activation `current`) reads the old
+//!   target forever. Same semantics as the model's `FlatView`.
+//!
+//! **Phase Q (completion): the boot view is now hierarchical.** Entries carry
+//! a kind byte (file vs dir); a dir entry points at another encoded dir block,
+//! so the durable store the editor/browser/shell all share nests directories
+//! exactly like the design doc's POSIX projection. Path-based operations
+//! ([`BootView::mkdir_at`], [`BootView::create_file_at`],
+//! [`BootView::list_entries`], [`BootView::read_file_at`]) resolve a
+//! `&[Name]` path from the root and COW-propagate the new root up the
+//! ancestor chain on mutation — the same commit-to-root discipline
+//! `store::TreeView` already documents, now over the NVMe-backed view. The
+//! editor's `memo.txt`, the update manager's `gen-N`/`current`, and the
+//! shell's `ls`/`open`/`new` all operate at the root (empty path), unchanged.
 //!
 //! Honest limits (same discipline as `nvme_store`): blocks are single 512 B
-//! sectors and the view indexes at most [`VIEW_MAX_FILES`] names; the
-//! descriptor carries the generation number + package name only (no signature
-//! — the model's signing chain stays out of scope here); health is supplied by
-//! the caller ([`payloads_verify`] verifies every payload block against the
-//! live disk).
+//! sectors and the view indexes at most [`VIEW_MAX_FILES`] entries per
+//! directory; the descriptor carries the generation number + package name only
+//! (no signature — the model's signing chain stays out of scope here); health
+//! is supplied by the caller ([`payloads_verify`] verifies every payload block
+//! against the live disk). Directory depth is capped at [`MAX_DEPTH`], the
+//! same bound the in-memory `store::TreeView` uses.
 
 use crate::nvme_store::{BlockIo, Store};
-use crate::store::{BlockId, Name, MAX_FILES};
+use crate::store::{BlockId, Name, MAX_DEPTH, MAX_FILES};
+
+/// Entry kind byte: a regular file.
+pub const KIND_FILE: u8 = 0;
+/// Entry kind byte: a directory (its id points at another encoded dir block).
+pub const KIND_DIR: u8 = 1;
 
 /// Maximum number of names the COW boot view can hold.
 pub const VIEW_MAX_FILES: usize = MAX_FILES;
@@ -121,10 +139,11 @@ pub fn decode_descriptor(b: &[u8]) -> Option<GenerationDescriptor> {
 // --- COW boot view ----------------------------------------------------------
 
 /// The directory encoding stored as one content-addressed block:
-/// `count u16 LE` then per entry `name_len u8`, `name`, `block id [u8; 32]`.
+/// `count u16 LE` then per entry `name_len u8`, `kind u8`, `name`, `block id [u8; 32]`.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct DirEntry {
     pub name: Name,
+    pub kind: u8,
     pub id: BlockId,
 }
 
@@ -137,10 +156,12 @@ pub(crate) fn encode_dir(entries: &[DirEntry]) -> Option<([u8; DIR_BUF], usize)>
     let mut at = 2usize;
     for e in entries {
         let name = e.name.as_slice();
-        if at + 1 + name.len() + 32 > DIR_BUF {
+        if at + 2 + name.len() + 32 > DIR_BUF {
             return None;
         }
         out[at] = name.len() as u8;
+        at += 1;
+        out[at] = e.kind;
         at += 1;
         out[at..at + name.len()].copy_from_slice(name);
         at += name.len();
@@ -163,6 +184,8 @@ pub(crate) fn decode_dir(bytes: &[u8], out: &mut [DirEntry; VIEW_MAX_FILES]) -> 
         let Some(&nlen) = bytes.get(at) else { break };
         at += 1;
         let nlen = nlen as usize;
+        let Some(&kind) = bytes.get(at) else { break };
+        at += 1;
         let Some(name_bytes) = bytes.get(at..at + nlen) else {
             break;
         };
@@ -176,10 +199,24 @@ pub(crate) fn decode_dir(bytes: &[u8], out: &mut [DirEntry; VIEW_MAX_FILES]) -> 
         let mut id = [0u8; 32];
         id.copy_from_slice(id_bytes);
         at += 32;
-        out[written] = DirEntry { name, id };
+        out[written] = DirEntry { name, kind, id };
         written += 1;
     }
     written
+}
+
+/// Decode a dir block by id; an unreadable/missing block yields an empty table.
+fn read_dir_block(
+    store: &mut Store,
+    io: &mut impl BlockIo,
+    id: &BlockId,
+) -> [DirEntry; VIEW_MAX_FILES] {
+    let mut out = [DirEntry::default(); VIEW_MAX_FILES];
+    let mut buf = [0u8; DIR_BUF];
+    if let Some(n) = store.get(io, id, &mut buf) {
+        decode_dir(&buf[..n], &mut out);
+    }
+    out
 }
 
 /// The COW boot view. `dir` is the block id of the current encoded directory;
@@ -211,12 +248,7 @@ impl BootView {
     }
 
     fn read_dir(&self, store: &mut Store, io: &mut impl BlockIo) -> [DirEntry; VIEW_MAX_FILES] {
-        let mut out = [DirEntry::default(); VIEW_MAX_FILES];
-        let mut buf = [0u8; DIR_BUF];
-        if let Some(n) = store.get(io, &self.dir, &mut buf) {
-            decode_dir(&buf[..n], &mut out);
-        }
-        out
+        read_dir_block(store, io, &self.dir)
     }
 
     /// Resolve `name` to its content block id in this view (None if absent).
@@ -240,33 +272,7 @@ impl BootView {
     /// A mutation: commit a new directory block with `name -> id` bound (COW).
     /// The old dir block is untouched and keeps reading the old table forever.
     fn set(&mut self, store: &mut Store, io: &mut impl BlockIo, name: Name, id: BlockId) -> bool {
-        let cur = self.read_dir(store, io);
-        let mut out = [DirEntry::default(); VIEW_MAX_FILES];
-        let mut n = 0usize;
-        let mut replaced = false;
-        for e in cur.iter() {
-            if e.name.as_slice().is_empty() {
-                continue;
-            }
-            if e.name.matches(name.as_slice()) && !replaced {
-                out[n] = DirEntry { name, id };
-                replaced = true;
-            } else {
-                out[n] = *e;
-            }
-            n += 1;
-        }
-        if !replaced {
-            if n >= VIEW_MAX_FILES {
-                return false;
-            }
-            out[n] = DirEntry { name, id };
-            n += 1;
-        }
-        let Some((enc, len)) = encode_dir(&out[..n]) else {
-            return false;
-        };
-        let Some(new_dir) = store.put(io, &enc[..len]) else {
+        let Some(new_dir) = set_entry_block(store, io, self.dir, name, KIND_FILE, id) else {
             return false;
         };
         self.dir = new_dir;
@@ -307,6 +313,282 @@ impl BootView {
         }
         n
     }
+
+    /// Walk `path` from the root, returning the final directory block plus the
+    /// ancestor chain needed to COW-propagate a mutation back to the root.
+    fn resolve(&self, store: &mut Store, io: &mut impl BlockIo, path: &[Name]) -> Option<Resolved> {
+        let mut dir = self.dir;
+        let mut levels = [(BlockId::default(), Name::default()); MAX_DEPTH];
+        let mut nl = 0usize;
+        for name in path.iter() {
+            let entries = read_dir_block(store, io, &dir);
+            let e = entries.iter().find(|e| e.name == *name)?;
+            if e.kind != KIND_DIR {
+                return None;
+            }
+            if nl >= MAX_DEPTH {
+                return None;
+            }
+            levels[nl] = (dir, *name);
+            nl += 1;
+            dir = e.id;
+        }
+        Some(Resolved {
+            parent: dir,
+            levels,
+            nlevels: nl,
+        })
+    }
+
+    /// COW the subtree change `parent_new` (the rewritten final dir block) up
+    /// the ancestor chain, returning the new root block id.
+    fn commit_tree(
+        store: &mut Store,
+        io: &mut impl BlockIo,
+        r: &Resolved,
+        parent_new: BlockId,
+    ) -> Option<BlockId> {
+        let mut cur = parent_new;
+        for i in (0..r.nlevels).rev() {
+            let (dir, name) = r.levels[i];
+            cur = rewrite_entry_block(store, io, dir, name, cur)?;
+        }
+        Some(cur)
+    }
+
+    /// Add `name -> (kind, id)` to the dir block `dir` (COW, no aliasing),
+    /// returning the new dir block id.
+    fn add_entry_block(
+        store: &mut Store,
+        io: &mut impl BlockIo,
+        dir: BlockId,
+        name: Name,
+        kind: u8,
+        id: BlockId,
+    ) -> Option<BlockId> {
+        let entries = read_dir_block(store, io, &dir);
+        let mut out = [DirEntry::default(); VIEW_MAX_FILES];
+        let mut n = 0usize;
+        for e in entries.iter() {
+            if e.name.as_slice().is_empty() {
+                continue;
+            }
+            if e.name == name {
+                return None;
+            }
+            out[n] = *e;
+            n += 1;
+        }
+        if n >= VIEW_MAX_FILES {
+            return None;
+        }
+        out[n] = DirEntry { name, kind, id };
+        n += 1;
+        let (enc, len) = encode_dir(&out[..n])?;
+        store.put(io, &enc[..len])
+    }
+
+    /// The entries of the directory at `path` as `(name, kind)` pairs, decoded
+    /// into `out`; returns how many (0 if the path does not resolve).
+    pub fn list_entries(
+        &self,
+        store: &mut Store,
+        io: &mut impl BlockIo,
+        path: &[Name],
+        out: &mut [(Name, u8); VIEW_MAX_FILES],
+    ) -> usize {
+        let Some(r) = self.resolve(store, io, path) else {
+            return 0;
+        };
+        let entries = read_dir_block(store, io, &r.parent);
+        let mut n = 0usize;
+        for e in entries.iter() {
+            if e.name.as_slice().is_empty() {
+                continue;
+            }
+            out[n] = (e.name, e.kind);
+            n += 1;
+        }
+        n
+    }
+
+    /// Read the bytes of the file `name` inside the directory at `path`.
+    pub fn read_file_at(
+        &self,
+        store: &mut Store,
+        io: &mut impl BlockIo,
+        path: &[Name],
+        name: &[u8],
+        out: &mut [u8],
+    ) -> Option<usize> {
+        let r = self.resolve(store, io, path)?;
+        let entries = read_dir_block(store, io, &r.parent);
+        let e = entries.iter().find(|e| e.name.matches(name))?;
+        if e.kind != KIND_FILE {
+            return None;
+        }
+        store.get(io, &e.id, out)
+    }
+
+    /// Create an empty directory `name` inside the directory at `path` (COW to
+    /// root). Returns false if the path does not resolve, the name is taken, or
+    /// the directory is full.
+    pub fn mkdir_at(
+        &mut self,
+        store: &mut Store,
+        io: &mut impl BlockIo,
+        path: &[Name],
+        name: &[u8],
+    ) -> bool {
+        if path.len() >= MAX_DEPTH {
+            return false;
+        }
+        let Some(r) = self.resolve(store, io, path) else {
+            return false;
+        };
+        let Some(cname) = Name::from_slice(name) else {
+            return false;
+        };
+        let (empty, elen) = match encode_dir(&[]) {
+            Some(x) => x,
+            None => return false,
+        };
+        let Some(new_dir) = store.put(io, &empty[..elen]) else {
+            return false;
+        };
+        let Some(parent_new) = Self::add_entry_block(store, io, r.parent, cname, KIND_DIR, new_dir)
+        else {
+            return false;
+        };
+        let Some(root_new) = Self::commit_tree(store, io, &r, parent_new) else {
+            return false;
+        };
+        self.dir = root_new;
+        true
+    }
+
+    /// Create a file `name` inside the directory at `path` holding `bytes`
+    /// (COW to root). Returns the content block id, or None.
+    pub fn create_file_at(
+        &mut self,
+        store: &mut Store,
+        io: &mut impl BlockIo,
+        path: &[Name],
+        name: &[u8],
+        bytes: &[u8],
+    ) -> Option<BlockId> {
+        let r = self.resolve(store, io, path)?;
+        let cname = Name::from_slice(name)?;
+        let id = store.put(io, bytes)?;
+        let parent_new = Self::add_entry_block(store, io, r.parent, cname, KIND_FILE, id)?;
+        let root_new = Self::commit_tree(store, io, &r, parent_new)?;
+        self.dir = root_new;
+        Some(id)
+    }
+}
+
+/// A resolved path: the final directory block plus each ancestor `(dir, name)`
+/// pair needed to COW-propagate a mutation up to the root.
+struct Resolved {
+    parent: BlockId,
+    levels: [(BlockId, Name); MAX_DEPTH],
+    nlevels: usize,
+}
+
+/// Replace the entry `name` in the dir block `dir` to point at `new_child`
+/// (COW), returning the new dir block id.
+fn rewrite_entry_block(
+    store: &mut Store,
+    io: &mut impl BlockIo,
+    dir: BlockId,
+    name: Name,
+    new_child: BlockId,
+) -> Option<BlockId> {
+    let entries = read_dir_block(store, io, &dir);
+    let mut out = [DirEntry::default(); VIEW_MAX_FILES];
+    let mut n = 0usize;
+    let mut done = false;
+    for e in entries.iter() {
+        if e.name.as_slice().is_empty() {
+            continue;
+        }
+        if e.name == name && !done {
+            out[n] = DirEntry {
+                name,
+                kind: e.kind,
+                id: new_child,
+            };
+            done = true;
+        } else {
+            out[n] = *e;
+        }
+        n += 1;
+    }
+    if !done {
+        return None;
+    }
+    let (enc, len) = encode_dir(&out[..n])?;
+    store.put(io, &enc[..len])
+}
+
+/// Replace-or-add `name -> (kind, id)` in the dir block `dir` (COW),
+/// returning the new dir block id. Unlike [`rewrite_entry_block`] this also
+/// appends the entry when absent (the general write path, used by root
+/// `set` and path-aware `write_file_at`).
+fn set_entry_block(
+    store: &mut Store,
+    io: &mut impl BlockIo,
+    dir: BlockId,
+    name: Name,
+    kind: u8,
+    id: BlockId,
+) -> Option<BlockId> {
+    let entries = read_dir_block(store, io, &dir);
+    let mut out = [DirEntry::default(); VIEW_MAX_FILES];
+    let mut n = 0usize;
+    let mut replaced = false;
+    for e in entries.iter() {
+        if e.name.as_slice().is_empty() {
+            continue;
+        }
+        if e.name.matches(name.as_slice()) && !replaced {
+            out[n] = DirEntry { name, kind, id };
+            replaced = true;
+        } else {
+            out[n] = *e;
+        }
+        n += 1;
+    }
+    if !replaced {
+        if n >= VIEW_MAX_FILES {
+            return None;
+        }
+        out[n] = DirEntry { name, kind, id };
+        n += 1;
+    }
+    let (enc, len) = encode_dir(&out[..n])?;
+    store.put(io, &enc[..len])
+}
+
+/// Write `bytes` to the file `name` inside the directory at `path` (COW to
+/// root) — replace-or-add, so this is the save path for a file the editor
+/// opened from a subdirectory, not just the root. Returns the content block
+/// id.
+pub fn write_file_at<IO: BlockIo>(
+    view: &mut BootView,
+    store: &mut Store,
+    io: &mut IO,
+    path: &[Name],
+    name: &[u8],
+    bytes: &[u8],
+) -> Option<BlockId> {
+    let r = view.resolve(store, io, path)?;
+    let cname = Name::from_slice(name)?;
+    let id = store.put(io, bytes)?;
+    let parent_new = set_entry_block(store, io, r.parent, cname, KIND_FILE, id)?;
+    let root_new = BootView::commit_tree(store, io, &r, parent_new)?;
+    view.dir = root_new;
+    Some(id)
 }
 
 // --- Update manager ---------------------------------------------------------
@@ -584,6 +866,7 @@ mod tests {
         let a = Name::from_slice(b"memo.txt").unwrap();
         let e = [DirEntry {
             name: a,
+            kind: KIND_FILE,
             id: [7u8; 32],
         }];
         let (enc, len) = encode_dir(&e).unwrap();
@@ -601,6 +884,88 @@ mod tests {
         assert_eq!(decode_dir(&forged, &mut out), 0);
         // The real encoding still decodes after all that abuse.
         assert_eq!(decode_dir(&enc[..len], &mut out), 1);
+        assert_eq!(out[0].kind, KIND_FILE);
+    }
+
+    #[test]
+    fn boot_view_hierarchy_is_durable_and_cow() {
+        let _g = crate::kernel_state_guard();
+        let (mut disk, mut store, _um) = world();
+        let mut view = BootView::create(&mut store, &mut disk).unwrap();
+        // mkdir at root.
+        assert!(view.mkdir_at(&mut store, &mut disk, &[], b"docs"));
+        // A file inside docs (path depth 1).
+        let sub = [Name::from_slice(b"docs").unwrap()];
+        assert!(view
+            .create_file_at(&mut store, &mut disk, &sub, b"readme.txt", b"hi")
+            .is_some());
+        // list root: docs shows up as a dir.
+        let mut root = [(Name::default(), 0u8); VIEW_MAX_FILES];
+        assert_eq!(view.list_entries(&mut store, &mut disk, &[], &mut root), 1);
+        assert_eq!(root[0], (Name::from_slice(b"docs").unwrap(), KIND_DIR));
+        // list inside docs: readme.txt shows up as a file.
+        let mut inside = [(Name::default(), 0u8); VIEW_MAX_FILES];
+        assert_eq!(
+            view.list_entries(&mut store, &mut disk, &sub, &mut inside),
+            1
+        );
+        assert_eq!(
+            inside[0],
+            (Name::from_slice(b"readme.txt").unwrap(), KIND_FILE)
+        );
+        // read through the path.
+        let mut buf = [0u8; SECTOR];
+        assert_eq!(
+            view.read_file_at(&mut store, &mut disk, &sub, b"readme.txt", &mut buf)
+                .unwrap(),
+            2
+        );
+        assert_eq!(&buf[..2], b"hi");
+        // A file deep in the tree: docs/logs/today.
+        let logs = [
+            Name::from_slice(b"docs").unwrap(),
+            Name::from_slice(b"logs").unwrap(),
+        ];
+        assert!(view.mkdir_at(&mut store, &mut disk, &sub, b"logs"));
+        assert!(view
+            .create_file_at(&mut store, &mut disk, &logs, b"today", b"ok")
+            .is_some());
+        // Reading via the deep path resolves.
+        assert_eq!(
+            view.read_file_at(&mut store, &mut disk, &logs, b"today", &mut buf)
+                .unwrap(),
+            2
+        );
+        // Mutating a subdir must not clobber the sibling at root (COW root).
+        assert_eq!(
+            view.list_entries(
+                &mut store,
+                &mut disk,
+                &[],
+                &mut [(Name::default(), 0); VIEW_MAX_FILES]
+            ),
+            1
+        );
+        // The path resolving to a file (not a dir) must not resolve.
+        let through_file = [
+            Name::from_slice(b"docs").unwrap(),
+            Name::from_slice(b"readme.txt").unwrap(),
+        ];
+        assert!(!view.mkdir_at(&mut store, &mut disk, &through_file, b"oops"));
+        // COW: the pre-mutation root id still reads only the old table.
+        let pre = view.dir_id();
+        assert!(view.mkdir_at(&mut store, &mut disk, &[], b"images"));
+        let old = BootView::at(pre);
+        let mut oldroot = [(Name::default(), 0u8); VIEW_MAX_FILES];
+        assert_eq!(
+            old.list_entries(&mut store, &mut disk, &[], &mut oldroot),
+            1
+        );
+        let mut newroot = [(Name::default(), 0u8); VIEW_MAX_FILES];
+        assert_eq!(
+            view.list_entries(&mut store, &mut disk, &[], &mut newroot),
+            2
+        );
     }
 
     #[test]
