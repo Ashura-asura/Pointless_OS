@@ -3,6 +3,7 @@
 
 mod elf;
 mod fleet_cfg;
+mod gop;
 mod memory_map;
 mod page_tables;
 mod serial;
@@ -148,6 +149,47 @@ fn main() -> Status {
             // disarmed, and the memory map is finalized. From this point on
             // only raw hardware (serial, LAPIC, paging) remains usable, so
             // all remaining prints go to the polled COM1 port only.
+            //
+            // Query the Graphics Output Protocol BEFORE this point: it is
+            // a boot service and dies with the rest of firmware. The
+            // framebuffer it hands out survives (it is device memory),
+            // so the kernel can keep drawing to it after handover.
+            let gop_config = gop::query();
+            match &gop_config {
+                Some(h) => {
+                    // `GopHandoff` is packed; copy fields out before
+                    // formatting (no unaligned references).
+                    let (w, hgt, stride, fmt, base, size) = (
+                        h.width,
+                        h.height,
+                        h.stride_px,
+                        if h.pixel_format == 1 { "BGRX" } else { "RGBX" },
+                        h.framebuffer_base,
+                        h.framebuffer_size,
+                    );
+                    sprintln!(
+                        "Aegis: GOP: framebuffer {w}x{hgt} stride {stride} fmt {fmt} @ {base:#x} ({size} bytes)"
+                    );
+                    uefi::println!(
+                        "Aegis: GOP: framebuffer {}x{} stride {} fmt {} @ {:#x} ({} bytes)",
+                        w,
+                        hgt,
+                        stride,
+                        fmt,
+                        base,
+                        size
+                    );
+                }
+                None => {
+                    sprintln!(
+                        "Aegis: GOP: no usable framebuffer - kernel falls back to Bochs VBE probe"
+                    );
+                    uefi::println!(
+                        "Aegis: GOP: no usable framebuffer - kernel falls back to Bochs VBE probe"
+                    );
+                }
+            }
+
             uefi::println!("Aegis: Calling ExitBootServices...");
             let final_map = unsafe {
                 uefi::boot::exit_boot_services(Some(uefi::boot::MemoryType::LOADER_DATA))
@@ -275,6 +317,38 @@ fn main() -> Status {
                     fleet_bytes.len()
                 );
             }
+            // Append the GOP handoff block right after the fleet block
+            // (offset 5199), matching boot_info.rs GOP_OFFSET. Always
+            // written: `present = 0` when no usable GOP was found, so the
+            // kernel can tell "no GOP" from "GOP but unusable".
+            let gop_bytes = gop::to_handoff_bytes(&gop_config.unwrap_or(gop::GopHandoff {
+                present: 0,
+                pixel_format: 0,
+                width: 0,
+                height: 0,
+                stride_px: 0,
+                bpp: 0,
+                framebuffer_base: 0,
+                framebuffer_size: 0,
+            }));
+            unsafe {
+                core::ptr::write_bytes(
+                    (handoff_addr as *mut u8).add(gop::GOP_OFFSET),
+                    0,
+                    gop_bytes.len(),
+                );
+                core::ptr::copy_nonoverlapping(
+                    gop_bytes.as_ptr(),
+                    (handoff_addr as *mut u8).add(gop::GOP_OFFSET),
+                    gop_bytes.len(),
+                );
+            }
+            sprintln!(
+                "Aegis: GOP handoff block written at handoff+{} ({} bytes, present={})",
+                gop::GOP_OFFSET,
+                gop_bytes.len(),
+                gop_config.as_ref().map(|_| 1).unwrap_or(0)
+            );
             let written_count = handoff.entry_count;
             sprintln!(
                 "Aegis: boot-info written at 0x{:X} ({} descriptors, image end 0x{:X})",

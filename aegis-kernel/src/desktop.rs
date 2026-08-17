@@ -84,6 +84,7 @@
 use crate::browser::FileBrowser;
 use crate::compositor::{self, Cell, MAX_WINDOWS};
 use crate::editor::{self, Editor, EDITOR_BUF_MAX};
+use crate::gpu::GpuDevice;
 use crate::input::{Key, KeyEvent, MouseEvent};
 use crate::store::{Name, MAX_DEPTH};
 use crate::terminal::{Command, Terminal};
@@ -1942,8 +1943,10 @@ static mut DESKTOP: Option<Desktop> = None;
 /// or without this. When present, every `boot_blit`/`handle_key` re-blit
 /// fans the same composited `Cell` screen out to real pixels too, via
 /// `gpu_compositor::blit_cells` — see that module for why this is "a
-/// second output backend", not a rewrite of the compositor itself.
-static mut GPU: Option<crate::gpu::BochsGpu> = None;
+/// second output backend", not a rewrite of the compositor itself. The
+/// backend is type-erased (`GpuBackend`): GOP on machines where the
+/// loader handed over a UEFI framebuffer, Bochs VBE otherwise.
+static mut GPU: Option<crate::gpu::GpuBackend> = None;
 
 /// Pixel offset of the centered cell image within the GPU framebuffer
 /// (Phase O): the mouse reports pixel coordinates, the window manager works
@@ -1968,12 +1971,13 @@ pub unsafe fn install(d: Desktop) {
 
 /// Install the GPU pixel output backend (Phase H). Optional: call this
 /// before or after `install`, any time before the first `boot_blit`/
-/// `handle_key`, only if `gpu::BochsGpu::probe` + `set_mode` succeeded.
+/// `handle_key`, only if a display backend was selected at boot (`GopGpu`
+/// from the bootloader's GOP handoff, or `BochsGpu::probe` + `set_mode`).
 ///
 /// # Safety
 ///
 /// Single-threaded boot-time call, once.
-pub unsafe fn install_gpu(mut g: crate::gpu::BochsGpu) {
+pub unsafe fn install_gpu(mut g: crate::gpu::GpuBackend) {
     if let Some((_, mode)) = g.framebuffer_mut() {
         let ox = ((mode.width as i16).saturating_sub(SW as i16 * 8)) / 2;
         let oy = ((mode.height as i16).saturating_sub(SH as i16 * 16)) / 2;

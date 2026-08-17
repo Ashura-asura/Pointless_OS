@@ -187,11 +187,11 @@ fn parse_relocations(data: &[u8]) -> Result<Vec<Relocation>, ElfError> {
     if shoff == 0 || shnum == 0 || shentsize < 64 {
         return Ok(Vec::new()); // No section headers: no relocations to apply
     }
-    if shstrndx as usize >= shnum as usize {
+    if shstrndx >= shnum {
         return Err(ElfError);
     }
 
-    let shstr_off = shoff + shstrndx as usize * shentsize;
+    let shstr_off = shoff + shstrndx * shentsize;
     let shstr_offset = u64::from_le_bytes(
         data[shstr_off + 24..shstr_off + 32]
             .try_into()
@@ -209,7 +209,7 @@ fn parse_relocations(data: &[u8]) -> Result<Vec<Relocation>, ElfError> {
 
     let mut relocations = Vec::new();
     for i in 0..shnum {
-        let sec_off = shoff + i as usize * shentsize;
+        let sec_off = shoff + i * shentsize;
         let name_idx = u32::from_le_bytes(
             data[sec_off..sec_off + 4]
                 .try_into()

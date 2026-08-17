@@ -212,8 +212,11 @@ static mut DIAGED: bool = false;
 
 /// Clear the screen and reset the cursor. Text-mode entry is split out so
 /// the buffer logic stays unit-testable on the host (no port I/O).
+///
+/// NOTE: `vga_enter_text_mode` must NOT be called from here — it disables
+/// the firmware's Bochs-VBE/GOP display mode, which a pixel backend needs.
+/// Callers that end up with no pixel backend call it explicitly.
 pub fn vga_init() {
-    vga_enter_text_mode();
     vga_clear_screen();
 }
 

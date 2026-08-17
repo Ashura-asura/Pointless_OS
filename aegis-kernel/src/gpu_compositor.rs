@@ -13,7 +13,7 @@
 
 use crate::compositor::Cell;
 use crate::font::FONT8X16_BASIC;
-use crate::gpu::BochsGpu;
+use crate::gpu::GpuDevice;
 
 const GLYPH_W: usize = 8;
 const GLYPH_H: usize = 16;
@@ -54,7 +54,11 @@ const PALETTE: [[u8; 3]; 16] = [
 /// pixels, centered within the mode if the mode is larger, clipped if
 /// smaller. Attribute byte layout matches `vga.rs`: low nibble =
 /// foreground color index, high nibble = background color index.
-pub fn blit_cells(gpu: &mut BochsGpu, screen: &[Cell], sw: usize, sh: usize) {
+///
+/// Generic over `GpuDevice` so the same pixel path serves both the Bochs
+/// VBE backend (QEMU) and the UEFI GOP backend (real hardware); the
+/// mode's `bgr` flag selects the pixel byte order.
+pub fn blit_cells<G: GpuDevice>(gpu: &mut G, screen: &[Cell], sw: usize, sh: usize) {
     let Some((fb, mode)) = gpu.framebuffer_mut() else {
         return; // no mode set: no-op, by design (see doc comment above)
     };
@@ -105,11 +109,18 @@ pub fn blit_cells(gpu: &mut BochsGpu, screen: &[Cell], sw: usize, sh: usize) {
                     if offset + bpp_bytes > fb.len() {
                         continue;
                     }
-                    // BGRX8888: the standard byte layout for Bochs/QEMU
-                    // VBE 32bpp linear framebuffers.
-                    fb[offset] = color[2]; // B
-                    fb[offset + 1] = color[1]; // G
-                    fb[offset + 2] = color[0]; // R
+                    // Pixel byte order comes from the mode: BGRX8888 for
+                    // Bochs/QEMU VBE and GOP `Bgr`, RGBX8888 for GOP
+                    // `Rgb` (common on real hardware).
+                    if mode.bgr {
+                        fb[offset] = color[2]; // B
+                        fb[offset + 1] = color[1]; // G
+                        fb[offset + 2] = color[0]; // R
+                    } else {
+                        fb[offset] = color[0]; // R
+                        fb[offset + 1] = color[1]; // G
+                        fb[offset + 2] = color[2]; // B
+                    }
                     if bpp_bytes > 3 {
                         fb[offset + 3] = 0xFF; // X / alpha
                     }
@@ -122,7 +133,7 @@ pub fn blit_cells(gpu: &mut BochsGpu, screen: &[Cell], sw: usize, sh: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu::Mode;
+    use crate::gpu::{BochsGpu, Mode};
 
     /// `FONT8X16_BASIC[0]` (char 0, NUL) is all-zero bytes: every pixel of
     /// that glyph is "unset", i.e. it paints as background everywhere.
@@ -162,6 +173,7 @@ mod tests {
             height: 16,
             bpp: 32,
             pitch: 32,
+            bgr: true,
         };
         let mut buf = [0xABu8; 32 * 16];
         let mut gpu = BochsGpu::test_with_mode(&mut buf, Some(mode));
@@ -178,6 +190,7 @@ mod tests {
             height: GLYPH_H as u32,
             bpp: 32,
             pitch: GLYPH_W * 4,
+            bgr: true,
         };
         let mut buf = vec![0u8; mode.pitch * GLYPH_H];
         let mut gpu = BochsGpu::test_with_mode(&mut buf, Some(mode));
@@ -210,6 +223,7 @@ mod tests {
             height: (GLYPH_H * 2) as u32,
             bpp: 32,
             pitch: GLYPH_W * 2 * 4,
+            bgr: true,
         };
         let mut buf = vec![0xABu8; mode.pitch * (GLYPH_H * 2)];
         let mut gpu = BochsGpu::test_with_mode(&mut buf, Some(mode));
@@ -238,6 +252,7 @@ mod tests {
             height: 4,
             bpp: 32,
             pitch: 4 * 4,
+            bgr: true,
         };
         let mut buf = vec![0u8; mode.pitch * 4];
         let mut gpu = BochsGpu::test_with_mode(&mut buf, Some(mode));
@@ -260,11 +275,40 @@ mod tests {
             height: (SH * GLYPH_H) as u32,
             bpp: 32,
             pitch: SW * GLYPH_W * 4,
+            bgr: true,
         };
         let mut buf = vec![0u8; mode.pitch * SH * GLYPH_H];
         let mut gpu = BochsGpu::test_with_mode(&mut buf, Some(mode));
         let screen = vec![0x0F41u16; SW * SH]; // white-on-black 'A' everywhere
         blit_cells(&mut gpu, &screen, SW, SH);
         assert_eq!(px(&buf, mode.pitch, 0, 0)[3], 0xFF);
+    }
+
+    #[test]
+    fn rgb_mode_writes_rgbx_byte_order() {
+        // GOP PixelFormat::Rgb framebuffers are RGBX8888: the red channel
+        // byte comes first, unlike BGRX (Bochs). Same glyph, same palette
+        // entry — only the byte order differs.
+        fn rgbr(rgb: [u8; 3]) -> [u8; 4] {
+            [rgb[0], rgb[1], rgb[2], 0xFF]
+        }
+
+        let mode = Mode {
+            width: GLYPH_W as u32,
+            height: GLYPH_H as u32,
+            bpp: 32,
+            pitch: GLYPH_W * 4,
+            bgr: false, // GOP Rgb
+        };
+        let mut buf = vec![0u8; mode.pitch * GLYPH_H];
+        let mut gop = crate::gpu::GopGpu::test_with_buffer(&mut buf, mode);
+
+        let attr: u16 = (2 << 4) | 1; // fg = blue (1), bg = green (2)
+        let cell_a = (attr << 8) | CHAR_A;
+        blit_cells(&mut gop, &[cell_a], 1, 1);
+
+        assert_eq!(px(&buf, mode.pitch, 3, 2), rgbr(PALETTE[1])); // fg: blue, R-first
+        assert_eq!(px(&buf, mode.pitch, 0, 2), rgbr(PALETTE[2])); // bg: green
+        assert_eq!(px(&buf, mode.pitch, 7, 15), rgbr(PALETTE[2])); // bg: green
     }
 }

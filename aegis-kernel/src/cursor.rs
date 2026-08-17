@@ -111,6 +111,7 @@ mod tests {
             height: 16,
             bpp: 32,
             pitch: 16 * 4,
+            bgr: true,
         };
         let mut buf = vec![0xABu8; 16 * 16 * 4];
         draw_cursor(&mut buf, &mode, 0, 0);
@@ -130,6 +131,7 @@ mod tests {
             height: 16,
             bpp: 32,
             pitch: 16 * 4,
+            bgr: true,
         };
         let mut buf = vec![0xABu8; 16 * 16 * 4];
         draw_cursor(&mut buf, &mode, -5, -5); // must not panic
@@ -154,6 +156,7 @@ mod tests {
             height: 600,
             bpp: 32,
             pitch: 800 * 4,
+            bgr: true,
         };
         let mut buf = vec![0xABu8; 800 * 600 * 4];
         draw_cursor(&mut buf, &mode, 795, 595); // must not panic
@@ -173,6 +176,7 @@ mod tests {
             height: 16,
             bpp: 32,
             pitch: 16 * 4,
+            bgr: true,
         };
         let mut buf = vec![0xABu8; 16 * 16 * 4];
         draw_cursor(&mut buf, &mode, -100, -100); // must not panic

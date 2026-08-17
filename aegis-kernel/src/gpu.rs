@@ -94,10 +94,16 @@ pub struct Mode {
     pub width: u32,
     pub height: u32,
     pub bpp: u16,
-    /// Bytes per scanline row (`width * bpp/8`). This driver never asks
-    /// for a virtual width wider than the visible width, so there is no
-    /// extra row padding to account for.
+    /// Bytes per scanline row. For the Bochs driver this is
+    /// `width * bpp/8` (no virtual width padding); for the UEFI GOP
+    /// driver it is `stride_px * bpp/8`, which may be wider than the
+    /// visible width (GOP scan-line padding).
     pub pitch: usize,
+    /// Byte order of each pixel: `true` = BGRX8888 (blue first — the
+    /// Bochs/QEMU VBE convention, and GOP `PixelFormat::Bgr`); `false` =
+    /// RGBX8888 (red first — GOP `PixelFormat::Rgb`, common on real
+    /// hardware). `gpu_compositor` branches on this when writing pixels.
+    pub bgr: bool,
 }
 
 /// Compute the `Mode` for `width`x`height`@`bpp`, or `None` if it does not
@@ -120,6 +126,7 @@ pub fn mode_geometry(width: u32, height: u32, bpp: u16, lfb_len: usize) -> Optio
         height,
         bpp,
         pitch,
+        bgr: true, // Bochs/QEMU VBE convention: BGRX8888
     })
 }
 
@@ -329,6 +336,151 @@ impl BochsGpu {
     }
 }
 
+/// The narrow seam `gpu_compositor::blit_cells` renders through: a pixel
+/// framebuffer plus the `Mode` that describes its geometry and byte order.
+/// Implemented by `BochsGpu` (QEMU/OVMF's VBE display) and `GopGpu` (the
+/// UEFI Graphics Output Protocol framebuffer — the only display real
+/// hardware offers), so the compositor never knows which backend it is
+/// drawing into.
+pub trait GpuDevice {
+    /// The currently-installed mode, if any.
+    fn mode(&self) -> Option<Mode>;
+    /// Raw pixel access for `gpu_compositor::blit_cells`. `None` if no
+    /// mode is installed — `blit_cells` treats that as a no-op, by design,
+    /// so the VGA text backend never depends on this driver.
+    fn framebuffer_mut(&mut self) -> Option<(&mut [u8], Mode)>;
+}
+
+impl GpuDevice for BochsGpu {
+    fn mode(&self) -> Option<Mode> {
+        self.mode()
+    }
+
+    fn framebuffer_mut(&mut self) -> Option<(&mut [u8], Mode)> {
+        self.framebuffer_mut()
+    }
+}
+
+/// The UEFI Graphics Output Protocol display backend (Phase T): consumes
+/// the GOP framebuffer + mode the bootloader queried before
+/// `ExitBootServices` and handed over in the boot-info page (`GopHandoff`).
+/// Real hardware has no Bochs VBE dispi interface, so this is the display
+/// path for physical machines; on QEMU/OVMF it is also present (OVMF
+/// provides GOP over the Bochs device), which is how it gets exercised
+/// without hardware.
+///
+/// It never programs the display itself: the firmware already set the GOP
+/// mode before handing over, so the driver only validates the handoff and
+/// exposes the framebuffer through the `GpuDevice` seam. Honest limits:
+/// the loader's identity map covers the first 4 GiB only, so a
+/// framebuffer above 4 GiB is rejected (`GopHandoff` parsing refuses it)
+/// and the machine falls back to the text backend; extending the map is
+/// future work.
+pub struct GopGpu {
+    lfb: *mut u8,
+    mode: Option<Mode>,
+}
+
+impl GopGpu {
+    /// Validate a GOP handoff block and build the backend over it. Pure
+    /// and total: `None` for an absent/invalid handoff (the caller then
+    /// falls back to the Bochs-VBE probe, or to the text backend alone).
+    pub fn from_handoff(h: crate::boot_info::GopHandoff) -> Option<GopGpu> {
+        if h.present != 1 {
+            return None;
+        }
+        let bgr = match h.pixel_format {
+            1 => true,        // PixelFormat::Bgr: BGRX8888
+            0 => false,       // PixelFormat::Rgb: RGBX8888
+            _ => return None, // Bitmask/BltOnly are not CPU-writable
+        };
+        if h.bpp != 32 {
+            return None;
+        }
+        if h.width == 0 || h.height == 0 || h.stride_px == 0 || h.stride_px < h.width {
+            return None;
+        }
+        // Same < 4 GiB identity-map guard `parse_gop` applies; re-checked
+        // here so the driver is safe even against a handoff that bypassed
+        // the parser.
+        if h.framebuffer_base == 0 || h.framebuffer_base >= 0x1_0000_0000 {
+            return None;
+        }
+        let bytes_per_pixel = (h.bpp / 8) as usize;
+        let pitch = (h.stride_px as usize).checked_mul(bytes_per_pixel)?;
+        let needed = pitch.checked_mul(h.height as usize)?;
+        if needed > h.framebuffer_size as usize {
+            return None;
+        }
+        let mode = Mode {
+            width: h.width,
+            height: h.height,
+            bpp: h.bpp as u16,
+            pitch,
+            bgr,
+        };
+        Some(GopGpu {
+            lfb: h.framebuffer_base as *mut u8,
+            mode: Some(mode),
+        })
+    }
+
+    /// Test-only constructor: build a `GopGpu` directly over a host-owned
+    /// buffer, bypassing the handoff entirely — `from_handoff` points at a
+    /// real hardware address (e.g. 0xE0000000) that must never be touched
+    /// under `cargo test`, so the pixel-slice behavior is exercised over
+    /// a host buffer instead, exactly like `BochsGpu::test_with_mode`.
+    /// `buf` must be at least `mode`'s `pitch * height` bytes.
+    #[cfg(test)]
+    pub fn test_with_buffer(buf: &mut [u8], mode: Mode) -> GopGpu {
+        GopGpu {
+            lfb: buf.as_mut_ptr(),
+            mode: Some(mode),
+        }
+    }
+}
+
+impl GpuDevice for GopGpu {
+    fn mode(&self) -> Option<Mode> {
+        self.mode
+    }
+
+    fn framebuffer_mut(&mut self) -> Option<(&mut [u8], Mode)> {
+        let mode = self.mode?;
+        let len = mode.pitch * mode.height as usize;
+        // Safety: `len` was checked against `framebuffer_size` (the size
+        // GOP reported for the framebuffer region) in `from_handoff`, so
+        // `self.lfb` actually has at least `len` bytes behind it.
+        let fb = unsafe { core::slice::from_raw_parts_mut(self.lfb, len) };
+        Some((fb, mode))
+    }
+}
+
+/// Type-erased display backend, selected at boot: GOP first (works on real
+/// hardware and, being a UEFI standard protocol, on QEMU/OVMF too), Bochs
+/// VBE second (fallback when the loader found no usable GOP). Held by
+/// `desktop::install_gpu` and rendered through the `GpuDevice` seam.
+pub enum GpuBackend {
+    Bochs(BochsGpu),
+    Gop(GopGpu),
+}
+
+impl GpuDevice for GpuBackend {
+    fn mode(&self) -> Option<Mode> {
+        match self {
+            GpuBackend::Bochs(g) => g.mode(),
+            GpuBackend::Gop(g) => g.mode(),
+        }
+    }
+
+    fn framebuffer_mut(&mut self) -> Option<(&mut [u8], Mode)> {
+        match self {
+            GpuBackend::Bochs(g) => g.framebuffer_mut(),
+            GpuBackend::Gop(g) => g.framebuffer_mut(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,11 +539,91 @@ mod tests {
             height: 2,
             bpp: 32,
             pitch: 16,
+            bgr: true,
         };
         let mut buf = [0u8; 32];
         let mut gpu = BochsGpu::test_with_mode(&mut buf, Some(mode));
         let (fb, m) = gpu.framebuffer_mut().unwrap();
         assert_eq!(fb.len(), 32);
+        assert_eq!(m, mode);
+    }
+
+    fn sample_gop() -> crate::boot_info::GopHandoff {
+        crate::boot_info::GopHandoff {
+            present: 1,
+            pixel_format: 1, // Bgr
+            width: 800,
+            height: 600,
+            stride_px: 800,
+            bpp: 32,
+            framebuffer_base: 0xE000_0000,
+            framebuffer_size: 800 * 600 * 4,
+        }
+    }
+
+    #[test]
+    fn gop_from_handoff_accepts_bgr_and_computes_mode() {
+        let g = GopGpu::from_handoff(sample_gop()).expect("valid handoff must build");
+        let mode = g.mode().expect("mode installed");
+        assert_eq!(mode.width, 800);
+        assert_eq!(mode.height, 600);
+        assert_eq!(mode.bpp, 32);
+        assert_eq!(mode.pitch, 800 * 4);
+        assert!(mode.bgr);
+    }
+
+    #[test]
+    fn gop_from_handoff_accepts_rgb_and_flags_byte_order() {
+        let mut h = sample_gop();
+        h.pixel_format = 0; // Rgb
+        let g = GopGpu::from_handoff(h).expect("rgb handoff must build");
+        assert!(!g.mode().unwrap().bgr);
+    }
+
+    #[test]
+    fn gop_from_handoff_rejects_unusable_handoffs() {
+        let mut h = sample_gop();
+        h.present = 0;
+        assert!(GopGpu::from_handoff(h).is_none());
+
+        let mut h = sample_gop();
+        h.pixel_format = 2; // Bitmask
+        assert!(GopGpu::from_handoff(h).is_none());
+
+        let mut h = sample_gop();
+        h.pixel_format = 3; // BltOnly
+        assert!(GopGpu::from_handoff(h).is_none());
+
+        let mut h = sample_gop();
+        h.bpp = 24;
+        assert!(GopGpu::from_handoff(h).is_none());
+
+        let mut h = sample_gop();
+        h.framebuffer_base = 0x1_0000_0000; // above identity map
+        assert!(GopGpu::from_handoff(h).is_none());
+
+        let mut h = sample_gop();
+        h.framebuffer_size = 800 * 600 * 4 - 1;
+        assert!(GopGpu::from_handoff(h).is_none());
+
+        let mut h = sample_gop();
+        h.stride_px = 0;
+        assert!(GopGpu::from_handoff(h).is_none());
+    }
+
+    #[test]
+    fn gop_framebuffer_mut_slice_uses_padded_stride() {
+        let mode = Mode {
+            width: 800,
+            height: 600,
+            bpp: 32,
+            pitch: 832 * 4, // GOP scan-line padding
+            bgr: true,
+        };
+        let mut buf = vec![0u8; mode.pitch * 600];
+        let mut g = GopGpu::test_with_buffer(&mut buf, mode);
+        let (fb, m) = g.framebuffer_mut().expect("framebuffer available");
+        assert_eq!(fb.len(), 832 * 600 * 4);
         assert_eq!(m, mode);
     }
 }

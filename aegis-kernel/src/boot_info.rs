@@ -26,6 +26,12 @@
 //!              `present == 1` the block is valid and the kernel's fleet
 //!              demo is driven by it (role, NodeIds, IPs, stale window,
 //!              shared key) instead of the compile-time feature defaults.
+//!   offset 5199 (= 5144 + 55): optional `GopHandoff` block. If
+//!              `present == 1` the block is valid and the kernel's display
+//!              driver uses the UEFI Graphics Output Protocol framebuffer
+//!              the loader queried before `ExitBootServices` (real
+//!              hardware has no Bochs VBE dispi interface), instead of
+//!              falling back to the Bochs-VBE PCI probe.
 //!
 //! Only the first `entry_count` entries are valid; the loader zero-fills
 //! the page so stale entries read as ty=0 (reserved). The FleetConfig block
@@ -45,6 +51,10 @@ pub const TYPE_CONVENTIONAL: u32 = 7;
 
 /// Byte offset of the optional `FleetConfig` block in the handoff page.
 pub const FLEET_OFFSET: usize = 24 + MapEntry::size() * MAX_ENTRIES;
+
+/// Byte offset of the optional `GopHandoff` block in the handoff page:
+/// directly after the 55-byte fleet block.
+pub const GOP_OFFSET: usize = FLEET_OFFSET + FleetConfig::size();
 
 /// Runtime fleet configuration parsed from `\FLEET.CFG` on the boot volume.
 /// The loader writes this block at `FLEET_OFFSET`; `present == 0` means no
@@ -219,6 +229,99 @@ pub fn fleet_config() -> Option<FleetConfig> {
     unsafe { FLEET_CONFIG }
 }
 
+/// UEFI Graphics Output Protocol handoff: the framebuffer + mode the
+/// loader queried from GOP before `ExitBootServices`, for the kernel's
+/// display driver to consume on machines where the Bochs VBE dispi
+/// interface does not exist (all real hardware).
+///
+/// Mirrored byte-for-byte by `uefi-boot/src/gop.rs` — the loader writes
+/// this block at `GOP_OFFSET`; `present == 0` means the loader found no
+/// usable GOP (or a Blt-only/bitmask framebuffer) and the kernel falls
+/// back to the Bochs-VBE PCI probe.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct GopHandoff {
+    /// 1 = block valid, 0 = absent/unusable.
+    pub present: u32,
+    /// GOP `PixelFormat` flattened: 0 = Rgb (RGBX8888), 1 = Bgr (BGRX8888).
+    /// Anything else (Bitmask, BltOnly) means the framebuffer is not
+    /// directly CPU-writable — the loader refuses to report it.
+    pub pixel_format: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Pixels per scan line (GOP `stride` — often wider than `width`).
+    pub stride_px: u32,
+    /// Bits per pixel of the framebuffer (32 for both Rgb/Bgr formats).
+    pub bpp: u32,
+    pub framebuffer_base: u64,
+    pub framebuffer_size: u64,
+}
+
+impl GopHandoff {
+    pub const fn size() -> usize {
+        size_of::<GopHandoff>()
+    }
+}
+
+/// Parse the optional `GopHandoff` block from a raw handoff page. Pure and
+/// total: returns `None` if absent, truncated, or any field is unusable.
+pub fn parse_gop(raw: &[u8]) -> Option<GopHandoff> {
+    let off = GOP_OFFSET;
+    if raw.len() < off + GopHandoff::size() {
+        return None;
+    }
+    let present = read_u32(raw, off)?;
+    if present != 1 {
+        return None;
+    }
+    let pixel_format = read_u32(raw, off + 4)?;
+    if pixel_format > 1 {
+        // Bitmask/BltOnly framebuffers are not directly CPU-writable.
+        return None;
+    }
+    let width = read_u32(raw, off + 8)?;
+    let height = read_u32(raw, off + 12)?;
+    let stride_px = read_u32(raw, off + 16)?;
+    let bpp = read_u32(raw, off + 20)?;
+    if width == 0 || height == 0 || stride_px == 0 || stride_px < width || bpp != 32 {
+        return None;
+    }
+    let framebuffer_base = read_u64(raw, off + 24)?;
+    let framebuffer_size = read_u64(raw, off + 32)?;
+    // The loader's identity map covers the first 4 GiB only; a framebuffer
+    // above that is not mapped and would fault on first pixel write. The
+    // kernel rejects it here rather than guessing (documented honest limit:
+    // covering >4 GiB framebuffers needs an extended identity map).
+    if framebuffer_base == 0 || framebuffer_base >= 0x1_0000_0000 {
+        return None;
+    }
+    let stride_bytes = (stride_px as u64).checked_mul((bpp / 8) as u64)?;
+    let needed = stride_bytes.checked_mul(height as u64)?;
+    if needed > framebuffer_size {
+        return None;
+    }
+    Some(GopHandoff {
+        present,
+        pixel_format,
+        width,
+        height,
+        stride_px,
+        bpp,
+        framebuffer_base,
+        framebuffer_size,
+    })
+}
+
+/// Read the optional `GopHandoff` block from a live handoff page.
+///
+/// # Safety
+/// Must be called after the bootloader has written the handoff, before
+/// anything repurposes the page.
+pub unsafe fn gop_at(addr: u64) -> Option<GopHandoff> {
+    let raw = core::slice::from_raw_parts(addr as *const u8, (HANDOFF_PAGES * 4096) as usize);
+    parse_gop(raw)
+}
+
 fn read_u32(raw: &[u8], off: usize) -> Option<u32> {
     if raw.len() < off + 4 {
         return None;
@@ -286,6 +389,33 @@ fn fleet_to_bytes(f: &FleetConfig) -> [u8; FleetConfig::size()] {
     b[15..23].copy_from_slice(&f.stale_after.to_le_bytes());
     b[23..].copy_from_slice(&f.shared_key);
     b
+}
+
+fn gop_to_bytes(g: &GopHandoff) -> [u8; GopHandoff::size()] {
+    let mut b = [0u8; GopHandoff::size()];
+    b[0..4].copy_from_slice(&g.present.to_le_bytes());
+    b[4..8].copy_from_slice(&g.pixel_format.to_le_bytes());
+    b[8..12].copy_from_slice(&g.width.to_le_bytes());
+    b[12..16].copy_from_slice(&g.height.to_le_bytes());
+    b[16..20].copy_from_slice(&g.stride_px.to_le_bytes());
+    b[20..24].copy_from_slice(&g.bpp.to_le_bytes());
+    b[24..32].copy_from_slice(&g.framebuffer_base.to_le_bytes());
+    b[32..40].copy_from_slice(&g.framebuffer_size.to_le_bytes());
+    b
+}
+
+/// Build a handoff page image that additionally carries a `GopHandoff`
+/// block (used by tests; the bootloader writes its own at runtime).
+pub fn build_image_with_gop(
+    entries: &[MapEntry],
+    image_end: u64,
+    gop: &GopHandoff,
+) -> [u8; (HANDOFF_PAGES * 4096) as usize] {
+    let img = build_image(entries, image_end);
+    let mut out = [0u8; (HANDOFF_PAGES * 4096) as usize];
+    out[..img.len()].copy_from_slice(&img);
+    out[GOP_OFFSET..GOP_OFFSET + GopHandoff::size()].copy_from_slice(&gop_to_bytes(gop));
+    out
 }
 
 #[cfg(test)]
@@ -477,5 +607,122 @@ mod tests {
         let img = build_image_with_fleet(&sample_entries(), 0x5_2000, &fleet);
         let parsed = unsafe { fleet_at(&img[0] as *const u8 as u64) }.expect("fleet must locate");
         assert_eq!(parsed, fleet);
+    }
+
+    fn sample_gop() -> GopHandoff {
+        GopHandoff {
+            present: 1,
+            pixel_format: 1, // Bgr (BGRX8888)
+            width: 800,
+            height: 600,
+            stride_px: 800,
+            bpp: 32,
+            framebuffer_base: 0xE000_0000,
+            framebuffer_size: 800 * 600 * 4,
+        }
+    }
+
+    #[test]
+    fn gop_block_roundtrips() {
+        let gop = sample_gop();
+        let img = build_image_with_gop(&sample_entries(), 0x5_2000, &gop);
+        let parsed = parse_gop(&img).expect("gop block must parse");
+        assert_eq!(parsed, gop);
+    }
+
+    #[test]
+    fn gop_block_absent_when_present_zero() {
+        let entries = sample_entries();
+        let img = build_image(&entries, 0x5_2000).to_vec();
+        assert_eq!(parse_gop(&img), None);
+    }
+
+    #[test]
+    fn gop_block_rejects_non_writable_pixel_formats() {
+        for fmt in [2u32, 3u32, 4u32] {
+            let mut gop = sample_gop();
+            gop.pixel_format = fmt;
+            let img = build_image_with_gop(&sample_entries(), 0x5_2000, &gop);
+            assert_eq!(
+                parse_gop(&img),
+                None,
+                "pixel_format={} must be rejected",
+                fmt
+            );
+        }
+    }
+
+    #[test]
+    fn gop_block_accepts_rgb_format() {
+        let mut gop = sample_gop();
+        gop.pixel_format = 0; // Rgb (RGBX8888)
+        let img = build_image_with_gop(&sample_entries(), 0x5_2000, &gop);
+        let parsed = parse_gop(&img).expect("rgb gop block must parse");
+        // `GopHandoff` is packed; copy the field out before asserting.
+        let fmt = parsed.pixel_format;
+        assert_eq!(fmt, 0);
+    }
+
+    #[test]
+    fn gop_block_rejects_framebuffer_above_4gb() {
+        let mut gop = sample_gop();
+        gop.framebuffer_base = 0x1_0000_0000;
+        let img = build_image_with_gop(&sample_entries(), 0x5_2000, &gop);
+        assert_eq!(parse_gop(&img), None);
+    }
+
+    #[test]
+    fn gop_block_rejects_undersized_framebuffer() {
+        let mut gop = sample_gop();
+        gop.framebuffer_size = 800 * 600 * 4 - 1;
+        let img = build_image_with_gop(&sample_entries(), 0x5_2000, &gop);
+        assert_eq!(parse_gop(&img), None);
+    }
+
+    #[test]
+    fn gop_block_rejects_zero_or_shrunken_stride() {
+        let mut gop = sample_gop();
+        gop.stride_px = 0;
+        let img = build_image_with_gop(&sample_entries(), 0x5_2000, &gop);
+        assert_eq!(parse_gop(&img), None);
+
+        let mut gop = sample_gop();
+        gop.stride_px = gop.width - 1; // stride narrower than width: impossible
+        let img = build_image_with_gop(&sample_entries(), 0x5_2000, &gop);
+        assert_eq!(parse_gop(&img), None);
+    }
+
+    #[test]
+    fn gop_block_rejects_non_32bpp() {
+        let mut gop = sample_gop();
+        gop.bpp = 24;
+        let img = build_image_with_gop(&sample_entries(), 0x5_2000, &gop);
+        assert_eq!(parse_gop(&img), None);
+    }
+
+    #[test]
+    fn gop_block_accepts_padded_stride() {
+        let mut gop = sample_gop();
+        gop.stride_px = 832; // common GOP stride padding
+        gop.framebuffer_size = 832 * 600 * 4;
+        let img = build_image_with_gop(&sample_entries(), 0x5_2000, &gop);
+        let parsed = parse_gop(&img).expect("padded-stride gop block must parse");
+        // `GopHandoff` is packed; copy the field out before asserting.
+        let stride = parsed.stride_px;
+        assert_eq!(stride, 832);
+    }
+
+    #[test]
+    fn gop_block_fits_within_handoff_pages() {
+        let total = GOP_OFFSET + GopHandoff::size();
+        assert!(total as u64 <= HANDOFF_PAGES * 4096);
+    }
+
+    #[test]
+    fn gop_at_reads_from_live_page() {
+        let gop = sample_gop();
+        let img = build_image_with_gop(&sample_entries(), 0x5_2000, &gop);
+        let parsed = unsafe { gop_at(&img[0] as *const u8 as u64) }.expect("gop must locate");
+        assert_eq!(parsed, gop);
     }
 }

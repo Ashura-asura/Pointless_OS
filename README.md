@@ -35,8 +35,8 @@ engineering experimentation.
 An active research prototype. **All 12 phases of the design-doc roadmap are
 implemented and closed**, with the core architectural claim — a role-granted,
 zero-capability AI agent that provably cannot self-escalate, running one real
-task — verified live under QEMU. The **full live test suite is 718 tests**:
-**568 in `aegis-kernel`** (contract tests over the real kernel,
+task — verified live under QEMU. The **full live test suite is 745 tests**:
+**595 in `aegis-kernel`** (contract tests over the real kernel,
 `cargo test --features chaos-demo`), **128 in the `aegis` model crates**, and
 **22 in `uefi-boot`** (loader + ELF parsing), fmt/clippy-clean.
 
@@ -72,6 +72,18 @@ serial logs + framebuffer captures):
   to focus + raise, focused segment highlighted) — two-boot demos prove
   edited and created files and directories survive a power cycle, and the
   desktop roadmap (phases H…S) is fully landed.
+- **GOP-first display backend (real-hardware portability milestone 2)**:
+  the UEFI loader queries the **Graphics Output Protocol** before
+  ExitBootServices and hands the framebuffer + mode to the kernel in a
+  boot-info block; the kernel's `GpuDevice` seam drives the **GOP
+  framebuffer** (any resolution, BGRX/RGBX byte order, stride-aware) with the
+  Bochs-VBE probe as fallback — the only display path a physical machine
+  offers. Live-verified under QEMU/OVMF: the loader sets 800x600 via real
+  firmware mode-setting, the handoff round-trips, and the desktop renders
+  through the GOP path (taskbar demo 4/4, screendump pixel-matched).
+  Honest limit: the GOP framebuffer must sit below 4 GiB (the loader's
+  identity map covers 0..4 GiB); framebuffers above that are rejected and
+  the kernel falls back.
 - **Fleet / distributed**: a two-node link over real e1000e/socket-netdev
   frames — capability envelopes, consensus re-election, split-brain resolution,
   and remote invocation of a transferred capability.
@@ -105,7 +117,7 @@ Limits section, split into *closed / reduced / inherent*):
 ## Repository layout
 - `aegis-kernel/` — the real kernel: boot, drivers, netstack, TLS, store,
   scheduler, supervision, desktop/compositor/editor, compat layers
-  (`cargo test --features chaos-demo` = 568 tests)
+  (`cargo test --features chaos-demo` = 595 tests)
 - `aegis/` — model crates mirroring the kernel (capability-core, store,
   net, fleet, etc.; 128 tests)
 - `uefi-boot/` — UEFI loader + image build + QEMU demo scripts (22 tests)

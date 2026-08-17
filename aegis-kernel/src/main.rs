@@ -48,6 +48,10 @@ pub extern "sysv64" fn _start(handoff_addr: u64) -> ! {
 
 extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     aegis_kernel::serial::SerialWriter::init();
+    // Blank the VGA text buffer only: entering text mode (which disables
+    // the firmware's Bochs-VBE/GOP display mode) is deferred until after
+    // the display backend is chosen below — a pixel backend must not kill
+    // the GOP framebuffer the firmware set up.
     aegis_kernel::vga::vga_init();
     sprintln!("=== Aegis Phase 2: Bare-Metal Kernel ===");
     sprintln!("Aegis: kernel started (loader handed off at entry)");
@@ -216,32 +220,76 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         sprintln!("Aegis: PCI: NVMe controller present");
     }
 
-    // Phase H (roadmap §5): minimal GPU framebuffer driver. Probe the
-    // display device (Bochs VBE "dispi"), set an 800x600x32 linear mode,
-    // and install it as the desktop's second output backend so every
-    // boot_blit/handle_key re-blit fans the composited screen out to real
-    // pixels in addition to the VGA text cells. Strictly additive: if no
-    // Bochs-VBE display is present (or it rejects the mode), the desktop
-    // falls back to the text backend alone — the pixel output is a
-    // superset of the old proof, never a requirement for it.
+    // Phase H/T (roadmap §5): display backend selection. GOP first: the
+    // bootloader queried the UEFI Graphics Output Protocol before
+    // ExitBootServices and handed the framebuffer + mode over in the
+    // boot-info page — the only display path real hardware offers (no
+    // Bochs VBE dispi ports exist on physical machines), and present on
+    // QEMU/OVMF too. Fall back to the Bochs VBE dispi probe when the
+    // loader found no usable GOP. Strictly additive: if neither backend
+    // is available (or the mode is rejected), the desktop falls back to
+    // the text backend alone — the pixel output is a superset of the old
+    // proof, never a requirement for it.
     {
         use aegis_kernel::desktop::install_gpu;
-        match aegis_kernel::gpu::BochsGpu::probe(&pci) {
-            Some(mut g) => {
-                let ok = g.set_mode(800, 600);
-                sprintln!("Aegis: GPU: set_mode(800x600x32) = {}", ok);
-                if ok {
-                    unsafe {
-                        install_gpu(g);
+        use aegis_kernel::gpu::{BochsGpu, GopGpu, GpuBackend, GpuDevice};
+        let mut backend: Option<GpuBackend> = None;
+
+        // GOP path: consumes the handed-over framebuffer as-is — the
+        // firmware already set the mode, so there is nothing to program.
+        if let Some(h) = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) } {
+            if let Some(g) = GopGpu::from_handoff(h) {
+                if let Some(m) = g.mode() {
+                    // `GopHandoff` is packed; copy the base out first.
+                    let base = h.framebuffer_base;
+                    sprintln!(
+                        "Aegis: GPU: GOP framebuffer {}x{}@{}bpp (pitch {}, {} byte order) at {:#x}",
+                        m.width,
+                        m.height,
+                        m.bpp,
+                        m.pitch,
+                        if m.bgr { "BGRX" } else { "RGBX" },
+                        base
+                    );
+                    backend = Some(GpuBackend::Gop(g));
+                }
+            } else {
+                sprintln!(
+                    "Aegis: GPU: GOP handoff present but unusable - falling back to Bochs probe"
+                );
+            }
+        } else {
+            sprintln!("Aegis: GPU: no GOP handoff - falling back to Bochs VBE probe");
+        }
+
+        // Bochs path (fallback): QEMU's std/stdvga/bochs-display devices.
+        if backend.is_none() {
+            match BochsGpu::probe(&pci) {
+                Some(mut g) => {
+                    let ok = g.set_mode(800, 600);
+                    sprintln!("Aegis: GPU: set_mode(800x600x32) = {}", ok);
+                    if ok {
+                        backend = Some(GpuBackend::Bochs(g));
+                    } else {
+                        sprintln!("Aegis: GPU: mode rejected - text backend only");
                     }
-                    sprintln!("Aegis: GPU: framebuffer backend installed (desktop -> pixels too)");
-                } else {
-                    sprintln!("Aegis: GPU: mode rejected - text backend only");
+                }
+                None => {
+                    sprintln!("Aegis: GPU: no Bochs-VBE display device - text backend only");
                 }
             }
-            None => {
-                sprintln!("Aegis: GPU: no Bochs-VBE display device - text backend only");
+        }
+
+        if let Some(b) = backend {
+            unsafe {
+                install_gpu(b);
             }
+            sprintln!("Aegis: GPU: framebuffer backend installed (desktop -> pixels too)");
+        } else {
+            // No pixel backend: enter the legacy VGA text console (this
+            // re-enables VGA and disables the Bochs-VBE/GOP mode, so it
+            // must never run when the firmware's framebuffer is in use).
+            aegis_kernel::vga::vga_enter_text_mode();
         }
     }
 
