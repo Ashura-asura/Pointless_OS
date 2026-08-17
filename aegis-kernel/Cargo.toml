@@ -6,6 +6,13 @@ rust-version = "1.82"
 
 [features]
 kernel = []
+# Real-hardware milestone 1 (serial canary): the canary build compiles the
+# storage write path OUT entirely — no NVMe probe, no FAT ESP read, no
+# object store, no editor/browser seeding, no system-update. What is left
+# proves boot on physical silicon with zero disk writes: UEFI loader -> GOP
+# display -> scheduler -> desktop. The network demo is NOT gated: it is
+# write-free and self-skips when no e1000e is present.
+canary = []
 # Phase 4 conformance: emit a replayable capability trace (C:lines) to COM1 at
 # the syscall dispatch choke point. Off by default; the shipped image carries
 # no trace state and no extra output.

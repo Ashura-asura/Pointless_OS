@@ -25,3 +25,7 @@ vgamem.bin
 BOOT_RESULT.txt
 PROGRESS*.txt
 FLEET.CFG
+
+# Canary build isolation dirs (build-canary.ps1)
+target-canary/
+target-normal/

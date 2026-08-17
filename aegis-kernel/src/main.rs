@@ -6,6 +6,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Write the first four bytes of `id` into `out` as xx:xx (for demo printout).
+#[cfg(not(feature = "canary"))]
 fn hex_bytes(id: &[u8; 32], out: &mut [u8; 4]) {
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = id[i];
@@ -742,6 +743,17 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
 
     // Live NVMe demo: probe BAR0, reset, admin + IO queues, identify, read
     // LBA 0/1 and check the GPT signature (disk image is GPT-partitioned).
+    // CANARY build (feature = "canary", real-hardware milestone 1): this
+    // whole block — NVMe probe, FAT ESP mount, object store, editor/browser
+    // seeding, system-update — is compiled OUT, so the canary provably makes
+    // zero disk writes on physical hardware. The canary still renders the
+    // desktop through the GOP framebuffer and runs the scheduler.
+    #[cfg(feature = "canary")]
+    {
+        sprintln!(
+            "Aegis: CANARY: storage path compiled out (feature=canary) — no NVMe probe, no FAT, no store, no disk writes"
+        );
+    }
     {
         let (total, free) = unsafe { aegis_kernel::frame::stats_global() };
         let rsp: u64;
@@ -753,6 +765,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             rsp
         );
     }
+    #[cfg(not(feature = "canary"))]
     if let Some(mut ctrl) = aegis_kernel::nvme::NvmeController::probe(&pci) {
         sprintln!(
             "Aegis: NVMe: BAR {:x} CAP=0x{:08X} VS=0x{:08X}",
