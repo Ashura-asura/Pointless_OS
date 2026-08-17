@@ -14,6 +14,16 @@ the docs' claims. Two numbers, honestly separated:
   a graphical shell — those are all later-phase and premature before the core
   claim is validated", §11.G) plus genuinely absent engineering (real IOMMU
   hardware registers, real GPU, hypervisor vehicles).
+- **DECISION — kernel lineage (recorded)**: we evaluated adopting seL4 /
+  verified-lineage kernels and chose a from-scratch capability microkernel
+  (seL4-lineage design, custom Rust implementation — ARCHITECTURE.md §A):
+  seL4's formal-proof timeline is multi-year, its IPC-first architecture
+  fights the compat layer, and the isolation model we need is deliverable in
+  Rust at this scale. "Verified" therefore means finite-instance TLA+
+  model-checking (`AegisCapabilities.tla` 331k states, `AegisCeiling.tla`
+  5.64M states, negative controls proving non-vacuous), **not** an inductive
+  seL4-class proof — that ceiling is tracked in the Phase 1 row and in
+  SECURITY_AUDIT.md.
 - **Core architectural claim (§11.F prototype / Phase 6): ~85–90%** — the
   "smallest prototype that proves the architecture" (role-granted,
   zero-capability AI agent that provably cannot self-escalate, running one

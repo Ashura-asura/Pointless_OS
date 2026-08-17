@@ -133,6 +133,8 @@ We seriously considered five distinct OS architectures. Here's why we rejected f
 
 **Verdict**: This is our **kernel architecture** (seL4-lineage design), but not sufficient alone.
 
+**DECISION (recorded)**: We evaluated adopting seL4 or a verified-lineage kernel and decided **against** it — (1) the formal-proof path is multi-year for a fraction of the surface, (2) its IPC-first design fights the compat layer we must ship (every filesystem read = one IPC hop minimum), and (3) the isolation model we actually need (capability gates, no ambient authority, scoped roles) is deliverable in a from-scratch Rust microkernel of this size with contract tests + TLA+ model-checking. Consequence tracked honestly in HONEST_STATUS.md: "verified" = finite-instance TLA+ model-checking (`AegisCapabilities.tla`, `AegisCeiling.tla`), **not** an inductive seL4-class proof.
+
 ---
 
 ### B. Exokernel / Library-OS Substrate
