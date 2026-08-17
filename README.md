@@ -65,10 +65,13 @@ serial logs + framebuffer captures):
 - **Interactive desktop**: a live compositor desktop rendered to real 800x600
   pixels through a Bochs VBE framebuffer backend, PS/2 keyboard (Tab focus,
   arrow-move), a **PS/2 mouse driver** with a trail-free cursor, window chrome
-  (drag/resize/close), a **text editor over the NVMe-backed store**, and a
+  (drag/resize/close), a **text editor over the NVMe-backed store**, a
   **hierarchical file browser** (nested dirs, `.`/`..`, mouse-click
-  create-dir/file via its action bar) — a two-boot demo proves edited and
-  created files and directories survive a power cycle.
+  create-dir/file via its action bar), a **shell window** (`ls`/`open`/`cat`/
+  `new`/`clear`/`help`), and a **taskbar** (one segment per app window, click
+  to focus + raise, focused segment highlighted) — two-boot demos prove
+  edited and created files and directories survive a power cycle, and the
+  desktop roadmap (phases H…S) is fully landed.
 - **Fleet / distributed**: a two-node link over real e1000e/socket-netdev
   frames — capability envelopes, consensus re-election, split-brain resolution,
   and remote invocation of a transferred capability.
@@ -148,8 +151,9 @@ the demo scripts' headers.
 1. Real-hardware certification (the single largest remaining gap).
 2. Real DMAR IOMMU programming and interrupt-driven (MSI-X) NIC paths.
 3. Hypervisor-based compat vehicles (VMX bring-up primitive exists).
-4. Phase S onward: more desktop apps on the live desktop (app launcher /
-   taskbar is the last unimplemented desktop phase).
+4. More desktop apps on the live desktop: multi-instance spawning (taskbar
+   "launch" currently raises the one boot-time instance of each app) and a
+   manifest-driven app model (the desktop roadmap itself is complete).
 
 ## License
 Refer to the repository LICENSE file for licensing terms.

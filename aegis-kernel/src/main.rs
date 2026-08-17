@@ -2221,6 +2221,12 @@ extern "sysv64" fn task_input() -> ! {
                                 name_len
                             );
                         }
+                        aegis_kernel::desktop::MouseOutcome::TaskbarFocused { window_id } => {
+                            sprintln!(
+                                "Aegis: taskbar@click -> window id={} focused and raised",
+                                window_id
+                            );
+                        }
                     }
                 }
             }

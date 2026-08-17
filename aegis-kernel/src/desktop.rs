@@ -66,6 +66,20 @@
 //! punctuation, so a file name can never be typed directly — `ls` + a
 //! numbered `open`/`cat` is the keyboard-only equivalent of the browser's
 //! click-to-open gesture.
+//!
+//! Phase S turns the status-bar window (id 2, row `SH-1`) into a real
+//! taskbar (`render_taskbar`): three fixed-width segments, `[Shell]`
+//! `[Editor]` `[Browser]`, one per app window, the currently-focused one
+//! drawn in reverse video. A left click on a segment (`apply_mouse`'s new
+//! `STATUS_WINDOW_ID` branch) focuses and raises that window and reports
+//! `MouseOutcome::TaskbarFocused` — the mouse-only way to switch between
+//! the shell, editor, and browser without Tab, closing the DoD's "launch
+//! the text editor, launch the file browser, click between them to bring
+//! each to front" loop. Honest scope: every app window here is a
+//! boot-time singleton (there is no window-instantiation path in this
+//! codebase), so a taskbar click "launches" an app by raising its one
+//! already-existing window rather than spawning a new instance — see the
+//! note on `TASKBAR_LABELS` for what would be needed to go further.
 
 use crate::browser::FileBrowser;
 use crate::compositor::{self, Cell, MAX_WINDOWS};
@@ -103,6 +117,31 @@ pub const BROWSER_X: i16 = 44;
 pub const BROWSER_Y: i16 = 13;
 pub const BROWSER_W: u16 = 34;
 pub const BROWSER_H: u16 = 10;
+
+/// Taskbar layout (Phase S): the status-bar window (id 2, row `SH-1`) is
+/// repurposed as a real taskbar — three fixed-width click segments, one
+/// per always-present app window, in creation order. `TASKBAR_SEG_W = 12`
+/// is wide enough for the longest label (`[Browser]`, 9 cells) with a
+/// 3-cell gap so segments never visually run together.
+///
+/// Honest scope: every app window in this desktop (shell, editor, browser)
+/// is a boot-time singleton — there is no per-app window-instantiation
+/// path in this codebase, so a taskbar click "launches" an app by
+/// focusing + raising its one already-existing window, not by spawning a
+/// new instance. That matches the roadmap's DoD ("launch the text editor,
+/// launch the file browser, click between them to bring each to front")
+/// for a single window per app; true multi-instance spawning (e.g. two
+/// editor windows open on two different files at once) would need a
+/// window-instantiation refactor this phase does not attempt — flagged
+/// here rather than silently implied.
+const TASKBAR_SEG_W: i16 = 12;
+const TASKBAR_LABELS: [&[u8]; 3] = [b"[Shell]", b"[Editor]", b"[Browser]"];
+
+/// The id `create_window` was called with for the status/taskbar window
+/// in `Desktop::new()`. A named const instead of the bare literal `2` at
+/// each call site, matching how `shell_id`/`editor_id`/`browser_id` are
+/// named even though their values are also fixed at construction.
+const STATUS_WINDOW_ID: u32 = 2;
 
 /// The shell prompt rendered at the start of the shell line.
 const PROMPT: &[u8] = b"aegis:~$ ";
@@ -267,6 +306,12 @@ pub enum MouseOutcome {
     /// A click on the browser's "new dir" affordance created a `dirN`
     /// directory. `name_len` is 0 when no durable store is present.
     CreatedDir { browser_id: u32, name_len: usize },
+    /// Phase S: a click on a taskbar entry brought `window_id` to front
+    /// (focused + raised it), the mouse-only way to switch between the
+    /// shell, editor, and browser windows without Tab. A no-op click on
+    /// the entry for the window already in front still reports this —
+    /// it's already at front, so there's nothing further to do.
+    TaskbarFocused { window_id: u32 },
 }
 
 /// Minimum window size a corner drag can shrink an app window to.
@@ -420,6 +465,10 @@ impl Desktop {
         for c in fb_status.iter_mut() {
             *c = 0x0F00 | b'-' as u16;
         }
+        // Placeholder dashes above; `render_taskbar()` (called from the
+        // first `composite()` at the end of this constructor, Phase S)
+        // overwrites this with the real taskbar segments before it's ever
+        // shown, so this init only matters if construction panics first.
 
         let mut d = Desktop {
             wm,
@@ -867,10 +916,66 @@ impl Desktop {
         }
     }
 
+    /// Render the taskbar (Phase S; the status-bar window's framebuffer,
+    /// `fb_status`, repurposed): one highlighted segment per app window,
+    /// the currently-focused one drawn as a solid button (reverse-video
+    /// attribute `0x4F00`, the same attribute the close button already
+    /// uses) so the taskbar always shows which window is in front, not
+    /// just which is clickable. Re-run at the top of every `composite()`
+    /// call so it can never drift out of sync with `self.focus`.
+    fn render_taskbar(&mut self) {
+        for c in self.fb_status.iter_mut() {
+            *c = 0x0F00 | b'-' as u16;
+        }
+        let focus_idx = match self.focus {
+            AppFocus::Shell => 0,
+            AppFocus::Editor => 1,
+            AppFocus::Browser => 2,
+        };
+        for (seg, label) in TASKBAR_LABELS.iter().enumerate() {
+            let base = seg as i16 * TASKBAR_SEG_W;
+            if base as usize >= SW {
+                break;
+            }
+            let attr: u16 = if seg == focus_idx { 0x4F00 } else { 0x1F00 };
+            for i in 0..TASKBAR_SEG_W {
+                let idx = base + i;
+                if (idx as usize) < SW {
+                    self.fb_status[idx as usize] = attr | b' ' as u16;
+                }
+            }
+            for (i, &b) in label.iter().enumerate() {
+                let idx = base + i as i16;
+                if (idx as usize) < SW {
+                    self.fb_status[idx as usize] = attr | b as u16;
+                }
+            }
+        }
+    }
+
+    /// Which taskbar segment (0=shell, 1=editor, 2=browser) column `cx`
+    /// falls in, or `None` past the last labeled segment (the taskbar
+    /// doesn't fill the whole row's width). Shared by the click handler in
+    /// `apply_mouse` and any test wanting to assert click regions, so the
+    /// hit-test and the render in `render_taskbar` can never disagree
+    /// about where a segment's boundary is.
+    fn taskbar_segment_at(&self, cx: i16) -> Option<usize> {
+        if cx < 0 {
+            return None;
+        }
+        let seg = (cx / TASKBAR_SEG_W) as usize;
+        if seg < TASKBAR_LABELS.len() {
+            Some(seg)
+        } else {
+            None
+        }
+    }
+
     /// Re-composite the window manager + framebuffers into `screen`, then
     /// paint the desktop background over any cell the compositor left
     /// transparent (so the whole screen is the blue desktop, not a void).
     fn composite(&mut self) {
+        self.render_taskbar();
         let mut fbs: [Option<&[Cell]>; MAX_WINDOWS] = [None; MAX_WINDOWS];
         fbs[0] = Some(&self.fb_title);
         fbs[1] = Some(&self.fb_status);
@@ -1405,7 +1510,26 @@ impl Desktop {
             }
         } else if me.left_button {
             if let Some(id) = self.wm.hit_test(cx, cy) {
-                if self.is_app_window(id) {
+                if id == STATUS_WINDOW_ID {
+                    // Phase S: a fresh press on the taskbar row. Map the
+                    // column to a segment and, if it names one of the
+                    // three app windows, focus + raise it — the mouse-only
+                    // "launch/switch app" gesture (see the honest-scope
+                    // note on `TASKBAR_LABELS` for what "launch" means
+                    // here: raising the one existing singleton window).
+                    if let Some(seg) = self.taskbar_segment_at(cx) {
+                        let target = match seg {
+                            0 => self.shell_id,
+                            1 => self.editor_id,
+                            2 => self.browser_id,
+                            _ => unreachable!(
+                                "taskbar_segment_at bounds-checks against TASKBAR_LABELS"
+                            ),
+                        };
+                        self.focus_content_press(target);
+                        return Some(MouseOutcome::TaskbarFocused { window_id: target });
+                    }
+                } else if self.is_app_window(id) {
                     // Phase Q completion: a content click on a browser row is
                     // acted on here — descend into directories, open files,
                     // and the action bar creates. The `wy`/`ww`/`wh` window
@@ -1942,7 +2066,9 @@ mod tests {
             [SHELL_Y as usize * SW + SHELL_X as usize + SHELL_W as usize - 1]
             & 0xFF) as u8;
         assert_eq!(close_cell, b'X');
-        let status_ok = (d.screen()[(SH - 1) * SW] & 0xFF) as u8 == b'-';
+        // Phase S: the status row is now the taskbar — its first cell is
+        // the `[` of the `[Shell]` segment (not the old `-` placeholder).
+        let status_ok = (d.screen()[(SH - 1) * SW] & 0xFF) as u8 == b'[';
         assert!(status_ok);
         // Title + status + shell + editor + browser: no demo windows.
         assert_eq!(d.window_count(), 5);
@@ -2728,6 +2854,130 @@ mod tests {
             }
             _ => panic!("expected a new-dir create report from the action bar"),
         }
+    }
+
+    // --- Phase S: taskbar --------------------------------------------------
+
+    /// The taskbar segment boundaries match `TASKBAR_SEG_W`/`TASKBAR_LABELS`
+    /// exactly: segment 0 is columns 0..12, segment 1 12..24, segment 2
+    /// 24..36, and nothing past that (the taskbar doesn't fill the full
+    /// 80-column row).
+    #[test]
+    fn taskbar_segment_at_matches_the_rendered_layout() {
+        let d = Desktop::new();
+        assert_eq!(d.taskbar_segment_at(0), Some(0));
+        assert_eq!(d.taskbar_segment_at(11), Some(0));
+        assert_eq!(d.taskbar_segment_at(12), Some(1));
+        assert_eq!(d.taskbar_segment_at(23), Some(1));
+        assert_eq!(d.taskbar_segment_at(24), Some(2));
+        assert_eq!(d.taskbar_segment_at(35), Some(2));
+        assert_eq!(
+            d.taskbar_segment_at(36),
+            None,
+            "past the last labeled segment"
+        );
+        assert_eq!(d.taskbar_segment_at(-1), None);
+    }
+
+    /// A click on the taskbar's editor segment focuses and raises the
+    /// editor window — the mouse-only "launch the editor" gesture — and
+    /// reports `TaskbarFocused`. Pixel (96, 384) is cell (12, 24): column
+    /// 12 is segment 1's first column, row 24 is the taskbar row.
+    #[test]
+    fn taskbar_click_focuses_and_raises_the_editor() {
+        let mut d = Desktop::new();
+        assert_eq!(d.focus, AppFocus::Shell);
+        let out = d
+            .apply_mouse(MouseEvent {
+                x: 96,
+                y: 384,
+                left_button: true,
+                right_button: false,
+                scroll: 0,
+            })
+            .unwrap();
+        match out {
+            MouseOutcome::TaskbarFocused { window_id } => {
+                assert_eq!(window_id, d.editor_id());
+            }
+            _ => panic!("expected a taskbar focus outcome"),
+        }
+        assert_eq!(d.focus, AppFocus::Editor);
+        // Raised: the editor window now has the highest z-order.
+        let max_z = |id: u32| d.wm.window(id).unwrap().z_order;
+        assert!(max_z(d.editor_id()) > max_z(d.shell_id()));
+        assert!(max_z(d.editor_id()) > max_z(d.browser_id()));
+    }
+
+    /// A click on the taskbar's browser segment (cell (24, 24), pixel
+    /// (192, 384)) focuses and raises the browser window the same way.
+    /// Together with the editor test above, this is the mouse-only
+    /// "click between them to bring each to front" loop from the Phase S
+    /// DoD, driven purely through `apply_mouse` — no Tab.
+    #[test]
+    fn taskbar_click_switches_between_editor_and_browser_mouse_only() {
+        let mut d = Desktop::new();
+        d.apply_mouse(MouseEvent {
+            x: 96,
+            y: 384,
+            left_button: true,
+            right_button: false,
+            scroll: 0,
+        });
+        assert_eq!(d.focus, AppFocus::Editor);
+
+        let out = d
+            .apply_mouse(MouseEvent {
+                x: 192,
+                y: 384,
+                left_button: true,
+                right_button: false,
+                scroll: 0,
+            })
+            .unwrap();
+        match out {
+            MouseOutcome::TaskbarFocused { window_id } => {
+                assert_eq!(window_id, d.browser_id());
+            }
+            _ => panic!("expected a taskbar focus outcome"),
+        }
+        assert_eq!(d.focus, AppFocus::Browser);
+        let max_z = |id: u32| d.wm.window(id).unwrap().z_order;
+        assert!(max_z(d.browser_id()) > max_z(d.editor_id()));
+    }
+
+    /// `render_taskbar` paints the focused segment in reverse video
+    /// (`0x4F00`, the same attribute the close button uses) and every
+    /// other segment in the normal title attribute (`0x1F00`) — the
+    /// visual half of "see the taskbar" from the Phase S DoD.
+    #[test]
+    fn render_taskbar_highlights_only_the_focused_segment() {
+        let mut d = Desktop::new();
+        // Boot default: shell focused, segment 0 highlighted.
+        assert_eq!(
+            d.fb_status[0] & 0xFF00,
+            0x4F00,
+            "shell segment starts highlighted"
+        );
+        assert_eq!(
+            d.fb_status[12] & 0xFF00,
+            0x1F00,
+            "editor segment starts unhighlighted"
+        );
+        assert_eq!(
+            d.fb_status[24] & 0xFF00,
+            0x1F00,
+            "browser segment starts unhighlighted"
+        );
+
+        d.apply_key(key(Key::Tab)).unwrap(); // -> editor
+        assert_eq!(
+            d.fb_status[0] & 0xFF00,
+            0x1F00,
+            "shell no longer highlighted"
+        );
+        assert_eq!(d.fb_status[12] & 0xFF00, 0x4F00, "editor now highlighted");
+        assert_eq!(d.fb_status[24] & 0xFF00, 0x1F00);
     }
 
     // --- Phase R: the shell window's command interpreter -------------------
