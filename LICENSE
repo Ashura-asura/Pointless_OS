@@ -1,0 +1,65 @@
+Pointless OS (Aegis) — Dual License: MIT OR Apache-2.0
+
+The Pointless OS / Aegis source code in this repository is dual-licensed under
+either of:
+
+  * the Apache License, Version 2.0
+    (http://www.apache.org/licenses/LICENSE-2.0)
+  * the MIT license
+    (https://opensource.org/licenses/MIT)
+
+at your option. This dual-license scheme is the one used by the Rust project
+and the wider Rust ecosystem; the SPDX expression is `MIT OR Apache-2.0`.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you shall be dual-licensed as above,
+without any additional terms or conditions.
+
+-------------------------------------------------------------------------------
+
+The MIT License (MIT)
+
+Copyright (c) 2026 Ashura (Pointless OS / Aegis contributors)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+
+Apache License, Version 2.0
+
+The full text of the Apache License, Version 2.0 is available at:
+http://www.apache.org/licenses/LICENSE-2.0
+
+It is not reproduced here in full; the canonical text at the URL above is the
+binding version. For the purposes of this repository the Apache-2.0 terms
+apply only to the Pointless OS / Aegis original code, and only where you
+choose the Apache option of the dual license.
+
+IMPORTANT — GPL-2.0 PACKAGED BINARIES
+
+This dual license covers the Pointless OS / Aegis *original* code only. The
+repository also *ships* third-party binaries under different licenses:
+
+  * `guest/out/bzImage`                    — Linux kernel, GPL-2.0-only
+  * `guest/out/initramfs.cpio.gz` and the
+    `guest/initramfs/` tree               — BusyBox and applets, GPL-2.0-only
+
+See `LICENSING.md` for the full third-party notices, the exact source/build
+recipe for those binaries, and the obligations that distributing them imposes
+on you.
