@@ -158,6 +158,23 @@ impl Pic8259 {
         None
     }
 
+    /// The next vector/IRQ to inject, if any — same INTA-style priority
+    /// resolution as `take_pending` but without consuming (no IRR -> ISR
+    /// move). The run loop peeks first to gate injection on the guest's
+    /// interrupt state (RFLAGS.IF, STI/MOV-SS blocking) so an IRQ the
+    /// guest is not ready for stays latched in the IRR for a later exit.
+    pub fn peek_pending(&self) -> Option<(u8, u8)> {
+        if let Some(irq) = self.master.pending() {
+            if irq == 2 {
+                if let Some(sirq) = self.slave.pending() {
+                    return Some((self.slave.base + sirq, 8 + sirq));
+                }
+            }
+            return Some((self.master.base + irq, irq));
+        }
+        None
+    }
+
     /// Guest EOI (OCW2, non-specific or specific).
     fn eoi(&mut self, which: WhichPic, level: Option<u8>) {
         let pic = match which {
@@ -539,6 +556,14 @@ impl Pit8254 {
     /// Advance all modeled channels by `n` PIT cycles; IRQ0 pulses on ch0.
     pub fn advance(&mut self, n: u32) -> u32 {
         self.ch0.advance(n) + self.ch1.advance(n) + self.ch2.advance(n)
+    }
+
+    /// Channel 2 OUT line (bit 7 of port 0x61): high once a mode-0 count
+    /// has expired. The classic guest TSC-calibration path (the Linux
+    /// kernel's `pit_calibrate_tsc`) runs channel 2 in mode 0 and reads
+    /// the count to expiry, so this lets that calibration converge.
+    pub fn ch2_out2(&self) -> bool {
+        self.ch2.count != 0 && self.ch2.remaining == 0
     }
 
     fn channel(&mut self, sel: u8) -> &mut PitChannel {
@@ -934,6 +959,8 @@ pub struct DeviceSet<'a, S: BlockStore> {
     pub pci: PciConfigBus,
     /// The virtio-blk device (legacy PCI, I/O BAR, INTx#A -> IRQ 11).
     pub virtio: crate::virtio::VirtioBlk<'a, S>,
+    /// Port 0x61 refresh-flag state (bit 5 toggles on every read).
+    pit61_refresh: bool,
 }
 
 impl<'a, S: BlockStore> DeviceSet<'a, S> {
@@ -946,6 +973,7 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
             rtc: CmosRtc::new(rtc_epoch_seconds),
             pci: PciConfigBus::new(),
             virtio: crate::virtio::VirtioBlk::new(store),
+            pit61_refresh: false,
         };
         ds.pci.init(capacity);
         ds
@@ -957,6 +985,15 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
             0x20 | 0x21 | 0xA0 | 0xA1 => self.pic.inb(port),
             0x3F8..=0x3FF => self.uart.inb(port),
             0x40..=0x43 => self.pit.inb(port),
+            0x61 => {
+                // PIT2 status port: OUT2 on bit 7, refresh flag toggling
+                // on bit 5 (the guest kernel's timer calibration reads
+                // this during boot).
+                self.pit61_refresh = !self.pit61_refresh;
+                let out2 = if self.pit.ch2_out2() { 0x80 } else { 0 };
+                let refresh = if self.pit61_refresh { 0x20 } else { 0 };
+                out2 | refresh | 0x10
+            }
             0x70 | 0x71 => self.rtc.inb(port),
             _ => {
                 let bar = self.pci.virtio_bar();
@@ -1041,6 +1078,14 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
     /// ack semantics applied). The run loop calls this before each entry.
     pub fn pic_pending_vector(&mut self) -> Option<u8> {
         self.pic.take_pending().map(|(v, _)| v)
+    }
+
+    /// Non-consuming look at the PIC's next injectable vector. The run
+    /// loop peeks first so an IRQ the guest is not ready for (IF clear,
+    /// interrupt blocking active) stays latched in the IRR until a later
+    /// exit, instead of being lost by the ack.
+    pub fn pic_peek_vector(&self) -> Option<u8> {
+        self.pic.peek_pending().map(|(v, _)| v)
     }
 
     /// Recompute PIC IRR from device lines and PIT pulses. Called by the
@@ -1376,10 +1421,47 @@ mod tests {
     fn device_set_unhandled_ports_float() {
         let mut store = MemStore::new(4);
         let mut ds = DeviceSet::new(&mut store, 0);
-        assert_eq!(ds.inb(0x61), 0xFF); // speaker port: not emulated
         assert_eq!(ds.inl(0x4000), 0xFFFF_FFFF);
-        ds.outb(0x61, 0xFF); // must not panic
+        ds.outb(0x61, 0xFF); // speaker control writes are ignored
         ds.outl(0x4000, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn device_set_pit2_status_port_and_peek() {
+        let mut store = MemStore::new(4);
+        let mut ds = DeviceSet::new(&mut store, 0);
+        // Port 0x61: refresh flag (bit 5) toggles on every read; bit 7
+        // (OUT2) is low while channel 2 has not expired; the other bits
+        // read as the floating-bus-ish default.
+        let a = ds.inb(0x61);
+        let b = ds.inb(0x61);
+        assert_ne!(a & 0x20, b & 0x20, "refresh flag must toggle");
+        assert_eq!(a & 0x80, 0, "OUT2 low before any channel-2 count");
+        // Channel 2 in mode 0, count 4, then expire it.
+        ds.outb(0x43, 0xB0);
+        ds.outb(0x42, 0x04);
+        ds.outb(0x42, 0x00);
+        assert!(!ds.pit.ch2_out2());
+        ds.pit.advance(3);
+        assert!(!ds.pit.ch2_out2());
+        ds.pit.advance(1);
+        assert!(ds.pit.ch2_out2(), "mode-0 expiry raises OUT2");
+        assert_ne!(ds.inb(0x61) & 0x80, 0, "OUT2 reflected on port 0x61");
+        // peek_pending must not consume: the same vector is peekable
+        // repeatedly until taken. Bring the PIC up with IRQs unmasked
+        // (ICW sequence + OCW1, as the guest kernel does).
+        ds.outb(0x20, 0x11);
+        ds.outb(0x21, 0x20);
+        ds.outb(0x21, 0x04);
+        ds.outb(0x21, 0x01);
+        ds.outb(0x21, 0x00);
+        ds.host_rx(b'x');
+        ds.outb(0x3F9, 0x01); // enable UART RX interrupt
+        ds.update_pic(0);
+        assert_eq!(ds.pic_peek_vector(), Some(0x24));
+        assert_eq!(ds.pic_peek_vector(), Some(0x24), "peek must not consume");
+        assert_eq!(ds.pic_pending_vector(), Some(0x24));
+        assert_eq!(ds.pic_peek_vector(), None, "taken vector is gone");
     }
 
     #[test]

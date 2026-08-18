@@ -1,6 +1,6 @@
-//! Phase K + Phase U-6: VT-x (VMX) bring-up and the hypervisor run loop —
-//! the foundation of the design doc's "VM-based full-fidelity path"
-//! (§7 Phase 9).
+//! Phase K + Phase U-6 + Phase U-7: VT-x (VMX) bring-up, the hypervisor
+//! run loop, and the real Linux guest boot — the foundation of the design
+//! doc's "VM-based full-fidelity path" (§7 Phase 9).
 //!
 //! Honest scope, stated up front per this repo's own Ground Rule 6: this
 //! machine has no VT-x (`VirtualizationFirmwareEnabled=False`), so everything
@@ -12,9 +12,13 @@
 //! VM-entry -> guest-executes -> VM-exit -> host-handles round trip. The
 //! run loop (Phase U-6) adds what sits ON TOP: a resumable VM
 //! (`vmlaunch` then repeated `vmresume`), nested paging (EPT),
-//! external-interrupt/HLT/I/O VM-exit dispatch, and in-guest device
-//! emulation via `Vm::handle_io` — the exact machinery a real Linux guest
-//! image needs once it boots under Aegis's hypervisor on VT-x hardware.
+//! external-interrupt/HLT/I/O VM-exit dispatch, in-guest device
+//! emulation via `Vm::handle_io`, virtual-clock feeding at wall-clock
+//! speed (host TSC calibrated against the host PIT), and interrupt
+//! injection gated on the guest's RFLAGS.IF — the machinery a real Linux
+//! guest needs. Phase U-7 (`guest_boot_demo`) boots the committed guest
+//! image (bzImage + initramfs, embedded into the kernel) under that run
+//! loop, stopping when the guest reaches its shell on the emulated 16550.
 //!
 //! I could not compile, run, or verify the hardware half in the sandbox
 //! that wrote it (no VMX/SVM CPU flag present, confirmed via CPUID — see
@@ -97,6 +101,9 @@ mod field {
     pub const SECONDARY_VM_EXEC_CONTROL: u64 = 0x401E;
     pub const VM_EXIT_CONTROLS: u64 = 0x400C;
     pub const VM_ENTRY_CONTROLS: u64 = 0x4012;
+    /// Interruption-information field: written to inject an event at the
+    /// next VM-entry (bit 31 = valid, bits 10:8 = type, bits 7:0 = vector).
+    pub const VM_ENTRY_INTR_INFO: u64 = 0x4016;
     // 32-bit read-only (VM-exit info)
     pub const VM_INSTRUCTION_ERROR: u64 = 0x4400;
     pub const VM_EXIT_REASON: u64 = 0x4402;
@@ -590,6 +597,87 @@ fn exit_reason_tag(reason: u16) -> &'static str {
 }
 
 // ---------------------------------------------------------------------
+// Host TSC: the run loop's virtual-clock reference. The guest's PIT and
+// CMOS advance by the *real* host time that elapsed since the last exit
+// (TSC deltas at the calibrated host frequency), so a Linux guest's own
+// timer calibration sees a consistent TSC:PIT ratio — the same trick the
+// kernel itself uses on bare metal.
+// ---------------------------------------------------------------------
+
+/// Ticks of the host TSC (nominal frequency from `TSC_HZ`, calibrated
+/// against the host PIT once per boot by `calibrate_host_tsc_hz`).
+fn rdtsc_cycles() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Host TSC frequency in Hz, 0 until `calibrate_host_tsc_hz` succeeds.
+static mut TSC_HZ: u64 = 0;
+
+/// TSC Hz derived from a PIT calibration: `cycles` of TSC elapsed while
+/// the PIT counted `count` PIT cycles at `PIT_CLOCK_HZ`. Pure, so the
+/// arithmetic is contract-tested without touching any hardware.
+#[cfg(feature = "vmx-demo")]
+fn tsc_hz_from_calibration(cycles: u64, count: u64) -> u64 {
+    if cycles == 0 || count == 0 {
+        0
+    } else {
+        cycles * crate::vm::PIT_CLOCK_HZ / count
+    }
+}
+
+/// Calibrate the host TSC against the host 8254 PIT channel 2 — the
+/// classic PC bootstrap technique (the Linux guest does the same inside
+/// its own boot). Loads a 10 ms mode-0 count, measures the TSC delta
+/// until the count expires, and derives Hz. Returns 0 if the PIT or TSC
+/// misbehaved (the run loop then leaves the virtual clock frozen).
+///
+/// # Safety
+/// Runs host port I/O on the PIT (unused by this kernel after the PICs
+/// are masked) and reads the TSC; call once, before the run loop.
+#[cfg(feature = "vmx-demo")]
+unsafe fn calibrate_host_tsc_hz() -> u64 {
+    const CAL_MS: u64 = 10;
+    const MAX_SPINS: u32 = 200_000;
+    let latch = ((crate::vm::PIT_CLOCK_HZ * CAL_MS) / 1000) as u16;
+    // Gate 2 high / speaker off, then channel 2, mode 0, LSB-then-MSB.
+    unsafe {
+        asm!("out dx, al", in("dx") 0x61u16, in("al") 0x01u8, options(nomem, preserves_flags));
+    }
+    unsafe {
+        asm!("out dx, al", in("dx") 0x43u16, in("al") 0xB0u8, options(nomem, preserves_flags));
+    }
+    unsafe {
+        asm!("out dx, al", in("dx") 0x42u16, in("al") (latch & 0xFF) as u8, options(nomem, preserves_flags));
+    }
+    unsafe {
+        asm!("out dx, al", in("dx") 0x42u16, in("al") (latch >> 8) as u8, options(nomem, preserves_flags));
+    }
+    let t0 = rdtsc_cycles();
+    let mut spins = 0u32;
+    loop {
+        // Latch + read the current count; a spent mode-0 channel holds at 0.
+        unsafe {
+            asm!("out dx, al", in("dx") 0x43u16, in("al") 0x80u8, options(nomem, preserves_flags));
+        }
+        let lo: u8;
+        let hi: u8;
+        unsafe {
+            asm!("in al, dx", out("al") lo, in("dx") 0x42u16, options(nomem, preserves_flags));
+            asm!("in al, dx", out("al") hi, in("dx") 0x42u16, options(nomem, preserves_flags));
+        }
+        if u16::from_le_bytes([lo, hi]) == 0 {
+            break;
+        }
+        spins += 1;
+        if spins >= MAX_SPINS {
+            return 0;
+        }
+    }
+    let t1 = rdtsc_cycles();
+    tsc_hz_from_calibration(t1.wrapping_sub(t0), latch as u64)
+}
+
+// ---------------------------------------------------------------------
 // Phase U-6 run-loop demo (feature-gated): the resumable VM under EPT.
 // ---------------------------------------------------------------------
 
@@ -785,6 +873,196 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
                 e,
                 exits
             );
+            Err(e)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Phase U-7: the real Linux guest under Aegis's hypervisor (feature-gated).
+// ---------------------------------------------------------------------
+
+/// The committed guest kernel image (built by `guest/build-guest.sh`,
+/// evidence in `guest/out/`). Embedded into the kernel image so the
+/// hypervisor ships with its guest — this is what the user will boot on
+/// real VT-x hardware.
+#[cfg(feature = "vmx-demo")]
+const GUEST_BZIMAGE: &[u8] = include_bytes!("../../guest/out/bzImage");
+
+/// The committed guest initramfs (BusyBox + the Phase U /init, which
+/// prints the Phase U DoD marker when it reaches its interactive shell).
+#[cfg(feature = "vmx-demo")]
+const GUEST_INITRAMFS: &[u8] = include_bytes!("../../guest/out/initramfs.cpio.gz");
+
+/// Guest RAM for the real-kernel demo: must cover the kernel's `init_size`
+/// window (34 MiB) plus the initrd at 16 MiB; Linux relocates itself into
+/// the top of this region at decompress time.
+#[cfg(feature = "vmx-demo")]
+const GUEST_BOOT_RAM_MB: u64 = 128;
+
+/// Backstop exit budget for the real-kernel run (the demo normally ends
+/// on the DoD marker, not the budget).
+#[cfg(feature = "vmx-demo")]
+const GUEST_BOOT_MAX_EXITS: u64 = 2_000_000;
+
+/// The line `guest/initramfs/init` prints when it reaches the interactive
+/// shell on the virtual serial console — the Phase U Definition of Done
+/// completion point.
+#[cfg(feature = "vmx-demo")]
+const DOD_MARKER: &[u8] = b"Phase U DoD point";
+
+/// The Phase U-7 end-to-end demo: boots the real committed Linux guest
+/// (bzImage + initramfs) under Aegis's hypervisor. Allocates 128 MiB of
+/// contiguous host frames as guest RAM, loads the image through the EPT
+/// (`Vm::load_linux` maps the whole grant), calibrates the host TSC
+/// against the PIT so the guest's virtual clock tracks wall-clock time,
+/// and runs the kernel under the resumable run loop with the guest's
+/// serial console drained through the emulated 16550 and timer/PIC
+/// interrupt injection enabled. Stops when the guest prints the Phase U
+/// DoD marker (its shell is up), or at the exit budget.
+///
+/// # Safety
+/// Requires VMX root operation and the same preconditions as
+/// `vmx_run_guest`; run only on a VT-x-capable CPU (guard with
+/// `vmx_supported()`), once per boot, before interrupts turn on.
+#[cfg(feature = "vmx-demo")]
+pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
+    enable_vmx_operation()?;
+
+    let vmxon_region = alloc_vmx_region()?;
+    if !vmxon(vmxon_region) {
+        return Err("VMXON failed — check IA32_FEATURE_CONTROL and CR0/CR4 fixed-bit MSRs");
+    }
+    crate::sprintln!("Aegis: [vmx] VMXON ok, region at {:#x}", vmxon_region);
+
+    let vmcs_region = alloc_vmx_region()?;
+    if !vmclear(vmcs_region) {
+        return Err("VMCLEAR failed on fresh VMCS region");
+    }
+    if !vmptrld(vmcs_region) {
+        return Err("VMPTRLD failed — VMCS not made current");
+    }
+    crate::sprintln!("Aegis: [vmx] VMCS active at {:#x}", vmcs_region);
+
+    // Host TSC calibration drives the guest's virtual clock (PIT/CMOS) at
+    // wall-clock speed, so the guest kernel's own timer calibration sees
+    // a consistent TSC:PIT ratio.
+    let tsc_hz = calibrate_host_tsc_hz();
+    if tsc_hz == 0 {
+        return Err("host TSC calibration failed (PIT/TSC misbehaving)");
+    }
+    unsafe { TSC_HZ = tsc_hz };
+    crate::sprintln!("Aegis: [vmx] host TSC calibrated at {} Hz", tsc_hz);
+
+    // Guest RAM: one contiguous host allocation for the whole grant.
+    let frames = (GUEST_BOOT_RAM_MB << 20) / 4096;
+    let guest_ram = crate::frame::alloc_contiguous_global(frames)
+        .ok_or("frame allocator: out of memory for guest RAM (128 MiB contiguous)")?;
+    crate::sprintln!(
+        "Aegis: [vmx] guest RAM: {} MiB at host phys {:#x}",
+        GUEST_BOOT_RAM_MB,
+        guest_ram
+    );
+
+    let mut store = RamDiskStore { data: [0; 512] };
+    let devices = crate::vdev::DeviceSet::new(&mut store, 0);
+    let grant = crate::ept::MemGrant::new(0, frames);
+    let mut vm = Vm::new(0, grant, devices, guest_ram, 1000);
+
+    // `noapic`: the guest has no ACPI tables, so Linux must not touch the
+    // LAPIC/I/O-APIC MMIO (unmapped in the EPT — a violation would stop
+    // the run). The legacy PIC + PIT + 16550 are the whole device set.
+    const CMDLINE: &str = "console=ttyS0,115200n8 noapic";
+    vm.load_linux(
+        &mut crate::ept::KernelAlloc,
+        GUEST_BZIMAGE,
+        Some(GUEST_INITRAMFS),
+        CMDLINE,
+    )
+    .map_err(|_| "guest image load failed (layout/EPT error — see vm.rs GuestBoot)")?;
+    let boot = vm.boot_state().ok_or("guest not loaded")?;
+    setup_host_state()?;
+
+    crate::sprintln!(
+        "Aegis: [vmx] guest boot: bzImage {} bytes, initramfs {} bytes, cmdline \"{}\"",
+        GUEST_BZIMAGE.len(),
+        GUEST_INITRAMFS.len(),
+        CMDLINE
+    );
+    crate::sprintln!(
+        "Aegis: [vmx] guest boot: running the real Linux kernel under EPT (exit budget {})",
+        GUEST_BOOT_MAX_EXITS
+    );
+
+    // Guest console capture: buffer serial bytes into lines, print each
+    // complete line with a prefix, and stop shortly after the Phase U DoD
+    // marker line (the guest's shell is up — everything after it is idle
+    // traffic). The exit budget is the backstop.
+    let mut line = [0u8; 512];
+    let mut line_len = 0usize;
+    let mut marker_exit: Option<u64> = None;
+    let mut exits = 0u64;
+    let mut ept_handler = |vm: &mut Vm<'_, RamDiskStore>, v: crate::ept::EptViolation| {
+        crate::sprintln!(
+            "Aegis: [vmx] guest boot EPT violation at {:#x} (unexpected — the full grant is mapped)",
+            v.guest_phys
+        );
+        let _ = vm;
+        Ok::<bool, &'static str>(false)
+    };
+    let mut exit_hook = |vm: &mut Vm<'_, RamDiskStore>| {
+        while let Some(b) = vm.devices.uart.take_tx() {
+            if b == b'\n' || line_len == line.len() {
+                let text = core::str::from_utf8(&line[..line_len]).unwrap_or("<non-utf8>");
+                crate::sprintln!("Aegis: [vmx-guest] {}", text);
+                if marker_exit.is_none()
+                    && line[..line_len]
+                        .windows(DOD_MARKER.len())
+                        .any(|w| w == DOD_MARKER)
+                {
+                    marker_exit = Some(exits);
+                }
+                line_len = 0;
+            } else if b != b'\r' {
+                line[line_len] = b;
+                line_len += 1;
+            }
+        }
+        exits += 1;
+        if let Some(at) = marker_exit {
+            // Flush a few exits past the marker (the shell prompt itself),
+            // then stop cleanly.
+            if exits >= at + 20 {
+                return Ok::<bool, &'static str>(false);
+            }
+        }
+        Ok::<bool, &'static str>(exits < GUEST_BOOT_MAX_EXITS)
+    };
+
+    let result = vmx_run_guest(
+        &boot,
+        &mut vm,
+        GUEST_BOOT_MAX_EXITS,
+        &mut ept_handler,
+        &mut exit_hook,
+    );
+    match result {
+        Ok(()) if marker_exit.is_some() => {
+            crate::sprintln!(
+                "Aegis: [vmx] guest boot: Phase U DoD marker seen — the real Linux kernel reached its shell through Aegis's hypervisor ({} VM-exits)",
+                exits
+            );
+            Ok(())
+        }
+        Ok(()) => {
+            crate::sprintln!(
+                "Aegis: [vmx] guest boot: stopped before the DoD marker ({} VM-exits)",
+                exits
+            );
+            Err("guest boot stopped before the DoD marker (see the [vmx-guest] log)")
+        }
+        Err(e) => {
+            crate::sprintln!("Aegis: [vmx] guest boot failed: {} ({} VM-exits)", e, exits);
             Err(e)
         }
     }
@@ -1141,6 +1419,36 @@ type EptViolationHook<'a, S> =
 /// effects, PIC updates, guest output draining). `Ok(false)` stops the run.
 type ExitHook<'a, S> = dyn for<'x> FnMut(&mut Vm<'x, S>) -> Result<bool, &'static str> + 'a;
 
+/// Deliver a pending PIC vector at the next VM-entry if the guest is
+/// ready for it: RFLAGS.IF set and no STI/MOV-SS interrupt blocking. A
+/// pending vector wakes a halted guest (the HLT activity state is cleared
+/// so the entry does not halt again). The vector is taken from the PIC
+/// (IRR -> ISR ack) only when actually injected, so an IF-clear guest
+/// keeps the IRQ latched for a later exit.
+///
+/// # Safety
+/// Requires a current VMCS and VMX root operation (same context as
+/// `vmx_run_guest`).
+unsafe fn maybe_inject_interrupt<S: BlockStore>(devices: &mut crate::vdev::DeviceSet<'_, S>) {
+    if devices.pic_peek_vector().is_none() {
+        return;
+    }
+    let rflags = vmread(field::GUEST_RFLAGS);
+    if rflags & (1 << 9) == 0 {
+        return;
+    }
+    if vmread(field::GUEST_INTERRUPTIBILITY_INFO) != 0 {
+        return;
+    }
+    if let Some(vector) = devices.pic_pending_vector() {
+        vmwrite(field::GUEST_ACTIVITY_STATE, 0);
+        vmwrite(
+            field::VM_ENTRY_INTR_INFO,
+            0x8000_0000 | (vector as u64 & 0xFF),
+        );
+    }
+}
+
 /// Run one VM through its full entry/exit cycle until the exit hook says stop,
 /// an EPT handler refuses, an exit is unhandled, or the exit budget is
 /// exhausted. First entry uses `vmlaunch`; every subsequent entry uses
@@ -1159,6 +1467,16 @@ type ExitHook<'a, S> = dyn for<'x> FnMut(&mut Vm<'x, S>) -> Result<bool, &'stati
 ///   instruction length;
 /// - EPT violation (48): count it on the VM, hand the decoded violation
 ///   to the handler (which decides isolation policy); `Ok(false)` stops.
+///
+/// After every handled exit, before the next entry, the loop also:
+/// - advances the guest's virtual clock (PIT/CMOS) by the real host time
+///   that elapsed since the last exit (TSC deltas at the calibrated host
+///   frequency — see the TSC block above). Sub-millisecond remainders
+///   accumulate so the PIT keeps moving even while the guest spins in
+///   tight I/O loops;
+/// - reflects device lines into the PIC (`update_pic`);
+/// - injects a pending PIC vector if the guest is ready for one
+///   (RFLAGS.IF set, no interrupt blocking — see `maybe_inject_interrupt`).
 ///
 /// `Ok(())` means the run ended by the hook's request or the exit budget;
 /// `Err` means something refused (unhandled exit, string I/O, decode
@@ -1189,6 +1507,11 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
 
     let mut entered = false;
     let mut exits = 0u64;
+    // Virtual-clock bookkeeping: the last host TSC sample and the
+    // sub-millisecond accumulator (µs), so fractional per-exit deltas are
+    // not lost to integer rounding.
+    let mut last_tsc = rdtsc_cycles();
+    let mut frac_us: u64 = 0;
     loop {
         if exits >= max_exits {
             return Err("exit budget exhausted");
@@ -1207,6 +1530,24 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
             });
         }
         exits += 1;
+
+        // Virtual clock: feed the guest's PIT/CMOS the real host time that
+        // passed while the guest ran and this exit was emulated. The PIT
+        // only moves when the host TSC frequency is known (calibrated by
+        // `calibrate_host_tsc_hz`); without it the clock stays frozen.
+        let now = rdtsc_cycles();
+        let delta = now.wrapping_sub(last_tsc);
+        last_tsc = now;
+        let mut pulses = 0u32;
+        let hz = unsafe { TSC_HZ };
+        if hz > 0 && delta > 0 {
+            frac_us = frac_us.wrapping_add(delta.saturating_mul(1_000_000) / hz);
+            let ms = (frac_us / 1000) as u32;
+            frac_us %= 1000;
+            if ms > 0 {
+                pulses = vm.advance_time(ms);
+            }
+        }
 
         let reason = (vmread(field::VM_EXIT_REASON) & 0xFFFF) as u16;
         match classify_exit(reason) {
@@ -1272,6 +1613,12 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
                 });
             }
         }
+
+        // Device lines (UART RX/virtio INTx, plus the PIT pulses just fed)
+        // into the PIC, then a ready-for-it guest gets the vector injected
+        // at the next entry.
+        vm.devices.update_pic(pulses);
+        maybe_inject_interrupt(&mut vm.devices);
     }
 }
 
@@ -1550,5 +1897,69 @@ mod tests {
         assert_eq!(field::GUEST_RIP >> 8, 0x68);
         assert_eq!(field::HOST_RIP >> 8, 0x6C);
         assert_eq!(field::EXIT_QUALIFICATION >> 8, 0x64);
+        assert_eq!(field::VM_ENTRY_INTR_INFO >> 8, 0x40);
+    }
+
+    #[cfg(feature = "vmx-demo")]
+    #[test]
+    fn tsc_hz_from_calibration_math() {
+        // 10 ms at 1.19318 MHz = 11932 PIT counts; 10 ms at 2.5 GHz =
+        // 25,000,000 TSC cycles -> 2,500,000,000 Hz.
+        assert_eq!(
+            tsc_hz_from_calibration(25_000_000, 11_932),
+            25_000_000 * 1_193_180 / 11_932
+        );
+        // Sanity: ~2.5 GHz result.
+        assert!(tsc_hz_from_calibration(25_000_000, 11_932) > 2_000_000_000);
+        assert!(tsc_hz_from_calibration(25_000_000, 11_932) < 3_000_000_000);
+        // Zero guards: no cycles or no count must never divide by zero.
+        assert_eq!(tsc_hz_from_calibration(0, 11_932), 0);
+        assert_eq!(tsc_hz_from_calibration(25_000_000, 0), 0);
+    }
+
+    #[cfg(feature = "vmx-demo")]
+    #[test]
+    fn guest_boot_layout_fits_the_grant() {
+        // The Phase U-7 demo's embedded image must satisfy every layout
+        // rule `Vm::load_linux` enforces — checked without a VMX CPU by
+        // running the same pure code the demo runs.
+        let frames = (GUEST_BOOT_RAM_MB << 20) / 4096;
+        let grant = crate::ept::MemGrant::new(0, frames);
+        let (_, code_len) = crate::vm::parse_bzimage(GUEST_BZIMAGE).expect("bzImage parses");
+        let boot = crate::vm::GuestBoot::build(
+            &grant,
+            GUEST_BZIMAGE,
+            Some(GUEST_INITRAMFS),
+            "console=ttyS0,115200n8 noapic",
+        )
+        .expect("guest layout fits the 128 MiB grant");
+        // The kernel's decompression window (init_size) plus the initrd
+        // must sit inside guest RAM: the kernel relocates itself to the
+        // top of RAM at decompress time.
+        assert!((code_len as u64) < crate::vm::INITRD_GPA);
+        assert!(boot.initrd_gpa + boot.initrd_len as u64 <= boot.ram_end_gpa);
+        // init_size is read from the image header; the window from the
+        // kernel load address must fit below the top of guest RAM.
+        let init_size = u32::from_le_bytes([
+            GUEST_BZIMAGE[0x260],
+            GUEST_BZIMAGE[0x261],
+            GUEST_BZIMAGE[0x262],
+            GUEST_BZIMAGE[0x263],
+        ]);
+        assert!(
+            crate::vm::CODE32_GPA + init_size as u64 <= boot.ram_end_gpa,
+            "init_size window must fit in guest RAM"
+        );
+    }
+
+    #[cfg(feature = "vmx-demo")]
+    #[test]
+    fn guest_boot_ram_is_contiguous_allocatable() {
+        // The demo needs 32768 consecutive host frames. The allocator's
+        // contiguous path is bitmap-based (tested in frame.rs); this test
+        // just pins the arithmetic the demo uses.
+        let frames = (GUEST_BOOT_RAM_MB << 20) / 4096;
+        assert_eq!(frames, 32768);
+        assert_eq!(frames * 4096, 128 << 20);
     }
 }

@@ -3,9 +3,13 @@
 //!
 //! Layout (kernel PML4):
 //! - Entries 0-2: 1 GB huge pages (identity). Entry 0 is broken into a PD
-//!   of 2 MB pages; its first 2 MB region is further broken into 4 KB pages
-//!   so the executable window (the kernel image's R+X PT_LOAD, parsed from
-//!   the ELF at runtime) can be the ONLY executable pages in the low map.
+//!   of 2 MB pages; the 2 MB regions containing the executable window (the
+//!   kernel image's R+X PT_LOAD, parsed from the ELF at runtime) are further
+//!   broken into 4 KB pages so the window can be the ONLY executable pages
+//!   in the low map. The first 2 MB region is always split in ordinary
+//!   builds (kernel image + VGA text framebuffer live there); a kernel image
+//!   whose text links above 2 MB (large embedded payload, e.g. a guest OS
+//!   image) gets its window region split the same way.
 //! - Entry 3: the 0xC0000000-0xFFFFFFFF scratch window (2 MB pages), with
 //!   the local APIC page broken out into 4 KB pages (QEMU TCG cannot do
 //!   MMIO writes through huge pages).
@@ -15,9 +19,9 @@
 //!   also NX, so a user task fetching an instruction from 0xB8000 #PFs
 //!   (verified live by `task_nx_test`).
 //!
-//! Honest limits: 4 KB granularity only for the first 2 MB; the rest of the
-//! low map uses 2 MB/1 GB huge pages. Verified under QEMU/TCG, not on
-//! physical hardware.
+//! Honest limits: 4 KB granularity only for the 2 MB regions that contain
+//! the executable window; the rest of the low map uses 2 MB/1 GB huge pages.
+//! Verified under QEMU/TCG, not on physical hardware.
 
 use core::arch::asm;
 
@@ -66,8 +70,11 @@ static mut KERNEL_PDPT: PageTable = PageTable::new();
 
 // First 1 GB broken into 2 MB pages (so data can be marked NX).
 static mut KERNEL_PD0: PageTable = PageTable::new();
-// First 2 MB broken into 4 KB pages (so code and data can be separated).
-static mut KERNEL_PT_LOW0: PageTable = PageTable::new();
+// 4 KB tables for the 2 MB regions that contain part of the executable
+// window (so code and data can be separated there). The window is a single
+// contiguous R+X PT_LOAD of the kernel image, so it can straddle at most two
+// 2 MB regions.
+static mut KERNEL_PT_WIN: [PageTable; 2] = [PageTable::new(); 2];
 
 // Scratch area for the 0xC0000000-0xFFFFFFFF window (splits the huge page so
 // the local APIC page can be mapped with ordinary 4 KB pages: QEMU TCG cannot
@@ -110,15 +117,25 @@ pub fn exec_page_range(text_start: u64, text_end: u64) -> (usize, usize) {
     (first, last)
 }
 
-/// Is 4 KB page `page` inside the executable window?
+/// Does the half-open 2 MB region `[region_start, region_end)` contain any
+/// part of the executable window `[ts, te)`?
+pub fn region_contains_window(ts: u64, te: u64, region_start: u64, region_end: u64) -> bool {
+    ts < region_end && te > region_start
+}
+
+/// Is 4 KB page `page` inside the executable window? `page` is the address's
+/// global 4 KB page index (`addr >> 12`), not a 2 MB-region-local index —
+/// the window is a range of global pages, so a region-local index only
+/// matches for the first 2 MB (where the two coincide).
 pub fn is_exec_page(page: usize, text_start: u64, text_end: u64) -> bool {
     let (first, last) = exec_page_range(text_start, text_end);
     page >= first && page < last
 }
 
 /// Wait, is the page at virtual address `addr` inside the window?
+/// Is the 4 KB page containing virtual address `addr` inside the window?
 pub fn addr_is_exec(addr: u64, text_start: u64, text_end: u64) -> bool {
-    is_exec_page(pt_index(addr), text_start, text_end)
+    is_exec_page((addr >> 12) as usize, text_start, text_end)
 }
 
 /// Parse the executable (R+X) PT_LOAD window of an ELF64 image from raw
@@ -226,14 +243,15 @@ pub unsafe fn init_kernel_tables() {
     let pml4 = (&raw mut KERNEL_PML4).as_mut().unwrap();
     let pdpt = (&raw mut KERNEL_PDPT).as_mut().unwrap();
     let pd0 = (&raw mut KERNEL_PD0).as_mut().unwrap();
-    let pt_low0 = (&raw mut KERNEL_PT_LOW0).as_mut().unwrap();
     let pd = (&raw mut SCRATCH_PD).as_mut().unwrap();
     let pt = (&raw mut SCRATCH_PT).as_mut().unwrap();
 
     pml4.clear();
     pdpt.clear();
     pd0.clear();
-    pt_low0.clear();
+    for pt_win in (&raw mut KERNEL_PT_WIN).as_mut().unwrap().iter_mut() {
+        pt_win.clear();
+    }
     pd.clear();
     pt.clear();
     (&raw mut DEV_HI_PDPT).as_mut().unwrap().clear();
@@ -243,22 +261,45 @@ pub unsafe fn init_kernel_tables() {
     // Executable window of the kernel image. Everything outside it is NX.
     let window = kernel_text_window();
 
-    // First 1 GB: PD of 2 MB pages. Every 2 MB region is NX by default;
-    // the first 2 MB is split into 4 KB pages (below), which is where the
-    // kernel image and the VGA text framebuffer live.
+    // First 1 GB: PD of 2 MB pages. Every 2 MB region is NX by default.
     pdpt.entries[0] = core::ptr::addr_of!(KERNEL_PD0) as u64 | PRESENT | WRITABLE;
     for i in 0..512u64 {
         pd0.entries[i as usize] = (i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX;
     }
-    // First 2 MB: 4 KB pages. Executable only where the kernel text lives.
-    pd0.entries[0] = core::ptr::addr_of!(KERNEL_PT_LOW0) as u64 | PRESENT | WRITABLE;
+    // 2 MB regions that contain part of the executable window are split into
+    // 4 KB pages so the window can be the ONLY executable pages in the low
+    // map. The first 2 MB is split whenever the ELF parses (it is where the
+    // kernel image and the VGA text framebuffer live in ordinary builds); a
+    // kernel image whose text links above 2 MB — e.g. one carrying a large
+    // embedded payload — gets its window region split the same way, so the
+    // text stays executable after the CR3 switch.
+    let mut win_tables = 0usize;
     for i in 0..512u64 {
-        let addr = i * 0x1000;
-        let flags = PRESENT | WRITABLE | NX;
-        pt_low0.entries[i as usize] = match window {
-            Some((ts, te)) if addr_is_exec(addr, ts, te) => addr | (flags & !NX),
-            _ => addr | flags,
+        let region_start = i * 0x20_0000;
+        let region_end = region_start + 0x20_0000;
+        let hit = match window {
+            Some((ts, te)) => region_contains_window(ts, te, region_start, region_end),
+            None => i == 0,
         };
+        if !hit {
+            continue;
+        }
+        let pt = match core::ptr::addr_of_mut!(KERNEL_PT_WIN[win_tables]).as_mut() {
+            Some(pt) => pt,
+            None => core::panic!("exec window spans more than two 2 MB regions"),
+        };
+        win_tables += 1;
+        pt.clear();
+        for k in 0..512u64 {
+            let addr = region_start + k * 0x1000;
+            let flags = PRESENT | WRITABLE | NX;
+            pt.entries[k as usize] = match window {
+                Some((ts, te)) if addr_is_exec(addr, ts, te) => addr | (flags & !NX),
+                _ => addr | flags,
+            };
+        }
+        pd0.entries[i as usize] =
+            core::ptr::addr_of!(KERNEL_PT_WIN[win_tables - 1]) as u64 | PRESENT | WRITABLE;
     }
 
     // GBs 1-2: 1 GB huge pages, NX (no executable content lives there).
@@ -319,10 +360,12 @@ pub unsafe fn init_kernel_tables() {
 /// The new PML4 copies the kernel PML4 (kernel code accessible from ring-0
 /// during interrupts), then clones the kernel's tables so USER flags can be
 /// added without mutating the shared kernel tables:
-///   - the first 2 MB region becomes a per-user 4 KB clone of the kernel's
-///     low PT (every leaf USER — the ring-3 task's own code runs from the
-///     kernel image in the low identity map, a teaching-kernel compromise —
-///     but NX is preserved, so only text pages are executable), and
+///   - every 4 KB-split 2 MB region of the stack's GB (the low 2 MB kernel
+///     image window, plus any exec-window region above 2 MB) becomes a
+///     per-user 4 KB clone with every leaf USER — the ring-3 task's own code
+///     runs from the kernel image in the identity map, a teaching-kernel
+///     compromise — but NX is preserved, so only text pages are executable,
+///     and
 ///   - the 2 MB region containing the task's stack is marked USER (and stays
 ///     NX: a ring-3 stack is data, never executable).
 ///
@@ -397,20 +440,29 @@ pub unsafe fn create_user_pml4(stack_phys: u64) -> u64 {
             new_pd.entries[i] = kernel_pd.entries[i];
         }
         if pdpt_idx == 0 {
-            // First 2 MB of GB 0 is a 4 KB PT (kernel image + VGA text).
-            // Clone it per-user and mark every leaf USER (code fetch for
-            // ring-3). NX is preserved, so only text pages are executable.
-            let kernel_pt_phys = new_pd.entries[0] & !0xFFF;
-            let kernel_pt = &*(kernel_pt_phys as *const PageTable);
-            let new_pt_frame = match alloc_global() {
-                Some(f) => f,
-                None => return 0,
-            };
-            let new_pt = &mut *(new_pt_frame as *mut PageTable);
-            for i in 0..512 {
-                new_pt.entries[i] = kernel_pt.entries[i] | USER;
+            // GB 0's 4 KB-split 2 MB regions — the low 2 MB kernel image
+            // window, plus any exec-window region above 2 MB when the kernel
+            // text links high (large embedded payload) — are cloned per-user
+            // with every leaf marked USER: ring-3 task code runs from the
+            // kernel image, a teaching-kernel compromise. NX is preserved,
+            // so only text pages are executable.
+            for pd_i in 0..512 {
+                let e = new_pd.entries[pd_i];
+                if e & PRESENT == 0 || e & HUGE_PAGE != 0 {
+                    continue;
+                }
+                let kernel_pt_phys = e & !0xFFF;
+                let kernel_pt = &*(kernel_pt_phys as *const PageTable);
+                let new_pt_frame = match alloc_global() {
+                    Some(f) => f,
+                    None => return 0,
+                };
+                let new_pt = &mut *(new_pt_frame as *mut PageTable);
+                for i in 0..512 {
+                    new_pt.entries[i] = kernel_pt.entries[i] | USER;
+                }
+                new_pd.entries[pd_i] = new_pt_frame | PRESENT | WRITABLE | USER;
             }
-            new_pd.entries[0] = new_pt_frame | PRESENT | WRITABLE | USER;
         }
         new_pd.entries[pd_idx] |= USER;
         user_pdpt.entries[pdpt_idx] = new_pd_frame | PRESENT | WRITABLE | USER;
@@ -613,6 +665,27 @@ mod tests {
         assert_eq!(pdpt_index(0xC000000000), 256);
         assert_eq!(pd_index(0xC000000000), 0);
         assert_eq!(pt_index(0xC000000000), 0);
+    }
+
+    #[test]
+    fn region_contains_window_matches_2mb_regions() {
+        let (ts, te) = (0xAF_3EB0u64, 0xB2_0724u64); // text window above 2 MB
+                                                     // Inside the window's own 2 MB region (0xA00000-0xC00000).
+        assert!(region_contains_window(ts, te, 0xA00000, 0xC00000));
+        // Region entirely below the window.
+        assert!(!region_contains_window(ts, te, 0, 0x200000));
+        assert!(!region_contains_window(ts, te, 0x800000, 0xA00000));
+        // Region entirely above the window.
+        assert!(!region_contains_window(ts, te, 0xC00000, 0xE00000));
+        // Window ending exactly at a region start: not inside that region.
+        assert!(!region_contains_window(
+            0x100000, 0x200000, 0x200000, 0x400000
+        ));
+        // Window straddling a region boundary: both regions hit.
+        assert!(region_contains_window(0x1FF000, 0x201000, 0, 0x200000));
+        assert!(region_contains_window(
+            0x1FF000, 0x201000, 0x200000, 0x400000
+        ));
     }
 
     #[test]

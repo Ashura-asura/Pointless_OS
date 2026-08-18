@@ -2017,7 +2017,8 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         }
     }
 
-    // Phase K + Phase U-6 (feature-gated): VT-x bring-up + run-loop demos.
+    // Phase K + Phase U-6 + Phase U-7 (feature-gated): VT-x bring-up, the
+    // run-loop demo, and the real Linux guest boot.
     // Last thing before interrupts turn on and the idle loop owns the
     // machine. `vmx_supported()` is a cheap no-op CPUID check; the demos
     // only run when VT-x is actually present. On a CPU without VT-x this
@@ -2025,9 +2026,12 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // zero behavior change. On a VMX-capable CPU: `bringup_demo()` proves
     // one full round trip (vmlaunch -> guest -> VM-exit -> handled), then
     // `run_loop_demo()` runs a resumable 32-bit guest under EPT that talks
-    // to the emulated 16550 and halts — bounded by its exit budget, so the
-    // machine keeps booting afterward (unlike the old bring-up, nothing
-    // halts forever anymore).
+    // to the emulated 16550 and halts — and `guest_boot_demo()` (Phase
+    // U-7) boots the real committed Linux guest (bzImage + initramfs, ~11
+    // MiB embedded) under the same run loop, with the guest's serial
+    // console, timer and PIC emulated by Aegis, stopping when the guest
+    // reaches its shell (the Phase U DoD point). Each is bounded by its
+    // own exit budget, so the machine keeps booting afterward.
     #[cfg(feature = "vmx-demo")]
     {
         if aegis_kernel::vmx::vmx_supported() {
@@ -2043,6 +2047,13 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 match aegis_kernel::vmx::run_loop_demo() {
                     Ok(()) => sprintln!("Aegis: [vmx] run-loop demo complete"),
                     Err(e) => sprintln!("Aegis: [vmx] run-loop demo failed: {}", e),
+                }
+            }
+            sprintln!("Aegis: [vmx] running Phase U-7 guest boot (real Linux kernel under EPT)");
+            unsafe {
+                match aegis_kernel::vmx::guest_boot_demo() {
+                    Ok(()) => sprintln!("Aegis: [vmx] guest boot complete — Phase U DoD achieved"),
+                    Err(e) => sprintln!("Aegis: [vmx] guest boot failed: {}", e),
                 }
             }
         } else {
