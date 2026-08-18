@@ -206,6 +206,79 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         }
     }
 
+    // Phase Y: host-side ACPI discovery + SMP groundwork. Reads the real
+    // RSDP/RSDT/XSDT/MADT tables QEMU/OVMF expose (EBDA + F-seg search like
+    // Linux, then the UEFI ACPI Reclaim/NVS regions from the boot memory map
+    // — OVMF installs the RSDP there, at high addresses), enumerates the
+    // CPUs/APICs, and stashes the result for future SMP phases (see acpi.rs).
+    // Pure and total — the boot must NEVER panic when ACPI is absent: a
+    // single honest line, then we keep booting on the legacy PIC/PIT path.
+    sprintln!("Aegis: acpi: scanning for RSDP (EBDA + F-seg + ACPI regions)");
+    let (acpi_ranges, acpi_range_count) = match boot_info.as_ref() {
+        Some(info) => aegis_kernel::acpi::acpi_ranges_from_map(info.entries),
+        None => ([(0u64, 0u64); aegis_kernel::acpi::MAX_ACPI_RANGES], 0),
+    };
+    let discovered = unsafe { aegis_kernel::acpi::discover(&acpi_ranges[..acpi_range_count]) };
+    match discovered.as_ref() {
+        Some(d) => {
+            unsafe {
+                aegis_kernel::acpi::set_discovered(Some(*d));
+            }
+            sprintln!(
+                "Aegis: acpi: RSDP rev={} rsdt=0x{:X} xsdt=0x{:X} (checksum ok)",
+                d.rsdp.revision,
+                d.rsdp.rsdt_address,
+                d.rsdp.xsdt_address
+            );
+            let sig = d.root_signature;
+            sprintln!(
+                "Aegis: acpi: root table {}{}{}{} count={}",
+                sig[0] as char,
+                sig[1] as char,
+                sig[2] as char,
+                sig[3] as char,
+                d.root_entries.count
+            );
+            match d.madt.as_ref() {
+                Some(m) => {
+                    sprintln!(
+                        "Aegis: acpi: MADT at 0x{:X} lapic=0x{:X} flags=0x{:X}",
+                        d.madt_address,
+                        m.lapic_address,
+                        m.flags
+                    );
+                    match &d.smp.ioapic {
+                        Some(io) => {
+                            sprintln!(
+                                "Aegis: acpi: SMP: {} processor(s) enabled (apic ids [{}]), ioapic=0x{:X} gsi_base={}",
+                                d.smp.cpu_count,
+                                aegis_kernel::acpi::ApicIdList(&d.smp),
+                                io.address,
+                                io.global_interrupt_base
+                            );
+                        }
+                        None => {
+                            sprintln!(
+                                "Aegis: acpi: SMP: {} processor(s) enabled (apic ids [{}]), ioapic=-",
+                                d.smp.cpu_count,
+                                aegis_kernel::acpi::ApicIdList(&d.smp)
+                            );
+                        }
+                    }
+                    sprintln!("Aegis: acpi: irq overrides: {}", m.override_count);
+                }
+                None => {
+                    sprintln!(
+                        "Aegis: acpi: ACPI unavailable - running with legacy PIC/PIT (no MADT)"
+                    );
+                }
+            }
+        }
+        None => {
+            sprintln!("Aegis: acpi: ACPI unavailable - running with legacy PIC/PIT (no MADT)");
+        }
+    }
+
     // Live PCI enumeration over the legacy 0xCF8/0xCFC config ports.
     let mut pci = aegis_kernel::pci::PciDeviceList::new();
     unsafe {

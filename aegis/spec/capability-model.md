@@ -1107,3 +1107,58 @@ decoder beyond PPM. The package manager installs/removes the catalog payloads by
 store-object content addressing; there is no manifest/signature step (that stays
 the Phase-7 `update.rs` path). Mouse-driven input is the emulated PS/2 path,
 and all display is QEMU/OVMF framebuffer output — UNTESTED on real hardware.
+
+### Machine-checked verification (executable): ACPI discovery + SMP groundwork (§8 Phase Y)
+
+`aegis-kernel` additions (26 more tests, **710 kernel total; 713 with
+`--features vmx-demo`**): the kernel now reads the *real* ACPI tables the
+firmware exposes and enumerates the CPUs/APICs — the first step toward SMP —
+as pure, total, contract-tested code, with a tested encoder path so the same
+types can later construct guest ACPI tables.
+
+- `acpi.rs` (26) — **parsers:** `parse_rsdp` (revision 0/1/2; ACPI 1.0
+  checksum over bytes 0..20 and, for rev ≥ 2, the extended checksum over the
+  full 36 bytes; nonzero RSDT required; future revisions rejected — they must
+  fail to parse, never be misread); `parse_sdt_header` (length ≥ 36, whole-table
+  checksum, non-zero signature); `parse_table_entries` (RSDT 32-bit / XSDT
+  64-bit; an XSDT entry ≥ 0x1_0000_0000 rejects the WHOLE parse — the identity
+  map covers only the first 4 GiB — never silent truncation; bounded by
+  `MAX_TABLES`); `parse_madt` (44-byte fixed part then `{type,length,body}`
+  entries: LAPIC / IOAPIC first-wins / IRQ override; unknown types skipped by
+  length; a length byte < 2 or an entry overrunning the table stops the walk
+  cleanly; never panics); `scan_rsdp` (16-byte-aligned offsets only).
+  **Discovery:** `discover_core<R: PhysRead>` is the pure decision logic over an
+  abstract physical-memory reader (tests inject synthetic regions); `read_phys`/
+  `LiveReader` are the live identity-mapped reads; the RSDP search is three-tier
+  — the EBDA segment word at 0x40E, the 0xE0000..0x100000 F-seg window, then the
+  UEFI ACPI Reclaim/NVS regions from the boot memory map (`acpi_ranges_from_map`
+  over new `TYPE_ACPI_RECLAIM`/`TYPE_ACPI_NVS`, where OVMF installs the RSDP at
+  high addresses the legacy locations cannot reach). **SMP groundwork:**
+  `smp_info_from_madt` yields `SmpInfo` (enabled-CPU count, APIC ids, IOAPIC,
+  LAPIC address), stashed by `set_discovered` for future SMP phases.
+  **Guest-flexibility seam:** `build_rsdp`/`build_madt`/`build_sdt_header`
+  encode over the *same* types, and the round-trip tests
+  (`build_rsdp_round_trips`, `build_madt_round_trips`) keep encoder and parser
+  in lockstep — NOT yet wired into the VM; a future guest-ACPI phase consumes
+  this seam.
+- `main.rs` — boot markers (`Aegis: acpi: scanning for RSDP`, `RSDP rev=…
+  rsdt=… (checksum ok)`, `root table RSDT count=…`, `MADT at 0x… lapic=…`,
+  `SMP: N processor(s) enabled (apic ids […])`, `irq overrides: K`); an
+  ACPI-absent boot prints one honest line (`ACPI unavailable - running with
+  legacy PIC/PIT`) and continues to the desktop.
+
+**Live proof (`uefi-boot/serial-acpi-demo.log`, QEMU `-machine q35 -smp 2`):**
+`Aegis: acpi: RSDP rev=0 rsdt=0x1FB7D000 xsdt=0x0 (checksum ok)` (found via the
+UEFI ACPI Reclaim region — EBDA/F-seg empty under OVMF),
+`root table RSDT count=6`, `MADT at 0x1FB78000 lapic=0xFEE00000 flags=0x1`,
+`SMP: 2 processor(s) enabled (apic ids [0,1])` (matches `-smp 2`),
+`ioapic=0xFEC00000 gsi_base=0`, `irq overrides: 5`, then
+`compositor desktop shown on the VM display` — **0 exceptions, 0 panics**.
+
+**Honest limits.** This is CPU/APIC *enumeration* groundwork, not bring-up:
+BSP only, no AP boot (INIT-SIPI), no per-CPU LAPIC reprogramming, no per-CPU
+stacks. Any ACPI table above 4 GiB is rejected because the identity map covers
+only the first 4 GiB (documented — real machines can place them there). The
+search is the Linux-style EBDA + F-seg + ACPI-region scan; vendor-specific RSDP
+locations on physical hardware would be missed. Everything is QEMU/OVMF-verified,
+UNTESTED on physical silicon.

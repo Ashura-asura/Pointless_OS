@@ -49,6 +49,15 @@ const MAX_ENTRIES: usize = 256;
 
 pub const TYPE_CONVENTIONAL: u32 = 7;
 
+/// UEFI `EfiACPIReclaimMemory` — where firmware installs the ACPI tables
+/// (RSDP/RSDT/XSDT/FADT/MADT). OVMF keeps them at high physical addresses,
+/// far above the legacy EBDA/F-seg locations.
+pub const TYPE_ACPI_RECLAIM: u32 = 9;
+
+/// UEFI `EfiACPIMemoryNVS` — firmware ACPI runtime NVS; may also hold parts
+/// of the ACPI table set.
+pub const TYPE_ACPI_NVS: u32 = 10;
+
 /// Byte offset of the optional `FleetConfig` block in the handoff page.
 pub const FLEET_OFFSET: usize = 24 + MapEntry::size() * MAX_ENTRIES;
 
