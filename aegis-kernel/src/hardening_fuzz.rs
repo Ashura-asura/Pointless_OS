@@ -315,7 +315,9 @@ fn tls_record_decrypt_never_panics_and_never_authenticates_garbage() {
             record[0] = 0x17; // application data content type
             record[1] = 0x03;
             record[2] = 0x03;
-            let payload = (record.len() - 5 - 16).min(0xFFFF) as u16;
+            // 5-byte header + 16-byte AEAD tag; saturate so tiny records get a
+            // plausible (clamped) length instead of panicking on underflow.
+            let payload = record.len().saturating_sub(5 + 16).min(0xFFFF) as u16;
             record[3..5].copy_from_slice(&payload.to_be_bytes());
         }
         let mut buf = [0u8; 4096];
@@ -397,21 +399,21 @@ fn syscall_boundary_rejects_hostile_indices() {
         // Per syscall: which argument positions are *index-type* (fuzzed) and
         // which drive bulk copies (forced to 0). Pointer positions stay `va`.
         let (fuzz, zero): (&[usize], &[usize]) = match num {
-            1 => (&[], &[1]),            // Write: buf=va, len=0
-            5 => (&[0], &[2]),           // Call: ep_slot fuzzed; msg_va=va, len=0, reply=va
-            6 => (&[0], &[]),            // Serve: ep_slot fuzzed; recvbuf=va
-            7 => (&[0, 1], &[3]),        // Reply: ep_slot+caller fuzzed; reply=va, rlen=0
-            9 => (&[0, 1, 2], &[]),      // CapGrant: dst, src_slot, dst_slot
-            10 => (&[], &[0]),           // MemCreate: frames=0 (allocates)
-            11 => (&[0], &[]),           // MemLen: slot
-            12 => (&[0, 1, 2], &[]),     // MemRead: slot/offset/len; dst=va
-            13 => (&[0, 1, 2], &[]),     // MemWrite: slot/offset/len; src=va
-            14..=16 => (&[0], &[]), // TaskState/Kill/Restart: slot
-            17 => (&[0, 1, 2], &[]),     // CapRevoke: dst, dst_slot, src_slot
-            18 => (&[0, 1, 3], &[]),     // RoleGrant: role/grantee/dst_slot; target=va
-            19 => (&[0], &[]),           // NetSocket: kind fuzzed (no NetRoot -> denied)
-            20 | 23 => (&[0], &[]),      // NetConnect/Close: slot
-            21 | 22 => (&[0], &[2]),     // NetSend/Recv: slot fuzzed; va=va, len=0
+            1 => (&[], &[1]),        // Write: buf=va, len=0
+            5 => (&[0], &[2]),       // Call: ep_slot fuzzed; msg_va=va, len=0, reply=va
+            6 => (&[0], &[]),        // Serve: ep_slot fuzzed; recvbuf=va
+            7 => (&[0, 1], &[3]),    // Reply: ep_slot+caller fuzzed; reply=va, rlen=0
+            9 => (&[0, 1, 2], &[]),  // CapGrant: dst, src_slot, dst_slot
+            10 => (&[], &[0]),       // MemCreate: frames=0 (allocates)
+            11 => (&[0], &[]),       // MemLen: slot
+            12 => (&[0, 1, 2], &[]), // MemRead: slot/offset/len; dst=va
+            13 => (&[0, 1, 2], &[]), // MemWrite: slot/offset/len; src=va
+            14..=16 => (&[0], &[]),  // TaskState/Kill/Restart: slot
+            17 => (&[0, 1, 2], &[]), // CapRevoke: dst, dst_slot, src_slot
+            18 => (&[0, 1, 3], &[]), // RoleGrant: role/grantee/dst_slot; target=va
+            19 => (&[0], &[]),       // NetSocket: kind fuzzed (no NetRoot -> denied)
+            20 | 23 => (&[0], &[]),  // NetConnect/Close: slot
+            21 | 22 => (&[0], &[2]), // NetSend/Recv: slot fuzzed; va=va, len=0
             _ => (&[], &[]),
         };
         for _ in 0..200 {

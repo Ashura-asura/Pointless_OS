@@ -710,10 +710,16 @@ mod tests {
             // reply on this endpoint must be refused too.
             assert_eq!(ipc_reply(0, 7, 0, 4), -1);
             // Only the matching blocked caller is accepted.
-            let buf = [0u8; 16];
+            let src = [0xAAu8; 4];
+            let dst = [0u8; 16];
             ENDPOINTS[0].caller = 7;
-            ENDPOINTS[0].caller_reply_va = buf.as_ptr() as u64;
-            assert_eq!(ipc_reply(0, 7, buf.as_ptr() as u64, 4), 0);
+            ENDPOINTS[0].caller_reply_va = dst.as_ptr() as u64;
+            assert_eq!(ipc_reply(0, 7, src.as_ptr() as u64, 4), 0);
+            assert_eq!(
+                &dst[..4],
+                &src,
+                "the reply bytes land in the caller's buffer"
+            );
         }
         assert_eq!(
             crate::audit::op_counts(2)[crate::audit::OpKind::Send.index()],
