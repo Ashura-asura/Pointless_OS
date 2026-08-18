@@ -22,7 +22,7 @@ rows below as re-verified just because this file was edited.*
 | Adaptive/AI ceiling (monotonic non-expansion) | `aegis-kernel/src/ceiling.rs` | 14 property tests; caught+fixed a real scope-expansion bug |
 | Parser/syscall total functions (no panic on garbage) | `aegis-kernel/src/hardening.rs` | 21 boundary tests over ELF/PE loaders, IPv4/Ethernet/ARP/UDP/TCP parsers, both syscall ABIs, compat layers, shell/window/graph/input |
 | Adaptive/AI ceiling under arbitrary interleaving (all 3 roles) | `aegis/spec/AegisCeiling.tla` | TLC model-check: 5,644,801 states / 147,456 distinct / 0 errors; negative control confirms non-vacuous |
-| Boundary-parser fuzzing (decode_entries, parse_elf, parse_pe) | `phase-m-fuzz/` links the real `aegis-kernel` crate (see `PHASE_M_STATUS.md`) | **180,000,000 inputs across 2 independent seeds (random + mutation-based from valid seeds), 0 panics, against the real in-crate functions**; the extracted-copy harness in `phase-m-fuzz/extracted/` reproduces the identical numbers, so there is no extraction drift; extraction validated by running all 23 of the parsers' own original unit tests unmodified |
+| Boundary-parser fuzzing (decode_entries, parse_elf, parse_pe) | `phase-m-fuzz/` links the real `aegis-kernel` crate | **180,000,000 inputs across 2 independent seeds (random + mutation-based from valid seeds), 0 panics, against the real in-crate functions**; the extracted-copy harness in `phase-m-fuzz/extracted/` reproduces the identical numbers, so there is no extraction drift; extraction validated by running all 23 of the parsers' own original unit tests unmodified |
 | Per-phase contracts | all crates | 645 total tests, 0 failures (495 kernel + 128 workspace + 22 bootloader: 13 ELF-contract + 9 fleet-CFG-contract) |
 
 ## Certification status by claim
@@ -60,9 +60,9 @@ rows below as re-verified just because this file was edited.*
 3. **No security audit of third-party toolchain output.** The Rust compiler, UEFI
    firmware, and hypervisors are trusted per the threat model.
 4. **Fuzzing covers three boundary parsers, not the full attack surface.**
-   `decode_entries`, `parse_elf`, `parse_pe` have a real host-side fuzz campaign
-   (180M inputs across 2 seeds, 0 crashes, against the real in-crate functions —
-   see `PHASE_M_STATUS.md`). The network parsers named in the master roadmap
+`decode_entries`, `parse_elf`, `parse_pe` have a real host-side fuzz campaign
+    (180M inputs across 2 seeds, 0 crashes, against the real in-crate functions).
+    The network parsers named in the master roadmap
    (ARP/Ethernet/IPv4/UDP/TCP/TLS) are NOT yet in this campaign — they depend on
    kernel-crate types that don't extract as cleanly as the three above;
    `hardening.rs`'s 21 deterministic boundary tests are the only coverage those
