@@ -22,7 +22,7 @@ const GLYPH_H: usize = 16;
 /// matches `vga.rs`'s 6-bit DAC palette scaled up to 8 bits (`v * 4`, e.g.
 /// `0x2A * 4 = 0xA8` ≈ `0xAA` below), so text rendered here has the same
 /// colors as the VGA text-mode backend.
-const PALETTE: [[u8; 3]; 16] = [
+pub const PALETTE: [[u8; 3]; 16] = [
     [0x00, 0x00, 0x00], // 0 black
     [0x00, 0x00, 0xAA], // 1 blue
     [0x00, 0xAA, 0x00], // 2 green

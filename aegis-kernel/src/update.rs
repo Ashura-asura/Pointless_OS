@@ -485,6 +485,56 @@ impl BootView {
         self.dir = root_new;
         Some(id)
     }
+
+    /// Remove the file `name` from the root of this view (COW unlink — the old
+    /// dir block keeps reading the pre-removal table forever). Returns
+    /// `Some(true)` when the file was removed, `Some(false)` when the name is
+    /// absent or is a directory (directories are never removed through this
+    /// path), and `None` when the store write fails.
+    pub fn remove_file(
+        &mut self,
+        store: &mut Store,
+        io: &mut impl BlockIo,
+        name: &[u8],
+    ) -> Option<bool> {
+        let cname = Name::from_slice(name)?;
+        let entries = self.read_dir(store, io);
+        match entries.iter().find(|e| e.name == cname) {
+            None => Some(false),
+            Some(e) if e.kind == KIND_DIR => Some(false),
+            Some(_) => {
+                let new_dir = remove_entry_block(store, io, self.dir, cname)?;
+                self.dir = new_dir;
+                Some(true)
+            }
+        }
+    }
+
+    /// Remove the file `name` inside the directory at `path` (COW unlink
+    /// propagated to root). `Some(true)` on removal, `Some(false)` if the name
+    /// is absent or a directory, `None` if the path does not resolve or the
+    /// store write fails.
+    pub fn remove_file_at(
+        &mut self,
+        store: &mut Store,
+        io: &mut impl BlockIo,
+        path: &[Name],
+        name: &[u8],
+    ) -> Option<bool> {
+        let r = self.resolve(store, io, path)?;
+        let cname = Name::from_slice(name)?;
+        let entries = read_dir_block(store, io, &r.parent);
+        match entries.iter().find(|e| e.name == cname) {
+            None => Some(false),
+            Some(e) if e.kind == KIND_DIR => Some(false),
+            Some(_) => {
+                let parent_new = remove_entry_block(store, io, r.parent, cname)?;
+                let root_new = Self::commit_tree(store, io, &r, parent_new)?;
+                self.dir = root_new;
+                Some(true)
+            }
+        }
+    }
 }
 
 /// A resolved path: the final directory block plus each ancestor `(dir, name)`
@@ -525,6 +575,36 @@ fn rewrite_entry_block(
         n += 1;
     }
     if !done {
+        return None;
+    }
+    let (enc, len) = encode_dir(&out[..n])?;
+    store.put(io, &enc[..len])
+}
+
+/// Remove the entry `name` from the dir block `dir` (COW unlink), returning
+/// the new dir block id. `None` if the name is absent.
+fn remove_entry_block(
+    store: &mut Store,
+    io: &mut impl BlockIo,
+    dir: BlockId,
+    name: Name,
+) -> Option<BlockId> {
+    let entries = read_dir_block(store, io, &dir);
+    let mut out = [DirEntry::default(); VIEW_MAX_FILES];
+    let mut n = 0usize;
+    let mut removed = false;
+    for e in entries.iter() {
+        if e.name.as_slice().is_empty() {
+            continue;
+        }
+        if e.name == name && !removed {
+            removed = true;
+        } else {
+            out[n] = *e;
+            n += 1;
+        }
+    }
+    if !removed {
         return None;
     }
     let (enc, len) = encode_dir(&out[..n])?;
@@ -1167,5 +1247,88 @@ mod tests {
         // The re-install added only the new descriptor + COW dir block, not the
         // payload.
         assert_eq!(store2.count() - count_before, 2);
+    }
+
+    #[test]
+    fn remove_file_keeps_siblings() {
+        let _g = crate::kernel_state_guard();
+        let (mut disk, mut store, _um) = world();
+        let mut view = BootView::create(&mut store, &mut disk).unwrap();
+        assert!(view
+            .write_file(&mut store, &mut disk, b"memo.txt", b"note")
+            .is_some());
+        assert!(view
+            .write_file(&mut store, &mut disk, b"pkg-a.txt", b"1")
+            .is_some());
+        assert!(view
+            .write_file(&mut store, &mut disk, b"pkg-b.txt", b"2")
+            .is_some());
+        assert!(view.mkdir_at(&mut store, &mut disk, &[], b"docs"));
+        // Removing one file leaves the others intact.
+        assert_eq!(
+            view.remove_file(&mut store, &mut disk, b"pkg-a.txt"),
+            Some(true)
+        );
+        assert_eq!(
+            view.remove_file(&mut store, &mut disk, b"pkg-a.txt"),
+            Some(false)
+        );
+        assert_eq!(
+            view.read_file(&mut store, &mut disk, b"memo.txt", &mut [0u8; SECTOR])
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            view.read_file(&mut store, &mut disk, b"pkg-b.txt", &mut [0u8; SECTOR])
+                .unwrap(),
+            1
+        );
+        // A directory is never removed through this path.
+        assert_eq!(
+            view.remove_file(&mut store, &mut disk, b"docs"),
+            Some(false)
+        );
+        // The COW table still lists the surviving siblings.
+        let mut names = [Name::default(); VIEW_MAX_FILES];
+        assert_eq!(view.list(&mut store, &mut disk, &mut names), 3);
+        assert!(names[..3]
+            .iter()
+            .any(|n| n.matches(b"memo.txt") && !n.as_slice().is_empty()));
+        assert!(names[..3].iter().any(|n| n.matches(b"pkg-b.txt")));
+        assert!(names[..3].iter().any(|n| n.matches(b"docs")));
+    }
+
+    #[test]
+    fn remove_file_at_is_cow_and_propagated_to_root() {
+        let _g = crate::kernel_state_guard();
+        let (mut disk, mut store, _um) = world();
+        let mut view = BootView::create(&mut store, &mut disk).unwrap();
+        let sub = [Name::from_slice(b"docs").unwrap()];
+        assert!(view.mkdir_at(&mut store, &mut disk, &[], b"docs"));
+        assert!(view
+            .create_file_at(&mut store, &mut disk, &sub, b"a.txt", b"x")
+            .is_some());
+        assert!(view
+            .create_file_at(&mut store, &mut disk, &sub, b"b.txt", b"y")
+            .is_some());
+        let pre = view.dir_id();
+        assert_eq!(
+            view.remove_file_at(&mut store, &mut disk, &sub, b"a.txt"),
+            Some(true)
+        );
+        // The sibling survives inside docs.
+        let mut inside = [(Name::default(), 0u8); VIEW_MAX_FILES];
+        assert_eq!(
+            view.list_entries(&mut store, &mut disk, &sub, &mut inside),
+            1
+        );
+        assert_eq!(inside[0], (Name::from_slice(b"b.txt").unwrap(), KIND_FILE));
+        // COW: the pre-removal root still reads the old table with a.txt.
+        let old = BootView::at(pre);
+        let mut old_inside = [(Name::default(), 0u8); VIEW_MAX_FILES];
+        assert_eq!(
+            old.list_entries(&mut store, &mut disk, &sub, &mut old_inside),
+            2
+        );
     }
 }

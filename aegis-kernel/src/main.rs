@@ -578,23 +578,35 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                         } else {
                             // Encrypted flight: unprotect with the server
                             // handshake key.
-                            let client = tls.as_mut().unwrap();
-                            match client.unprotect_server_hs(&rbuf[..rec_len], plain) {
-                                Some((inner_ct, payload)) => {
-                                    if inner_ct == aegis_kernel::tls::CT_HANDSHAKE {
-                                        if !client.on_server_handshake_payload(payload) {
-                                            sprintln!(
-                                                "Aegis: tls: server handshake payload rejected"
-                                            );
-                                            flight_done = true;
-                                        } else if client.server_finished_verified {
-                                            sprintln!("Aegis: tls: server Finished verified");
+                            match tls.as_mut() {
+                                Some(client) => {
+                                    match client.unprotect_server_hs(&rbuf[..rec_len], plain) {
+                                        Some((inner_ct, payload)) => {
+                                            if inner_ct == aegis_kernel::tls::CT_HANDSHAKE {
+                                                if !client.on_server_handshake_payload(payload) {
+                                                    sprintln!(
+                                                        "Aegis: tls: server handshake payload rejected"
+                                                    );
+                                                    flight_done = true;
+                                                } else if client.server_finished_verified {
+                                                    sprintln!(
+                                                        "Aegis: tls: server Finished verified"
+                                                    );
+                                                    flight_done = true;
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            sprintln!("Aegis: tls: server record auth failed");
                                             flight_done = true;
                                         }
                                     }
                                 }
                                 None => {
-                                    sprintln!("Aegis: tls: server record auth failed");
+                                    // The is_none branch above ran first, so an
+                                    // encrypted flight without state is a
+                                    // logic error, not a recoverable case.
+                                    sprintln!("Aegis: tls: state lost during handshake");
                                     flight_done = true;
                                 }
                             }
@@ -1126,6 +1138,11 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                             hex[3],
                             still_edited
                         );
+                        // Phase AA: reconcile the viewer + package-manager
+                        // payloads against the store (seed only what is absent,
+                        // so a user-replaced img.ppm or an installed package
+                        // survives a reboot) and report the seed.
+                        aa_seed(&mut st, &mut ctrl, &mut view);
                         unsafe {
                             aegis_kernel::editor::install(EditorFs {
                                 ctrl,
@@ -1155,6 +1172,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                             anchored,
                             created
                         );
+                        aa_seed(&mut st, &mut ctrl, &mut view);
                         unsafe {
                             aegis_kernel::editor::install(EditorFs {
                                 ctrl,
@@ -1478,6 +1496,42 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             core::str::from_utf8(&listing[..llen]).unwrap_or("<non-utf8>"),
             d.browser_count(),
             d.browser_id()
+        );
+
+        // Phase AA: report the three new windows' boot evidence — window ids,
+        // the package manager's store-backed listing (empty unless the store
+        // has pkg-* objects), and the viewer's parsed image dimension (0
+        // unless img.ppm parsed, the honest empty frame).
+        sprintln!("Aegis: calc window id={}", d.calc_id());
+        sprintln!("Aegis: viewer window id={}", d.viewer_id());
+        sprintln!("Aegis: pkgmgr window id={}", d.pkgmgr_id());
+        let mut plist = [0u8; 128];
+        let mut plen = 0;
+        for i in 0..d.pkgmgr_count() {
+            if let Some(name) = d.pkgmgr_name(i) {
+                let n = name.len();
+                if plen + n + 2 > plist.len() {
+                    break;
+                }
+                if i > 0 {
+                    plist[plen] = b',';
+                    plen += 1;
+                }
+                plist[plen..plen + n].copy_from_slice(name);
+                plen += n;
+            }
+        }
+        sprintln!(
+            "Aegis: pkgmgr@boot listing [{}] ({} packages, window id={})",
+            core::str::from_utf8(&plist[..plen]).unwrap_or("<non-utf8>"),
+            d.pkgmgr_count(),
+            d.pkgmgr_id()
+        );
+        sprintln!(
+            "Aegis: viewer@boot img.ppm -> {}x{} (window id={})",
+            d.viewer_dim(),
+            d.viewer_dim(),
+            d.viewer_id()
         );
         unsafe {
             aegis_kernel::desktop::install(d);
@@ -2094,6 +2148,40 @@ pub extern "sysv64" fn run_idle() -> ! {
     }
 }
 
+/// Phase AA store seeding: the viewer's `img.ppm` demo image and the two
+/// catalog package objects (`pkg-alpha.txt`, `pkg-beta.txt`) are written only
+/// when absent, so a reboot (which proves the F2-saved memo edit) also proves
+/// the Phase AA payloads persist, and a user-replaced image or an installed
+/// package is never clobbered. Reports each seed honestly over serial.
+fn aa_seed(
+    st: &mut aegis_kernel::nvme_store::Store,
+    ctrl: &mut aegis_kernel::nvme::NvmeController,
+    view: &mut aegis_kernel::update::BootView,
+) {
+    let ppm = aegis_kernel::viewer::build_demo_ppm();
+    let seeded_img = view.get(st, ctrl, b"img.ppm").is_none()
+        && view.write_file(st, ctrl, b"img.ppm", &ppm[..444]).is_some();
+    let seeded_alpha = view.get(st, ctrl, b"pkg-alpha.txt").is_none()
+        && view
+            .write_file(st, ctrl, b"pkg-alpha.txt", b"alpha tools v1\n")
+            .is_some();
+    let seeded_beta = view.get(st, ctrl, b"pkg-beta.txt").is_none()
+        && view
+            .write_file(st, ctrl, b"pkg-beta.txt", b"beta utils v1\n")
+            .is_some();
+    let created = (seeded_alpha as u8) + (seeded_beta as u8);
+    sprintln!(
+        "Aegis: viewer@seed img.ppm (444 bytes) created = {}",
+        seeded_img
+    );
+    sprintln!(
+        "Aegis: pkgmgr@seed {}/2 package objects created (pkg-alpha.txt = {}, pkg-beta.txt = {})",
+        created,
+        seeded_alpha,
+        seeded_beta
+    );
+}
+
 /// Kernel input task: drains the PS/2 ring buffer and applies each keypress
 /// to the live desktop (Tab cycles focus, arrows move the focused window),
 /// re-compositing and re-blitting, then prints the outcome over serial —
@@ -2217,6 +2305,36 @@ extern "sysv64" fn task_input() -> ! {
                                     name_len
                                 );
                             }
+                            aegis_kernel::desktop::KeyOutcome::CalcPressed { window_id, label } => {
+                                sprintln!(
+                                    "Aegis: calc@press '{}' -> window id={}",
+                                    label as char,
+                                    window_id
+                                );
+                                let mut disp = [0u8; 16];
+                                let n = aegis_kernel::desktop::Desktop::calc_result(&mut disp);
+                                sprintln!(
+                                    "Aegis: calc@result {}",
+                                    core::str::from_utf8(&disp[..n]).unwrap_or("<non-utf8>")
+                                );
+                            }
+                            aegis_kernel::desktop::KeyOutcome::PkgSelected { window_id, index } => {
+                                sprintln!(
+                                    "Aegis: pkgmgr@select -> window id={} selected row {}",
+                                    window_id,
+                                    index
+                                );
+                            }
+                            aegis_kernel::desktop::KeyOutcome::PkgInstalled {
+                                window_id,
+                                index,
+                            } => {
+                                sprintln!(
+                                    "Aegis: pkgmgr@install -> window id={} installed row {}",
+                                    window_id,
+                                    index
+                                );
+                            }
                         }
                     }
                 }
@@ -2308,6 +2426,25 @@ extern "sysv64" fn task_input() -> ! {
                                 "Aegis: taskbar@click -> window id={} focused and raised",
                                 window_id
                             );
+                        }
+                        aegis_kernel::desktop::MouseOutcome::CalcPressed { window_id, label } => {
+                            sprintln!(
+                                "Aegis: calc@press '{}' -> window id={}",
+                                label as char,
+                                window_id
+                            );
+                            let mut disp = [0u8; 16];
+                            let n = aegis_kernel::desktop::Desktop::calc_result(&mut disp);
+                            sprintln!(
+                                "Aegis: calc@result {}",
+                                core::str::from_utf8(&disp[..n]).unwrap_or("<non-utf8>")
+                            );
+                        }
+                        aegis_kernel::desktop::MouseOutcome::PackageInstall { name_index } => {
+                            sprintln!("Aegis: pkgmgr@install -> installed row {}", name_index);
+                        }
+                        aegis_kernel::desktop::MouseOutcome::PackageRemove { name_index } => {
+                            sprintln!("Aegis: pkgmgr@remove -> removed row {}", name_index);
                         }
                     }
                 }
@@ -2926,7 +3063,7 @@ extern "sysv64" fn task_advisor() -> ! {
     let q = b"restart? y/n";
     let sent = user_syscall5(21, 0, q.as_ptr() as u64, q.len() as u64, 0); // net_send
     user_print(b"Aegis: [advisor] query sent (");
-    print_dec(sent as u64);
+    print_dec(sent);
     user_print(b" bytes)\r\n");
     // Read the response (TCP echo reply from the host listener). The kernel
     // drains the NIC in task_input's round-robin slice, so poll the socket

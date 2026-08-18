@@ -44,6 +44,7 @@ pub mod policy_engine;
 pub mod profiler;
 
 pub mod browser;
+pub mod calc;
 pub mod compositor;
 pub mod cursor;
 pub mod desktop;
@@ -52,10 +53,12 @@ pub mod gpu;
 pub mod gpu_compositor;
 pub mod input;
 pub mod object_graph;
+pub mod pkgmgr;
 pub mod ps2;
 pub mod ps2_mouse;
 pub mod shell;
 pub mod terminal;
+pub mod viewer;
 pub mod window;
 
 pub mod elf_loader;

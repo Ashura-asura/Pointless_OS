@@ -82,13 +82,16 @@
 //! note on `TASKBAR_LABELS` for what would be needed to go further.
 
 use crate::browser::FileBrowser;
+use crate::calc::Calc;
 use crate::compositor::{self, Cell, MAX_WINDOWS};
 use crate::editor::{self, Editor, EDITOR_BUF_MAX};
 use crate::gpu::GpuDevice;
 use crate::input::{Key, KeyEvent, MouseEvent};
+use crate::pkgmgr::{PkgList, MAX_PACKAGES, NAME_WIDTH};
 use crate::store::{Name, MAX_DEPTH};
 use crate::terminal::{Command, Terminal};
-use crate::update::{KIND_DIR, VIEW_MAX_FILES};
+use crate::update::{KIND_DIR, KIND_FILE, VIEW_MAX_FILES};
+use crate::viewer::{parse_ppm, ViewerImage};
 use crate::window::{Region, WindowManager};
 
 /// Screen size in VGA text cells.
@@ -119,24 +122,75 @@ pub const BROWSER_Y: i16 = 13;
 pub const BROWSER_W: u16 = 34;
 pub const BROWSER_H: u16 = 10;
 
+/// Calculator window geometry (Phase AA: the fourth real app window), in the
+/// free right-hand band of the screen (columns 60..79) the shell/editor/
+/// browser never cover. 20 wide is exactly one cell per 3-cell button column
+/// (4 buttons x 3 cells = 12) plus the two side gutters and the window chrome;
+/// the 4x4 button grid sits on rows 2..5 below a display row (row 1), leaving
+/// row 6 blank below the buttons. The `6 * 7 =` cells the QEMU demo clicks
+/// land at screen cells (70,6), (74,6), (62,5), (70,8) — see
+/// `crate::calc::BUTTONS`.
+pub const CALC_X: i16 = 60;
+pub const CALC_Y: i16 = 3;
+pub const CALC_W: u16 = 20;
+pub const CALC_H: u16 = 8;
+
+/// Image-viewer window geometry (Phase AA: the fifth real app window), in the
+/// free band between the browser (columns 44..58) and the calculator
+/// (columns 60..79) on rows 3..17. 15x15 fits the 12x12 image plus its 1-cell
+/// border frame and title bar: row 0 title, row 1 top border, rows 2..13 the
+/// image, row 14 the bottom border.
+pub const VIEWER_X: i16 = 44;
+pub const VIEWER_Y: i16 = 3;
+pub const VIEWER_W: u16 = 15;
+pub const VIEWER_H: u16 = 15;
+
+/// Package-manager window geometry (Phase AA: the sixth real app window), the
+/// full left band below the shell (columns 0..43, rows 15..23). Height 9 keeps
+/// the window clear of the taskbar row (24) so the taskbar stays clickable.
+pub const PKG_X: i16 = 0;
+pub const PKG_Y: i16 = 15;
+pub const PKG_W: u16 = 44;
+pub const PKG_H: u16 = 9;
+
+/// The package payloads the pkgmgr window knows how to install. Honest
+/// Phase-7 mechanism: a "package" is a store object named `pkg-<name>.txt`;
+/// `install_selected` writes the canonical payload (content-addressable, so
+/// reinstalling identical bytes dedups to the same block) and `remove_selected`
+/// unlinks the object. The boot seeds `pkg-alpha.txt` and `pkg-beta.txt` into
+/// the store, so the live listing shows exactly this catalog at boot.
+const PKG_CATALOG: [(&[u8], &[u8]); 2] = [
+    (b"pkg-alpha.txt", b"alpha tools v1\n"),
+    (b"pkg-beta.txt", b"beta utils v1\n"),
+];
+
 /// Taskbar layout (Phase S): the status-bar window (id 2, row `SH-1`) is
-/// repurposed as a real taskbar — three fixed-width click segments, one
-/// per always-present app window, in creation order. `TASKBAR_SEG_W = 12`
-/// is wide enough for the longest label (`[Browser]`, 9 cells) with a
-/// 3-cell gap so segments never visually run together.
+/// repurposed as a real taskbar — one fixed-width click segment per
+/// always-present app window, in creation order. `TASKBAR_SEG_W = 12` is wide
+/// enough for the longest label (`[Browser]`, 9 cells) with a 3-cell gap so
+/// segments never visually run together. Phase AA adds the Calc, Viewer, and
+/// Pkg segments (windows 6/7/8), six segments x 12 = 72 cells of the 80-wide
+/// row.
 ///
-/// Honest scope: every app window in this desktop (shell, editor, browser)
-/// is a boot-time singleton — there is no per-app window-instantiation
-/// path in this codebase, so a taskbar click "launches" an app by
-/// focusing + raising its one already-existing window, not by spawning a
-/// new instance. That matches the roadmap's DoD ("launch the text editor,
-/// launch the file browser, click between them to bring each to front")
-/// for a single window per app; true multi-instance spawning (e.g. two
-/// editor windows open on two different files at once) would need a
+/// Honest scope: every app window in this desktop (shell, editor, browser,
+/// calculator, viewer, package manager) is a boot-time singleton — there is
+/// no per-app window-instantiation path in this codebase, so a taskbar click
+/// "launches" an app by focusing + raising its one already-existing window,
+/// not by spawning a new instance. That matches the roadmap's DoD ("launch
+/// the text editor, launch the file browser, click between them to bring
+/// each to front") for a single window per app; true multi-instance spawning
+/// (e.g. two editor windows open on two different files at once) would need a
 /// window-instantiation refactor this phase does not attempt — flagged
 /// here rather than silently implied.
 const TASKBAR_SEG_W: i16 = 12;
-const TASKBAR_LABELS: [&[u8]; 3] = [b"[Shell]", b"[Editor]", b"[Browser]"];
+const TASKBAR_LABELS: [&[u8]; 6] = [
+    b"[Shell]",
+    b"[Editor]",
+    b"[Browser]",
+    b"[Calc]",
+    b"[Viewer]",
+    b"[Pkg]",
+];
 
 /// The id `create_window` was called with for the status/taskbar window
 /// in `Desktop::new()`. A named const instead of the bare literal `2` at
@@ -257,6 +311,18 @@ pub enum KeyOutcome {
     /// first unused N) in the current directory. `name_len` is 0 when no
     /// durable store is present.
     CreatedDir { window_id: u32, name_len: usize },
+    /// A key that reached the focused calculator window was applied to its
+    /// model (`Calc::press_*`); `label` is the digit/operator/`=`/`C`
+    /// byte it mapped to, so the caller prints the live `calc@press` line.
+    /// The display after the press is `Desktop::calc_display_text()`.
+    CalcPressed { window_id: u32, label: u8 },
+    /// A package-manager key moved the selection; `index` is the now-selected
+    /// row.
+    PkgSelected { window_id: u32, index: usize },
+    /// Enter, with the package manager focused, installed the selected
+    /// package (wrote its canonical payload into the store). `index` is the
+    /// selected row; the store object name is `Desktop::pkgmgr_name(index)`.
+    PkgInstalled { window_id: u32, index: usize },
 }
 
 /// Which app window owns keyboard input. Tab cycles this; a mouse press on
@@ -268,6 +334,9 @@ enum AppFocus {
     Shell,
     Editor,
     Browser,
+    Calc,
+    Viewer,
+    PkgMgr,
 }
 
 /// What a mouse event did to the live desktop. The caller (input task)
@@ -313,6 +382,17 @@ pub enum MouseOutcome {
     /// the entry for the window already in front still reports this —
     /// it's already at front, so there's nothing further to do.
     TaskbarFocused { window_id: u32 },
+    /// Phase AA: a click on a calculator button pressed `label` (a digit,
+    /// an operator, `=` or `C`). `window_id` is the calculator window.
+    CalcPressed { window_id: u32, label: u8 },
+    /// Phase AA: a click on the package manager's `[Inst]` cell installed
+    /// the selected package (wrote its canonical payload into the store);
+    /// `name_index` is the selected listing row.
+    PackageInstall { name_index: usize },
+    /// Phase AA: a click on the package manager's `[Rem]` cell removed the
+    /// selected package (unlinked its store object); `name_index` is the
+    /// listing row that was removed.
+    PackageRemove { name_index: usize },
 }
 
 /// Minimum window size a corner drag can shrink an app window to.
@@ -355,10 +435,16 @@ pub struct Desktop {
     fb_shell: [Cell; (SHELL_W as usize) * (SHELL_H as usize)],
     fb_editor: [Cell; (EDITOR_W as usize) * (EDITOR_H as usize)],
     fb_browser: [Cell; (BROWSER_W as usize) * (BROWSER_H as usize)],
+    fb_calc: [Cell; (CALC_W as usize) * (CALC_H as usize)],
+    fb_viewer: [Cell; (VIEWER_W as usize) * (VIEWER_H as usize)],
+    fb_pkg: [Cell; (PKG_W as usize) * (PKG_H as usize)],
     screen: [Cell; SW * SH],
     shell_id: u32,
     editor_id: u32,
     browser_id: u32,
+    calc_id: u32,
+    viewer_id: u32,
+    pkgmgr_id: u32,
     editor: Editor,
     editor_name: Name,
     /// The directory path the editor's open file lives in (empty = root).
@@ -370,6 +456,9 @@ pub struct Desktop {
     editor_depth: usize,
     browser: FileBrowser,
     terminal: Terminal,
+    calc: Calc,
+    viewer: ViewerImage,
+    pkg: PkgList,
     focus: AppFocus,
     line: [u8; LINE_MAX],
     line_len: usize,
@@ -447,6 +536,42 @@ impl Desktop {
                 },
             )
             .unwrap();
+        let calc = wm
+            .create_window(
+                6,
+                b"calc",
+                Region {
+                    x: CALC_X,
+                    y: CALC_Y,
+                    width: CALC_W,
+                    height: CALC_H,
+                },
+            )
+            .unwrap();
+        let viewer = wm
+            .create_window(
+                7,
+                b"viewer",
+                Region {
+                    x: VIEWER_X,
+                    y: VIEWER_Y,
+                    width: VIEWER_W,
+                    height: VIEWER_H,
+                },
+            )
+            .unwrap();
+        let pkgmgr = wm
+            .create_window(
+                8,
+                b"pkgmgr",
+                Region {
+                    x: PKG_X,
+                    y: PKG_Y,
+                    width: PKG_W,
+                    height: PKG_H,
+                },
+            )
+            .unwrap();
         // The shell is the default post-boot surface: focused AND raised, so
         // it occludes the editor across their overlap until the editor is
         // focused (Tab or a click on its content).
@@ -478,16 +603,25 @@ impl Desktop {
             fb_shell: [0u16; (SHELL_W as usize) * (SHELL_H as usize)],
             fb_editor: [0u16; (EDITOR_W as usize) * (EDITOR_H as usize)],
             fb_browser: [0u16; (BROWSER_W as usize) * (BROWSER_H as usize)],
+            fb_calc: [0u16; (CALC_W as usize) * (CALC_H as usize)],
+            fb_viewer: [0u16; (VIEWER_W as usize) * (VIEWER_H as usize)],
+            fb_pkg: [0u16; (PKG_W as usize) * (PKG_H as usize)],
             screen: [compositor::TRANSPARENT; SW * SH],
             shell_id: shell,
             editor_id: editor,
             browser_id: browser,
+            calc_id: calc,
+            viewer_id: viewer,
+            pkgmgr_id: pkgmgr,
             editor: Desktop::editor_initial(),
             editor_name: Name::from_slice(editor::FILE_NAME).unwrap(),
             editor_path: [Name::default(); MAX_DEPTH],
             editor_depth: 0,
             browser: FileBrowser::new(),
             terminal: Terminal::new(),
+            calc: Calc::new(),
+            viewer: ViewerImage::new(),
+            pkg: PkgList::new(),
             focus: AppFocus::Shell,
             line: [0u8; LINE_MAX],
             line_len: 0,
@@ -497,6 +631,12 @@ impl Desktop {
         d.render_editor();
         d.refresh_browser_listing();
         d.render_browser();
+        // Phase AA: the viewer and the package manager populate from the same
+        // durable boot view at construction time, exactly like the browser —
+        // the seeded img.ppm / pkg-*.txt objects become the live content
+        // (empty image / empty list honestly when there is no store).
+        d.refresh_viewer_image();
+        d.refresh_pkg_listing();
         d.composite();
         d
     }
@@ -567,6 +707,64 @@ impl Desktop {
             core::str::from_utf8(&path[..plen]).unwrap_or("<non-utf8>"),
             self.browser.count(),
             self.browser_id
+        );
+    }
+
+    /// (Re)parse the viewer's `img.ppm` from the durable boot view (Phase AA).
+    /// A no-op keep of the current image when there is no store — the honest
+    /// in-memory fallback shows an empty frame. The boot log separately
+    /// reports the seed; this reconciles the live window to it.
+    fn refresh_viewer_image(&mut self) {
+        let mut buf = [0u8; 512];
+        let n = editor::with(|fs| fs.open(b"img.ppm", &mut buf)).flatten();
+        if let Some(n) = n {
+            if let Some(img) = parse_ppm(&buf[..n]) {
+                self.viewer = img;
+            }
+        }
+    }
+
+    /// Refresh the package manager's listing from the durable boot view's
+    /// root (Phase AA): every non-directory entry whose name starts with
+    /// `pkg-` is an installed package (the honest Phase-7 mechanism — a
+    /// package is a store object). An empty listing when no NVMe store is
+    /// present, matching the browser's honest degrade.
+    fn refresh_pkg_listing(&mut self) {
+        let mut raw = [(Name::default(), 0u8); VIEW_MAX_FILES];
+        let n = editor::with(|fs| fs.browser_list(&[], &mut raw)).unwrap_or(0);
+        let mut pkgs: [&[u8]; MAX_PACKAGES] = [&[]; MAX_PACKAGES];
+        let mut m = 0usize;
+        for e in raw[..n].iter() {
+            let name = e.0.as_slice();
+            if e.1 == KIND_FILE && name.starts_with(b"pkg-") && m < MAX_PACKAGES {
+                pkgs[m] = name;
+                m += 1;
+            }
+        }
+        self.pkg.set_entries(&pkgs[..m]);
+        // Report the refreshed listing over serial (the boot log separately
+        // prints the `pkgmgr@boot` line from main.rs).
+        let mut listing = [0u8; 128];
+        let mut llen = 0usize;
+        for i in 0..self.pkg.count {
+            if let Some(name) = self.pkg.name(i) {
+                let n = name.len();
+                if llen + n + 2 > listing.len() {
+                    break;
+                }
+                if i > 0 {
+                    listing[llen] = b',';
+                    llen += 1;
+                }
+                listing[llen..llen + n].copy_from_slice(name);
+                llen += n;
+            }
+        }
+        crate::sprintln!(
+            "Aegis: pkgmgr@listing [{}] ({} packages, window id={})",
+            core::str::from_utf8(&listing[..llen]).unwrap_or("<non-utf8>"),
+            self.pkg.count,
+            self.pkgmgr_id
         );
     }
 
@@ -917,6 +1115,195 @@ impl Desktop {
         }
     }
 
+    /// Render the calculator window's framebuffer: row 0 is the title bar
+    /// ("Calc" + a close button at the last cell); row 1 is the display —
+    /// `Calc::display_text()` (the current operand/result, or `ERR`); rows
+    /// 2..5 are the 4x4 button grid from `crate::calc::BUTTONS`, each button
+    /// three cells wide with its label centered, so a click maps to exactly
+    /// one button (see `calc_button_at`). Cells past the content keep the
+    /// dotted fill.
+    fn render_calc(&mut self) {
+        let (w, h) = self
+            .wm
+            .window(self.calc_id)
+            .map(|w| (w.region.width as usize, w.region.height as usize))
+            .unwrap_or((CALC_W as usize, CALC_H as usize));
+        let total = w * h;
+        for c in self.fb_calc[..total].iter_mut() {
+            *c = 0x0F00 | b'.' as u16;
+        }
+        for i in 0..w {
+            self.fb_calc[i] = 0x1F00 | b' ' as u16;
+        }
+        for (i, t) in b"Calc".iter().enumerate() {
+            if i + 1 < w {
+                self.fb_calc[i] = 0x1F00 | *t as u16;
+            }
+        }
+        if w > 0 {
+            self.fb_calc[w - 1] = 0x4F00 | b'X' as u16;
+        }
+        // Display row (row 1): the current `display_text()`.
+        if h > 1 {
+            let row_base = w;
+            for (i, &b) in self.calc.display_text().iter().enumerate() {
+                if i < w {
+                    self.fb_calc[row_base + i] = 0x0F00 | b as u16;
+                }
+            }
+        }
+        // Button grid (rows 2..5): button (r,c) spans local cols 1+4c..3+4c
+        // with its label centered at 2+4c. Only full-width rows are painted.
+        for (r, row) in crate::calc::BUTTONS.iter().enumerate() {
+            for (c, &label) in row.iter().enumerate() {
+                for i in 0..3 {
+                    let col = 1 + 4 * c + i;
+                    let row_base = (2 + r) * w;
+                    if row_base + col < total && (2 + r) < h {
+                        self.fb_calc[row_base + col] = 0x0F00 | b' ' as u16;
+                    }
+                }
+                let col = 2 + 4 * c;
+                let row_base = (2 + r) * w;
+                if row_base + col < total && (2 + r) < h {
+                    self.fb_calc[row_base + col] = 0x0F00 | label as u16;
+                }
+            }
+        }
+    }
+
+    /// Render the image-viewer window's framebuffer: row 0 is the title bar
+    /// ("Viewer" + a close button); rows 1 and 14 are the border frame
+    /// (`+---+`), with the 12x12 image painted cell-for-cell on rows 2..13,
+    /// columns 1..12, from `ViewerImage::cell`. Without a parsed image the
+    /// frame shows the dotted fill (honest empty state).
+    fn render_viewer(&mut self) {
+        let (w, h) = self
+            .wm
+            .window(self.viewer_id)
+            .map(|w| (w.region.width as usize, w.region.height as usize))
+            .unwrap_or((VIEWER_W as usize, VIEWER_H as usize));
+        let total = w * h;
+        for c in self.fb_viewer[..total].iter_mut() {
+            *c = 0x0F00 | b'.' as u16;
+        }
+        for i in 0..w {
+            self.fb_viewer[i] = 0x1F00 | b' ' as u16;
+        }
+        for (i, t) in b"Viewer".iter().enumerate() {
+            if i + 1 < w {
+                self.fb_viewer[i] = 0x1F00 | *t as u16;
+            }
+        }
+        if w > 0 {
+            self.fb_viewer[w - 1] = 0x4F00 | b'X' as u16;
+        }
+        let paint = |fb: &mut [Cell; (VIEWER_W as usize) * (VIEWER_H as usize)],
+                     w: usize,
+                     r: usize,
+                     c: usize,
+                     cell: Cell| {
+            if r < h && c < w && r * w + c < total {
+                fb[r * w + c] = cell;
+            }
+        };
+        // Border frame: top row 1, bottom row h-1, left/right columns 0/13.
+        for c in 0..w.min(14) {
+            if c == 0 || c == 13 {
+                paint(&mut self.fb_viewer, w, 1, c, 0x0F00 | b'|' as u16);
+                paint(&mut self.fb_viewer, w, h - 1, c, 0x0F00 | b'|' as u16);
+            } else {
+                paint(&mut self.fb_viewer, w, 1, c, 0x0F00 | b'-' as u16);
+                paint(&mut self.fb_viewer, w, h - 1, c, 0x0F00 | b'-' as u16);
+            }
+        }
+        // The image: rows 2..13, cols 1..12.
+        if self.viewer.dim > 0 {
+            for y in 0..self.viewer.dim as usize {
+                for x in 0..self.viewer.dim as usize {
+                    paint(
+                        &mut self.fb_viewer,
+                        w,
+                        2 + y,
+                        1 + x,
+                        self.viewer.cell(x as u32, y as u32),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Render the package-manager window's framebuffer: row 0 is the title
+    /// bar ("Pkgmgr" + a close button); rows 1..h-2 list the installed
+    /// packages, the selected row marked with a leading `*`; the last row is
+    /// an action bar with the `[Inst]` and `[Rem]` affordances (Phase AA:
+    /// install / remove the selected package). Empty listing -> empty body
+    /// rows (honest).
+    fn render_pkg(&mut self) {
+        let (w, h) = self
+            .wm
+            .window(self.pkgmgr_id)
+            .map(|w| (w.region.width as usize, w.region.height as usize))
+            .unwrap_or((PKG_W as usize, PKG_H as usize));
+        let total = w * h;
+        for c in self.fb_pkg[..total].iter_mut() {
+            *c = 0x0F00 | b'.' as u16;
+        }
+        for i in 0..w {
+            self.fb_pkg[i] = 0x1F00 | b' ' as u16;
+        }
+        for (i, t) in b"Pkgmgr".iter().enumerate() {
+            if i + 1 < w {
+                self.fb_pkg[i] = 0x1F00 | *t as u16;
+            }
+        }
+        if w > 0 {
+            self.fb_pkg[w - 1] = 0x4F00 | b'X' as u16;
+        }
+        // Listing rows: rows 1..h-2 (the last row is the action bar).
+        let listing_rows = h.saturating_sub(2);
+        for row in 0..listing_rows {
+            let Some(name) = self.pkg.name(row) else {
+                break;
+            };
+            let row_base = (row + 1) * w;
+            let marker = if self.pkg.is_selected(row) {
+                b'*'
+            } else {
+                b' '
+            };
+            if row_base < total {
+                self.fb_pkg[row_base] = 0x0F00 | marker as u16;
+            }
+            for (i, &b) in name.iter().enumerate() {
+                let idx = row_base + 1 + i;
+                if idx < total && idx < row_base + w {
+                    self.fb_pkg[idx] = 0x0F00 | b as u16;
+                }
+            }
+        }
+        // Action bar (last row): [Inst] install, [Rem] remove.
+        if h > 1 {
+            let base = (h - 1) * w;
+            for i in 0..w {
+                if base + i < total {
+                    self.fb_pkg[base + i] = 0x1F00 | b' ' as u16;
+                }
+            }
+            let actions: [&[u8]; 2] = [b"[Inst]", b"[Rem]"];
+            let mut at = 0usize;
+            for act in actions {
+                for (i, &b) in act.iter().enumerate() {
+                    let idx = base + at + i;
+                    if idx < total && idx < base + w {
+                        self.fb_pkg[idx] = 0x1F00 | b as u16;
+                    }
+                }
+                at += act.len() + 2;
+            }
+        }
+    }
+
     /// Render the taskbar (Phase S; the status-bar window's framebuffer,
     /// `fb_status`, repurposed): one highlighted segment per app window,
     /// the currently-focused one drawn as a solid button (reverse-video
@@ -932,6 +1319,9 @@ impl Desktop {
             AppFocus::Shell => 0,
             AppFocus::Editor => 1,
             AppFocus::Browser => 2,
+            AppFocus::Calc => 3,
+            AppFocus::Viewer => 4,
+            AppFocus::PkgMgr => 5,
         };
         for (seg, label) in TASKBAR_LABELS.iter().enumerate() {
             let base = seg as i16 * TASKBAR_SEG_W;
@@ -983,6 +1373,9 @@ impl Desktop {
         fbs[2] = Some(&self.fb_shell);
         fbs[3] = Some(&self.fb_editor);
         fbs[4] = Some(&self.fb_browser);
+        fbs[5] = Some(&self.fb_calc);
+        fbs[6] = Some(&self.fb_viewer);
+        fbs[7] = Some(&self.fb_pkg);
         compositor::composite(&self.wm, &fbs, &mut self.screen).unwrap();
         let desktop_bg: Cell = 0x1000 | b' ' as u16;
         for c in self.screen.iter_mut() {
@@ -1024,12 +1417,91 @@ impl Desktop {
             AppFocus::Shell => self.apply_key_shell(ke),
             AppFocus::Editor => self.apply_key_editor(ke),
             AppFocus::Browser => self.apply_key_browser(ke),
+            AppFocus::Calc => self.apply_key_calc(ke),
+            AppFocus::Viewer => None, // passive window: no keyboard actions
+            AppFocus::PkgMgr => self.apply_key_pkg(ke),
         }
     }
 
-    /// Cycle keyboard focus between the shell, the editor and the file
-    /// browser, raising the newly-focused window's z-order so it occludes
-    /// the others in overlap (Phase Q: three app windows, Tab walks them).
+    /// Calculator-focused keys (Phase AA): digits press into the model,
+    /// Enter is `=`, Backspace is `C`. Honest limit, inherited from
+    /// `input.rs`: there is no `Key` for `+ - * /` or `.` (no punctuation
+    /// keys at all), so operators reach the calculator only by mouse click —
+    /// the keyboard's `CalcPressed` labels are digits, `=` and `C`.
+    fn apply_key_calc(&mut self, ke: KeyEvent) -> Option<KeyOutcome> {
+        let label = match ke.key {
+            Key::Zero => Some(b'0'),
+            Key::One => Some(b'1'),
+            Key::Two => Some(b'2'),
+            Key::Three => Some(b'3'),
+            Key::Four => Some(b'4'),
+            Key::Five => Some(b'5'),
+            Key::Six => Some(b'6'),
+            Key::Seven => Some(b'7'),
+            Key::Eight => Some(b'8'),
+            Key::Nine => Some(b'9'),
+            Key::Enter => Some(b'='),
+            Key::Backspace => Some(b'C'),
+            _ => None,
+        }?;
+        match label {
+            b'C' => self.calc.press_clear(),
+            b'=' => self.calc.press_equals(),
+            d => self.calc.press_digit(d - b'0'),
+        }
+        self.render_calc();
+        self.composite();
+        Some(KeyOutcome::CalcPressed {
+            window_id: self.calc_id,
+            label,
+        })
+    }
+
+    /// Package-manager keys (Phase AA): arrows move the selection, Enter
+    /// installs the selected package (writes its canonical payload to the
+    /// store). No key removes — removal is the `[Rem]` mouse affordance, so
+    /// an accidental keypress can never delete a package.
+    fn apply_key_pkg(&mut self, ke: KeyEvent) -> Option<KeyOutcome> {
+        match ke.key {
+            Key::ArrowUp => {
+                if self.pkg.select_prev() {
+                    self.render_pkg();
+                    self.composite();
+                    Some(KeyOutcome::PkgSelected {
+                        window_id: self.pkgmgr_id,
+                        index: self.pkg.selected,
+                    })
+                } else {
+                    None
+                }
+            }
+            Key::ArrowDown => {
+                if self.pkg.select_next() {
+                    self.render_pkg();
+                    self.composite();
+                    Some(KeyOutcome::PkgSelected {
+                        window_id: self.pkgmgr_id,
+                        index: self.pkg.selected,
+                    })
+                } else {
+                    None
+                }
+            }
+            Key::Enter => {
+                let index = self.install_selected()?;
+                Some(KeyOutcome::PkgInstalled {
+                    window_id: self.pkgmgr_id,
+                    index,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Cycle keyboard focus between the six app windows (shell, editor,
+    /// browser, calculator, viewer, package manager), raising the
+    /// newly-focused window's z-order so it occludes the others in overlap
+    /// (Phase AA: Tab walks all six).
     fn cycle_focus(&mut self) -> KeyOutcome {
         match self.focus {
             AppFocus::Shell => {
@@ -1053,6 +1525,36 @@ impl Desktop {
                 }
             }
             AppFocus::Browser => {
+                self.focus = AppFocus::Calc;
+                let _ = self.wm.focus_window(self.calc_id);
+                self.render_calc();
+                self.composite();
+                KeyOutcome::Focused {
+                    window_id: self.calc_id,
+                    editor: false,
+                }
+            }
+            AppFocus::Calc => {
+                self.focus = AppFocus::Viewer;
+                let _ = self.wm.focus_window(self.viewer_id);
+                self.render_viewer();
+                self.composite();
+                KeyOutcome::Focused {
+                    window_id: self.viewer_id,
+                    editor: false,
+                }
+            }
+            AppFocus::Viewer => {
+                self.focus = AppFocus::PkgMgr;
+                let _ = self.wm.focus_window(self.pkgmgr_id);
+                self.render_pkg();
+                self.composite();
+                KeyOutcome::Focused {
+                    window_id: self.pkgmgr_id,
+                    editor: false,
+                }
+            }
+            AppFocus::PkgMgr => {
                 self.focus = AppFocus::Shell;
                 let _ = self.wm.focus_window(self.shell_id);
                 self.render_shell();
@@ -1442,6 +1944,70 @@ impl Desktop {
         }
     }
 
+    /// The calculator button at screen cell `(cx, cy)` inside the calc
+    /// window at `(wx, wy)`, or `None` for the title bar / gaps / display
+    /// rows. Rows 2..5 are the button grid; each button (r,c) spans local
+    /// cols 1+4c..3+4c, so `col` maps to `c = (col-1)/4` and the label sits
+    /// at `2+4c` — the exact cell a demo clicks.
+    fn calc_button_at(&self, wx: i16, wy: i16, cx: i16, cy: i16) -> Option<u8> {
+        let lr = cy - wy;
+        let lc = cx - wx;
+        if !(2..=5).contains(&lr) || lc < 1 {
+            return None;
+        }
+        let bc = (lc - 1) / 4;
+        if bc >= 4 {
+            return None;
+        }
+        Some(crate::calc::BUTTONS[(lr - 2) as usize][bc as usize])
+    }
+
+    /// Install the selected package: write its canonical payload (from
+    /// [`PKG_CATALOG`]) into the boot view as the selected `pkg-...` store
+    /// object, refresh the listing, and return the selected index. Content
+    /// addressing makes reinstalling the same bytes a dedup (no new data
+    /// block), exactly like the Phase U install path. `None` when nothing is
+    /// selected, the package is not in the catalog, or there is no durable
+    /// store.
+    fn install_selected(&mut self) -> Option<usize> {
+        let mut name = [0u8; NAME_WIDTH];
+        let n = self.pkg.selected_name()?.len();
+        name[..n].copy_from_slice(self.pkg.selected_name()?);
+        let payload = PKG_CATALOG
+            .iter()
+            .find(|(cat, _)| *cat == &name[..n])
+            .map(|(_, p)| *p)?;
+        let ok = editor::with(|fs| fs.write_named(&name[..n], payload)).is_some();
+        if !ok {
+            return None;
+        }
+        self.refresh_pkg_listing();
+        self.render_pkg();
+        self.composite();
+        Some(self.pkg.selected)
+    }
+
+    /// Remove the selected package: unlink its `pkg-...` store object from
+    /// the boot view (COW — `EditorFs::remove_named`), refresh the listing,
+    /// and return the index that was removed. `None` when nothing is
+    /// selected or no durable store is present.
+    fn remove_selected(&mut self) -> Option<usize> {
+        let mut name = [0u8; NAME_WIDTH];
+        let n = self.pkg.selected_name()?.len();
+        name[..n].copy_from_slice(self.pkg.selected_name()?);
+        let removed = editor::with(|fs| fs.remove_named(&name[..n]))
+            .flatten()
+            .unwrap_or(false);
+        if !removed {
+            return None;
+        }
+        let idx = self.pkg.selected;
+        self.refresh_pkg_listing();
+        self.render_pkg();
+        self.composite();
+        Some(idx)
+    }
+
     /// Apply one mouse event to the live desktop. A left press on the
     /// topmost app window's chrome starts a drag (title bar = move, bottom-
     /// right corner = resize, close button = close on release); during a
@@ -1523,6 +2089,9 @@ impl Desktop {
                             0 => self.shell_id,
                             1 => self.editor_id,
                             2 => self.browser_id,
+                            3 => self.calc_id,
+                            4 => self.viewer_id,
+                            5 => self.pkgmgr_id,
                             _ => unreachable!(
                                 "taskbar_segment_at bounds-checks against TASKBAR_LABELS"
                             ),
@@ -1626,6 +2195,95 @@ impl Desktop {
                                 });
                             }
                         }
+                        // Phase AA: a content click on the calculator window
+                        // presses a button — the mouse-only way to reach the
+                        // operators (no `Key` exists for them). The press
+                        // focuses + raises the calculator first so the
+                        // display row belongs to the front window.
+                        if id == self.calc_id && cy > wy {
+                            if let Some(label) = self.calc_button_at(wx, wy, cx, cy) {
+                                match label {
+                                    b'C' => self.calc.press_clear(),
+                                    b'=' => self.calc.press_equals(),
+                                    b'+' | b'-' | b'*' | b'/' => self.calc.press_op(label),
+                                    d => self.calc.press_digit(d - b'0'),
+                                }
+                                self.focus_content_press(id);
+                                self.render_calc();
+                                self.composite();
+                                return Some(MouseOutcome::CalcPressed {
+                                    window_id: self.calc_id,
+                                    label,
+                                });
+                            }
+                        }
+                        // Phase AA: a content click on the package-manager
+                        // window selects a listing row or hits the action
+                        // bar's [Inst] / [Rem] affordances. Rows 1..h-2 are
+                        // entries (click selects); the last row is the bar.
+                        if id == self.pkgmgr_id && cy > wy {
+                            let click_row = (cy - wy - 1).max(0) as usize;
+                            let is_action = click_row + 2 >= wh as usize;
+                            if is_action {
+                                let click_col = (cx - wx - 1).max(0) as usize;
+                                return match click_col / 7 {
+                                    0 => {
+                                        let index = self.install_selected();
+                                        match index {
+                                            Some(index) => Some(MouseOutcome::PackageInstall {
+                                                name_index: index,
+                                            }),
+                                            None => {
+                                                self.focus_content_press(id);
+                                                Some(MouseOutcome::Moved {
+                                                    x: me.x,
+                                                    y: me.y,
+                                                    left: true,
+                                                    right: me.right_button,
+                                                })
+                                            }
+                                        }
+                                    }
+                                    1 => {
+                                        let index = self.remove_selected();
+                                        match index {
+                                            Some(index) => Some(MouseOutcome::PackageRemove {
+                                                name_index: index,
+                                            }),
+                                            None => {
+                                                self.focus_content_press(id);
+                                                Some(MouseOutcome::Moved {
+                                                    x: me.x,
+                                                    y: me.y,
+                                                    left: true,
+                                                    right: me.right_button,
+                                                })
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        self.focus_content_press(id);
+                                        Some(MouseOutcome::Moved {
+                                            x: me.x,
+                                            y: me.y,
+                                            left: true,
+                                            right: me.right_button,
+                                        })
+                                    }
+                                };
+                            }
+                            if self.pkg.select_to(click_row) {
+                                self.render_pkg();
+                                self.composite();
+                                self.focus_content_press(id);
+                                return Some(MouseOutcome::Moved {
+                                    x: me.x,
+                                    y: me.y,
+                                    left: true,
+                                    right: me.right_button,
+                                });
+                            }
+                        }
                     }
                     // A press on an app window's content (not its chrome)
                     // focuses that window: it takes keyboard input and is
@@ -1690,6 +2348,12 @@ impl Desktop {
             self.render_editor();
         } else if id == self.browser_id {
             self.render_browser();
+        } else if id == self.calc_id {
+            self.render_calc();
+        } else if id == self.viewer_id {
+            self.render_viewer();
+        } else if id == self.pkgmgr_id {
+            self.render_pkg();
         }
     }
 
@@ -1701,6 +2365,12 @@ impl Desktop {
             AppFocus::Editor
         } else if id == self.browser_id {
             AppFocus::Browser
+        } else if id == self.calc_id {
+            AppFocus::Calc
+        } else if id == self.viewer_id {
+            AppFocus::Viewer
+        } else if id == self.pkgmgr_id {
+            AppFocus::PkgMgr
         } else {
             AppFocus::Shell
         };
@@ -1712,10 +2382,15 @@ impl Desktop {
         }
     }
 
-    /// True if `id` is a draggable app window (Phase O/P/Q: the shell
-    /// window, the editor window and the file browser window).
+    /// True if `id` is a draggable app window (Phase O/P/Q/AA: the shell,
+    /// editor, browser, calculator, viewer and package-manager windows).
     fn is_app_window(&self, id: u32) -> bool {
-        id == self.shell_id || id == self.editor_id || id == self.browser_id
+        id == self.shell_id
+            || id == self.editor_id
+            || id == self.browser_id
+            || id == self.calc_id
+            || id == self.viewer_id
+            || id == self.pkgmgr_id
     }
 
     /// The framebuffer dimensions backing an app window (the ceiling a corner
@@ -1727,9 +2402,74 @@ impl Desktop {
             (EDITOR_W as i16, EDITOR_H as i16)
         } else if id == self.browser_id {
             (BROWSER_W as i16, BROWSER_H as i16)
+        } else if id == self.calc_id {
+            (CALC_W as i16, CALC_H as i16)
+        } else if id == self.viewer_id {
+            (VIEWER_W as i16, VIEWER_H as i16)
+        } else if id == self.pkgmgr_id {
+            (PKG_W as i16, PKG_H as i16)
         } else {
             (0, 0)
         }
+    }
+
+    /// Window id of the calculator window (Phase AA).
+    pub fn calc_id(&self) -> u32 {
+        self.calc_id
+    }
+
+    /// Window id of the image-viewer window (Phase AA).
+    pub fn viewer_id(&self) -> u32 {
+        self.viewer_id
+    }
+
+    /// The viewer's currently parsed image edge length (0 until a PPM was
+    /// parsed — the honest empty frame).
+    pub fn viewer_dim(&self) -> u32 {
+        self.viewer.dim
+    }
+
+    /// Window id of the package-manager window (Phase AA).
+    pub fn pkgmgr_id(&self) -> u32 {
+        self.pkgmgr_id
+    }
+
+    /// The calculator's current display text (`Calc::display_text()`) —
+    /// what the boot log prints as `calc@result`.
+    pub fn calc_display_text(&self) -> &[u8] {
+        self.calc.display_text()
+    }
+
+    /// Copy the live desktop's calculator display into `out`, returning its
+    /// length — the input task's `calc@result` serial evidence after a button
+    /// press. 0 when no desktop is installed.
+    pub fn calc_result(out: &mut [u8; 16]) -> usize {
+        let Some(d) = unsafe { core::ptr::addr_of_mut!(DESKTOP).as_mut() }.and_then(|o| o.as_mut())
+        else {
+            return 0;
+        };
+        let t = d.calc_display_text();
+        let n = t.len().min(out.len());
+        out[..n].copy_from_slice(&t[..n]);
+        n
+    }
+
+    /// Number of packages currently listed in the package manager (the boot
+    /// log reports it so the listing is provable across a power cycle).
+    pub fn pkgmgr_count(&self) -> usize {
+        self.pkg.count
+    }
+
+    /// The package manager's `idx`-th listed package name, if any.
+    pub fn pkgmgr_name(&self, idx: usize) -> Option<&[u8]> {
+        self.pkg.name(idx)
+    }
+
+    /// Re-run the package-manager listing refresh (exposed so `main.rs` can
+    /// resync after boot-time seeding, and so a later install/remove is
+    /// provable).
+    pub fn refresh_pkg_listing_public(&mut self) {
+        self.refresh_pkg_listing();
     }
 }
 
@@ -2057,6 +2797,7 @@ mod tests {
 
     #[test]
     fn boot_shell_surface_is_default() {
+        let _g = crate::kernel_state_guard();
         let d = Desktop::new();
         // Title bar first cell is 'S' (of "Shell"); the prompt is on the
         // window's last row (Phase R), leaving room for scrollback above.
@@ -2074,12 +2815,13 @@ mod tests {
         // the `[` of the `[Shell]` segment (not the old `-` placeholder).
         let status_ok = (d.screen()[(SH - 1) * SW] & 0xFF) as u8 == b'[';
         assert!(status_ok);
-        // Title + status + shell + editor + browser: no demo windows.
-        assert_eq!(d.window_count(), 5);
+        // Title + status + shell + editor + browser + calc + viewer + pkgmgr.
+        assert_eq!(d.window_count(), 8);
     }
 
     #[test]
     fn keystroke_echoes_through_full_path() {
+        let _g = crate::kernel_state_guard();
         // PS/2 ring buffer path: scancodes for 'h' (0x23) then 'i' (0x17).
         let mut st = Ps2State::new();
         let mut buf = InputBuffer::new();
@@ -2108,6 +2850,7 @@ mod tests {
 
     #[test]
     fn shift_produces_uppercase_echo() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         let out = d
             .apply_key(KeyEvent {
@@ -2129,6 +2872,7 @@ mod tests {
 
     #[test]
     fn backspace_removes_last_char() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         d.apply_key(KeyEvent {
             key: Key::H,
@@ -2162,6 +2906,7 @@ mod tests {
 
     #[test]
     fn enter_clears_the_line() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         d.apply_key(KeyEvent {
             key: Key::H,
@@ -2195,6 +2940,7 @@ mod tests {
 
     #[test]
     fn arrow_key_moves_shell_window() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         let out = d.apply_key(arrow(Key::ArrowRight)).unwrap();
         match out {
@@ -2217,6 +2963,7 @@ mod tests {
 
     #[test]
     fn arrow_key_move_clamps_at_minimum() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         // SHELL_Y is already 2; MOVE_MIN_Y is 1, so a single Up reaches the
         // clamp and a second Up must not go any further.
@@ -2230,6 +2977,7 @@ mod tests {
 
     #[test]
     fn arrow_key_move_clamps_at_maximum() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         // Drive far past the right edge; must clamp at MOVE_MAX_X and stay
         // fully on screen (never past SW - SHELL_W).
@@ -2245,6 +2993,7 @@ mod tests {
 
     #[test]
     fn mouse_outcome_reports_event() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         // Press on the global title bar (cell (0,0)): not an app window, so it
         // reports position rather than starting a drag.
@@ -2268,6 +3017,7 @@ mod tests {
 
     #[test]
     fn mouse_drag_moves_shell_window() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         // Press on the title bar (cell (10,2) -> pixel (80,32)).
         let press = d.apply_mouse(MouseEvent {
@@ -2313,6 +3063,7 @@ mod tests {
 
     #[test]
     fn mouse_drag_clamps_on_screen() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         // Press on the title bar and drag far up-left: must clamp to (0,1).
         d.apply_mouse(MouseEvent {
@@ -2351,6 +3102,7 @@ mod tests {
 
     #[test]
     fn mouse_resize_changes_size() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         // Press on the resize handle (cell (61,13) -> pixel (488,208)).
         d.apply_mouse(MouseEvent {
@@ -2397,6 +3149,7 @@ mod tests {
 
     #[test]
     fn mouse_resize_clamps_to_minimum() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         d.apply_mouse(MouseEvent {
             x: 488,
@@ -2425,6 +3178,7 @@ mod tests {
 
     #[test]
     fn mouse_resize_cannot_exceed_framebuffer() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         d.apply_mouse(MouseEvent {
             x: 488,
@@ -2454,8 +3208,9 @@ mod tests {
 
     #[test]
     fn mouse_close_destroys_window() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
-        assert_eq!(d.window_count(), 5);
+        assert_eq!(d.window_count(), 8);
         // Press the close button (cell (61,2) -> pixel (488,32)).
         d.apply_mouse(MouseEvent {
             x: 488,
@@ -2478,12 +3233,13 @@ mod tests {
             MouseOutcome::Closed { window_id } => assert_eq!(window_id, d.shell_id()),
             _ => panic!("expected a close"),
         }
-        assert_eq!(d.window_count(), 4);
+        assert_eq!(d.window_count(), 7);
         assert!(d.wm.window(d.shell_id()).is_none());
     }
 
     #[test]
     fn mouse_press_on_content_does_not_drag() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         // Press on content (cell (10,5) -> pixel (80,80)): not chrome, no drag.
         let out = d
@@ -2508,6 +3264,7 @@ mod tests {
 
     #[test]
     fn mouse_release_without_drag_is_harmless() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         let out = d
             .apply_mouse(MouseEvent {
@@ -2534,8 +3291,9 @@ mod tests {
 
     #[test]
     fn editor_window_is_second_app_window() {
+        let _g = crate::kernel_state_guard();
         let d = Desktop::new();
-        assert_eq!(d.window_count(), 5);
+        assert_eq!(d.window_count(), 8);
         let w = d.wm.window(d.editor_id()).unwrap();
         assert_eq!(
             (w.region.x, w.region.y, w.region.width, w.region.height),
@@ -2545,6 +3303,7 @@ mod tests {
 
     #[test]
     fn tab_cycles_focus_and_raises_editor() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         // Tab -> editor focused and raised: its title 'E' is now the topmost
         // cell at (10,6) (the shell previously occluded that cell).
@@ -2574,23 +3333,31 @@ mod tests {
             (d.screen()[BROWSER_Y as usize * SW + BROWSER_X as usize] & 0xFF) as u8,
             b'F'
         );
-        // Tab -> shell refocused and raised: the shell occludes (44,13) again.
+        // Tab -> calculator focused and raised (Phase AA: the third Tab
+        // continues the six-app cycle, shell/editor/browser/calc/viewer/pkg).
         let out = d.apply_key(key(Key::Tab)).unwrap();
         match out {
             KeyOutcome::Focused {
                 window_id,
                 editor: false,
-            } => assert_eq!(window_id, d.shell_id()),
-            _ => panic!("expected focus back on the shell"),
+            } => assert_eq!(window_id, d.calc_id()),
+            _ => panic!("expected focus on the calculator"),
         }
-        assert_ne!(
-            (d.screen()[BROWSER_Y as usize * SW + BROWSER_X as usize] & 0xFF) as u8,
-            b'F'
+        assert_eq!(
+            (d.screen()[CALC_Y as usize * SW + CALC_X as usize] & 0xFF) as u8,
+            b'C'
         );
+        // Raised: the calculator now has the highest z-order of the six
+        // app windows (it was created last, so only focus_window can put
+        // it above the browser the second Tab raised).
+        let max_z = |id: u32| d.wm.window(id).unwrap().z_order;
+        assert!(max_z(d.calc_id()) > max_z(d.browser_id()));
+        assert!(max_z(d.calc_id()) > max_z(d.shell_id()));
     }
 
     #[test]
     fn editor_typing_edits_buffer_and_screen() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         d.apply_key(key(Key::Tab)).unwrap();
         // The editor starts from the seed; typing appends at cursor 24.
@@ -2624,6 +3391,7 @@ mod tests {
 
     #[test]
     fn editor_arrow_keys_move_cursor() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         d.apply_key(key(Key::Tab)).unwrap();
         d.apply_key(key(Key::X)).unwrap();
@@ -2645,6 +3413,7 @@ mod tests {
 
     #[test]
     fn editor_enter_inserts_newline() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         d.apply_key(key(Key::Tab)).unwrap();
         // Enter at the end of the seed (24 bytes) inserts '\n' at pos 24.
@@ -2670,6 +3439,7 @@ mod tests {
 
     #[test]
     fn f2_save_reports_buffer_len_and_honest_block() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         d.apply_key(key(Key::Tab)).unwrap();
         d.apply_key(key(Key::X)).unwrap();
@@ -2702,6 +3472,7 @@ mod tests {
     /// renders — a stand-in for the disk write host tests can't see.
     #[test]
     fn f2_save_targets_the_currently_open_file_not_always_memo() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         assert_eq!(d.editor_name.as_slice(), editor::FILE_NAME);
 
@@ -2732,8 +3503,9 @@ mod tests {
 
     #[test]
     fn browser_window_is_third_app_window() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
-        assert_eq!(d.window_count(), 5);
+        assert_eq!(d.window_count(), 8);
         let w = d.wm.window(d.browser_id()).unwrap();
         assert_eq!(
             (w.region.x, w.region.y, w.region.width, w.region.height),
@@ -2752,8 +3524,10 @@ mod tests {
 
     #[test]
     fn tab_cycles_focus_through_browser_to_shell() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
-        // Shell -> editor -> browser -> shell: the full three-app cycle.
+        // Shell -> editor -> browser: the first two steps of the six-app
+        // cycle (Phase AA: Tab walks shell/editor/browser/calc/viewer/pkg).
         d.apply_key(key(Key::Tab)).unwrap(); // -> editor
         let out = d.apply_key(key(Key::Tab)).unwrap(); // -> browser
         match out {
@@ -2780,6 +3554,7 @@ mod tests {
 
     #[test]
     fn browser_mouse_click_without_store_does_not_open() {
+        let _g = crate::kernel_state_guard();
         // No durable store is installed in tests, so the listing is empty: a
         // content click on the browser must NOT fabricate an open — it falls
         // through to the generic content-focus path and reports the position.
@@ -2806,6 +3581,7 @@ mod tests {
 
     #[test]
     fn browser_mouse_action_bar_reaches_create_cells() {
+        let _g = crate::kernel_state_guard();
         // The browser's last row is the action bar (local row wh-1 ->
         // click_row wh-2). Regression: the is_action gate used to be
         // `click_row + 1 >= wh`, which the action bar never satisfied, so
@@ -2864,10 +3640,12 @@ mod tests {
 
     /// The taskbar segment boundaries match `TASKBAR_SEG_W`/`TASKBAR_LABELS`
     /// exactly: segment 0 is columns 0..12, segment 1 12..24, segment 2
-    /// 24..36, and nothing past that (the taskbar doesn't fill the full
-    /// 80-column row).
+    /// 24..36, segment 3 36..48, segment 4 48..60, segment 5 60..72, and
+    /// nothing past the last labeled segment (the taskbar doesn't fill the
+    /// full 80-column row).
     #[test]
     fn taskbar_segment_at_matches_the_rendered_layout() {
+        let _g = crate::kernel_state_guard();
         let d = Desktop::new();
         assert_eq!(d.taskbar_segment_at(0), Some(0));
         assert_eq!(d.taskbar_segment_at(11), Some(0));
@@ -2875,8 +3653,14 @@ mod tests {
         assert_eq!(d.taskbar_segment_at(23), Some(1));
         assert_eq!(d.taskbar_segment_at(24), Some(2));
         assert_eq!(d.taskbar_segment_at(35), Some(2));
+        assert_eq!(d.taskbar_segment_at(36), Some(3));
+        assert_eq!(d.taskbar_segment_at(47), Some(3));
+        assert_eq!(d.taskbar_segment_at(48), Some(4));
+        assert_eq!(d.taskbar_segment_at(59), Some(4));
+        assert_eq!(d.taskbar_segment_at(60), Some(5));
+        assert_eq!(d.taskbar_segment_at(71), Some(5));
         assert_eq!(
-            d.taskbar_segment_at(36),
+            d.taskbar_segment_at(72),
             None,
             "past the last labeled segment"
         );
@@ -2889,6 +3673,7 @@ mod tests {
     /// 12 is segment 1's first column, row 24 is the taskbar row.
     #[test]
     fn taskbar_click_focuses_and_raises_the_editor() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         assert_eq!(d.focus, AppFocus::Shell);
         let out = d
@@ -2920,6 +3705,7 @@ mod tests {
     /// DoD, driven purely through `apply_mouse` — no Tab.
     #[test]
     fn taskbar_click_switches_between_editor_and_browser_mouse_only() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         d.apply_mouse(MouseEvent {
             x: 96,
@@ -2956,6 +3742,7 @@ mod tests {
     /// visual half of "see the taskbar" from the Phase S DoD.
     #[test]
     fn render_taskbar_highlights_only_the_focused_segment() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         // Boot default: shell focused, segment 0 highlighted.
         assert_eq!(
@@ -3044,6 +3831,7 @@ mod tests {
 
     #[test]
     fn help_command_lists_every_command() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         let out = run_shell_command(&mut d, b"help");
         match out {
@@ -3061,6 +3849,7 @@ mod tests {
 
     #[test]
     fn ls_without_a_durable_store_reports_honestly_empty() {
+        let _g = crate::kernel_state_guard();
         // No NVMe store is installed in tests (same honest degrade the
         // browser's F3 test above already exercises) — `ls` must say so
         // rather than fabricating rows.
@@ -3075,6 +3864,7 @@ mod tests {
 
     #[test]
     fn open_without_a_prior_listing_is_a_usage_error_not_a_panic() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         let out = run_shell_command(&mut d, b"open 1");
         match out {
@@ -3089,6 +3879,7 @@ mod tests {
 
     #[test]
     fn open_with_no_argument_is_a_usage_error() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         let out = run_shell_command(&mut d, b"open");
         match out {
@@ -3103,6 +3894,7 @@ mod tests {
 
     #[test]
     fn new_without_a_durable_store_reports_honestly() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         let out = run_shell_command(&mut d, b"new");
         match out {
@@ -3117,6 +3909,7 @@ mod tests {
 
     #[test]
     fn clear_empties_the_scrollback() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         run_shell_command(&mut d, b"help");
         assert!(!d.terminal.lines().is_empty());
@@ -3130,6 +3923,7 @@ mod tests {
 
     #[test]
     fn unknown_command_reports_without_panicking() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         let out = run_shell_command(&mut d, b"frobnicate");
         match out {
@@ -3144,6 +3938,7 @@ mod tests {
 
     #[test]
     fn empty_line_produces_no_output() {
+        let _g = crate::kernel_state_guard();
         let mut d = Desktop::new();
         let out = d.apply_key(key(Key::Enter)).unwrap();
         match out {
@@ -3158,6 +3953,7 @@ mod tests {
 
     #[test]
     fn scrollback_renders_top_down_from_row_one() {
+        let _g = crate::kernel_state_guard();
         // After `help`, the composited screen should show the first help
         // line directly below the title bar (row 1), proving render_shell
         // actually paints scrollback rather than just tracking it
@@ -3171,5 +3967,199 @@ mod tests {
         assert_eq!(cell, b'c');
         let cell2 = (d.screen()[first_output_row * SW + SHELL_X as usize + 1] & 0xFF) as u8;
         assert_eq!(cell2, b'o');
+    }
+
+    // --- Phase AA: calculator, viewer, package manager ---------------------
+
+    fn click(d: &mut Desktop, px: i16, py: i16) -> Option<MouseOutcome> {
+        d.apply_mouse(MouseEvent {
+            x: px,
+            y: py,
+            left_button: true,
+            right_button: false,
+            scroll: 0,
+        })
+    }
+
+    /// A click on the taskbar's Calc segment (cell (41,24) -> pixel (328,384),
+    /// column 41 is segment 3's first column) focuses and raises the
+    /// calculator window — the mouse-only "launch the calculator" gesture.
+    #[test]
+    fn taskbar_click_focuses_and_raises_the_calculator() {
+        let _g = crate::kernel_state_guard();
+        let mut d = Desktop::new();
+        assert_eq!(d.focus, AppFocus::Shell);
+        let out = click(&mut d, 328, 384).unwrap();
+        match out {
+            MouseOutcome::TaskbarFocused { window_id } => {
+                assert_eq!(window_id, d.calc_id());
+            }
+            _ => panic!("expected a taskbar focus outcome"),
+        }
+        assert_eq!(d.focus, AppFocus::Calc);
+        // Raised: the calculator is now the topmost of the six app windows.
+        let max_z = |id: u32| d.wm.window(id).unwrap().z_order;
+        assert!(max_z(d.calc_id()) > max_z(d.shell_id()));
+        assert!(max_z(d.calc_id()) > max_z(d.browser_id()));
+    }
+
+    /// Click the calculator's button cells `6 * 7 =` (the exact cells the
+    /// QEMU demo drives through HMP `mouse_move`/`mouse_button`): '6' at cell
+    /// (70,6) -> pixel (560,96), '*' at (74,6) -> (592,96), '7' at (62,5) ->
+    /// (496,80), '=' at (70,8) -> (560,128). Each click maps through
+    /// `calc_button_at` to one `BUTTONS` label and the model computes 42.
+    #[test]
+    fn mouse_click_on_calc_buttons_computes_42() {
+        let _g = crate::kernel_state_guard();
+        let mut d = Desktop::new();
+        assert!(matches!(
+            click(&mut d, 560, 96).unwrap(),
+            MouseOutcome::CalcPressed { label: b'6', .. }
+        ));
+        assert!(matches!(
+            click(&mut d, 592, 96).unwrap(),
+            MouseOutcome::CalcPressed { label: b'*', .. }
+        ));
+        assert!(matches!(
+            click(&mut d, 496, 80).unwrap(),
+            MouseOutcome::CalcPressed { label: b'7', .. }
+        ));
+        assert!(matches!(
+            click(&mut d, 560, 128).unwrap(),
+            MouseOutcome::CalcPressed { label: b'=', .. }
+        ));
+        assert_eq!(d.calc_display_text(), b"42");
+        // The display row (row 1 of the calc window, cell (60,4)) shows '4'.
+        let disp = (d.screen()[(CALC_Y as usize + 1) * SW + CALC_X as usize] & 0xFF) as u8;
+        assert_eq!(disp, b'4');
+    }
+
+    /// Tab walks all six app windows in creation order and wraps around.
+    #[test]
+    fn tab_cycles_through_all_six_windows() {
+        let _g = crate::kernel_state_guard();
+        let mut d = Desktop::new();
+        let steps: [(AppFocus, u32); 6] = [
+            (AppFocus::Editor, d.editor_id()),
+            (AppFocus::Browser, d.browser_id()),
+            (AppFocus::Calc, d.calc_id()),
+            (AppFocus::Viewer, d.viewer_id()),
+            (AppFocus::PkgMgr, d.pkgmgr_id()),
+            (AppFocus::Shell, d.shell_id()),
+        ];
+        for (i, (focus, id)) in steps.iter().enumerate() {
+            let out = d.apply_key(key(Key::Tab)).unwrap();
+            match out {
+                KeyOutcome::Focused { window_id, .. } => {
+                    assert_eq!(window_id, *id, "tab {i} focused the wrong window");
+                }
+                _ => panic!("tab {i}: expected a focus outcome"),
+            }
+            assert_eq!(d.focus, *focus, "tab {i}: wrong focus state");
+        }
+        // The cycle repeats: a seventh Tab returns to the editor.
+        let out = d.apply_key(key(Key::Tab)).unwrap();
+        match out {
+            KeyOutcome::Focused { window_id, .. } => assert_eq!(window_id, d.editor_id()),
+            _ => panic!("expected the cycle to wrap to the editor"),
+        }
+    }
+
+    /// A durable store world for the Phase AA desktop tests that must prove
+    /// store-backed content (the package manager's listing + install).
+    fn aa_world() -> (
+        crate::editor::test_store::MemDisk,
+        crate::nvme_store::Store,
+        crate::update::BootView,
+    ) {
+        crate::editor::test_store::world()
+    }
+
+    /// RAII handle: installs a MemDisk-backed editor handle for the desktop
+    /// test and guarantees it is cleared on drop (even a panicking test can
+    /// never leak its store into the next test).
+    struct TestFsGuard;
+
+    impl TestFsGuard {
+        fn install(fs: crate::editor::EditorFs<crate::editor::test_store::MemDisk>) -> Self {
+            unsafe { crate::editor::install_test(fs) };
+            TestFsGuard
+        }
+    }
+
+    impl Drop for TestFsGuard {
+        fn drop(&mut self) {
+            unsafe { crate::editor::uninstall_test() };
+        }
+    }
+
+    /// Click a pkgmgr listing row (rows 1..h-2, cell (1+0, PKG_Y+1+row) ->
+    /// pixel ((col), (row)*16)) then the `[Inst]` affordance (last window
+    /// row, cell (1, PKG_Y+PKG_H-1)), with a durable store seeded with the
+    /// two catalog packages. The click selects the row and the install
+    /// returns `PackageInstall { name_index }`.
+    #[test]
+    fn pkgmgr_click_selects_and_install_returns_outcome() {
+        let _g = crate::kernel_state_guard();
+        let (mut disk, mut store, mut view) = aa_world();
+        assert!(view
+            .write_file(&mut store, &mut disk, b"pkg-alpha.txt", b"alpha tools v1\n")
+            .is_some());
+        assert!(view
+            .write_file(&mut store, &mut disk, b"pkg-beta.txt", b"beta utils v1\n")
+            .is_some());
+        let _fs = TestFsGuard::install(crate::editor::EditorFs {
+            ctrl: disk,
+            store,
+            view,
+        });
+        let mut d = Desktop::new();
+        assert_eq!(d.pkgmgr_count(), 2);
+        assert_eq!(d.pkgmgr_name(0).unwrap(), b"pkg-alpha.txt");
+        assert_eq!(d.pkgmgr_name(1).unwrap(), b"pkg-beta.txt");
+        // Click the first listing row (cell (1, 16) -> pixel (8, 256)).
+        let sel = click(&mut d, 8, 256).unwrap();
+        assert!(matches!(sel, MouseOutcome::Moved { .. }));
+        assert_eq!(d.pkg.selected, 0);
+        // Click [Inst] (first action-bar cell, cell (1, 23) -> (8, 368)).
+        let out = click(&mut d, 8, 368).unwrap();
+        match out {
+            MouseOutcome::PackageInstall { name_index } => assert_eq!(name_index, 0),
+            _ => panic!("expected a package install outcome"),
+        }
+        // The store object still exists and the listing still shows it.
+        assert_eq!(d.pkgmgr_count(), 2);
+    }
+
+    /// The viewer window exists as the fifth app window and renders the
+    /// seeded `img.ppm` from a durable store into its image rows.
+    #[test]
+    fn viewer_window_is_listed_and_renderable() {
+        let _g = crate::kernel_state_guard();
+        let (mut disk, mut store, mut view) = aa_world();
+        let ppm = crate::viewer::build_demo_ppm();
+        assert!(view
+            .write_file(&mut store, &mut disk, b"img.ppm", &ppm[..444])
+            .is_some());
+        let _fs = TestFsGuard::install(crate::editor::EditorFs {
+            ctrl: disk,
+            store,
+            view,
+        });
+        let mut d = Desktop::new();
+        assert_eq!(d.window_count(), 8);
+        assert!(d.wm.window(d.viewer_id()).is_some());
+        // Raise the viewer (four Tabs) and confirm its title renders.
+        for _ in 0..4 {
+            d.apply_key(key(Key::Tab)).unwrap();
+        }
+        let title = (d.screen()[VIEWER_Y as usize * SW + VIEWER_X as usize] & 0xFF) as u8;
+        assert_eq!(title, b'V');
+        // The top-left image cell (corner block -> red palette index 4)
+        // renders at cell (VIEWER_X+1, VIEWER_Y+2) — pixels 8*45 and 16*5.
+        let cell = d.screen()[(VIEWER_Y as usize + 2) * SW + VIEWER_X as usize + 1];
+        assert_eq!((cell >> 8) & 0xFF, 0x44, "red corner block cell");
+        let center = d.screen()[(VIEWER_Y as usize + 2 + 6) * SW + VIEWER_X as usize + 1 + 6];
+        assert_eq!((center >> 8) & 0xFF, 0xFF, "white cross cell");
     }
 }

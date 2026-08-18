@@ -1052,3 +1052,58 @@ Aegis-hosted run of the same image remains **hardware-gated** (no VT-x on this
 machine: `VirtualizationFirmwareEnabled=False`), which is why this section is an
 executable machine-checked claim about the guest image, not a claim that the
 hypervisor has hosted it yet.
+
+### Machine-checked verification (executable): calculator / viewer / package-manager apps (§8 Phase AA)
+
+`aegis-kernel` additions (27 more tests, 684 kernel total; **687 with
+`--features vmx-demo`**): three more real desktop app windows complete the
+six-window desktop, all over the same boot-view store the editor, browser, and
+shell already share.
+
+- `calc.rs` (8) — the calculator model: digit/operator/equals/clear state,
+  chained-op ordering (`6 * 7 =` accumulates 42), division-by-zero → `E`,
+  4-digit display truncation, and the `BUTTONS` byte-string layout that
+  `desktop.rs` hit-tests (`calc_button_at`) so a mouse click presses a button.
+  `Desktop::calc_result` exposes the display for the serial `calc@result` line.
+- `viewer.rs` (6) — `parse_ppm`/`parse_dim` decode the P6/P5 headers (the
+  corner-detection bounds were fixed to reject oversized dimensions), palette
+  quantization maps each pixel to the compositor's 16-color `PALETTE`
+  (`gpu_compositor::PALETTE` is now `pub`), and `build_demo_ppm` produces the
+  444-byte 12x12 gradient the kernel seeds as `img.ppm` — the same store object
+  the browser lists, so the viewer renders exactly what the browser opens.
+- `pkgmgr.rs` (4) — listing (`pkg-*` root files), selection, and the
+  selected-name gate behind the `[Inst]`/`[Rem]` action bar; install writes the
+  catalog payload through the store (content-addressed, so reinstall dedups),
+  remove unlinks via COW — the same honest "a package is a store object"
+  mechanism as Phase 7's update path.
+- `desktop.rs` (5 new integration tests) — the full event pipeline drives
+  `taskbar_click_focuses_and_raises_the_calculator`,
+  `mouse_click_on_calc_buttons_computes_42`, `tab_cycles_through_all_six_windows`,
+  `pkgmgr_click_selects_and_install_returns_outcome`, and
+  `viewer_window_is_listed_and_renderable` through the real `apply_mouse`/
+  `apply_key` paths with a MemDisk-backed `EditorFs` (the `test_store` seam) —
+  the same handler code the live kernel runs.
+- `editor.rs` (2) — `remove_named`/`remove_named_at`, the COW unlink halves the
+  package manager's remove uses; the `EditorFs<C: BlockIo>` generalization adds
+  the `EditorHandle` trait + `with`/`test_store` seam (tests inject a MemDisk
+  controller; the live kernel's `NvmeController` is unchanged), keeping the
+  public call surface identical.
+- `update.rs` (2) — `remove_file`/`remove_file_at` (the `Store`/`BootView` COW
+  unlink) with reuse/emptiness rules.
+
+**Live proof (mouse-only, QEMU):** `uefi-boot/serial-aa-demo.log` +
+`scr-aa-{baseline,calc,pkg}.ppm` — taskbar Calc click then `6` `*` `7` `=` →
+`Aegis: calc@result 42`; taskbar Pkg click → listing row select → `[Inst]` →
+`Aegis: pkgmgr@install -> installed row 0`; boot markers
+`Aegis: viewer@boot img.ppm -> 12x12` and `pkgmgr@boot listing
+[pkg-alpha.txt,pkg-beta.txt] (2 packages, window id=8)`.
+
+**Honest limits.** Windows are boot-time singletons — a taskbar segment click
+focuses + raises the one existing window, it does not spawn a new instance (no
+window-instantiation path yet, as Phase S noted). The calculator has no
+parentheses or unary ops (fixed-array 4-digit arithmetic). The viewer renders
+the demo image and any store object the browser can open; there is no image
+decoder beyond PPM. The package manager installs/removes the catalog payloads by
+store-object content addressing; there is no manifest/signature step (that stays
+the Phase-7 `update.rs` path). Mouse-driven input is the emulated PS/2 path,
+and all display is QEMU/OVMF framebuffer output — UNTESTED on real hardware.

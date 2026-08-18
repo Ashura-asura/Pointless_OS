@@ -370,13 +370,13 @@ pub fn create_empty<IO: BlockIo>(
 /// The concrete boot-time editor file handle: the live NVMe controller + the
 /// store + the anchored boot view. Installed once as the global below; the
 /// desktop reads the file at `Desktop::new()` and writes it on F2.
-pub struct EditorFs {
-    pub ctrl: NvmeController,
+pub struct EditorFs<C: BlockIo> {
+    pub ctrl: C,
     pub store: Store,
     pub view: BootView,
 }
 
-impl EditorFs {
+impl<C: BlockIo> EditorFs<C> {
     /// Read `memo.txt` through this handle (see [`read_memo`]).
     pub fn read_memo(&mut self, out: &mut [u8]) -> Option<usize> {
         read_memo(&mut self.store, &mut self.ctrl, &mut self.view, out)
@@ -492,32 +492,238 @@ impl EditorFs {
         let dir = self.view.dir_id();
         self.store.set_anchor(&mut self.ctrl, &dir)
     }
+
+    /// Remove the file `name` from the boot view root (Phase AA: the package
+    /// manager's "remove" action, which unlinks the `pkg-...` store object).
+    /// `Some(true)` when removed, `Some(false)` when absent or a directory,
+    /// `None` on a store failure. Re-anchors the store header so the removal
+    /// survives a reboot, like every other mutation.
+    pub fn remove_named(&mut self, name: &[u8]) -> Option<bool> {
+        let removed = self
+            .view
+            .remove_file(&mut self.store, &mut self.ctrl, name)?;
+        if removed {
+            let dir = self.view.dir_id();
+            return self.store.set_anchor(&mut self.ctrl, &dir).then_some(true);
+        }
+        Some(false)
+    }
+
+    /// Remove the file `name` inside the directory at `path` (Phase AA:
+    /// path-aware remove). Re-anchors. `Some(true)` / `Some(false)` / `None`
+    /// semantics as [`Self::remove_named`].
+    pub fn remove_named_at(&mut self, path: &[Name], name: &[u8]) -> Option<bool> {
+        let removed = self
+            .view
+            .remove_file_at(&mut self.store, &mut self.ctrl, path, name)?;
+        if removed {
+            let dir = self.view.dir_id();
+            return self.store.set_anchor(&mut self.ctrl, &dir).then_some(true);
+        }
+        Some(false)
+    }
 }
 
 /// The one live editor file handle, installed at boot inside the NVMe store
 /// block (after the corruption demo, so the seeded file can never land in the
 /// deliberately-corrupted slot-0 block).
-static mut EDITOR_FS: Option<EditorFs> = None;
+static mut EDITOR_FS: Option<EditorFs<NvmeController>> = None;
 
 /// Install the live editor file handle.
 ///
 /// # Safety
 ///
 /// Single-threaded boot-time call, once, after `Store::open` succeeded.
-pub unsafe fn install(fs: EditorFs) {
+pub unsafe fn install(fs: EditorFs<NvmeController>) {
     core::ptr::addr_of_mut!(EDITOR_FS).write(Some(fs));
 }
 
-/// Run `f` against the live editor handle, if one was installed. None when
+#[cfg(test)]
+pub mod test_store {
+    use super::{BlockIo, BootView, EditorFs, Store};
+
+    /// An in-RAM disk used to install a durable editor handle in tests. It
+    /// also appears in this crate's other test modules (same shape), so it
+    /// lives here next to the injection point that uses it.
+    pub struct MemDisk {
+        pub sectors: Vec<[u8; 512]>,
+    }
+
+    impl MemDisk {
+        pub fn new(sectors: usize) -> MemDisk {
+            MemDisk {
+                sectors: vec![[0u8; 512]; sectors],
+            }
+        }
+    }
+
+    impl BlockIo for MemDisk {
+        fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> bool {
+            let Some(s) = self.sectors.get(lba as usize) else {
+                return false;
+            };
+            out[..512].copy_from_slice(s);
+            true
+        }
+
+        fn write_sector(&mut self, lba: u64, data: &[u8]) -> bool {
+            let Some(s) = self.sectors.get_mut(lba as usize) else {
+                return false;
+            };
+            s[..512.min(data.len())].copy_from_slice(&data[..512.min(data.len())]);
+            true
+        }
+    }
+
+    /// A fresh store + boot view on a MemDisk, ready for desktop/editor tests
+    /// that need a real durable handle (`unsafe { install_test(...) }`).
+    pub fn world() -> (MemDisk, Store, BootView) {
+        let mut disk = MemDisk::new(9000);
+        let mut store = Store::open(&mut disk).unwrap();
+        let view = BootView::create(&mut store, &mut disk).unwrap();
+        (disk, store, view)
+    }
+
+    /// The test-time replacement for the live handle, installed the same way
+    /// [`super::install`] installs the NVMe-backed one. [`super::with`] serves
+    /// this handle first in test builds so the desktop's store-backed windows
+    /// (package manager, viewer) are exercisable without NVMe hardware.
+    pub static mut TEST_EDITOR_FS: Option<EditorFs<MemDisk>> = None;
+
+    pub fn installed() -> bool {
+        unsafe { core::ptr::addr_of!(TEST_EDITOR_FS).as_ref() }
+            .map(|o| o.is_some())
+            .unwrap_or(false)
+    }
+}
+
+/// Install a MemDisk-backed editor handle for tests (see [`with`]). Any
+/// previously installed test handle is replaced.
+///
+/// # Safety
+///
+/// Single-threaded test call.
+#[cfg(test)]
+pub unsafe fn install_test(fs: EditorFs<test_store::MemDisk>) {
+    core::ptr::addr_of_mut!(test_store::TEST_EDITOR_FS).write(Some(fs));
+}
+
+/// Clear any MemDisk-backed editor handle installed by [`install_test`], so a
+/// test's durable store never leaks into the next test (which would silently
+/// change the browser/package-manager listings it sees).
+///
+/// # Safety
+///
+/// Single-threaded test call.
+#[cfg(test)]
+pub unsafe fn uninstall_test() {
+    core::ptr::addr_of_mut!(test_store::TEST_EDITOR_FS).write(None);
+}
+
+/// The durable file-handle surface the desktop drives through [`with`]. A
+/// trait (rather than a concrete `EditorFs`) lets the SAME closure run against
+/// either the live NVMe-backed handle at boot or a MemDisk-backed test handle
+/// ([`install_test`]) — the desktop's store-backed windows are fully testable
+/// without NVMe hardware.
+pub trait EditorHandle {
+    fn read_memo(&mut self, out: &mut [u8]) -> Option<usize>;
+    fn write_memo(&mut self, bytes: &[u8]) -> Option<BlockId>;
+    fn write_named(&mut self, name: &[u8], bytes: &[u8]) -> Option<BlockId>;
+    fn write_named_at(&mut self, path: &[Name], name: &[u8], bytes: &[u8]) -> Option<BlockId>;
+    fn list(&mut self, out: &mut [Name; VIEW_MAX_FILES]) -> usize;
+    fn open(&mut self, name: &[u8], out: &mut [u8]) -> Option<usize>;
+    fn create_empty(&mut self, name: &[u8]) -> bool;
+    fn browser_list(&mut self, path: &[Name], out: &mut [(Name, u8); VIEW_MAX_FILES]) -> usize;
+    fn browser_open(&mut self, path: &[Name], name: &[u8], out: &mut [u8]) -> Option<usize>;
+    fn browser_mkdir(&mut self, path: &[Name], name: &[u8]) -> bool;
+    fn browser_create(&mut self, path: &[Name], name: &[u8]) -> bool;
+    fn remove_named(&mut self, name: &[u8]) -> Option<bool>;
+    fn remove_named_at(&mut self, path: &[Name], name: &[u8]) -> Option<bool>;
+}
+
+impl<C: BlockIo> EditorHandle for EditorFs<C> {
+    fn read_memo(&mut self, out: &mut [u8]) -> Option<usize> {
+        self.read_memo(out)
+    }
+    fn write_memo(&mut self, bytes: &[u8]) -> Option<BlockId> {
+        self.write_memo(bytes)
+    }
+    fn write_named(&mut self, name: &[u8], bytes: &[u8]) -> Option<BlockId> {
+        self.write_named(name, bytes)
+    }
+    fn write_named_at(&mut self, path: &[Name], name: &[u8], bytes: &[u8]) -> Option<BlockId> {
+        self.write_named_at(path, name, bytes)
+    }
+    fn list(&mut self, out: &mut [Name; VIEW_MAX_FILES]) -> usize {
+        self.list(out)
+    }
+    fn open(&mut self, name: &[u8], out: &mut [u8]) -> Option<usize> {
+        self.open(name, out)
+    }
+    fn create_empty(&mut self, name: &[u8]) -> bool {
+        self.create_empty(name)
+    }
+    fn browser_list(&mut self, path: &[Name], out: &mut [(Name, u8); VIEW_MAX_FILES]) -> usize {
+        self.browser_list(path, out)
+    }
+    fn browser_open(&mut self, path: &[Name], name: &[u8], out: &mut [u8]) -> Option<usize> {
+        self.browser_open(path, name, out)
+    }
+    fn browser_mkdir(&mut self, path: &[Name], name: &[u8]) -> bool {
+        self.browser_mkdir(path, name)
+    }
+    fn browser_create(&mut self, path: &[Name], name: &[u8]) -> bool {
+        self.browser_create(path, name)
+    }
+    fn remove_named(&mut self, name: &[u8]) -> Option<bool> {
+        self.remove_named(name)
+    }
+    fn remove_named_at(&mut self, path: &[Name], name: &[u8]) -> Option<bool> {
+        self.remove_named_at(path, name)
+    }
+}
+
+/// Run `f` against a durable editor handle, if one was installed. None when
 /// there is no NVMe store (the editor then runs as an in-memory buffer only).
-pub fn with<R>(f: impl FnOnce(&mut EditorFs) -> R) -> Option<R> {
+/// In test builds a MemDisk-backed handle installed via [`install_test`] is
+/// served first, so the desktop's store-backed windows are testable without
+/// NVMe hardware.
+pub fn with<R>(f: impl FnOnce(&mut dyn EditorHandle) -> R) -> Option<R> {
+    let handle = {
+        #[cfg(test)]
+        {
+            match test_handle() {
+                Some(fs) => Some(fs),
+                None => live_handle(),
+            }
+        }
+        #[cfg(not(test))]
+        {
+            live_handle()
+        }
+    };
+    handle.map(f)
+}
+
+fn live_handle() -> Option<&'static mut dyn EditorHandle> {
     unsafe { core::ptr::addr_of_mut!(EDITOR_FS).as_mut() }
         .and_then(|o| o.as_mut())
-        .map(f)
+        .map(|fs| fs as &mut dyn EditorHandle)
+}
+
+#[cfg(test)]
+fn test_handle() -> Option<&'static mut dyn EditorHandle> {
+    unsafe { core::ptr::addr_of_mut!(test_store::TEST_EDITOR_FS).as_mut() }
+        .and_then(|o| o.as_mut())
+        .map(|fs| fs as &mut dyn EditorHandle)
 }
 
 /// True when a durable editor file handle was installed (for boot-log clarity).
 pub fn durable() -> bool {
+    #[cfg(test)]
+    if test_store::installed() {
+        return true;
+    }
     unsafe { core::ptr::addr_of!(EDITOR_FS).as_ref() }
         .map(|o| o.is_some())
         .unwrap_or(false)
