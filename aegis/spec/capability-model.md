@@ -1162,3 +1162,59 @@ only the first 4 GiB (documented — real machines can place them there). The
 search is the Linux-style EBDA + F-seg + ACPI-region scan; vendor-specific RSDP
 locations on physical hardware would be missed. Everything is QEMU/OVMF-verified,
 UNTESTED on physical silicon.
+
+### Machine-checked verification (executable): UHCI USB + SB16 DSP device models (§8 Phase Z)
+
+`aegis-kernel` additions (27 more tests, **737 kernel total; 740 with
+`--features vmx-demo`**): the hypervisor's guest device set grows two more
+peripherals — a UHCI USB host controller with a low-speed HID keyboard and a
+Sound Blaster 16 DSP — as pure register/state models over a memory-agnostic
+data path, exactly like the Phase U device set. These are the same discipline
+as `vm::GuestMem`/`acpi::PhysRead`: the emulation never touches real memory
+directly; the live run loop backs it with EPT-mapped guest memory, the tests
+and boot demo with a fixed `ByteArena`.
+
+- `vdev.rs` (27) — **UHCI (`UhciUsb`):** 16-bit register file at `UHCI_BASE`
+  0xCC00 (USBCMD/USBSTS/USBINTR/FRNUM/FRBASE/SOFMOD/PORTSC×2); GRESET/FGR full
+  reset; RW1C status; PORTSC port-1 reset that completes on PR clear (CCS+LSDA+PE
+  restored); FRNUM wraps at 2048; IRQ line = USBINT ∧ IOC-enable. The **frame-list
+  TD engine** (`process_frame_list`) is bounded (≤ 64 TDs per walk), validates
+  every link/frame-list entry before following it (a corrupt chain returns early,
+  never spins), decodes SETUP/IN/OUT with the low-speed bit and
+  MaxLen-0→0x800 semantics, writes completion back (status field bits 23:16,
+  actual length bits 30:21, NAK bit when the HCD armed NAK counting), and asserts
+  USBINT on IOC TDs. The **HID boot-keyboard** on port 1 serves the standard
+  device (18 B)/config (34 B)/report (63 B)/LANGID descriptors, a
+  SET_ADDRESS/GET_DESCRIPTOR/SET_CONFIGURATION/SET_IDLE/SET_PROTOCOL pending
+  machine, unknown requests → STALL + counter, and a bounded 8-byte report ring
+  (interrupt-IN drains it; NAK when idle or unconfigured). **SB16 (`Sb16Dsp`):**
+  the classic 0x220-0x237 surface — reset handshake (1-then-0 → 0xAA on the
+  0x22A read-data path, status bits at 0x22E/0x22C), get-version 0xE1→4.05,
+  speaker 0xD1/0xD3, time-constant 0x40, two-byte sample rate 0x41, playback
+  commands 0x10/0x14/0x90/0x91 into a bounded 8-request FIFO
+  (`pop_playback` for the host audio hook), input-DMA counted, unknown commands
+  counted. **Wiring:** `PciConfigBus` fabricates the UHCI at slot 5 (Intel
+  0x8086/0x7020, class 0x0C03, BAR0 0xCC01, IRQ 10); `DeviceSet` gains `usb`/
+  `audio` fields with 0x220..0x237 inb/outb and UHCI-range inw/outw dispatch,
+  `update_pic` raising PIC IRQ 10, and `usb_process` driving the frame walk +
+  PIC reflection in one call.
+- `main.rs` — a boot demo drives a 7-TD enumeration + key-report chain (frame
+  list at 0x1000, TDs at 0x2000, descriptor/report buffers in a fixed arena)
+  and a DSP session, printing serial markers
+  (`Aegis: usb: UHCI demo: …`, `Aegis: audio: SB16 DSP demo: …`).
+
+**Live proof (`uefi-boot/serial-z-demo.log`, QEMU `-machine q35 -smp 2`):**
+`Aegis: usb: UHCI demo: 7 TD(s) processed, addr 1, configured: true, 1 key
+report [0 0 4 0 0 0 0 0]` — the full enumeration ran inside the frame walk and
+the interrupt-IN delivered the queued scancode-4 ('a') report —
+`Aegis: audio: SB16 DSP demo: reset handshake 0xAA, version 4.5, speaker on,
+playback requests pending 0, last length 4096 (22050 Hz)` — then
+`compositor desktop shown on the VM display` — **0 exceptions, 0 panics**.
+
+**Honest limits.** UHCI has no bandwidth/reclamation scheduling, one low-speed
+device on port 1 only, and a bounded 64-TD-per-walk cap. The SB16's 8237 DMA is
+NOT emulated — a playback request carries the block length and sample rate
+only, leaving the actual sample data path to the host audio hook. Both are
+register/state models; wiring them to real VM-exit events is the
+hardware-gated half in `vm.rs`. Everything is QEMU/OVMF-verified, UNTESTED on
+physical silicon.

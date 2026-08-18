@@ -279,6 +279,97 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         }
     }
 
+    // Phase Z: USB + audio guest device models (UHCI keyboard / SB16 DSP),
+    // driven through a fixed byte arena exactly as the contract tests do —
+    // the live run loop replaces the arena with EPT-mapped guest memory.
+    {
+        use aegis_kernel::vdev::{ByteArena, Sb16Dsp, UhciUsb, UsbMem, SB16_BASE, UHCI_BASE};
+        let mut arena = [0u8; 0x4000];
+        let mut mem = ByteArena { buf: &mut arena };
+
+        // UHCI: build a one-frame enumeration + key-report chain.
+        let mut uhci = UhciUsb::new();
+        uhci.outw(UHCI_BASE, 1); // RUN
+        uhci.outw(UHCI_BASE + 0x08, 0x1000); // FRBASE
+        uhci.enqueue_key([0x00, 0x00, 0x04, 0, 0, 0, 0, 0]); // scancode 4 = 'a'
+        let _ = mem.write_u32(0x1000, 0x2000);
+        let _ = mem.write(0x3000, &[0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let _ = mem.write_u32(0x2000, 0x2010);
+        let _ = mem.write_u32(0x2004, 0x09);
+        let _ = mem.write_u32(0x2008, 0x2D | (8 << 21));
+        let _ = mem.write_u32(0x200C, 0x3000);
+        let _ = mem.write_u32(0x2010, 0x2020);
+        let _ = mem.write_u32(0x2014, 0x09);
+        let _ = mem.write_u32(0x2018, 0x69 | (1 << 8));
+        let _ = mem.write_u32(0x201C, 0x0);
+        let _ = mem.write(0x3010, &[0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]);
+        let _ = mem.write_u32(0x2020, 0x2030);
+        let _ = mem.write_u32(0x2024, 0x09);
+        let _ = mem.write_u32(0x2028, 0x2D | (1 << 8) | (8 << 21));
+        let _ = mem.write_u32(0x202C, 0x3010);
+        let _ = mem.write_u32(0x2030, 0x2040);
+        let _ = mem.write_u32(0x2034, 0x09);
+        let _ = mem.write_u32(0x2038, 0x69 | (1 << 8) | (18 << 21));
+        let _ = mem.write_u32(0x203C, 0x3020);
+        let _ = mem.write(0x3050, &[0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let _ = mem.write_u32(0x2040, 0x2050);
+        let _ = mem.write_u32(0x2044, 0x09);
+        let _ = mem.write_u32(0x2048, 0x2D | (1 << 8) | (8 << 21));
+        let _ = mem.write_u32(0x204C, 0x3050);
+        let _ = mem.write_u32(0x2050, 0x2060);
+        let _ = mem.write_u32(0x2054, 0x09);
+        let _ = mem.write_u32(0x2058, 0x69 | (1 << 8));
+        let _ = mem.write_u32(0x205C, 0x0);
+        let _ = mem.write_u32(0x2060, 0x1);
+        let _ = mem.write_u32(0x2064, 0x0B); // Active + IOC
+        let _ = mem.write_u32(0x2068, 0x69 | (1 << 8) | (1 << 16) | (8 << 21));
+        let _ = mem.write_u32(0x206C, 0x3040);
+        let tds = uhci.process_frame_list(&mut mem);
+        let mut report = [0u8; 8];
+        let _ = mem.read(0x3040, &mut report);
+        sprintln!(
+            "Aegis: usb: UHCI demo: {} TD(s) processed, addr {}, configured: {}, 1 key report [{} {} {} {} {} {} {} {}]",
+            tds,
+            uhci.device_address(),
+            uhci.configured(),
+            report[0],
+            report[1],
+            report[2],
+            report[3],
+            report[4],
+            report[5],
+            report[6],
+            report[7],
+        );
+
+        // SB16: reset handshake, version, sample rate, one playback request.
+        let mut dsp = Sb16Dsp::new();
+        dsp.outb(SB16_BASE + 0x06, 0x01);
+        dsp.outb(SB16_BASE + 0x06, 0x00);
+        let handshake = dsp.inb(SB16_BASE + 0x0A);
+        dsp.outb(SB16_BASE + 0x0C, 0xE1); // get version
+        let v_hi = dsp.inb(SB16_BASE + 0x0A);
+        let v_lo = dsp.inb(SB16_BASE + 0x0A);
+        dsp.outb(SB16_BASE + 0x0C, 0x41); // sample rate
+        dsp.outb(SB16_BASE + 0x0C, 0x22);
+        dsp.outb(SB16_BASE + 0x0C, 0x56); // 22050 Hz
+        dsp.outb(SB16_BASE + 0x0C, 0x14); // two-byte playback length
+        dsp.outb(SB16_BASE + 0x0C, 0x00);
+        dsp.outb(SB16_BASE + 0x0C, 0x10); // 4096 samples
+        let req = dsp.pop_playback();
+        let req_len = req.map_or(0, |r| r.length);
+        sprintln!(
+            "Aegis: audio: SB16 DSP demo: reset handshake 0x{:X}, version {}.{}, speaker {}, playback requests pending {}, last length {} ({} Hz)",
+            handshake,
+            v_hi,
+            v_lo,
+            if dsp.speaker_on() { "on" } else { "off" },
+            dsp.pending_playbacks(),
+            req_len,
+            dsp.sample_rate(),
+        );
+    }
+
     // Live PCI enumeration over the legacy 0xCF8/0xCFC config ports.
     let mut pci = aegis_kernel::pci::PciDeviceList::new();
     unsafe {

@@ -22,10 +22,23 @@
 //! real Linux guest to a shell": no UART FIFO depth emulation (single-byte
 //! buffer, FIFO-mode control bits stored only), no PIT sub-cycle OUT
 //! waveforms (mode 2/3 both fire one IRQ0 per programmed count; BCD counts
-//! stored but not decoded), no RTC alarm/NMI, no CMOS write-through, one
-//! PCI slot beyond the host bridge, no MSI-X/IO-APIC (guest is `noapic`),
+//! stored but not decoded), no RTC alarm/NMI, no CMOS write-through, two
+//! PCI slots beyond the host bridge (virtio-blk at slot 6, UHCI at slot 5),
+//! no MSI-X/IO-APIC (guest is `noapic`),
 //! no ACPI tables, unhandled port reads return 0xFF like a floating bus
 //! rather than faulting (real-hardware behavior).
+//!
+//! Phase Z adds two guest-visible peripherals to the same set: a UHCI USB
+//! host controller with a low-speed HID keyboard (16-bit registers at
+//! 0xCC00, INTx#A -> PIC IRQ 10) and a Sound Blaster 16 DSP (0x220-0x237,
+//! classic reset handshake + command surface). Both are pure register/state
+//! models with a memory-agnostic data path (`UsbMem`), exercised live by the
+//! hypervisor's run loop (`DeviceSet::usb_process`) and drained by host
+//! hooks (key reports / playback requests). Honest simplifications: UHCI has
+//! no bandwidth/reclamation scheduling, one low-speed device on port 1 only,
+//! a bounded 64-TD-per-walk cap, and the SB16's 8237 DMA is not emulated —
+//! a playback request carries the block length and sample rate only, leaving
+//! the actual sample data path to the host audio hook.
 
 use crate::virtio::BlockStore;
 
@@ -869,11 +882,34 @@ impl PciConfigBus {
                                     // the I/O region) — handled by virtio.rs, not here. The capacity is
                                     // stored for reference by the run loop.
         let _ = capacity_sectors;
+
+        let uhci = &mut self.slots[UHCI_SLOT].config;
+        put_u16(uhci, 0x00, 0x8086); // vendor: Intel (matches the UHCI role)
+        put_u16(uhci, 0x02, 0x7020); // device: UHCI (USB 1.1 host controller)
+        put_u16(uhci, 0x04, 0x0007); // command: I/O + memory + bus-master
+        put_u16(uhci, 0x06, 0x0000); // status
+        put_u32(uhci, 0x08, 0x0C030000); // class: serial bus controller, USB (UHCI)
+        put_u16(uhci, 0x0E, 0x0000); // header type 0
+        put_u32(uhci, 0x10, (UHCI_BASE as u32) | 0x1); // BAR0: I/O space, fixed base
+        put_u16(uhci, 0x2C, 0x8086); // subsystem vendor
+        put_u16(uhci, 0x2E, 0x7020); // subsystem id
+        put_u8(uhci, 0x3C, UHCI_IRQ); // interrupt line: PIC IRQ 10
+        put_u8(uhci, 0x3D, 0x01); // interrupt pin: INTx#A
+        put_u16(uhci, 0x3E, 0x0000); // min_gnt/max_lat
     }
 
     /// The base port of the virtio-blk I/O BAR, once the guest programs it.
     pub fn virtio_bar(&self) -> u16 {
         let raw = u32_from(&self.slots[VIRTIO_SLOT].config, 0x10);
+        if raw & 1 == 0 {
+            return 0;
+        }
+        (raw & 0xFFFC) as u16
+    }
+
+    /// The base port of the fabricated UHCI I/O BAR (fixed at [`UHCI_BASE`]).
+    pub fn uhci_bar(&self) -> u16 {
+        let raw = u32_from(&self.slots[UHCI_SLOT].config, 0x10);
         if raw & 1 == 0 {
             return 0;
         }
@@ -943,6 +979,875 @@ fn put_u8(config: &mut [u8; 256], off: usize, v: u8) {
 }
 
 // ---------------------------------------------------------------------
+// UHCI USB host controller (Phase Z)
+// ---------------------------------------------------------------------
+
+/// UHCI I/O base (standard PCI-assigned base; also the fixed BAR this
+/// hypervisor's fabricated UHCI PCI slot reports).
+pub const UHCI_BASE: u16 = 0xCC00;
+/// UHCI interrupt line (INTx#A -> PIC IRQ 10; IRQ 11 is the virtio-blk).
+pub const UHCI_IRQ: u8 = 10;
+/// PCI slot the fabricated UHCI device lives in.
+pub const UHCI_SLOT: usize = 5;
+
+/// Guest-memory interface the UHCI frame-list walk reads/writes through.
+/// The live run loop will back it with EPT-mapped guest memory; the contract
+/// tests and the boot demo back it with a fixed byte arena. Same discipline
+/// as `acpi::PhysRead` / `vm::GuestMem` — the emulation is memory-agnostic.
+pub trait UsbMem {
+    fn read(&self, addr: u32, out: &mut [u8]) -> bool;
+    fn write(&mut self, addr: u32, data: &[u8]) -> bool;
+
+    fn read_u32(&self, addr: u32) -> Option<u32> {
+        let mut b = [0u8; 4];
+        if self.read(addr, &mut b) {
+            Some(u32::from_le_bytes(b))
+        } else {
+            None
+        }
+    }
+
+    fn write_u32(&mut self, addr: u32, v: u32) -> bool {
+        self.write(addr, &v.to_le_bytes())
+    }
+}
+
+/// A plain in-memory byte arena implementing [`UsbMem`] — the test and demo
+/// backing store.
+pub struct ByteArena<'a> {
+    pub buf: &'a mut [u8],
+}
+
+impl UsbMem for ByteArena<'_> {
+    fn read(&self, addr: u32, out: &mut [u8]) -> bool {
+        let a = addr as usize;
+        if a + out.len() <= self.buf.len() {
+            out.copy_from_slice(&self.buf[a..a + out.len()]);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn write(&mut self, addr: u32, data: &[u8]) -> bool {
+        let a = addr as usize;
+        if a + data.len() <= self.buf.len() {
+            self.buf[a..a + data.len()].copy_from_slice(data);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A control transfer the HID keyboard has in flight (set by a SETUP TD,
+/// consumed by the next data or status TD).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UsbPending {
+    None,
+    GetDescriptor {
+        desc_type: u8,
+        index: u8,
+        requested_len: u16,
+        off: u16,
+    },
+    SetAddress(u8),
+    SetConfig(u8),
+    SetIdle(u8),
+    SetProtocol(u8),
+}
+
+/// UHCI host-controller model with one low-speed HID keyboard attached to
+/// port 1. Registers are 16-bit at `UHCI_BASE`; the frame-list TD engine
+/// (the actual data path) is exercised by the run loop via
+/// [`UhciUsb::process_frame_list`]. Port-I/O emulation and the TD walk are
+/// pure and contract-tested; no MMIO, no interrupt controller of its own
+/// (INTx#A -> PIC IRQ 10 through `DeviceSet::update_pic`).
+pub struct UhciUsb {
+    cmd: u16,
+    sts: u16,
+    intr: u16,
+    frnum: u16,
+    frbase: u32,
+    sofmod: u8,
+    portsc: [u16; 2],
+    /// Assigned USB device address (0 = unaddressed, awaiting SET_ADDRESS).
+    device_address: u8,
+    configured: bool,
+    idle: u8,
+    protocol: u8,
+    pending: UsbPending,
+    /// Bounded ring of queued 8-byte keyboard reports (interrupt-IN drains).
+    keys: [[u8; 8]; 16],
+    key_count: usize,
+    key_next: usize,
+    /// Total TDs completed since reset (the run loop's progress counter).
+    pub tds_processed: u64,
+    /// Control requests the device does not understand (honest counter).
+    pub unknown_requests: u32,
+}
+
+const UHCI_MAX_TDS_PER_WALK: usize = 64;
+const UHCI_KEY_RING: usize = 16;
+
+/// Standard 18-byte USB device descriptor for the HID keyboard.
+const USB_DEVICE_DESC: [u8; 18] = [
+    0x12, 0x01, // bLength, bDescriptorType (Device)
+    0x10, 0x01, // bcdUSB 1.10
+    0x00, 0x00, 0x00, // class/subclass/protocol (each interface defines)
+    0x08, // bMaxPacketSize0
+    0x34, 0x12, // idVendor 0x1234 (Aegis)
+    0x01, 0x00, // idProduct 0x0001 (HID keyboard)
+    0x00, 0x01, // bcdDevice 1.00
+    0x00, 0x00, 0x00, // iManufacturer/Product/Serial
+    0x01, // bNumConfigurations
+];
+
+/// 34-byte config descriptor: config + HID keyboard interface + interrupt IN
+/// endpoint.
+const USB_CONFIG_DESC: [u8; 34] = [
+    0x09, 0x02, 0x22, 0x00, 0x01, 0x01, 0x00, 0xA0, 0x32, // config
+    0x09, 0x04, 0x00, 0x00, 0x01, 0x03, 0x01, 0x01, 0x00, // interface (HID boot keyboard)
+    0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x3F, 0x00, // HID 1.11, 1 report desc (63)
+    0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0A, // EP1 IN, interrupt, 8 bytes, 10 ms
+];
+
+/// Standard boot-keyboard report descriptor (63 bytes).
+const USB_REPORT_DESC: [u8; 63] = [
+    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01,
+    0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x05, 0x75, 0x01,
+    0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91, 0x01, 0x95, 0x06,
+    0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00, 0xC0,
+];
+
+/// English LANGID string descriptor.
+const USB_STRING_LANGID: [u8; 4] = [0x04, 0x03, 0x09, 0x04];
+
+impl Default for UhciUsb {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UhciUsb {
+    pub const fn new() -> UhciUsb {
+        UhciUsb {
+            cmd: 0,
+            // Bit 5 (HC Halted) set at reset, like a real UHCI after reset.
+            sts: 0x0020,
+            intr: 0,
+            frnum: 0,
+            frbase: 0,
+            sofmod: 0x40,
+            // Port 1: current connect status + low-speed device attached.
+            portsc: [0x0011, 0x0000],
+            device_address: 0,
+            configured: false,
+            idle: 0,
+            protocol: 1,
+            pending: UsbPending::None,
+            keys: [[0u8; 8]; UHCI_KEY_RING],
+            key_count: 0,
+            key_next: 0,
+            tds_processed: 0,
+            unknown_requests: 0,
+        }
+    }
+
+    /// 16-bit register read over the UHCI I/O range.
+    pub fn inw(&self, port: u16) -> u16 {
+        match port - UHCI_BASE {
+            0x00 => self.cmd,
+            0x02 => self.sts,
+            0x04 => self.intr,
+            0x06 => self.frnum & 0x7FF,
+            0x08 => (self.frbase & 0xFFFF) as u16,
+            0x0A => (self.frbase >> 16) as u16,
+            0x0C => self.sofmod as u16,
+            0x10 => self.portsc[0],
+            0x12 => self.portsc[1],
+            _ => 0xFFFF,
+        }
+    }
+
+    /// 16-bit register write over the UHCI I/O range.
+    pub fn outw(&mut self, port: u16, val: u16) {
+        match port - UHCI_BASE {
+            0x00 => {
+                // USBCMD: RUN/STOP (bit 0); GRESET (bit 1) and FGR (bit 3)
+                // reset the whole controller.
+                if val & 0x000A != 0 {
+                    *self = UhciUsb::new();
+                    return;
+                }
+                self.cmd = val & 0x003F;
+            }
+            0x02 => {
+                // USBSTS: RW1C for the status bits (0x3E); bit 0 (USBINT)
+                // is cleared by writing 1 too.
+                self.sts &= !(val & 0x003F);
+            }
+            0x04 => self.intr = val & 0x000F,
+            0x06 => self.frnum = val & 0x07FF,
+            0x08 => {
+                let lo = val as u32;
+                self.frbase = (self.frbase & 0xFFFF_0000) | lo;
+                self.frbase &= 0xFFFF_F000; // page aligned
+            }
+            0x0A => {
+                self.frbase = (self.frbase & 0x0000_FFFF) | ((val as u32) << 16);
+            }
+            0x0C => self.sofmod = (val & 0x7F) as u8,
+            0x10 => self.write_portsc(0, val),
+            0x12 => self.write_portsc(1, val),
+            _ => {}
+        }
+    }
+
+    /// PORTSC write semantics: RW1C change bits clear when written 1; the
+    /// PR (port reset) bit arms a reset that completes when the driver
+    /// clears it; CCS/LSDA are read-only.
+    fn write_portsc(&mut self, port: usize, val: u16) {
+        let mut cur = self.portsc[port];
+        cur &= !(val & 0x4002); // CSC (bit 1) / OCC (bit 14) RW1C
+        if val & (1 << 13) != 0 {
+            cur |= 1 << 13; // PR: reset armed
+            cur &= !0x0004; // PE cleared during reset
+        } else {
+            // PR cleared: complete the reset. Port 1 has the keyboard, so it
+            // comes back connected + low-speed + enabled.
+            cur &= !(1 << 13);
+            if port == 0 {
+                cur |= 0x0011 | 0x0004; // CCS | LSDA | PE
+            }
+        }
+        self.portsc[port] = cur;
+    }
+
+    /// UHCI IRQ line: an interrupt-on-complete TD finished and IOC is enabled.
+    pub fn irq_line(&self) -> bool {
+        self.sts & 0x0001 != 0 && self.intr & 0x0001 != 0
+    }
+
+    /// The USB device address the guest has assigned (0 = unaddressed).
+    pub fn device_address(&self) -> u8 {
+        self.device_address
+    }
+
+    /// Whether the guest has completed SET_CONFIGURATION on the keyboard.
+    pub fn configured(&self) -> bool {
+        self.configured
+    }
+
+    /// Queue a keyboard report (8 bytes: modifier, reserved, 6 scancodes).
+    /// Bounded: drops when the ring is full.
+    pub fn enqueue_key(&mut self, report: [u8; 8]) {
+        if self.key_count < UHCI_KEY_RING {
+            let idx = (self.key_next + self.key_count) % UHCI_KEY_RING;
+            self.keys[idx] = report;
+            self.key_count += 1;
+        }
+    }
+
+    fn pop_key(&mut self) -> Option<[u8; 8]> {
+        if self.key_count == 0 {
+            return None;
+        }
+        let r = self.keys[self.key_next];
+        self.key_next = (self.key_next + 1) % UHCI_KEY_RING;
+        self.key_count -= 1;
+        Some(r)
+    }
+
+    /// Walk the current frame's TD list, executing each active TD against the
+    /// HID keyboard model and writing the completion back to guest memory.
+    /// Bounded (max [`UHCI_MAX_TDS_PER_WALK`] TDs, frame-list entry and every
+    /// link validated) — never loops forever on a corrupt chain. Returns the
+    /// number of TDs completed.
+    pub fn process_frame_list(&mut self, mem: &mut impl UsbMem) -> usize {
+        // Not running (RUN/STOP clear) or no frame list programmed: nothing.
+        if self.cmd & 0x0001 == 0 || self.frbase == 0 {
+            return 0;
+        }
+        let frame_idx = (self.frnum as usize) & 0x3FF;
+        let Some(entry) = mem.read_u32(self.frbase + (frame_idx as u32) * 4) else {
+            return 0;
+        };
+        if entry & 0x0000_0001 != 0 {
+            return 0; // terminated frame-list entry
+        }
+        let mut td_addr = entry & 0xFFFF_FFF0;
+        let mut processed = 0usize;
+        loop {
+            if processed >= UHCI_MAX_TDS_PER_WALK {
+                break;
+            }
+            if td_addr & 0x0000_0001 != 0 {
+                break; // link pointer terminate bit
+            }
+            let td = td_addr & 0xFFFF_FFF0;
+            let Some(link) = mem.read_u32(td) else {
+                break;
+            };
+            let Some(ctrl) = mem.read_u32(td + 4) else {
+                break;
+            };
+            if ctrl & 0x0000_0001 == 0 {
+                // Inactive TD: breadth-first walk continues to the link.
+                if link & 0x0000_0001 != 0 {
+                    break;
+                }
+                td_addr = link & 0xFFFF_FFF0;
+                continue;
+            }
+            let Some(token) = mem.read_u32(td + 8) else {
+                break;
+            };
+            let Some(buffer) = mem.read_u32(td + 12) else {
+                break;
+            };
+            let pid = (token & 0xFF) as u8;
+            let addr = ((token >> 8) & 0xFF) as u8;
+            let endpoint = ((token >> 16) & 0x07) as u8;
+            let mut maxlen = ((token >> 20) & 0x3FF) as usize;
+            if maxlen == 0 {
+                maxlen = 0x800; // UHCI: MaxLen 0 means 0x800
+            }
+            let buf = buffer & 0xFFFF_FFF0;
+            let ioc = ctrl & 0x0000_0002 != 0;
+            let done = self.execute_td(mem, pid, addr, endpoint, maxlen, buf);
+            // Write the completion back: clear Active, set the status field
+            // and the Actual-Length (bits 30:21) the HCD reads.
+            let mut ctrl = ctrl & !0x0000_0001;
+            ctrl = ctrl & !(0xFF << 16) | ((done.status as u32) << 16);
+            ctrl = ctrl & !(0x3FF << 21) | ((done.actual_len as u32 & 0x3FF) << 21);
+            let _ = mem.write_u32(td + 4, ctrl);
+            if done.nak {
+                // NAK also sets the NAK bit when the HCD armed NAK counting.
+                let _ = mem.write_u32(td + 4, ctrl | 0x0000_0040);
+            }
+            if ioc {
+                self.sts |= 0x0001; // USBINT
+            }
+            processed += 1;
+            if link & 0x0000_0001 != 0 {
+                break;
+            }
+            td_addr = link & 0xFFFF_FFF0;
+        }
+        self.tds_processed += processed as u64;
+        if processed > 0 {
+            self.frnum = (self.frnum + 1) & 0x7FF;
+        }
+        processed
+    }
+
+    /// Execute one TD against the device model, returning the completion
+    /// status to write back. Never touches host memory beyond what the TD's
+    /// buffer pointer grants through `mem`.
+    fn execute_td(
+        &mut self,
+        mem: &mut impl UsbMem,
+        pid: u8,
+        addr: u8,
+        endpoint: u8,
+        maxlen: usize,
+        buffer: u32,
+    ) -> TdResult {
+        let n = maxlen.min(64);
+        match pid {
+            // SETUP
+            0x2D => {
+                let mut setup = [0u8; 8];
+                if mem.read(buffer, &mut setup) {
+                    self.handle_setup(&setup);
+                }
+                TdResult {
+                    status: 0,
+                    actual_len: 8,
+                    nak: false,
+                }
+            }
+            // IN
+            0x69 => {
+                if endpoint == 1 {
+                    // Interrupt IN: report when configured, else NAK.
+                    if !self.configured {
+                        return TdResult::nak();
+                    }
+                    match self.pop_key() {
+                        Some(r) => {
+                            let _ = mem.write(buffer, &r[..n.min(8)]);
+                            TdResult {
+                                status: 0,
+                                actual_len: 8,
+                                nak: false,
+                            }
+                        }
+                        None => TdResult::nak(),
+                    }
+                } else {
+                    // Endpoint 0: descriptor data stage / status stage.
+                    match self.pending {
+                        UsbPending::GetDescriptor {
+                            desc_type,
+                            index,
+                            requested_len,
+                            off,
+                        } => {
+                            let desc = self.descriptor(desc_type, index);
+                            match desc {
+                                Some(d) => {
+                                    let off_us = off as usize;
+                                    let remaining = d.len().saturating_sub(off_us);
+                                    let want = (requested_len as usize).saturating_sub(off_us);
+                                    let take = remaining.min(want).min(n);
+                                    if take > 0 {
+                                        let _ = mem.write(buffer, &d[off_us..off_us + take]);
+                                    }
+                                    let new_off = off_us + take;
+                                    let done = new_off >= d.len() || take == 0;
+                                    self.pending = if done {
+                                        UsbPending::None
+                                    } else {
+                                        UsbPending::GetDescriptor {
+                                            desc_type,
+                                            index,
+                                            requested_len,
+                                            off: new_off as u16,
+                                        }
+                                    };
+                                    TdResult {
+                                        status: 0,
+                                        actual_len: take as u16,
+                                        nak: false,
+                                    }
+                                }
+                                None => {
+                                    self.unknown_requests += 1;
+                                    self.pending = UsbPending::None;
+                                    TdResult::stall()
+                                }
+                            }
+                        }
+                        UsbPending::SetAddress(a) => {
+                            self.device_address = a;
+                            self.pending = UsbPending::None;
+                            TdResult::zero()
+                        }
+                        UsbPending::SetConfig(c) => {
+                            self.configured = c == 1;
+                            self.pending = UsbPending::None;
+                            TdResult::zero()
+                        }
+                        UsbPending::SetIdle(v) => {
+                            self.idle = v;
+                            self.pending = UsbPending::None;
+                            TdResult::zero()
+                        }
+                        UsbPending::SetProtocol(p) => {
+                            self.protocol = p;
+                            self.pending = UsbPending::None;
+                            TdResult::zero()
+                        }
+                        UsbPending::None => TdResult::zero(),
+                    }
+                }
+            }
+            // OUT
+            0xE1 => {
+                if addr != 0 && !self.configured && endpoint == 1 {
+                    return TdResult::nak();
+                }
+                if let UsbPending::SetConfig(_)
+                | UsbPending::SetIdle(_)
+                | UsbPending::SetProtocol(_) = self.pending
+                {
+                    // Status-stage OUT after a control setup with no data stage.
+                    self.pending = UsbPending::None;
+                }
+                // Data we accept and discard (e.g. a SET_REPORT LED output).
+                let mut sink = [0u8; 64];
+                let take = n.min(64);
+                let _ = mem.read(buffer, &mut sink[..take]);
+                self.pending = UsbPending::None;
+                TdResult {
+                    status: 0,
+                    actual_len: take as u16,
+                    nak: false,
+                }
+            }
+            _ => {
+                self.unknown_requests += 1;
+                TdResult::stall()
+            }
+        }
+    }
+
+    fn descriptor(&self, desc_type: u8, index: u8) -> Option<&'static [u8]> {
+        if index != 0 {
+            return None;
+        }
+        match desc_type {
+            1 => Some(&USB_DEVICE_DESC),
+            2 => Some(&USB_CONFIG_DESC),
+            3 => Some(&USB_STRING_LANGID),
+            0x22 => Some(&USB_REPORT_DESC),
+            _ => None,
+        }
+    }
+
+    fn handle_setup(&mut self, s: &[u8; 8]) {
+        let bm = s[0];
+        let req = s[1];
+        let wvalue = u16::from_le_bytes([s[2], s[3]]);
+        let wlength = u16::from_le_bytes([s[6], s[7]]);
+        match (bm, req) {
+            (0x80, 0x06) => {
+                // GET_DESCRIPTOR: wValue high byte = type, low = index.
+                let desc_type = (wvalue >> 8) as u8;
+                let index = (wvalue & 0xFF) as u8;
+                self.pending = UsbPending::GetDescriptor {
+                    desc_type,
+                    index,
+                    requested_len: wlength,
+                    off: 0,
+                };
+            }
+            (0x00, 0x05) => {
+                self.pending = UsbPending::SetAddress((wvalue & 0x7F) as u8);
+            }
+            (0x00, 0x09) => {
+                self.pending = UsbPending::SetConfig((wvalue & 0xFF) as u8);
+            }
+            (0x21, 0x0A) => {
+                self.pending = UsbPending::SetIdle((wvalue >> 8) as u8);
+            }
+            (0x21, 0x0B) => {
+                self.pending = UsbPending::SetProtocol((wvalue & 0xFF) as u8);
+            }
+            _ => {
+                self.unknown_requests += 1;
+            }
+        }
+    }
+}
+
+/// Completion written back to a TD: the 8-bit status field (UHCI: 0x00 =
+/// success, 0x04 = STALL, 0x05 = NAK), the actual transfer length, and the
+/// NAK flag (sets the NAK bit when the HCD armed NAK counting).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TdResult {
+    status: u8,
+    actual_len: u16,
+    nak: bool,
+}
+
+impl TdResult {
+    fn zero() -> TdResult {
+        TdResult {
+            status: 0,
+            actual_len: 0,
+            nak: false,
+        }
+    }
+
+    fn nak() -> TdResult {
+        TdResult {
+            status: 0x05,
+            actual_len: 0,
+            nak: true,
+        }
+    }
+
+    fn stall() -> TdResult {
+        TdResult {
+            status: 0x04,
+            actual_len: 0,
+            nak: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Sound Blaster 16 DSP (Phase Z)
+// ---------------------------------------------------------------------
+
+/// SB16 DSP I/O base (the classic 0x220).
+pub const SB16_BASE: u16 = 0x220;
+/// Maximum pending playback requests the DSP keeps before the host hook
+/// drains them.
+pub const SB16_MAX_PLAYBACKS: usize = 8;
+
+/// One completed DSP playback request awaiting the host audio hook: the block
+/// length the guest programmed and the sample rate in effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaybackReq {
+    pub length: u16,
+    pub sample_rate: u32,
+    pub auto_init: bool,
+}
+
+/// The next DSP command byte that needs a parameter byte written to 0x22C.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DspPending {
+    None,
+    BlockLen1,
+    BlockLen2Lo,
+    BlockLen2Hi,
+    SampleRateLo,
+    SampleRateHi,
+    TimeConstant,
+}
+
+/// Sound Blaster 16 DSP register-level model: the reset handshake, the
+/// 0x22A read data path (status bit at 0x22E), the 0x22C write data path,
+/// the classic command surface (version query, speaker, sample rate, single-
+/// cycle / auto-init 8-bit output), and a bounded playback-request queue the
+/// host audio hook drains. Honest simplification, documented in the module
+/// docs: the 8237 DMA controller is NOT emulated — a playback request carries
+/// the block length (and sample rate) only; the run loop/host hook is
+/// responsible for the actual sample data path.
+pub struct Sb16Dsp {
+    read_buf: [u8; 8],
+    read_len: usize,
+    read_pos: usize,
+    write_ready: bool,
+    reset_done: bool,
+    speaker_on: bool,
+    sample_rate: u32,
+    time_constant: u8,
+    auto_init: bool,
+    pending: DspPending,
+    /// Staged low byte of a two-byte playback length (0x14/0x90/0x91).
+    len_lo: u8,
+    /// Staged low byte of a two-byte sample rate (0x41).
+    rate_lo: u8,
+    playbacks: [PlaybackReq; SB16_MAX_PLAYBACKS],
+    playback_count: usize,
+    pub unknown_cmds: u32,
+    pub input_requests: u32,
+}
+
+const SB16_VERSION_HI: u8 = 0x04;
+const SB16_VERSION_LO: u8 = 0x05;
+
+impl Default for Sb16Dsp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sb16Dsp {
+    pub const fn new() -> Sb16Dsp {
+        Sb16Dsp {
+            read_buf: [0u8; 8],
+            read_len: 0,
+            read_pos: 0,
+            write_ready: true,
+            reset_done: false,
+            speaker_on: true,
+            sample_rate: 11025,
+            time_constant: 0,
+            auto_init: false,
+            pending: DspPending::None,
+            len_lo: 0,
+            rate_lo: 0,
+            playbacks: [PlaybackReq {
+                length: 0,
+                sample_rate: 0,
+                auto_init: false,
+            }; SB16_MAX_PLAYBACKS],
+            playback_count: 0,
+            unknown_cmds: 0,
+            input_requests: 0,
+        }
+    }
+
+    fn push_read(&mut self, byte: u8) {
+        if self.read_len < self.read_buf.len() {
+            let idx = (self.read_pos + self.read_len) % self.read_buf.len();
+            self.read_buf[idx] = byte;
+            self.read_len += 1;
+        }
+    }
+
+    /// 8-bit port read over 0x220..0x237.
+    pub fn inb(&mut self, port: u16) -> u8 {
+        match port - SB16_BASE {
+            0x06 => 0, // reset port reads return 0
+            0x0A => {
+                // DSP read data.
+                if self.read_len == 0 {
+                    0
+                } else {
+                    let b = self.read_buf[self.read_pos];
+                    self.read_pos = (self.read_pos + 1) % self.read_buf.len();
+                    self.read_len -= 1;
+                    b
+                }
+            }
+            0x0E => {
+                // DSP read status: bit 7 = data ready to read.
+                if self.read_len > 0 {
+                    0x80
+                } else {
+                    0
+                }
+            }
+            0x0C => {
+                // DSP write status: bit 7 = ready to write.
+                if self.write_ready {
+                    0x80
+                } else {
+                    0
+                }
+            }
+            _ => 0xFF,
+        }
+    }
+
+    /// 8-bit port write over 0x220..0x237.
+    pub fn outb(&mut self, port: u16, val: u8) {
+        match port - SB16_BASE {
+            0x06 => {
+                // DSP reset: a 1 pulse arms the 0xAA handshake; the 0 clears.
+                if val != 0 {
+                    // Reset latches until a 0 write completes the handshake.
+                    self.write_ready = true;
+                } else {
+                    self.reset_done = true;
+                    self.read_len = 0;
+                    self.read_pos = 0;
+                    self.push_read(0xAA);
+                }
+            }
+            0x0C => {
+                // DSP write data.
+                self.write_ready = false;
+                match self.pending {
+                    DspPending::BlockLen1 => {
+                        let len = val as u16;
+                        self.enqueue_playback(len);
+                        self.pending = DspPending::None;
+                        self.write_ready = true;
+                    }
+                    DspPending::BlockLen2Lo => {
+                        self.pending = DspPending::BlockLen2Hi;
+                        self.len_lo = val;
+                        self.write_ready = true;
+                    }
+                    DspPending::BlockLen2Hi => {
+                        let len = ((val as u16) << 8) | self.len_lo as u16;
+                        self.pending = DspPending::None;
+                        self.enqueue_playback(len);
+                        self.write_ready = true;
+                    }
+                    DspPending::SampleRateLo => {
+                        self.rate_lo = val;
+                        self.pending = DspPending::SampleRateHi;
+                        self.write_ready = true;
+                    }
+                    DspPending::SampleRateHi => {
+                        let rate = ((val as u32) << 8) | self.rate_lo as u32;
+                        self.sample_rate = rate;
+                        self.pending = DspPending::None;
+                        self.write_ready = true;
+                    }
+                    DspPending::TimeConstant => {
+                        self.time_constant = val;
+                        // 256 - (1_000_000 / rate); store, rate derived later.
+                        self.pending = DspPending::None;
+                        self.write_ready = true;
+                    }
+                    DspPending::None => self.command(val),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn command(&mut self, cmd: u8) {
+        match cmd {
+            0xE1 => {
+                // Get version.
+                self.push_read(SB16_VERSION_HI);
+                self.push_read(SB16_VERSION_LO);
+            }
+            0xD1 => self.speaker_on = true,
+            0xD3 => self.speaker_on = false,
+            0x40 => self.pending = DspPending::TimeConstant,
+            0x41 => self.pending = DspPending::SampleRateLo,
+            0x10 => self.pending = DspPending::BlockLen1,
+            0x14 => self.pending = DspPending::BlockLen2Lo,
+            0x90 => {
+                // DAC 8-bit single-cycle (2-byte length).
+                self.auto_init = false;
+                self.pending = DspPending::BlockLen2Lo;
+            }
+            0x91 => {
+                // DAC 8-bit auto-init (2-byte length).
+                self.auto_init = true;
+                self.pending = DspPending::BlockLen2Lo;
+            }
+            0xD0 => { /* pause: no streaming state to pause yet */ }
+            0xD4 => { /* resume */ }
+            0xC0 | 0xC8 => self.input_requests += 1,
+            _ => self.unknown_cmds += 1,
+        }
+        self.write_ready = true;
+    }
+
+    fn enqueue_playback(&mut self, length: u16) {
+        if self.playback_count < SB16_MAX_PLAYBACKS {
+            self.playbacks[self.playback_count] = PlaybackReq {
+                length,
+                sample_rate: self.sample_rate,
+                auto_init: self.auto_init,
+            };
+            self.playback_count += 1;
+        }
+        self.auto_init = false;
+    }
+
+    /// Number of playback requests awaiting the host audio hook.
+    pub fn pending_playbacks(&self) -> usize {
+        self.playback_count
+    }
+
+    /// Pop the oldest playback request for the host audio hook.
+    pub fn pop_playback(&mut self) -> Option<PlaybackReq> {
+        if self.playback_count == 0 {
+            return None;
+        }
+        let r = self.playbacks[0];
+        self.playbacks.copy_within(1..self.playback_count, 0);
+        self.playback_count -= 1;
+        Some(r)
+    }
+
+    pub fn reset_done(&self) -> bool {
+        self.reset_done
+    }
+
+    pub fn speaker_on(&self) -> bool {
+        self.speaker_on
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn time_constant(&self) -> u8 {
+        self.time_constant
+    }
+
+    pub fn version(&self) -> (u8, u8) {
+        (SB16_VERSION_HI, SB16_VERSION_LO)
+    }
+}
+
+// ---------------------------------------------------------------------
 // The combined device set
 // ---------------------------------------------------------------------
 
@@ -959,6 +1864,13 @@ pub struct DeviceSet<'a, S: BlockStore> {
     pub pci: PciConfigBus,
     /// The virtio-blk device (legacy PCI, I/O BAR, INTx#A -> IRQ 11).
     pub virtio: crate::virtio::VirtioBlk<'a, S>,
+    /// The UHCI USB host controller with the HID keyboard (I/O BAR
+    /// 0xCC00, INTx#A -> IRQ 10). The run loop drives the frame-list walk
+    /// through [`DeviceSet::usb_process`].
+    pub usb: UhciUsb,
+    /// The Sound Blaster 16 DSP (0x220-0x237). Playback requests are
+    /// drained by the host audio hook.
+    pub audio: Sb16Dsp,
     /// Port 0x61 refresh-flag state (bit 5 toggles on every read).
     pit61_refresh: bool,
 }
@@ -973,6 +1885,8 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
             rtc: CmosRtc::new(rtc_epoch_seconds),
             pci: PciConfigBus::new(),
             virtio: crate::virtio::VirtioBlk::new(store),
+            usb: UhciUsb::new(),
+            audio: Sb16Dsp::new(),
             pit61_refresh: false,
         };
         ds.pci.init(capacity);
@@ -995,6 +1909,7 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
                 out2 | refresh | 0x10
             }
             0x70 | 0x71 => self.rtc.inb(port),
+            0x220..=0x237 => self.audio.inb(port),
             _ => {
                 let bar = self.pci.virtio_bar();
                 if bar != 0 && (port as u32) >= bar as u32 && (port as u32) < bar as u32 + 0x100 {
@@ -1013,6 +1928,7 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
             0x3F8..=0x3FF => self.uart.outb(port, val),
             0x40..=0x43 => self.pit.outb(port, val),
             0x70 | 0x71 => self.rtc.outb(port, val),
+            0x220..=0x237 => self.audio.outb(port, val),
             _ => {
                 let bar = self.pci.virtio_bar();
                 if bar != 0 && (port as u32) >= bar as u32 && (port as u32) < bar as u32 + 0x100 {
@@ -1022,11 +1938,14 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
         }
     }
 
-    /// 16-bit port read: only the virtio I/O BAR has 16-bit registers
-    /// (QUEUE_NUM / QUEUE_NUM_MAX); everything else in this device set is
-    /// byte- or dword-oriented, so 16-bit accesses to other ranges return
-    /// the floating-bus value.
+    /// 16-bit port read: the UHCI registers (0xCC00-0xCC1F) and the virtio
+    /// I/O BAR (QUEUE_NUM / QUEUE_NUM_MAX); everything else in this device
+    /// set is byte- or dword-oriented, so 16-bit accesses to other ranges
+    /// return the floating-bus value.
     pub fn inw(&mut self, port: u16) -> u16 {
+        if (UHCI_BASE..UHCI_BASE + 0x20).contains(&port) {
+            return self.usb.inw(port);
+        }
         let bar = self.pci.virtio_bar();
         if bar != 0 && (port as u32) >= bar as u32 && (port as u32) < bar as u32 + 0x100 {
             self.virtio.legacy_inw(port - bar)
@@ -1035,9 +1954,14 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
         }
     }
 
-    /// 16-bit port write: the virtio I/O BAR (QUEUE_NUM / QUEUE_SEL /
-    /// QUEUE_NOTIFY); other ranges are ignored (floating-bus).
+    /// 16-bit port write: the UHCI registers and the virtio I/O BAR
+    /// (QUEUE_NUM / QUEUE_SEL / QUEUE_NOTIFY); other ranges are ignored
+    /// (floating-bus).
     pub fn outw(&mut self, port: u16, val: u16) {
+        if (UHCI_BASE..UHCI_BASE + 0x20).contains(&port) {
+            self.usb.outw(port, val);
+            return;
+        }
         let bar = self.pci.virtio_bar();
         if bar != 0 && (port as u32) >= bar as u32 && (port as u32) < bar as u32 + 0x100 {
             self.virtio.legacy_outw(port - bar, val);
@@ -1100,6 +2024,18 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
         if self.virtio.irq_line() {
             self.pic.raise(VIRTIO_IRQ);
         }
+        if self.usb.irq_line() {
+            self.pic.raise(UHCI_IRQ);
+        }
+    }
+
+    /// Drive the UHCI frame-list walk (the run loop calls this on the guest's
+    /// behalf each time the UHCI is running); reflects resulting IRQ lines
+    /// into the PIC. Returns the number of TDs completed.
+    pub fn usb_process(&mut self, mem: &mut impl UsbMem) -> usize {
+        let done = self.usb.process_frame_list(mem);
+        self.update_pic(0);
+        done
     }
 
     /// Feed a byte from the host serial port into the guest UART.
@@ -1490,5 +2426,507 @@ mod tests {
     fn fmt_traits_do_not_panic() {
         let _ = format!("{:?}", PitChannel::new());
         let _ = format!("{:?}", PicState::new());
+    }
+
+    // -----------------------------------------------------------------
+    // Phase Z helpers: build UHCI TDs / frame lists in a ByteArena.
+    // -----------------------------------------------------------------
+
+    fn put_td(mem: &mut impl UsbMem, addr: u32, link: u32, ctrl: u32, token: u32, buffer: u32) {
+        let _ = mem.write_u32(addr, link);
+        let _ = mem.write_u32(addr + 4, ctrl);
+        let _ = mem.write_u32(addr + 8, token);
+        let _ = mem.write_u32(addr + 12, buffer);
+    }
+
+    fn u32_from_bytes(buf: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+    }
+
+    // -----------------------------------------------------------------
+    // Phase Z: UHCI registers
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn uhci_register_map_defaults() {
+        let uhci = UhciUsb::new();
+        assert_eq!(uhci.inw(UHCI_BASE), 0); // USBCMD
+        assert_eq!(uhci.inw(UHCI_BASE + 0x02), 0x0020); // USBSTS: HC Halted
+        assert_eq!(uhci.inw(UHCI_BASE + 0x04), 0); // USBINTR
+        assert_eq!(uhci.inw(UHCI_BASE + 0x06), 0); // FRNUM
+        assert_eq!(uhci.inw(UHCI_BASE + 0x08), 0); // FRBASE (lo)
+        assert_eq!(uhci.inw(UHCI_BASE + 0x0A), 0); // FRBASE (hi)
+        assert_eq!(uhci.inw(UHCI_BASE + 0x0C), 0x40); // SOFMOD
+        assert_eq!(uhci.inw(UHCI_BASE + 0x10), 0x0011); // PORTSC1: CCS + LSDA
+        assert_eq!(uhci.inw(UHCI_BASE + 0x12), 0x0000); // PORTSC2: empty
+        assert_eq!(uhci.inw(UHCI_BASE + 0x20), 0xFFFF); // out of range floats
+    }
+
+    #[test]
+    fn uhci_global_reset_restores_defaults() {
+        let mut uhci = UhciUsb::new();
+        uhci.outw(UHCI_BASE, 1); // RUN
+        uhci.outw(UHCI_BASE + 0x08, 0x1000);
+        uhci.outw(UHCI_BASE + 0x04, 0x000F);
+        uhci.outw(UHCI_BASE, 0x0002); // GRESET
+        assert_eq!(uhci.inw(UHCI_BASE), 0);
+        assert_eq!(uhci.inw(UHCI_BASE + 0x02), 0x0020);
+        assert_eq!(uhci.inw(UHCI_BASE + 0x04), 0);
+        assert_eq!(uhci.inw(UHCI_BASE + 0x08), 0);
+        assert_eq!(uhci.tds_processed, 0);
+    }
+
+    #[test]
+    fn uhci_portsc_reset_completes_on_pr_clear() {
+        let mut uhci = UhciUsb::new();
+        // Arm a port-1 reset.
+        uhci.outw(UHCI_BASE + 0x10, 0x2000);
+        assert_eq!(uhci.inw(UHCI_BASE + 0x10) & 0x2000, 0x2000, "PR set");
+        assert_eq!(uhci.inw(UHCI_BASE + 0x10) & 0x0004, 0, "PE cleared");
+        // Clear PR: the keyboard comes back connected + low-speed + enabled.
+        uhci.outw(UHCI_BASE + 0x10, 0x0000);
+        let ps = uhci.inw(UHCI_BASE + 0x10);
+        assert_eq!(ps & 0x2000, 0, "PR cleared");
+        assert_eq!(ps & 0x0011, 0x0011, "CCS + LSDA");
+        assert_eq!(ps & 0x0004, 0x0004, "PE re-enabled");
+    }
+
+    #[test]
+    fn uhci_frnum_wraps_at_2048() {
+        let mut uhci = UhciUsb::new();
+        uhci.outw(UHCI_BASE + 0x06, 0x07FF);
+        assert_eq!(uhci.inw(UHCI_BASE + 0x06), 0x07FF);
+        uhci.outw(UHCI_BASE + 0x06, 0x0800); // above the 11-bit range
+        assert_eq!(uhci.inw(UHCI_BASE + 0x06), 0x0000);
+    }
+
+    #[test]
+    fn uhci_irq_line_requires_intr_enable() {
+        let mut uhci = UhciUsb::new();
+        // USBINT pending but the IOC interrupt disabled: no line.
+        uhci.sts |= 0x0001;
+        assert!(!uhci.irq_line());
+        // Enable the IOC interrupt: the line asserts.
+        uhci.intr |= 0x0001;
+        assert!(uhci.irq_line());
+    }
+
+    // -----------------------------------------------------------------
+    // Phase Z: UHCI key ring
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn uhci_key_ring_round_trip() {
+        let mut uhci = UhciUsb::new();
+        assert_eq!(uhci.key_count, 0);
+        uhci.enqueue_key([0x02, 0, 0x04, 0, 0, 0, 0, 0]);
+        uhci.enqueue_key([0x00, 0, 0x05, 0, 0, 0, 0, 0]);
+        assert_eq!(uhci.key_count, 2);
+        assert_eq!(uhci.pop_key(), Some([0x02, 0, 0x04, 0, 0, 0, 0, 0]));
+        assert_eq!(uhci.pop_key(), Some([0x00, 0, 0x05, 0, 0, 0, 0, 0]));
+        assert_eq!(uhci.pop_key(), None);
+    }
+
+    #[test]
+    fn uhci_key_ring_is_bounded() {
+        let mut uhci = UhciUsb::new();
+        for i in 0..UHCI_KEY_RING + 8 {
+            uhci.enqueue_key([0, 0, i as u8, 0, 0, 0, 0, 0]);
+        }
+        assert_eq!(uhci.key_count, UHCI_KEY_RING);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase Z: UHCI TD engine
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn uhci_no_run_or_no_frame_list_returns_zero() {
+        let mut arena = vec![0u8; 0x4000];
+        let mut mem = ByteArena {
+            buf: arena.as_mut_slice(),
+        };
+        let mut uhci = UhciUsb::new();
+        // Not running.
+        assert_eq!(uhci.process_frame_list(&mut mem), 0);
+        // Running but no frame list.
+        uhci.outw(UHCI_BASE, 1);
+        assert_eq!(uhci.process_frame_list(&mut mem), 0);
+        assert_eq!(uhci.tds_processed, 0);
+    }
+
+    #[test]
+    fn uhci_terminated_frame_entry_returns_zero() {
+        let mut arena = vec![0u8; 0x4000];
+        let mut mem = ByteArena {
+            buf: arena.as_mut_slice(),
+        };
+        let mut uhci = UhciUsb::new();
+        uhci.outw(UHCI_BASE, 1);
+        uhci.outw(UHCI_BASE + 0x08, 0x1000);
+        let _ = mem.write_u32(0x1000, 0x0000_0001); // terminate bit set
+        assert_eq!(uhci.process_frame_list(&mut mem), 0);
+    }
+
+    #[test]
+    fn uhci_inactive_td_is_skipped() {
+        let mut arena = vec![0u8; 0x4000];
+        let mut mem = ByteArena {
+            buf: arena.as_mut_slice(),
+        };
+        let mut uhci = UhciUsb::new();
+        uhci.outw(UHCI_BASE, 1);
+        uhci.outw(UHCI_BASE + 0x08, 0x1000);
+        let _ = mem.write_u32(0x1000, 0x2000);
+        // TD1 inactive (active bit clear), links to TD2.
+        put_td(&mut mem, 0x2000, 0x2010, 0x00, 0x69, 0x0);
+        // TD2 active: IN endpoint 0 with nothing pending -> zero length.
+        put_td(&mut mem, 0x2010, 0x1, 0x09, 0x69, 0x0);
+        assert_eq!(uhci.process_frame_list(&mut mem), 1);
+        assert_eq!(uhci.tds_processed, 1);
+        // TD1's active bit is untouched; TD2's is cleared.
+        assert_eq!(u32_from_bytes(mem.buf, 0x2004) & 0x1, 0x0);
+        assert_eq!(u32_from_bytes(mem.buf, 0x2014) & 0x1, 0x0);
+    }
+
+    #[test]
+    fn uhci_enumeration_full_flow() {
+        let mut arena = vec![0u8; 0x4000];
+        let mut uhci = UhciUsb::new();
+        uhci.outw(UHCI_BASE, 1); // RUN
+        uhci.outw(UHCI_BASE + 0x08, 0x1000); // FRBASE
+        uhci.outw(UHCI_BASE + 0x04, 0x0001); // IOC interrupt enable
+        uhci.enqueue_key([0x00, 0x00, 0x04, 0, 0, 0, 0, 0]); // scancode 4 = 'a'
+        {
+            let mut mem = ByteArena {
+                buf: arena.as_mut_slice(),
+            };
+            let _ = mem.write_u32(0x1000, 0x2000);
+            // SETUP: Set Address 1.
+            let _ = mem.write(0x3000, &[0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            put_td(&mut mem, 0x2000, 0x2010, 0x09, 0x2D | (8 << 21), 0x3000);
+            // IN status stage (acknowledge the address).
+            put_td(&mut mem, 0x2010, 0x2020, 0x09, 0x69 | (1 << 8), 0x0);
+            // SETUP: GET_DESCRIPTOR device (type 1, length 18).
+            let _ = mem.write(0x3010, &[0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]);
+            put_td(
+                &mut mem,
+                0x2020,
+                0x2030,
+                0x09,
+                0x2D | (1 << 8) | (8 << 21),
+                0x3010,
+            );
+            // IN: device descriptor data stage.
+            put_td(
+                &mut mem,
+                0x2030,
+                0x2040,
+                0x09,
+                0x69 | (1 << 8) | (18 << 21),
+                0x3020,
+            );
+            // SETUP: SET_CONFIGURATION 1.
+            let _ = mem.write(0x3050, &[0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            put_td(
+                &mut mem,
+                0x2040,
+                0x2050,
+                0x09,
+                0x2D | (1 << 8) | (8 << 21),
+                0x3050,
+            );
+            // IN status stage.
+            put_td(&mut mem, 0x2050, 0x2060, 0x09, 0x69 | (1 << 8), 0x0);
+            // Interrupt IN: report (IOC set).
+            put_td(
+                &mut mem,
+                0x2060,
+                0x1,
+                0x0B,
+                0x69 | (1 << 8) | (1 << 16) | (8 << 21),
+                0x3040,
+            );
+            assert_eq!(uhci.process_frame_list(&mut mem), 7);
+            assert_eq!(uhci.tds_processed, 7);
+            // The device descriptor landed at 0x3020.
+            let mut desc = [0u8; 18];
+            mem.read(0x3020, &mut desc);
+            assert_eq!(&desc[..2], &[0x12, 0x01]);
+            assert_eq!(u16::from_le_bytes([desc[8], desc[9]]), 0x1234);
+            // The key report landed at 0x3040.
+            let mut report = [0u8; 8];
+            mem.read(0x3040, &mut report);
+            assert_eq!(report, [0x00, 0x00, 0x04, 0, 0, 0, 0, 0]);
+            // TD2's completion: Active cleared, status 0.
+            assert_eq!(u32_from_bytes(mem.buf, 0x2014) & 0x1, 0x0);
+            assert_eq!((u32_from_bytes(mem.buf, 0x2014) >> 16) & 0xFF, 0x00);
+        }
+        // Model state after the walk.
+        assert_eq!(uhci.device_address, 1);
+        assert!(uhci.configured);
+        assert!(uhci.irq_line(), "IOC TD completed -> USBINT + intr enabled");
+        assert_eq!(uhci.inw(UHCI_BASE + 0x06), 1, "frame advanced");
+    }
+
+    #[test]
+    fn uhci_interrupt_in_naks_when_idle() {
+        let mut arena = vec![0u8; 0x4000];
+        let mut mem = ByteArena {
+            buf: arena.as_mut_slice(),
+        };
+        let mut uhci = UhciUsb::new();
+        uhci.outw(UHCI_BASE, 1);
+        uhci.outw(UHCI_BASE + 0x08, 0x1000);
+        // Configure the device first (no keys queued).
+        uhci.configured = true;
+        let _ = mem.write_u32(0x1000, 0x2000);
+        put_td(
+            &mut mem,
+            0x2000,
+            0x1,
+            0x09,
+            0x69 | (1 << 8) | (1 << 16) | (8 << 21),
+            0x3040,
+        );
+        assert_eq!(uhci.process_frame_list(&mut mem), 1);
+        // NAK status (0x05) in bits 23:16, and the NAK bit (0x40) set.
+        let ctrl = u32_from_bytes(mem.buf, 0x2004);
+        assert_eq!((ctrl >> 16) & 0xFF, 0x05);
+        assert_ne!(ctrl & 0x40, 0);
+        assert_eq!(uhci.tds_processed, 1);
+    }
+
+    #[test]
+    fn uhci_unknown_request_stalls() {
+        let mut arena = vec![0u8; 0x4000];
+        let mut mem = ByteArena {
+            buf: arena.as_mut_slice(),
+        };
+        let mut uhci = UhciUsb::new();
+        uhci.outw(UHCI_BASE, 1);
+        uhci.outw(UHCI_BASE + 0x08, 0x1000);
+        let _ = mem.write_u32(0x1000, 0x2000);
+        // SETUP: GET_DESCRIPTOR for an unknown descriptor type (0x77).
+        let _ = mem.write(0x3000, &[0x80, 0x06, 0x00, 0x77, 0x00, 0x00, 0x12, 0x00]);
+        put_td(&mut mem, 0x2000, 0x2010, 0x09, 0x2D | (8 << 21), 0x3000);
+        // The IN data stage has no descriptor to serve: STALL.
+        put_td(&mut mem, 0x2010, 0x1, 0x09, 0x69 | (18 << 21), 0x3020);
+        assert_eq!(uhci.process_frame_list(&mut mem), 2);
+        assert!(uhci.unknown_requests > 0);
+        let ctrl = u32_from_bytes(mem.buf, 0x2014);
+        assert_eq!((ctrl >> 16) & 0xFF, 0x04, "STALL status");
+    }
+
+    #[test]
+    fn uhci_td_walk_is_bounded() {
+        let mut arena = vec![0u8; 0x4000];
+        let mut mem = ByteArena {
+            buf: arena.as_mut_slice(),
+        };
+        let mut uhci = UhciUsb::new();
+        uhci.outw(UHCI_BASE, 1);
+        uhci.outw(UHCI_BASE + 0x08, 0x1000);
+        let _ = mem.write_u32(0x1000, 0x2000);
+        // A chain of 70 active TDs: the walk must stop at 64.
+        let mut addr = 0x2000u32;
+        for i in 0..70u32 {
+            let link = if i == 69 { 0x1 } else { (addr + 0x10) & !1u32 };
+            put_td(&mut mem, addr, link, 0x09, 0x69, 0x0);
+            addr += 0x10;
+        }
+        assert_eq!(uhci.process_frame_list(&mut mem), 64);
+        assert_eq!(uhci.tds_processed, 64);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase Z: SB16 DSP
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sb16_reset_handshake() {
+        let mut dsp = Sb16Dsp::new();
+        assert!(!dsp.reset_done());
+        dsp.outb(SB16_BASE + 0x06, 0x01); // reset pulse high
+        assert_eq!(dsp.inb(SB16_BASE + 0x06), 0);
+        dsp.outb(SB16_BASE + 0x06, 0x00); // reset pulse low
+        assert!(dsp.reset_done());
+        // 0xAA appears on the read-data path; status shows data ready.
+        assert_eq!(dsp.inb(SB16_BASE + 0x0E), 0x80);
+        assert_eq!(dsp.inb(SB16_BASE + 0x0A), 0xAA);
+        assert_eq!(dsp.inb(SB16_BASE + 0x0E), 0x00);
+    }
+
+    #[test]
+    fn sb16_version_query() {
+        let mut dsp = Sb16Dsp::new();
+        dsp.outb(SB16_BASE + 0x0C, 0xE1);
+        assert_eq!(dsp.inb(SB16_BASE + 0x0A), 0x04);
+        assert_eq!(dsp.inb(SB16_BASE + 0x0A), 0x05);
+        assert_eq!(dsp.version(), (0x04, 0x05));
+    }
+
+    #[test]
+    fn sb16_speaker_toggle() {
+        let mut dsp = Sb16Dsp::new();
+        assert!(dsp.speaker_on());
+        dsp.outb(SB16_BASE + 0x0C, 0xD3); // speaker off
+        assert!(!dsp.speaker_on());
+        dsp.outb(SB16_BASE + 0x0C, 0xD1); // speaker on
+        assert!(dsp.speaker_on());
+    }
+
+    #[test]
+    fn sb16_sample_rate_two_byte() {
+        let mut dsp = Sb16Dsp::new();
+        dsp.outb(SB16_BASE + 0x0C, 0x41);
+        dsp.outb(SB16_BASE + 0x0C, 0x22); // lo byte
+        dsp.outb(SB16_BASE + 0x0C, 0x56); // hi byte
+        assert_eq!(dsp.sample_rate(), 0x5622);
+    }
+
+    #[test]
+    fn sb16_time_constant() {
+        let mut dsp = Sb16Dsp::new();
+        dsp.outb(SB16_BASE + 0x0C, 0x40);
+        dsp.outb(SB16_BASE + 0x0C, 0xE6); // 230 -> ~11 kHz
+        assert_eq!(dsp.time_constant(), 0xE6);
+    }
+
+    #[test]
+    fn sb16_single_cycle_playback() {
+        let mut dsp = Sb16Dsp::new();
+        dsp.outb(SB16_BASE + 0x0C, 0x10); // single-cycle, 1-byte length
+        dsp.outb(SB16_BASE + 0x0C, 0xFF); // length 0xFF
+        assert_eq!(dsp.pending_playbacks(), 1);
+        let req = dsp.pop_playback().unwrap();
+        assert_eq!(req.length, 0xFF);
+        assert!(!req.auto_init);
+    }
+
+    #[test]
+    fn sb16_two_byte_playback_length() {
+        let mut dsp = Sb16Dsp::new();
+        dsp.outb(SB16_BASE + 0x0C, 0x14); // two-byte length
+        dsp.outb(SB16_BASE + 0x0C, 0x00); // lo
+        dsp.outb(SB16_BASE + 0x0C, 0x10); // hi -> 0x1000
+        assert_eq!(dsp.pending_playbacks(), 1);
+        assert_eq!(dsp.pop_playback().unwrap().length, 0x1000);
+    }
+
+    #[test]
+    fn sb16_auto_init_playback() {
+        let mut dsp = Sb16Dsp::new();
+        dsp.outb(SB16_BASE + 0x0C, 0x41);
+        dsp.outb(SB16_BASE + 0x0C, 0x22);
+        dsp.outb(SB16_BASE + 0x0C, 0x56); // 22050 Hz
+        dsp.outb(SB16_BASE + 0x0C, 0x91); // auto-init DAC
+        dsp.outb(SB16_BASE + 0x0C, 0x00);
+        dsp.outb(SB16_BASE + 0x0C, 0x04); // length 0x0400
+        let req = dsp.pop_playback().unwrap();
+        assert_eq!(req.length, 0x0400);
+        assert_eq!(req.sample_rate, 0x5622);
+        assert!(req.auto_init);
+        assert_eq!(dsp.pending_playbacks(), 0);
+    }
+
+    #[test]
+    fn sb16_playback_fifo_is_bounded() {
+        let mut dsp = Sb16Dsp::new();
+        for _ in 0..SB16_MAX_PLAYBACKS + 4 {
+            dsp.outb(SB16_BASE + 0x0C, 0x10);
+            dsp.outb(SB16_BASE + 0x0C, 0x10);
+        }
+        assert_eq!(dsp.pending_playbacks(), SB16_MAX_PLAYBACKS);
+    }
+
+    #[test]
+    fn sb16_unknown_and_input_commands_counted() {
+        let mut dsp = Sb16Dsp::new();
+        dsp.outb(SB16_BASE + 0x0C, 0xF7); // unknown
+        dsp.outb(SB16_BASE + 0x0C, 0xE5); // unknown
+        dsp.outb(SB16_BASE + 0x0C, 0xC0); // input DMA 8-bit
+        assert_eq!(dsp.unknown_cmds, 2);
+        assert_eq!(dsp.input_requests, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase Z: DeviceSet wiring
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pci_uhci_slot_is_fabricated() {
+        let mut pci = PciConfigBus::new();
+        pci.init(0x1000);
+        pci.write_address(0x8000_0000 | ((UHCI_SLOT as u32) << 11));
+        assert_eq!(pci.read_data() & 0xFFFF, 0x8086);
+        pci.write_address(0x8000_0000 | ((UHCI_SLOT as u32) << 11) | (2 << 2));
+        assert_eq!(pci.read_data() >> 16, 0x0C03);
+        assert_eq!(pci.uhci_bar(), UHCI_BASE);
+    }
+
+    #[test]
+    fn device_set_routes_usb_and_audio_ports() {
+        let mut store = MemStore::new(4);
+        let mut ds = DeviceSet::new(&mut store, 0);
+        // UHCI register access through the 16-bit path.
+        assert_eq!(ds.inw(UHCI_BASE + 0x02), 0x0020);
+        ds.outw(UHCI_BASE, 1);
+        assert_eq!(ds.inw(UHCI_BASE), 1);
+        // SB16 register access through the 8-bit path.
+        assert_eq!(ds.inb(SB16_BASE + 0x06), 0);
+        ds.outb(SB16_BASE + 0x06, 0x01);
+        ds.outb(SB16_BASE + 0x06, 0x00);
+        assert_eq!(ds.inb(SB16_BASE + 0x0E), 0x80);
+        assert_eq!(ds.inb(SB16_BASE + 0x0A), 0xAA);
+        // Non-device ports still float.
+        assert_eq!(ds.inw(0xCC80), 0xFFFF);
+        assert_eq!(ds.inb(0x200), 0xFF);
+    }
+
+    #[test]
+    fn device_set_update_pic_raises_uhci_irq() {
+        let mut store = MemStore::new(4);
+        let mut ds = DeviceSet::new(&mut store, 0);
+        ds.outb(0x20, 0x11);
+        ds.outb(0x21, 0x20);
+        ds.outb(0x21, 0x04);
+        ds.outb(0x21, 0x01);
+        ds.outb(0x21, 0x00); // unmask all (master)
+        ds.outb(0xA0, 0x11);
+        ds.outb(0xA1, 0x28);
+        ds.outb(0xA1, 0x02);
+        ds.outb(0xA1, 0x01);
+        ds.outb(0xA1, 0x00); // unmask all (slave — UHCI IRQ 10 lives here)
+                             // Complete one IOC interrupt-IN TD so USBINT asserts.
+        ds.usb.outw(UHCI_BASE, 1);
+        ds.usb.outw(UHCI_BASE + 0x08, 0x1000);
+        ds.usb.outw(UHCI_BASE + 0x04, 0x0001);
+        ds.usb.configured = true;
+        ds.usb.enqueue_key([0x00, 0x00, 0x04, 0, 0, 0, 0, 0]);
+        let mut arena = vec![0u8; 0x4000];
+        {
+            let mut mem = ByteArena {
+                buf: arena.as_mut_slice(),
+            };
+            let _ = mem.write_u32(0x1000, 0x2000);
+            put_td(
+                &mut mem,
+                0x2000,
+                0x1,
+                0x0B, // Active + IOC
+                0x69 | (1 << 8) | (1 << 16) | (8 << 21),
+                0x3040,
+            );
+        }
+        assert_eq!(
+            ds.usb_process(&mut ByteArena {
+                buf: arena.as_mut_slice(),
+            }),
+            1
+        );
+        assert!(ds.usb.irq_line());
+        assert_eq!(ds.pic_peek_vector(), Some(0x20 + UHCI_IRQ));
+        assert_eq!(ds.pic_pending_vector(), Some(0x20 + UHCI_IRQ));
     }
 }
