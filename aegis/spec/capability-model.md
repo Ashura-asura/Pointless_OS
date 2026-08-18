@@ -959,3 +959,24 @@ wrapping or panicking; the certification matrix records exactly what is and is n
 certified. Honest limits: deterministic boundary testing, not fuzzing; model-level
 audit, not hardware certification — every hardware-touching operation remains UNTESTED;
 no inductive proof; no secure boot/attestation.
+
+### Machine-checked verification (executable): hypervisor groundwork (§8 Phase U)
+
+`aegis-kernel` additions (56 tests): `ept.rs` (13) — the 4-level EPT builder for the
+VMX path: grant-bounded `map` (refuses misalignment, overflow, out-of-grant, overlap —
+each refusal leaves the table untouched), `unmap_all` returns every table page
+(`table_pages` back to 0, allocator outstanding 0), `translate`, `eptp(root)` builds
+the VMCS EPTP value, `EptViolation`/`decode_ept_violation`, zero allocation while
+empty, OOM budget refusal. `vdev.rs` (19) — the in-guest device models the VM-exit
+handlers will service: 8259 PIC (cascaded, in-service hold, EOI), 16550 UART, 8254
+PIT (modes 0/2/3), PCI config bus fabricating host bridge + virtio-blk at I/O BAR
+0xC000. `virtio.rs` (11) — legacy virtio-blk queue engine: negotiation, descriptor
+chains, IN/OUT/FLUSH/GET_ID, ISR/IRQ semantics. `vm.rs` (~13) — `Vm` with `pub ept`,
+the bzImage guest boot protocol (`GuestBoot::build`/`write_all`: zero page with e820
++ boot_params handoff, code at 0x100000, initrd, cmdline, GDT/TSS), `BootState`,
+`PitTicker`, `Cap::VmRoot`-gated VM creation. Honest limits: the VMX run loop is
+designed but not implemented (no live EPT activation, no device servicing inside
+VM-exit handlers), and the live Aegis-hosted guest boot is hardware-gated (no VT-x
+on the development machine); the guest-image half is proven real — a Linux bzImage
++ BusyBox initramfs built by `guest/build-guest.sh` boots standalone under QEMU with
+committed evidence in `guest/out/`.

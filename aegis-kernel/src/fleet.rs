@@ -160,7 +160,7 @@ impl TokenObjectKind {
 /// or `None` for `Cap::None`/`Cap::NetRoot` (see `TokenObjectKind` doc).
 pub fn kind_and_id(cap: Cap) -> Option<(TokenObjectKind, u32)> {
     match cap {
-        Cap::None | Cap::NetRoot => None,
+        Cap::None | Cap::NetRoot | Cap::Vm(_) | Cap::VmRoot => None,
         Cap::Endpoint(id) => Some((TokenObjectKind::Endpoint, id)),
         Cap::Task(id) => Some((TokenObjectKind::Task, id)),
         Cap::MemRegion(id) => Some((TokenObjectKind::MemRegion, id)),

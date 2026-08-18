@@ -1,0 +1,31 @@
+#!/bin/sh
+# Aegis guest initramfs /init. Runs under the real Linux kernel built by
+# build-guest.sh. The shell it execs at the end is the interactive session
+# the Phase U Definition of Done verifies over the virtual serial console.
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+# Diagnostics go straight to the serial port: the kernel gives /init a
+# /dev/null stdio when it could not open an initial console, so stdout
+# alone is invisible in the evidence log.
+say() { printf '%s\n' "$*" > /dev/ttyS0 2>&1 || true; }
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+
+# Console plumbing. If devtmpfs was not mounted (it isn't before /init on
+# every config), create the two nodes we need by hand: PID 1 runs with full
+# capabilities, so mknod is allowed even without devtmpfs.
+mkdir -p /dev
+[ -c /dev/console ] || mknod /dev/console c 5 1
+[ -c /dev/ttyS0 ] || mknod /dev/ttyS0 c 4 64
+
+say "Aegis guest: initramfs up, device tree:"
+ls -l /dev/ttyS0 > /dev/ttyS0 2>&1 || true
+say "Aegis guest: uname: $(uname -a)"
+say "Aegis guest: shell: $(busybox --help 2>&1 | head -1)"
+say "Aegis guest: invoking interactive shell on ttyS0 (this is the Phase U DoD point)"
+
+# Interactive session on the virtual serial console. Explicit redirection so
+# the shell lives on ttyS0 regardless of what the kernel gave /init as stdio.
+exec /bin/sh </dev/ttyS0 >/dev/ttyS0 2>&1

@@ -69,6 +69,13 @@ pub mod win_compat;
 // Phase K (VT-x bring-up primitive — see module docs for honest scope)
 pub mod vmx;
 
+// Phase U (hypervisor: EPT + virtual devices + VM lifecycle — pure-logic
+// contract-tested; live VMX runs are hardware-gated, see module docs)
+pub mod ept;
+pub mod vdev;
+pub mod virtio;
+pub mod vm;
+
 // Phase L (chaos testing — see module docs for the fail-open definitions
 // and the honest "iteration count, not wall-clock duration" scoping)
 pub mod chaos;

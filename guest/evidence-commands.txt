@@ -1,0 +1,5 @@
+echo "Aegis guest: interactive session begins"
+uname -a
+busybox | head -1
+ls /bin | head -8
+echo "hello-from-guest-shell"

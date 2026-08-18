@@ -119,6 +119,15 @@ pub enum Cap {
     /// the socket directly via `netif::open_advisor_endpoint`, so an
     /// advisor-role agent needs no `NetRoot` and gets none).
     NetRoot,
+    /// Reference to a VM (a hypervisor guest) with the given id. Held by
+    /// the VM's owner; carrying it with CONTROL is what makes run/teardown
+    /// of that specific VM possible.
+    Vm(u32),
+    /// Phase U (master roadmap Track A): the singleton capability that
+    /// authorizes *creating* a VM at all (id is always 0). Mirrors `NetRoot`:
+    /// only a task explicitly handed `VmRoot` may mint a new VM — there is
+    /// no ambient "make a virtual machine" authority.
+    VmRoot,
 }
 
 /// One occupied row of a capability table: the object and the rights held on it.
@@ -151,6 +160,8 @@ impl Cap {
             Cap::Channel(id) => Some(id),
             Cap::NetEndpoint(id) => Some(id),
             Cap::NetRoot => Some(0),
+            Cap::Vm(id) => Some(id),
+            Cap::VmRoot => Some(0),
         }
     }
 }
@@ -190,6 +201,18 @@ pub const NET_RIGHTS: Rights = Rights::SEND.union(Rights::RECV);
 /// `netif::sys_net_socket`'s gate and `netif::grant_net_root`'s doc
 /// comment for why re-delegation must stay a kernel/boot-time decision).
 pub const NET_ROOT_RIGHTS: Rights = Rights::CONTROL;
+
+/// The right required on a `Cap::Vm` slot to operate the VM it names
+/// (load, run, tear down). `CONTROL` is reused deliberately, exactly like
+/// `NetRoot` above: running a VM is an administrative authority, not a
+/// per-message right. Never GRANT — a VM reference cannot be re-delegated
+/// by an ordinary `ipc_cap_grant` (the same reasoning as `NetRoot`).
+pub const VM_RIGHTS: Rights = Rights::CONTROL;
+
+/// The right required on a `Cap::VmRoot` slot to call VM creation. Never
+/// GRANT — minting VMs stays a kernel/boot-time decision, like
+/// `grant_net_root`.
+pub const VM_ROOT_RIGHTS: Rights = Rights::CONTROL;
 
 /// The rights a fresh memory-region capability grants its holder (READ/WRITE
 /// to touch the frames, GRANT to delegate it onward). Mirrors the model
