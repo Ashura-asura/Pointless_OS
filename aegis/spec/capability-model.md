@@ -974,9 +974,34 @@ PIT (modes 0/2/3), PCI config bus fabricating host bridge + virtio-blk at I/O BA
 chains, IN/OUT/FLUSH/GET_ID, ISR/IRQ semantics. `vm.rs` (~13) — `Vm` with `pub ept`,
 the bzImage guest boot protocol (`GuestBoot::build`/`write_all`: zero page with e820
 + boot_params handoff, code at 0x100000, initrd, cmdline, GDT/TSS), `BootState`,
-`PitTicker`, `Cap::VmRoot`-gated VM creation. Honest limits: the VMX run loop is
-designed but not implemented (no live EPT activation, no device servicing inside
-VM-exit handlers), and the live Aegis-hosted guest boot is hardware-gated (no VT-x
-on the development machine); the guest-image half is proven real — a Linux bzImage
-+ BusyBox initramfs built by `guest/build-guest.sh` boots standalone under QEMU with
-committed evidence in `guest/out/`.
+`PitTicker`, `Cap::VmRoot`-gated VM creation.
+
+### Machine-checked verification (executable): the resumable VMX run loop (§8 Phase U-6)
+
+`aegis-kernel` additions (7 more tests, 657 kernel total): `vmx.rs` now implements
+the run loop that connects the above pieces — `vmx_run_guest` (first `vmlaunch`,
+then repeated `vmresume`; every VM-exit returns to the loop: the entry trampolines
+write the caller's RSP into VMCS HOST_RSP each entry so the exit landing pad `ret`s
+back into the loop with the guest's 15 GPRs saved; r11-as-base is loaded last), exit
+dispatch over the corrected SDM Table 29-1 map (external interrupt → LAPIC EOI +
+per-exit hook; HLT → guest activity state HLT + RIP +1; I/O instruction →
+`decode_io_exit` per SDM Table 27-5 + opcode fetch through the EPT + `Vm::handle_io`
+emulation into the in-guest 16550/PIC/PIT + IN result written to the guest's saved
+RAX with upper bits preserved + RIP advanced by instruction length; EPT violation →
+counted on the VM + caller policy hook; anything unhandled is a loud `Err`, never
+swallowed), EPT activation in the VMCS (`setup_controls(use_ept, ept_root)`:
+EXT_INT_EXITING|IO_EXITING|HLT_EXITING|SECONDARY_CONTROLS primary, EPT +
+unrestricted guest + TSC offsetting secondary, EPTP programmed; refused — not
+degraded — if the capability MSRs cannot grant them), and `setup_guest_state_from_boot`
+(protected-mode VMCS guest state from `BootState`, AR bytes matching the
+`GuestBoot::write_setup_gdt` descriptors). Feature-gated `run_loop_demo()` proves the
+whole chain end-to-end on VMX hardware: a 32-bit guest under EPT prints through the
+emulated 16550 and halts, bounded by an exit budget; `bringup_demo` now returns after
+its round trip instead of halting. Honest limits: the hardware half (vmlaunch /
+vmresume / real EPT walks / the trampoline register dance) has never run — no VT-x
+on the development machine (`VirtualizationFirmwareEnabled=False`); the decode,
+dispatch, control-bit and state-setup logic is contract-tested, and the two demos
+run automatically behind `vmx_supported()` on any VT-x-capable boot. The live
+Aegis-hosted guest boot (Phase U DoD) remains hardware-gated; the guest-image half
+is proven real — a Linux bzImage + BusyBox initramfs built by `guest/build-guest.sh`
+boots standalone under QEMU with committed evidence in `guest/out/`.

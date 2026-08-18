@@ -330,6 +330,18 @@ pub unsafe fn init_lapic_timer() -> u64 {
     LAPIC_BASE
 }
 
+/// Signal end-of-interrupt to the local APIC (write 0 to the EOI register),
+/// clearing the in-service latch so the next interrupt can be delivered.
+/// The VMX run loop calls this after an external-interrupt VM-exit
+/// (EXT_INT_EXITING) before re-entering the guest.
+///
+/// # Safety
+/// Requires the local APIC to be enabled with `LAPIC_BASE` set
+/// (`init_lapic_timer` runs before this can ever be called).
+pub unsafe fn lapic_eoi() {
+    lapic_write(0xB0, 0);
+}
+
 /// Index of the interrupted RIP within an exception frame, given whether
 /// the vector pushes an architectural error code. Stub layout: `push 0`,
 /// then `rax rbx rcx rdx rsi rdi r8 r9 r10 r11`, then `sub rsp,8`; the

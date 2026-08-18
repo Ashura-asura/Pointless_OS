@@ -2017,26 +2017,36 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         }
     }
 
-    // Phase K (feature-gated): VT-x bring-up demo. Last thing before
-    // interrupts turn on and the idle loop owns the machine. `vmx_supported()`
-    // is a cheap no-op CPUID check; `bringup_demo()` only runs when VT-x is
-    // actually present. On a CPU without VT-x this prints and falls through to
-    // the normal idle boot — one `if` branch, zero behavior change. On a
-    // VMX-capable CPU it launches the real-mode guest and HALTS after the
-    // first real VM-exit (single round trip, no vmresume) — that halt is the
-    // demo's terminal state, so this must sit after every boot demo a test
-    // image still needs, which it does.
+    // Phase K + Phase U-6 (feature-gated): VT-x bring-up + run-loop demos.
+    // Last thing before interrupts turn on and the idle loop owns the
+    // machine. `vmx_supported()` is a cheap no-op CPUID check; the demos
+    // only run when VT-x is actually present. On a CPU without VT-x this
+    // prints and falls through to the normal idle boot — one `if` branch,
+    // zero behavior change. On a VMX-capable CPU: `bringup_demo()` proves
+    // one full round trip (vmlaunch -> guest -> VM-exit -> handled), then
+    // `run_loop_demo()` runs a resumable 32-bit guest under EPT that talks
+    // to the emulated 16550 and halts — bounded by its exit budget, so the
+    // machine keeps booting afterward (unlike the old bring-up, nothing
+    // halts forever anymore).
     #[cfg(feature = "vmx-demo")]
     {
         if aegis_kernel::vmx::vmx_supported() {
             sprintln!("Aegis: [vmx] VT-x present — running bring-up demo");
             unsafe {
-                let _ = aegis_kernel::vmx::bringup_demo();
+                match aegis_kernel::vmx::bringup_demo() {
+                    Ok(()) => sprintln!("Aegis: [vmx] bring-up round trip complete"),
+                    Err(e) => sprintln!("Aegis: [vmx] bring-up demo failed: {}", e),
+                }
             }
-            // Only reached if bring-up failed before a successful VM-entry.
-            sprintln!("Aegis: [vmx] bring-up demo returned (pre-entry failure, see above)");
+            sprintln!("Aegis: [vmx] running Phase U-6 run-loop demo (EPT + emulated devices)");
+            unsafe {
+                match aegis_kernel::vmx::run_loop_demo() {
+                    Ok(()) => sprintln!("Aegis: [vmx] run-loop demo complete"),
+                    Err(e) => sprintln!("Aegis: [vmx] run-loop demo failed: {}", e),
+                }
+            }
         } else {
-            sprintln!("Aegis: [vmx] no VT-x on this CPU — skipping VMX bring-up demo");
+            sprintln!("Aegis: [vmx] no VT-x on this CPU — skipping VMX demos");
         }
     }
 

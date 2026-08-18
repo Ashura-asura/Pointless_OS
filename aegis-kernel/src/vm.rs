@@ -316,11 +316,22 @@ impl GuestBoot {
     /// 0x8B), so the CPU's guest-state checks and the guest's own segment
     /// state agree.
     fn write_gdt(&self, mem: &mut impl GuestMem) -> Result<(), VmError> {
+        Self::write_setup_gdt(mem, self.gdt_gpa, self.tss_gpa)
+    }
+
+    /// The same setup GDT at caller-chosen guest addresses. Shared with the
+    /// VMX run-loop demo, whose guest uses the standard layout (GDT at
+    /// `GDT_GPA`, TSS at `TSS_GPA`) but is loaded without a `GuestBoot`.
+    pub fn write_setup_gdt(
+        mem: &mut impl GuestMem,
+        gdt_gpa: u64,
+        tss_gpa: u64,
+    ) -> Result<(), VmError> {
         let mut gdt = [0u8; 32];
         gdt[8..16].copy_from_slice(&[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00]); // code
         gdt[16..24].copy_from_slice(&[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00]); // data
-                                                                                        // TSS: base TSS_GPA, limit 0x67, busy 32-bit TSS.
-        let b = self.tss_gpa;
+                                                                                        // TSS: base `tss_gpa`, limit 0x67, busy 32-bit TSS.
+        let b = tss_gpa;
         gdt[24..32].copy_from_slice(&[
             0x67,
             0x00,
@@ -331,7 +342,7 @@ impl GuestBoot {
             ((b >> 24) & 0xFF) as u8,
             0x00,
         ]);
-        mem.write(self.gdt_gpa, &gdt)
+        mem.write(gdt_gpa, &gdt)
             .then_some(())
             .ok_or(VmError::GuestIo)
     }
@@ -552,6 +563,20 @@ impl<'a, S: BlockStore> Vm<'a, S> {
             host_ram_base,
             ept_violations: 0,
         }
+    }
+
+    /// Read one byte of guest memory through the EPT, or `None` if the
+    /// address is unmapped. The VMX run loop uses this to fetch the opcode
+    /// at guest RIP when decoding an I/O VM-exit.
+    pub fn read_guest_byte(&self, gpa: u64) -> Option<u8> {
+        let hpa = self.ept.translate(gpa)?;
+        Some(unsafe { core::ptr::read(hpa as *const u8) })
+    }
+
+    /// The register handoff for the loaded Linux image (`None` before a
+    /// successful `load_linux`), for the VMX run loop's VMCS setup.
+    pub fn boot_state(&self) -> Option<BootState> {
+        self.boot.as_ref().map(|b| b.boot_state())
     }
 
     /// Load a Linux bzImage (with optional initrd and cmdline) into the
