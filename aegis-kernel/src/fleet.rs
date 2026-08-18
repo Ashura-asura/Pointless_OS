@@ -67,7 +67,7 @@
 //!   entry point `netif`'s own internal helpers use), not a simulation.
 //! - `run_boot_demo`: a real two-node boot-time demo, gated by the
 //!   `fleet-node-a` / `fleet-node-b` Cargo features (see
-//!   `PHASE_I_INTEGRATION.md`), that performs one real mint, one real
+//!   `../../Docs/design/master-roadmap.md`), that performs one real mint, one real
 //!   cross-machine send, one real verify, and demonstrates fail-closed
 //!   behavior for real — by going stale for real when node A's process is
 //!   actually killed, not by a simulated flag.
@@ -899,7 +899,7 @@ pub fn poll_link(socket: u16) -> LinkEvent {
 // ---- Boot demo --------------------------------------------------------------
 //
 // Gated by the `fleet-node-a` / `fleet-node-b` Cargo features (mutually
-// exclusive — see PHASE_I_INTEGRATION.md). `main.rs` calls
+// exclusive — see ../../Docs/design/master-roadmap.md). `main.rs` calls
 // `fleet::run_boot_demo(&pci)` once, after the NIC is up, near the end of
 // the existing boot-demo sequence (after the other demos have closed their
 // sockets — see integration notes).
@@ -921,7 +921,7 @@ const NODE_A_ID: NodeId = NodeId([0xA1; 32]);
 const NODE_B_ID: NodeId = NodeId([0xB2; 32]);
 
 /// Node A's static IP for the private fleet link — see `netif.rs`'s
-/// `OUR_IP` feature-gate patch in PHASE_I_INTEGRATION.md.
+/// `OUR_IP` feature-gate patch in ../../Docs/design/master-roadmap.md.
 #[cfg(feature = "fleet-node-a")]
 const PEER_IP: [u8; 4] = [10, 0, 3, 2]; // node B
 #[cfg(feature = "fleet-node-b")]

@@ -11,14 +11,14 @@ harnesses, and design artifacts intended for research, evaluation, and
 engineering experimentation.
 
 ## Quick links
-- Architecture notes: ARCHITECTURE.md
-- Design monograph: os-from-first-principles.md
-- Honest status and limits: HONEST_STATUS.md
-- Capability model + machine-checked verification: aegis/spec/capability-model.md
-- Model SDK guide + runnable example: aegis/spec/sdk.md (`cargo run -p sdk-example`)
-- Security audit notes: SECURITY_AUDIT.md
-- Project report: PROJECT_REPORT.md
-- Licensing + third-party notices: LICENSING.md
+- Architecture notes: Docs/ARCHITECTURE.md
+- Design monograph: Docs/os-from-first-principles.md
+- Honest status and limits: Docs/HONEST_STATUS.md
+- Capability model + machine-checked verification: Docs/spec/capability-model.md
+- Model SDK guide + runnable example: Docs/spec/sdk.md (`cargo run -p sdk-example`)
+- Security audit notes: Docs/SECURITY_AUDIT.md
+- Project report: Docs/PROJECT_REPORT.md
+- Licensing + third-party notices: Docs/LICENSING.md
 
 ## Vision
 - Minimal trusted computing base: enforce isolation and capability semantics in a small kernel.
@@ -105,7 +105,7 @@ serial logs + framebuffer captures):
   the identity map) and enumerates the CPUs/APICs (`SMP: 2 processor(s)
   enabled` on `-smp 2`), with a tested guest-ACPI encoder seam.
 - **Model SDK**: the `aegis` model crates are documented as an SDK
-  (`aegis/spec/sdk.md`) with a runnable, contract-tested example —
+  (`Docs/spec/sdk.md`) with a runnable, contract-tested example —
   `cargo run -p sdk-example` walks the role-grant lifecycle end to end
   (denial before grant, propose→diff→confirm, escalation refused, expiry,
   two-party confirmation, circuit breaker, revocation, audit).
@@ -114,7 +114,7 @@ serial logs + framebuffer captures):
   0 panics), a TLA+ ceiling proof model-checked through TLC (5.64M states,
   0 errors), and a security-audit certification matrix.
 
-**Honest limits** (details in HONEST_STATUS.md — the single consolidated Known
+**Honest limits** (details in Docs/HONEST_STATUS.md — the single consolidated Known
 Limits section, split into *closed / reduced / inherent*):
 
 - Everything runs under QEMU/TCG or VMware — **no physical-hardware
@@ -144,15 +144,16 @@ Limits section, split into *closed / reduced / inherent*):
   `--features vmx-demo`**)
 - `aegis/` — model crates mirroring the kernel (capability-core, store,
   net, fleet, grants, conformance, etc.; 131 tests) + the SDK guide and
-  runnable example in `aegis/spec/sdk.md` and `aegis/crates/sdk-example/`
+  runnable example in `Docs/spec/sdk.md` and `aegis/crates/sdk-example/`
 - `uefi-boot/` — UEFI loader + image build + QEMU demo scripts (22 tests)
 - `guest/` — the real Linux guest image (bzImage + BusyBox initramfs,
   build scripts, committed evidence)
 - `phase-m-fuzz/` — host-side boundary-parser fuzzing harness
-- `aegis/spec/` — TLA+ specs (capabilities + ceiling), capability model, SDK
-- `os-from-first-principles.md`, `design/` — design monograph and roadmap
-- `docs/` — supplemental documentation
-- `LICENSE`, `LICENSING.md` — dual-license terms and third-party notices
+- `aegis/spec/` — TLA+ specs (capabilities + ceiling)
+- `Docs/` — design monograph (`Docs/os-from-first-principles.md`), roadmap
+  (`Docs/design/`), capability model + SDK guide (`Docs/spec/`), audits,
+  licensing, and status docs
+- `LICENSE`, `Docs/LICENSING.md` — dual-license terms and third-party notices
 
 ## Build & run (high level)
 

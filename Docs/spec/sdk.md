@@ -2,8 +2,8 @@
 
 This is the *executable model SDK*: the crates in the `aegis` workspace that
 implement, as pure, contract-tested Rust, the capability substrate described
-in `spec/capability-model.md` and the design monograph
-(`os-from-first-principles.md`). Everything here is model code — it runs on a
+in `capability-model.md` and the design monograph
+(`../os-from-first-principles.md`). Everything here is model code — it runs on a
 host OS, not on bare metal. The real kernel is `aegis-kernel/`; the bridge
 that proves the model and the kernel agree is `conformance`.
 
@@ -167,4 +167,4 @@ boundary is Rust module privacy, exactly as in `capability-core/src/kernel.rs`.
 - `aegis` workspace: **131 contract tests** across 17 crates (including 3 in
   `sdk-example`), `cargo fmt`/`clippy -D warnings` clean.
 - The kernel (`aegis-kernel`) and bootloader (`uefi-boot`) are counted
-  separately; see `HONEST_STATUS.md` for the combined totals.
+  separately; see `../HONEST_STATUS.md` for the combined totals.

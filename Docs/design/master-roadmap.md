@@ -27,7 +27,7 @@ boots. This is the single most important thing to fix, and everything
 below is sequenced around fixing it.
 
 There is also a design document in this repo,
-`os-from-first-principles.md`, that already answers most of the "what
+`../os-from-first-principles.md`, that already answers most of the "what
 should this actually be" questions. Its most important verdict (§11): the
 smallest prototype that proves the architecture is a minimal
 capability-scoped AI-agent execution context that (1) gets a *role*, not a
@@ -57,7 +57,7 @@ instead of adopting seL4's.
 
 ---
 
-## 1. Ground rules for every phase (from this repo's own `GROUND_RULES.md`)
+## 1. Ground rules for every phase (from this repo's own `../GROUND_RULES.md`)
 
 Apply these to every commit in every phase below, no exceptions:
 
@@ -85,11 +85,11 @@ Apply these to every commit in every phase below, no exceptions:
 
 **No new code. Documentation and repo hygiene only.**
 
-1. Create `design/future-work.md`. Move any README/ARCHITECTURE content
+1. Create `./future-work.md`. Move any README/ARCHITECTURE content
    describing Windows/Linux compatibility, distributed/fleet
    transparency, GPU compositor, or AI orchestration beyond what Phase 6
    below actually builds, into that file. Leave a one-line pointer in the
-   main docs: "Design only, not implemented — see design/future-work.md."
+   main docs: "Design only, not implemented — see ./future-work.md."
 2. Remove those moved items from any current test-count or feature
    summary anywhere in the repo — headline docs should only describe
    what's implemented today.
@@ -100,14 +100,14 @@ Apply these to every commit in every phase below, no exceptions:
    circuit-breaker system should actively discourage (this is the design
    doc's own reasoning, §3, not an added preference).
 4. Consolidate to a single "Known Limits" section (merge
-   `HONEST_STATUS.md` and `ARCHITECTURE.md` if both have one) using the
+   `../HONEST_STATUS.md` and `../ARCHITECTURE.md` if both have one) using the
    closed/reduced/inherent split from Ground Rule 6 above.
 
 **Definition of Done:** no doc describes an unimplemented feature as if
 live; one Known Limits section, not several disagreeing ones; zero
-biological-healing language remains outside `design/future-work.md`.
+biological-healing language remains outside `./future-work.md`.
 
-**Verify:** `grep -ril "self-healing\|immune\|biological" . --include="*.md" --include="*.rs"` returns nothing outside `design/future-work.md`.
+**Verify:** `grep -ril "self-healing\|immune\|biological" . --include="*.md" --include="*.rs"` returns nothing outside `./future-work.md`.
 
 ---
 
@@ -255,7 +255,7 @@ bound) → escalation message → kernel continues, 0 exceptions.
 
 ## 8. Phase 6 — Capability-scoped AI-agent prototype (the actual target)
 
-This is `os-from-first-principles.md` §11.F's own definition of done.
+This is `../os-from-first-principles.md` §11.F's own definition of done.
 Build exactly this, nothing broader, now that Phases 1–5 give it real
 capabilities, real denial, and real supervision to sit on.
 

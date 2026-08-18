@@ -1,6 +1,6 @@
-//! Aegis capability model — executable reference for `spec/capability-model.md`.
+//! Aegis capability model — executable reference for `../../../../../Docs/spec/capability-model.md`.
 //!
-//! Design doc: `os-from-first-principles.md`, Phases 0–1.
+//! Design doc: `../../../../../Docs/os-from-first-principles.md`, Phases 0–1.
 //! The kernel is the boundary: everything in this crate outside `kernel::Kernel` is
 //! either a pure type or a test.
 

@@ -53,7 +53,7 @@
 //!   fail-closed staleness and a real deterministic re-election that
 //!   resolves the split-brain. The two-node role comes from the runtime
 //!   FLEET.CFG (or the compile-time node feature as fallback). See the
-//!   `run_boot_demo` gate and `PHASE_J3_INTEGRATION.md` note in the module
+//!   `run_boot_demo` gate and `../../Docs/design/master-roadmap.md` note in the module
 //!   doc of `main.rs`.
 
 #[cfg(feature = "fleet-j3")]

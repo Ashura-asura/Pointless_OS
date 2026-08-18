@@ -1,13 +1,13 @@
 # Future Work — Design Only, Not Implemented
 
-These items are part of the Aegis design (see `os-from-first-principles.md` and
-`ARCHITECTURE.md`) but are **not implemented**. They are sequenced after the
+These items are part of the Aegis design (see `../os-from-first-principles.md` and
+`../ARCHITECTURE.md`) but are **not implemented**. They are sequenced after the
 capability-scoped AI-agent prototype (roadmap Phases 0–6) and are described
 here so the main docs only claim what is implemented and verified today.
 
 > **Status update (roadmap §10):** every deferred item below has now been
-> implemented at its honest scope and verified (see `HONEST_STATUS.md` and the
-> `design/master-roadmap.md` §10 rows). This file keeps the *design* reasoning
+> implemented at its honest scope and verified (see `../HONEST_STATUS.md` and the
+> `./master-roadmap.md` §10 rows). This file keeps the *design* reasoning
 > and the honest remaining limits of each — the full-fidelity vehicles are
 > still not built and are documented as such.
 
@@ -83,7 +83,7 @@ It can start once Phases 1–6 give it a real substrate.
 - Today the only live display is the VGA text console (80x25 white-on-black
   mirror of the COM1 log). No framebuffer graphics, no GPU accel, no mouse;
   keyboard input now works live (real PS/2 IRQ path driving Tab-focus +
-  arrow-move — see HONEST_STATUS.md).
+  arrow-move — see ../HONEST_STATUS.md).
 - Shell runtime, window manager, object graph, and input dispatcher exist as
   model-level contract tests, not a live UI.
 

@@ -21,7 +21,7 @@
 > compatibility, distributed-transparency and graphics sections are design
 > intent; each has now been implemented at its honest scope (see
 > `HONEST_STATUS.md` and `design/master-roadmap.md` §10). The implemented-and-verified
-> surface (boot, kernel, isolation, IPC, drivers, storage) is in README.md and
+> surface (boot, kernel, isolation, IPC, drivers, storage) is in ../README.md and
 > HONEST_STATUS.md; the full-fidelity vehicles that remain unimplemented are
 > documented honestly in design/future-work.md.
 
@@ -736,7 +736,7 @@ Windows compatibility is harder because:
 > broader orchestration) are now implemented at their honest scope — see
 > HONEST_STATUS.md, design/master-roadmap.md §10, and design/future-work.md for
 > the remaining full-fidelity limits.
-> What is actually implemented and verified today is in README.md and HONEST_STATUS.md.
+> What is actually implemented and verified today is in ../README.md and HONEST_STATUS.md.
 
 ---
 

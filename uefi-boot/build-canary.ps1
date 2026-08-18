@@ -1,6 +1,6 @@
 # Builds the real-hardware canary image (aegis-canary.img) from source.
 # Usage: powershell -File build-canary.ps1
-# Output: uefi-boot/aegis-canary.img (write to USB in DD mode, see hardware-milestones.md)
+# Output: uefi-boot/aegis-canary.img (write to USB in DD mode, see ../Docs/hardware-milestones.md)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $kern = "$root\aegis-kernel"

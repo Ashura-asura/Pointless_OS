@@ -31,7 +31,7 @@ caught and counted rather than aborting.
 
 ```
 phase-m-fuzz/
-├── README.md          this file
+├── ../../README.md      this file
 ├── Cargo.toml         real-crate harness (links aegis-kernel)
 ├── src/main.rs        real-crate fuzz driver
 ├── fuzz-run.log       EVIDENCE: real-crate run (180M / 2 seeds / 0 panics)

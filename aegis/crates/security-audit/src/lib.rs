@@ -11,7 +11,7 @@
 //!
 //! Honest limits: this is a model-level security audit over the finite
 //! reference scenario. It is NOT a certification of the implementation on real
-//! hardware — see `SECURITY_AUDIT.md` for the certification status matrix
+//! hardware — see `../../../../Docs/SECURITY_AUDIT.md` for the certification status matrix
 //! (every hardware-touching operation remains UNTESTED). It also cannot find
 //! bugs the manifests/kernel model do not express.
 //!
@@ -121,7 +121,7 @@ fn undeclared_holdings_fail() {
 fn delivery_overhang_warns_but_stays_clean() {
     // A *userspace* grantor holding a GRANT-carrying naming cap into the assistant
     // and holding strictly more than the assistant declares: overhang is a *warning*,
-    // never a build-breaking violation (design decision in capability-model.md).
+    // never a build-breaking violation (design decision in ../../../../Docs/spec/capability-model.md).
     // The kernel/boot session's own bootstrap edge is exempt (trusted bootstrap).
     let (mut k, root, agent, agent_cap, _, root_creator) = build_reference_world();
     let (ops, ops_cap) = k.create_task(root, root_creator, "ops").unwrap();

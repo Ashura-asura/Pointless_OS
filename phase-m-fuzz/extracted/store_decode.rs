@@ -1,6 +1,6 @@
 // Extracted verbatim from aegis-kernel/src/store.rs (decode_entries + the
 // Name/FileEntry types it depends on) for standalone fuzzing — see
-// PHASE_M_STATUS.md for why (MSRV blocker on the real crate).
+// ../../Docs/design/master-roadmap.md for why (MSRV blocker on the real crate).
 
 pub const NAME_BYTES: usize = 32;
 pub const MAX_FILES: usize = 8;

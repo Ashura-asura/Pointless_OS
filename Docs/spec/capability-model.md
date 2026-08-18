@@ -2,7 +2,7 @@
 
 *Status: v0.2 — the executable reference is `crates/capability-core`; this document is normative where the two disagree (and that is a bug in the code, not the spec). The delegation invariants below are machine-checked on a finite instance by TLC against `AegisCapabilities.tla` (§6).*
 
-This is the Phase 0 artifact from `os-from-first-principles.md` §7: a formalization of the
+This is the Phase 0 artifact from `../os-from-first-principles.md` §7: a formalization of the
 capability delegation rules, written before implementation. Notation is TLA+-flavored;
 the Rust tests in `capability-core` are the executable model check for the invariants stated
 here, and `AegisCapabilities.tla` is the machine-checked model (exhaustive TLC run, §6).
@@ -897,7 +897,7 @@ graph node/relationship CRUD and traversal, input ring buffer and focus dispatch
 limits: no GPU, no framebuffer output; these model tests use synthetic events — real
 keyboard input is proven live in the kernel (see `aegis-kernel/src/ps2.rs` +
 `desktop.rs` and the `shell-compositor@key` serial assertions in
-`HONEST_STATUS.md`), no mouse hardware.
+`../HONEST_STATUS.md`), no mouse hardware.
 
 ### Machine-checked verification (executable): Linux compatibility (§5/§7 Phase 8)
 
@@ -947,7 +947,7 @@ whereas real macaroons allow keyless attenuation (documented model difference).
 
 ### Machine-checked verification (executable): production hardening (§8/§7 Phase 12)
 
-`crates/security-audit` (10) + `aegis-kernel/src/hardening.rs` (17) + `SECURITY_AUDIT.md`:
+`crates/security-audit` (10) + `aegis-kernel/src/hardening.rs` (17) + `../SECURITY_AUDIT.md`:
 the reachable-authority audit is promoted to an aggregate build gate with contract
 tests covering the clean reference world, kernel-equivalent-demand rejection,
 undeclared-holding rejection, overhang-warns-not-fails, and structural-self-cap
@@ -1239,7 +1239,7 @@ crates): the SDK crates become a documented, runnable surface.
   kernel vs the `conformance` oracle), the crate map by layer, dependency
   guidance, and future-flexibility notes (workspace-versioned crates,
   `publish = false`, new crates/steps are CI-covered by construction).
-- **`LICENSE` + `LICENSING.md` (Phase X)** — the licensing gate: all original
+- **`LICENSE` + `../LICENSING.md` (Phase X)** — the licensing gate: all original
   code is MIT OR Apache-2.0; the shipped Linux bzImage + BusyBox initramfs
   are GPL-2.0-only (source offer satisfied by the committed `kernel.config`
   + `build-guest.sh`); the font8x16 and Hinnant algorithm snippets are public

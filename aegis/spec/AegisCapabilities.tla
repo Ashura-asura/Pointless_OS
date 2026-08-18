@@ -1,10 +1,10 @@
 --------------------------------- MODULE AegisCapabilities ----------------------------------
 (*
   Aegis Phase 0 — the capability delegation rules, in TLA+.
-  This is the model of aegis/spec/capability-model.md, faithful to crates/capability-core.
+  This is the model of ../../Docs/spec/capability-model.md, faithful to crates/capability-core.
   It is deliberately minimal: any claim it makes is about THIS model, i.e. about the
   authority semantics of the delegation machinery, not about real-machine isolation
-  (the honest ceiling already stated in capability-model.md §5).
+  (the honest ceiling already stated in ../../Docs/spec/capability-model.md §5).
 
   Why the model has teeth:
     - every task is an *adversary*: the search explores every task trying every

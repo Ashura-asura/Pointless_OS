@@ -1,4 +1,4 @@
-//! Executable checks for the invariants stated in `aegis/spec/capability-model.md`:
+//! Executable checks for the invariants stated in `../../../../Docs/spec/capability-model.md`:
 //! I2 (delegation monotonicity), I4 (cross-grantee, transitive revocation), I5
 //! (kernel-enforced ephemerality, inheritance, no extension), and the failure-audit
 //! guarantee.
