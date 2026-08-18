@@ -1,0 +1,3 @@
+#!/bin/sh
+# Aegis guest app: line / word / byte counts of stdin.
+wc -l -w -c

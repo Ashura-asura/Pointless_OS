@@ -40,7 +40,7 @@ the docs' claims. Two numbers, honestly separated:
 | 5 — Networking as a service | 85% | Real capability-gated loopback `netstack.rs` (6 tests); real e1000e NIC driver (7 tests); **a full polled TCP/IP stack in the kernel (`netif.rs`, 9 tests) that drives a real three-way handshake, HTTP request/response and close over the wire under QEMU** — SYN→SYN-ACK→ACK→GET→HTTP response→FIN captured externally on the host (pcap), with the HTTP response body rendered by the kernel; **plus a real TLS 1.3 client on a second socket (`tls.rs`, 18 tests): the kernel sends a spec-correct ClientHello to an OpenSSL-backed server on 8443, parses the ServerHello, derives the X25519 ECDHE shared secret that matches the host byte-for-byte, runs the full RFC 8446 §7.1 key schedule (handshake + application traffic secrets, now byte-validated end-to-end against RFC 8448 §3's published trace), and uses AES-128-GCM record protection — encrypted server flight and client Finished verified against the live capture, externally captured** | No interrupts (polled only); QEMU socket netdev, not physical hardware; live app-data exchange verified under the fixed `s_ap` derivation (see Phase-E log); certificate chain not verified; fixed deterministic scalar (no CSPRNG in the guest); no outbound routing/NAT; single connection demo wired in `main.rs`, syscalls 19–23 provide the capability-scoped socket API for tasks |
 | 6 — AI orchestration layer (the §11.F target) | 85% | Zero-cap ring-3 agent, kernel-declared roles (`restart-service`/`observe-service`), RoleGrant syscall 18, adversarial self-escalation all refused at gates, audit log — live under QEMU | No real AI model (histogram profiler), no real-time integration; anomaly observer test-only (ledger wired) |
 | 7 — Native app model + shell | 80% | `shell.rs`/window/graph/input (model-tested); live VGA text compositor + PS/2 keyboard (Tab-focus/arrows); **live Bochs VBE framebuffer backend (Phase H, closed): composited desktop rendered to real 800x600 pixels**; **GOP-first display backend (Phase T, closed): the UEFI loader hands the Graphics Output Protocol framebuffer + mode to the kernel (handoff block at boot-info+5199), and the `GpuDevice` seam drives the GOP framebuffer (any resolution, BGRX/RGBX, stride-aware) with the Bochs probe as fallback — QEMU/OVMF-verified, taskbar demo re-run clean on the GOP path**; **real desktop apps on the live boot view (Phases P/Q/R, closed): PS/2 mouse driver + window chrome (drag/resize/close), a text editor over the NVMe-backed store (`editor.rs`), a hierarchical file browser over the same store (`browser.rs`, nested dirs + `.`/`..`, F3/F4 and **mouse-click `[+ d]`/`[+ f]` action-bar create**), and the shell window as a command interpreter — `ls`/`open`/`cat`/`new`/`clear`/`help` with bounded scrollback (`terminal.rs` + `desktop.rs` `execute_shell_command`)** — **all live under QEMU with two-boot persistence evidence**; **Phase S (closed): a real taskbar** — the status-bar window (id 2, row `SH-1`) renders one segment per app window (`[Shell]`/`[Editor]`/`[Browser]`, focused segment in reverse video), and a mouse click on a segment focuses + raises that window (`MouseOutcome::TaskbarFocused`), live-verified mouse-only under QEMU (`qemu-taskbar-demo.ps1`, 4/4 `taskbar@click` serial lines, per-click screendumps) | Object/relationship-based UI stays model-tested (no kernel object-graph app); keyboard-only names (no `.`/punctuation `Key`); taskbar apps are boot-time singletons — a segment click focuses + raises the one existing window, it does **not** spawn a new instance (no window-instantiation path yet); GOP framebuffer must sit below 4 GiB (loader identity map); UNTESTED on real hardware |
-| 8 — Linux compat | 55% | Linux ABI translation + ELF loader + personality gating (32 tests), exercised live | No lightweight-VM vehicle (needs hypervisor); the ring-3 trap now exists and runs a real Linux ELF (Phase J, closed) |
+| 8 — Linux compat | 60% | Linux ABI translation + ELF loader + personality gating (32 tests), exercised live; **the Phase U/Phase V guest image (real Linux 6.12.103 bzImage + BusyBox initramfs) now runs REAL guest applications standalone under QEMU** — `calc` (bc), `fib`, `wordcount`, `sysinfo`, `filedemo` (tar+md5) all execute with output captured on the serial console (`guest/out/boot-standalone-serial.log`) | No lightweight-VM vehicle (needs hypervisor); the ring-3 trap now exists and runs a real Linux ELF (Phase J, closed); the Aegis-hosted run of the same guest image stays hardware-gated (no VT-x on this machine) |
 | 9 — Windows compat | 45% | NT ABI translation + PE loader + personality gating (31 tests), exercised live | No VM full-fidelity path (design doc: unsolved anywhere by translation) |
 | 10 — Supervision hardening + chaos + formal ceiling | 75% | Ceiling property tests (14), model chaos tests (6), model supervision (10), **real-kernel chaos harness (`chaos.rs`, feature-gated, 3 host tests) with the full 2000-iteration soak RUN on a real QEMU/OVMF boot (0 fail-open, serial-chaos2.log), TLA+ ceiling proof model-checked (AegisCeiling.tla: 5.64M states / 147k distinct / 0 errors)** | Ceiling is a finite-instance model-check, not an inductive proof |
 | 11 — Distributed extension | 85% | `fleet` crate (15 tests): locality, recipient binding, fail-closed partition; **live two-node link (J-2/J-3): consensus re-election + split-brain resolution + remote invocation of a transferred capability over real e1000e/socket-netdev frames** | Epoch reconciliation + NodeId tie-break, not Raft/Paxos/Byzantine; fail-closed on peer unreachable (withholds invokes, cannot retract an in-flight one) |
@@ -150,6 +150,38 @@ This is the **single consolidated Known Limits section** (`README.md` and
   nested-paging page-fault-driven on-demand mapping — **hardware-gated
   (no VT-x on this machine: `VirtualizationFirmwareEnabled=False`), same
   as Phase K.**
+  **Phase V (this commit) proves the guest image runs REAL APPLICATIONS:**
+  five guest apps (`calc` — bc expression calculator, `fib` — shell-arithmetic
+  Fibonacci, `wordcount` — wc of stdin, `sysinfo` — system report,
+  `filedemo` — tar round-trip + md5) are committed in `guest/initramfs/usr/bin/`
+  (0755). `guest/out/initramfs.cpio.gz` is rebuilt **append-only and
+  deterministically** by a throwaway Python script (not committed; `gzip mtime=0`):
+  the archive is truncated at the last newc `TRAILER!!!` (110-byte backup, magic
+  verified), five newc entries for `usr/bin/{calc,fib,wordcount,sysinfo,filedemo}`
+  (ino 1..5, mode 0100755, uid/gid 0, nlink 1, mtime 0, check 0) plus a fresh
+  trailer are appended, and a self-check re-parses the result: the 5 new entries
+  exist with exact content and **all original archive bytes before the trailer are
+  byte-identical to the pre-patch archive** (the archive also stays 512-byte block
+  aligned like the original GNU-cpio output — the kernel's initramfs unpacker
+  rejects it otherwise). The same file is what the hypervisor embeds
+  (`aegis-kernel/src/vmx.rs:895` `GUEST_INITRAMFS = include_bytes!("../../guest/out/initramfs.cpio.gz")`),
+  so what the standalone QEMU evidence proves is exactly the image Aegis would load.
+  Re-evidence: the guest was re-booted standalone under QEMU 11.0.50 (SeaBIOS
+  `-kernel` + `-initrd`, `AEGIS_NO_OVMF=1` path) with the Phase V evidence script
+  (`guest/evidence-commands.txt`) piped through the serial console and the whole
+  boot captured (`guest/out/boot-standalone-serial.log`, 334 lines): `calc "6 * 7"`
+  → `42`, `calc "2^10"` → `1024`, `fib 12` → `0 1 1 2 3 5 8 13 21 34 55 89`,
+  `wordcount` on the brown-fox line → `1 9 44`, `sysinfo` prints the report, and
+  `filedemo` lists `bin/busybox`/`bin/echo` and prints two identical md5 lines
+  (`198c0144fc34df609da629151a1e1818`), then `poweroff -f` → ACPI S5 → clean
+  QEMU exit (rc 0). Honest limit: `sysinfo`'s `mem:` and `procs:` fields are
+  empty/`1` because the initramfs contains no `/proc` mountpoint (init's
+  `mount -t proc proc /proc` fails on the missing directory), so `/proc/meminfo`
+  and `ps` are unavailable in the guest — the app and all its other fields are
+  real, and this is a guest-image limitation, not an emulation claim. Also honest:
+  this evidence remains the **standalone** guest under QEMU; the Aegis-hosted run
+  of the same image is still hardware-gated (no VT-x on this machine), exactly as
+  in Phase U/U-6/U-7.
 - **Distributed / fleet** — two real QEMU nodes on a real socket-netdev link
   (J-2/J-3, live): capability envelope transport, heartbeat reachability,
   partition fail-closed, **epoch-based consensus re-election, split-brain

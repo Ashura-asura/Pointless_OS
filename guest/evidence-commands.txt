@@ -3,3 +3,11 @@ uname -a
 busybox | head -1
 ls /bin | head -8
 echo "hello-from-guest-shell"
+echo "--- Phase V: guest apps ---"
+calc "6 * 7"
+calc "2^10"
+fib 12
+echo "the quick brown fox jumps over the lazy dog" | wordcount
+sysinfo
+filedemo
+echo "Aegis guest: Phase V apps complete"

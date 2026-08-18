@@ -1,0 +1,9 @@
+#!/bin/sh
+# Aegis guest app: system report.
+echo "== Aegis guest sysinfo =="
+echo "kernel: $(uname -r)"
+echo "host:   $(uname -n)"
+echo "date:   $(date)"
+echo "uptime: $(uptime)"
+echo "mem:    $(grep MemTotal /proc/meminfo)"
+echo "procs:  $(ps | wc -l) (incl. header)"

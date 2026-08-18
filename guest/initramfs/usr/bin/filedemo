@@ -1,0 +1,14 @@
+#!/bin/sh
+# Aegis guest app: tar roundtrip + md5 verification.
+set -e
+rm -rf /tmp/filedemo
+mkdir -p /tmp/filedemo/out
+cd /tmp/filedemo
+tar cf demo.tar -C / bin/busybox bin/echo
+echo "archive contents:"
+tar tf demo.tar
+tar xf demo.tar -C out
+echo "extracted files:"
+ls out/bin
+echo "checksum comparison (must match):"
+md5sum /bin/busybox out/bin/busybox

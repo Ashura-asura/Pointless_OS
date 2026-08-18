@@ -1,0 +1,4 @@
+#!/bin/sh
+# Aegis guest app: expression calculator over bc.
+[ $# -ge 1 ] || { echo "usage: calc <expression>"; exit 1; }
+echo "$*" | bc
