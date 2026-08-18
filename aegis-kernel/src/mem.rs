@@ -40,6 +40,11 @@ static mut REGIONS: [MemRegion; MAX_REGIONS] = [MemRegion {
 /// form a (potentially dangling) shared reference to the `static mut` — that
 /// is undefined behavior under Rust 2024's `static_mut_refs` rules.
 fn region(id: usize) -> Option<MemRegion> {
+    // Bounds guard: an out-of-range region id must never turn into a raw
+    // table read.
+    if id >= MAX_REGIONS {
+        return None;
+    }
     unsafe {
         let p = core::ptr::addr_of_mut!(REGIONS).cast::<MemRegion>().add(id);
         Some(core::ptr::read(p))
@@ -113,7 +118,7 @@ fn caps_region(cur: usize, slot: u64, need: Rights) -> Option<usize> {
         CapSlot {
             cap: Cap::MemRegion(id),
             rights,
-        } if rights.contains(need) => Some(id as usize),
+        } if rights.contains(need) && (id as usize) < MAX_REGIONS => Some(id as usize),
         _ => None,
     }
 }

@@ -4,14 +4,13 @@
 is the honest certification matrix for Phase 12. No claim below outruns its test
 evidence; nothing here certifies production behavior.*
 
-*Partial-reconciliation note: only the fuzzing and ceiling-proof rows were updated in
-this pass, with real re-run numbers. Everything else in this file predates Phases
-J/K/L (real VMware boots, real fleet networking, the VMX primitive) and has NOT been
-independently re-checked against those — several "NOT certified" rows below may be
-stale now that some of that work has real live-boot evidence elsewhere in
-`HONEST_STATUS.md`. A full pass reconciling every claim in this file against current
-`HONEST_STATUS.md` is real remaining work, not done here — don't treat the untouched
-rows below as re-verified just because this file was edited.*
+*Partial-reconciliation note: the fuzzing, kernel-boundary-hardening, and totals rows were
+updated in this pass with real re-run numbers (kernel 754/757, workspace 136, bootloader
+22). Several "NOT certified" rows below reflect real live-boot evidence gained in Phases
+J/K/L/G/T/P/Q/R/S/AA and re-checked in `HONEST_STATUS.md` (real VMware boots, real fleet
+networking, VT-d-style DMA gate, GOP-first display, live apps); the untouched rows below
+that lack such evidence remain genuinely not certified. Don't treat any row as re-verified
+just because this file was edited — the authoritative live status is `HONEST_STATUS.md`.*
 
 ## What the audits cover (machine-checked)
 
@@ -20,10 +19,11 @@ rows below as re-verified just because this file was edited.*
 | Capability model invariants (I1-I6) | `aegis/crates/capability-core` | 20+ contract tests; TLA+ model-check (331k states, 2 tasks, 3 slots) |
 | Reachable-authority vs compiled manifests | `aegis/crates/capability-audit` + `security-audit` | `cargo run -p capability-audit` (CI); 10 aggregate contract tests (clean reference world, kernel-equivalent rejection, undeclared-holdings rejection, overhang-warns-not-fails, self-cap exclusion) |
 | Adaptive/AI ceiling (monotonic non-expansion) | `aegis-kernel/src/ceiling.rs` | 14 property tests; caught+fixed a real scope-expansion bug |
-| Parser/syscall total functions (no panic on garbage) | `aegis-kernel/src/hardening.rs` | 21 boundary tests over ELF/PE loaders, IPv4/Ethernet/ARP/UDP/TCP parsers, both syscall ABIs, compat layers, shell/window/graph/input |
+| Parser/syscall total functions (no panic on garbage) | `aegis-kernel/src/hardening.rs` + `aegis-kernel/src/hardening_fuzz.rs` | 21 boundary tests over ELF/PE loaders, IPv4/Ethernet/ARP/UDP/TCP parsers, both syscall ABIs, compat layers, shell/window/graph/input; plus **13 hardened fuzz tests (~1.2M seeded parse calls over ethernet/arp/ipv4/udp/tcp/tls record decryption + a syscall-boundary fuzz driving every syscall number with hostile task/slot/endpoint indices — 0 panics, 0 OOB, current task never moved)** |
 | Adaptive/AI ceiling under arbitrary interleaving (all 3 roles) | `aegis/spec/AegisCeiling.tla` | TLC model-check: 5,644,801 states / 147,456 distinct / 0 errors; negative control confirms non-vacuous |
 | Boundary-parser fuzzing (decode_entries, parse_elf, parse_pe) | `phase-m-fuzz/` links the real `aegis-kernel` crate | **180,000,000 inputs across 2 independent seeds (random + mutation-based from valid seeds), 0 panics, against the real in-crate functions**; the extracted-copy harness in `phase-m-fuzz/extracted/` reproduces the identical numbers, so there is no extraction drift; extraction validated by running all 23 of the parsers' own original unit tests unmodified |
-| Per-phase contracts | all crates | 645 total tests, 0 failures (495 kernel + 128 workspace + 22 bootloader: 13 ELF-contract + 9 fleet-CFG-contract) |
+| Per-phase contracts | all crates | 912 total tests, 0 failures (754 kernel + 136 workspace + 22 bootloader: 13 ELF-contract + 9 fleet-CFG-contract); kernel also green at 757 with `--features vmx-demo` |
+| Kernel-boundary hardening (external audit, 2026-08-19) | `aegis-kernel/src/{ipc,netif,tasks,supervisor,mem}.rs` | Bounds+identity checks added on `ipc_cap_grant`/`ipc_reply`/netif slot indices/raw task accessors/cap-resolved ids; 5 adversarial tests (`cap_grant_refuses_out_of_range_recipient`, `reply_refuses_forged_and_out_of_range_callers`, `net_syscalls_refuse_out_of_range_slots`, `raw_accessors_refuse_out_of_range_indices`, `syscall_boundary_rejects_hostile_indices`); fail-closed, never panic |
 
 ## Certification status by claim
 
@@ -35,7 +35,7 @@ rows below as re-verified just because this file was edited.*
 | Boot on real UEFI hardware | **NOT certified** | UNTESTED: needs VMware/QEMU on real firmware |
 | GDT/TSS, IDT, per-process page tables on real CPU | **NOT certified** | UNTESTED: lgdt/lidt/cr3 require real hardware |
 | PCIe/IOMMU/NVMe/VirtIO on real hardware | **NOT certified** | UNTESTED: requires real devices |
-| Real NIC traffic (TCP/UDP) | **NOT certified** | Loopback + frame/protocol logic only |
+| Real NIC traffic (TCP/UDP) | QEMU-verified, not hardware-certified | Live e1000e handshake + HTTP + close captured on host (Phase 5); no physical NIC |
 | Cross-machine capability transport | **NOT certified** | Two-node in-process model; no sockets/consensus |
 | Full Linux/Windows application compatibility | **NOT certified** | Design doc: full Windows fidelity explicitly unsolved by translation alone; no hypervisor VM vehicles |
 

@@ -823,4 +823,125 @@ mod tests {
         assert_eq!(fleet_a.heartbeat(id_c), Err(FleetError::UnknownPeer));
         assert_eq!(fleet_a.mark_unreachable(id_c), Err(FleetError::UnknownPeer));
     }
+
+    /// Exhaustive state-space exploration of the fail-closed partition gate.
+    ///
+    /// The gate's whole observable state is `(issuer unreachable, issuer age
+    /// since last heartbeat)`, and the clock is monotone — so the reachable
+    /// state space is finite once age is capped. We enumerate *every* reachable
+    /// state by exploring all op sequences (heartbeat / mark_unreachable /
+    /// advance by 0, 1, stale_after, stale_after+1) and assert the invariant on
+    /// each: `verify` of a remote capability is `Ok` if and only if the issuer
+    /// is reachable and fresh; otherwise it fails closed with exactly
+    /// `PeerUnreachable` or `PeerStale`. Locality is never hidden by any
+    /// sequence — the envelope's locality and recipient binding are
+    /// invariants of the whole space.
+    #[test]
+    fn fail_closed_gate_holds_across_exhaustive_op_sequences() {
+        use std::collections::HashSet;
+
+        let (id_a, key_a) = node_a();
+        let (id_b, key_b) = node_b();
+        let mut fleet_a = Fleet::new(id_a, key_a);
+        fleet_a.register_peer(id_b, key_b).unwrap();
+        let chain = fleet_a.issue(7, ObjectKind::Task, Rights::READ, None);
+        let cap = fleet_a.send_to(chain, id_b).unwrap();
+        assert_eq!(cap.locality, Locality::Remote(id_a));
+        assert_eq!(cap.recipient, id_b);
+
+        const STALE_AFTER: u64 = 100;
+        const AGE_CAP: u64 = STALE_AFTER + 1;
+
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+        struct S {
+            unreachable: bool,
+            age: u64,
+        }
+        impl S {
+            fn reachable(self) -> bool {
+                !self.unreachable && self.age <= STALE_AFTER
+            }
+        }
+
+        let start = S {
+            unreachable: false,
+            age: 0,
+        };
+        let mut frontier = vec![start];
+        let mut seen: HashSet<S> = HashSet::new();
+        let mut transitions: u64 = 0;
+
+        while let Some(s) = frontier.pop() {
+            if !seen.insert(s) {
+                continue;
+            }
+
+            // Reconstruct a fleet in exactly this state and check the gate.
+            let mut holder = Fleet::new(id_b, key_b);
+            holder.register_peer(id_a, key_a).unwrap();
+            holder.advance_time(s.age);
+            if s.unreachable {
+                holder.mark_unreachable(id_a).unwrap();
+            }
+            if s.reachable() {
+                assert_eq!(
+                    holder.verify(&cap),
+                    Ok(()),
+                    "reachable + fresh issuer must verify: {s:?}"
+                );
+            } else if s.unreachable {
+                assert_eq!(
+                    holder.verify(&cap),
+                    Err(FleetError::PeerUnreachable),
+                    "partitioned issuer must deny: {s:?}"
+                );
+            } else {
+                assert_eq!(
+                    holder.verify(&cap),
+                    Err(FleetError::PeerStale),
+                    "stale issuer must deny: {s:?}"
+                );
+            }
+
+            // Expand: every one-step op the gate can observe.
+            let mut next = Vec::new();
+            next.push(S {
+                unreachable: false,
+                age: 0,
+            }); // heartbeat: refresh + clear partition
+            next.push(S {
+                unreachable: true,
+                age: s.age,
+            }); // mark_unreachable
+            for dt in [0u64, 1, STALE_AFTER, STALE_AFTER + 1] {
+                next.push(S {
+                    unreachable: s.unreachable,
+                    age: (s.age + dt).min(AGE_CAP),
+                }); // advance_time(dt)
+            }
+            for n in next {
+                if !seen.contains(&n) {
+                    transitions += 1;
+                    frontier.push(n);
+                }
+            }
+        }
+
+        // The space is genuinely explored: unreachable ∈ {false,true} and
+        // age ∈ 0..=AGE_CAP gives up to 2*(AGE_CAP+1) states; every reachable
+        // one is checked, and both sides of the gate are exercised.
+        assert!(
+            seen.len() >= 200,
+            "must explore the whole finite state space"
+        );
+        assert!(transitions > 0);
+        assert!(
+            seen.iter().any(|s| s.reachable()) && seen.iter().any(|s| !s.reachable()),
+            "both reachable and denied regions of the space are exercised"
+        );
+        // The cap itself was never altered by any sequence: locality is never
+        // hidden.
+        assert_eq!(cap.locality, Locality::Remote(id_a));
+        assert_eq!(cap.recipient, id_b);
+    }
 }

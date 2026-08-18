@@ -340,6 +340,12 @@ static mut CURRENT: usize = usize::MAX; // index into TASKS while a task runs
 
 /// Raw pointer to task `i`'s `TaskFrame` (offset past the `name` field).
 fn task_frame_ptr(i: usize) -> *mut TaskFrame {
+    // Bounds guard: an out-of-range task index falls back to the idle frame
+    // (a valid, writable static) so no caller can ever turn a malformed index
+    // into an OOB kernel write.
+    if i >= MAX_TASKS {
+        return core::ptr::addr_of_mut!(IDLE_FRAME).cast::<TaskFrame>();
+    }
     unsafe {
         core::ptr::addr_of_mut!(TASKS)
             .byte_add(i * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, frame))
@@ -527,6 +533,12 @@ pub fn schedule_next(cur: usize) -> Option<usize> {
 }
 
 fn task_state(idx: usize) -> TaskState {
+    // Bounds guard: an out-of-range index (a malformed syscall argument, for
+    // example) must be refused, never a raw-table OOB access. Zombie is the
+    // safest answer: such a task is never scheduled.
+    if idx >= MAX_TASKS {
+        return TaskState::Zombie;
+    }
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
             .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, state))
@@ -536,6 +548,10 @@ fn task_state(idx: usize) -> TaskState {
 }
 
 fn set_task_state(idx: usize, s: TaskState) {
+    // Bounds guard: refuse to write past the task table.
+    if idx >= MAX_TASKS {
+        return;
+    }
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
             .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, state))
@@ -546,6 +562,11 @@ fn set_task_state(idx: usize, s: TaskState) {
 
 /// Capability slot `slot` of task `idx`.
 pub fn task_cap(idx: usize, slot: usize) -> CapSlot {
+    // Bounds guard: out-of-range reads yield an empty cap, never a raw-table
+    // OOB access (every gate then fails closed on the empty slot).
+    if idx >= MAX_TASKS || slot >= MAX_CAPS {
+        return CapSlot::empty();
+    }
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
             .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, caps))
@@ -555,6 +576,13 @@ pub fn task_cap(idx: usize, slot: usize) -> CapSlot {
 }
 
 pub fn set_task_cap(idx: usize, slot: usize, cap: CapSlot) {
+    // Bounds guard: an out-of-range write is dropped (fail closed) instead of
+    // corrupting kernel memory. Every syscall-reachable path must still do its
+    // own argument validation — this is the last line of defense, not the
+    // first.
+    if idx >= MAX_TASKS || slot >= MAX_CAPS {
+        return;
+    }
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
             .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, caps))
@@ -566,6 +594,9 @@ pub fn set_task_cap(idx: usize, slot: usize, cap: CapSlot) {
 /// Copy a capability from `src` task's slot into `dst` task's table (first
 /// free slot). Returns the destination slot, or `usize::MAX` if full.
 pub fn grant_cap(dst: usize, src: usize, src_slot: usize) -> usize {
+    if dst >= MAX_TASKS || src >= MAX_TASKS || src_slot >= MAX_CAPS {
+        return usize::MAX;
+    }
     let slot = task_cap(src, src_slot);
     if slot.cap == Cap::None {
         return usize::MAX;
@@ -594,6 +625,9 @@ pub fn block_current(ep: usize) {
 
 /// Mark task `idx` runnable again.
 pub fn unblock_task(idx: usize) {
+    if idx >= MAX_TASKS {
+        return;
+    }
     set_task_state(idx, TaskState::Ready);
     unsafe {
         let p = core::ptr::addr_of_mut!(TASKS)
@@ -905,6 +939,7 @@ pub unsafe fn timer_preempt() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cap::Rights;
 
     extern "sysv64" fn dummy() -> ! {
         loop {
@@ -1088,5 +1123,44 @@ mod tests {
             assert!(is_task_alive(t));
             core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
         }
+    }
+
+    /// Kernel-boundary hardening (hostile-audit Phase 1): the raw task-table
+    /// accessors must refuse out-of-range indices instead of performing OOB
+    /// raw-pointer arithmetic — reads fail closed, writes are dropped, and the
+    /// frame accessor never hands out a kernel memory write beyond the table.
+    #[test]
+    fn raw_accessors_refuse_out_of_range_indices() {
+        let _g = crate::kernel_state_guard();
+        crate::audit::reset_for_test();
+        // Reads fail closed: an empty capability, a never-scheduled state.
+        assert_eq!(task_cap(MAX_TASKS, 0).cap, Cap::None);
+        assert_eq!(task_cap(0, MAX_CAPS).cap, Cap::None);
+        assert_eq!(task_state(MAX_TASKS), TaskState::Zombie);
+        // Writes are dropped, never a kernel-memory corruption.
+        set_task_cap(
+            MAX_TASKS,
+            0,
+            CapSlot {
+                cap: Cap::Task(1),
+                rights: Rights::ALL,
+            },
+        );
+        set_task_cap(
+            0,
+            MAX_CAPS,
+            CapSlot {
+                cap: Cap::Task(1),
+                rights: Rights::ALL,
+            },
+        );
+        set_task_state(MAX_TASKS, TaskState::Ready);
+        // The frame accessor falls back to a valid writable dummy instead
+        // of an OOB kernel write.
+        assert!(!task_frame_ptr(MAX_TASKS).is_null());
+        // grant_cap refuses a hostile source/destination pair.
+        assert_eq!(grant_cap(MAX_TASKS, 0, 0), usize::MAX);
+        assert_eq!(grant_cap(0, MAX_TASKS, 0), usize::MAX);
+        assert_eq!(grant_cap(0, 0, MAX_CAPS), usize::MAX);
     }
 }

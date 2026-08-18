@@ -735,7 +735,9 @@ Windows compatibility is harder because:
 > The deferred rows above (compatibility, distributed/fleet, GPU compositor,
 > broader orchestration) are now implemented at their honest scope — see
 > HONEST_STATUS.md, design/master-roadmap.md §10, and design/future-work.md for
-> the remaining full-fidelity limits.
+> the remaining full-fidelity limits. The audit-driven gap inventory (fixed
+> kernel-boundary bugs, designed-but-not-refactored ObjectID/pointer-gate
+> items, hardware/proof-gated ceilings) is in uncovered-from-first-principles.md.
 > What is actually implemented and verified today is in ../README.md and HONEST_STATUS.md.
 
 ---

@@ -1,0 +1,13 @@
+[package]
+name = "orchestration"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Aegis model adaptive orchestration: a supervised, capability-constrained agent session (grant ceiling + anomaly monitor + supervision tree), runnable and contract-tested"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+capability-core = { path = "../capability-core" }
+grants = { path = "../grants" }
+supervision-tree = { path = "../supervision-tree" }

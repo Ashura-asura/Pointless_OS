@@ -1230,6 +1230,13 @@ pub unsafe fn sys_net_socket(kind: u64, ip_packed: u64, port: u64) -> i64 {
 pub unsafe fn sys_net_connect(slot: u64) -> i64 {
     use crate::cap::{Cap, Rights};
     let cur = crate::tasks::current_idx();
+    // Bounds-check the ring-3 `slot` argument before indexing the caller's
+    // capability table: an out-of-range slot must be refused (fail closed),
+    // never a raw-table OOB read.
+    if (slot as usize) >= crate::tasks::MAX_CAPS {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
+        return -1;
+    }
     let cap = crate::tasks::task_cap(cur, slot as usize);
     let Cap::NetEndpoint(id) = cap.cap else {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
@@ -1264,6 +1271,13 @@ pub unsafe fn sys_net_connect(slot: u64) -> i64 {
 pub unsafe fn sys_net_send(slot: u64, va: u64, len: u64) -> i64 {
     use crate::cap::{Cap, Rights};
     let cur = crate::tasks::current_idx();
+    // Bounds-check the ring-3 `slot` argument before indexing the caller's
+    // capability table: an out-of-range slot must be refused (fail closed),
+    // never a raw-table OOB read.
+    if (slot as usize) >= crate::tasks::MAX_CAPS {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
+        return -1;
+    }
     let cap = crate::tasks::task_cap(cur, slot as usize);
     let Cap::NetEndpoint(id) = cap.cap else {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
@@ -1295,6 +1309,13 @@ pub unsafe fn sys_net_send(slot: u64, va: u64, len: u64) -> i64 {
 pub unsafe fn sys_net_recv(slot: u64, va: u64, len: u64) -> i64 {
     use crate::cap::{Cap, Rights};
     let cur = crate::tasks::current_idx();
+    // Bounds-check the ring-3 `slot` argument before indexing the caller's
+    // capability table: an out-of-range slot must be refused (fail closed),
+    // never a raw-table OOB read.
+    if (slot as usize) >= crate::tasks::MAX_CAPS {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
+        return -1;
+    }
     let cap = crate::tasks::task_cap(cur, slot as usize);
     let Cap::NetEndpoint(id) = cap.cap else {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
@@ -1333,6 +1354,13 @@ pub unsafe fn sys_net_recv(slot: u64, va: u64, len: u64) -> i64 {
 pub unsafe fn sys_net_close(slot: u64) -> i64 {
     use crate::cap::{Cap, CapSlot};
     let cur = crate::tasks::current_idx();
+    // Bounds-check the ring-3 `slot` argument before indexing the caller's
+    // capability table: an out-of-range slot must be refused (fail closed),
+    // never a raw-table OOB read.
+    if (slot as usize) >= crate::tasks::MAX_CAPS {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
+        return -1;
+    }
     let cap = crate::tasks::task_cap(cur, slot as usize);
     let Cap::NetEndpoint(id) = cap.cap else {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
@@ -2004,6 +2032,39 @@ mod tests {
             counts[crate::audit::OpKind::NetIo.index()],
             4,
             "one attributed record each for connect/send/recv/close"
+        );
+    }
+
+    #[test]
+    fn net_syscalls_refuse_out_of_range_slots() {
+        let _g = crate::kernel_state_guard();
+        crate::audit::reset_for_test();
+        crate::tasks::reset_table_for_test();
+        crate::tasks::set_current_for_test(6);
+        // A hostile ring-3 slot index must be refused (fail closed), never a
+        // raw-table OOB read of the caller's capability table.
+        assert_eq!(
+            unsafe { sys_net_connect(crate::tasks::MAX_CAPS as u64) },
+            -1
+        );
+        assert_eq!(
+            unsafe { sys_net_send(crate::tasks::MAX_CAPS as u64, 0, 0) },
+            -1
+        );
+        assert_eq!(
+            unsafe { sys_net_recv(crate::tasks::MAX_CAPS as u64, 0, 0) },
+            -1
+        );
+        assert_eq!(unsafe { sys_net_close(crate::tasks::MAX_CAPS as u64) }, -1);
+        assert_eq!(
+            unsafe { sys_net_connect(u64::MAX) },
+            -1,
+            "huge indices are refused too"
+        );
+        // Every refusal is audited (4 NetIo records).
+        assert_eq!(
+            crate::audit::op_counts(6)[crate::audit::OpKind::NetIo.index()],
+            5
         );
     }
 }

@@ -91,6 +91,8 @@ pub mod ceiling;
 
 pub mod hardening;
 
+pub mod hardening_fuzz;
+
 pub mod serial;
 
 pub mod store;

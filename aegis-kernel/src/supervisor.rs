@@ -38,7 +38,7 @@ fn caps_task(cur: usize, slot: u64, need: Rights) -> Option<usize> {
         CapSlot {
             cap: Cap::Task(idx),
             rights,
-        } if rights.contains(need) => Some(idx as usize),
+        } if rights.contains(need) && (idx as usize) < MAX_TASKS_TABLE => Some(idx as usize),
         _ => None,
     }
 }

@@ -168,7 +168,7 @@ fn caps_endpoint(cur: usize, slot: u64, need: Rights) -> Option<usize> {
         CapSlot {
             cap: Cap::Endpoint(id),
             rights,
-        } if rights.contains(need) => Some(id as usize),
+        } if rights.contains(need) && (id as usize) < MAX_ENDPOINTS => Some(id as usize),
         _ => None,
     }
 }
@@ -228,6 +228,15 @@ pub unsafe fn ipc_cap_grant(dst: u64, src_slot: u64, dst_slot: u64) -> i64 {
         || slot.cap == Cap::None
         || !slot.rights.contains(Rights::GRANT)
     {
+        crate::audit::record(cur, crate::audit::OpKind::Grant, target, false);
+        return -1;
+    }
+    // Bounds-check the recipient's table before touching it (mirrors
+    // `ipc_cap_revoke`). `dst` and `dst_slot` are ring-3 arguments; without
+    // this a caller holding GRANT on *any* slot could write past the task
+    // table into arbitrary kernel memory. A malformed argument is refused,
+    // never a panic, and the refusal is audited.
+    if (dst as usize) >= crate::tasks::MAX_TASKS || (dst_slot as usize) >= crate::tasks::MAX_CAPS {
         crate::audit::record(cur, crate::audit::OpKind::Grant, target, false);
         return -1;
     }
@@ -388,6 +397,21 @@ pub unsafe fn ipc_reply(ep_slot: u64, caller_id: u64, reply_va: u64, rlen: u64) 
         None => return -1,
     };
     let caller = caller_id as usize;
+    // The caller index is a ring-3 argument (the server echoes back the value
+    // `ipc_serve` returned). Validate it twice: the index must name a real
+    // task, and it must be the task actually blocked awaiting a reply on this
+    // endpoint. Without this a malicious server could write a forged return
+    // value into an arbitrary task's saved frame and force it runnable —
+    // `set_ret`/`unblock_task` both index the task table from `caller`.
+    if caller >= crate::tasks::MAX_TASKS || ENDPOINTS[ep].caller != caller {
+        crate::audit::record(
+            cur,
+            crate::audit::OpKind::Send,
+            Some(ENDPOINTS[ep].caller as u32),
+            false,
+        );
+        return -1;
+    }
     let rlen = core::cmp::min(rlen as usize, IPC_BUF);
     copy_user(reply_va, ENDPOINTS[ep].caller_reply_va, rlen);
     set_ret(caller, rlen as u64);
@@ -617,5 +641,84 @@ mod tests {
             // Endpoint is idle again (single-slot box consumed).
             assert_eq!(ENDPOINTS[NOTIFY_EP].state, EpState::Idle);
         }
+    }
+
+    #[test]
+    fn cap_grant_refuses_out_of_range_recipient() {
+        let _g = crate::kernel_state_guard();
+        crate::audit::reset_for_test();
+        crate::tasks::reset_table_for_test();
+        crate::tasks::set_current_for_test(5);
+        // The caller holds GRANT on a live capability it could legitimately
+        // delegate; only the recipient's *indices* are hostile.
+        set_task_cap(
+            5,
+            1,
+            CapSlot {
+                cap: Cap::Task(2),
+                rights: Rights::ALL,
+            },
+        );
+        // dst task index out of range.
+        assert_eq!(
+            unsafe { ipc_cap_grant(crate::tasks::MAX_TASKS as u64, 1, 0) },
+            -1
+        );
+        // dst slot out of range.
+        assert_eq!(
+            unsafe { ipc_cap_grant(0, 1, crate::tasks::MAX_CAPS as u64) },
+            -1
+        );
+        // Both indices huge.
+        assert_eq!(unsafe { ipc_cap_grant(u64::MAX, 1, u64::MAX) }, -1);
+        // The refusals are audited, and a well-formed grant still succeeds.
+        assert_eq!(unsafe { ipc_cap_grant(3, 1, 0) }, 0);
+        assert_eq!(
+            crate::audit::op_counts(5)[crate::audit::OpKind::Grant.index()],
+            4,
+            "three refusals + one success are all in the audit log"
+        );
+        assert_eq!(
+            task_cap(3, 0).cap,
+            Cap::Task(2),
+            "the valid grant must still land"
+        );
+    }
+
+    #[test]
+    fn reply_refuses_forged_and_out_of_range_callers() {
+        let _g = crate::kernel_state_guard();
+        crate::audit::reset_for_test();
+        crate::tasks::reset_table_for_test();
+        crate::tasks::set_current_for_test(2);
+        unsafe {
+            // A server holds RECV on endpoint 0.
+            set_task_cap(
+                2,
+                0,
+                CapSlot {
+                    cap: Cap::Endpoint(0),
+                    rights: Rights::ALL,
+                },
+            );
+            ENDPOINTS[0] = Endpoint::new();
+            ENDPOINTS[0].active = true;
+            // A caller index out of range must be refused (never an OOB write
+            // into the task table via set_ret/unblock_task).
+            assert_eq!(ipc_reply(0, crate::tasks::MAX_TASKS as u64, 0, 4), -1);
+            // A forged in-range caller that is NOT the task blocked awaiting a
+            // reply on this endpoint must be refused too.
+            assert_eq!(ipc_reply(0, 7, 0, 4), -1);
+            // Only the matching blocked caller is accepted.
+            let buf = [0u8; 16];
+            ENDPOINTS[0].caller = 7;
+            ENDPOINTS[0].caller_reply_va = buf.as_ptr() as u64;
+            assert_eq!(ipc_reply(0, 7, buf.as_ptr() as u64, 4), 0);
+        }
+        assert_eq!(
+            crate::audit::op_counts(2)[crate::audit::OpKind::Send.index()],
+            2,
+            "both forged/out-of-range reply attempts are audited"
+        );
     }
 }

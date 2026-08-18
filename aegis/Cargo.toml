@@ -18,6 +18,7 @@ members = [
     "crates/security-audit",
     "crates/conformance",
     "crates/sdk-example",
+    "crates/orchestration",
 ]
 
 [workspace.package]

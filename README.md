@@ -38,10 +38,14 @@ engineering experimentation.
 An active research prototype. **All 12 phases of the design-doc roadmap are
 implemented and closed**, with the core architectural claim — a role-granted,
 zero-capability AI agent that provably cannot self-escalate, running one real
-task — verified live under QEMU. The **full live test suite is 890 tests**:
-**737 in `aegis-kernel`** (contract tests over the real kernel, **740 with
-`--features vmx-demo`**), **131 in the `aegis` model crates**, and **22 in
-`uefi-boot`** (loader + ELF parsing), fmt/clippy-clean.
+task — verified live under QEMU. The **full live test suite is 912 tests**:
+**754 in `aegis-kernel`** (contract tests over the real kernel, **757 with
+`--features vmx-demo`**), **136 in the `aegis` model crates**, and **22 in
+`uefi-boot`** (loader + ELF parsing), fmt/clippy-clean. An external audit of
+the kernel (2026-08-19) found a critical `ipc_cap_grant` bounds bug and
+several boundary holes; all are fixed with adversarial tests, and the honest
+gap inventory (what is designed-but-not-refactored and what is hardware- or
+proof-gated) lives in `Docs/uncovered-from-first-principles.md`.
 
 What is real and live-verified (all under QEMU/OVMF, evidence committed as
 serial logs + framebuffer captures):
@@ -140,11 +144,11 @@ Limits section, split into *closed / reduced / inherent*):
 ## Repository layout
 - `aegis-kernel/` — the real kernel: boot, drivers, netstack, TLS, store,
   scheduler, supervision, desktop/compositor/editor, compat layers, ACPI/SMP,
-  and the hypervisor device models (`cargo test` = 737 tests; **740 with
+  and the hypervisor device models (`cargo test` = 754 tests; **757 with
   `--features vmx-demo`**)
 - `aegis/` — model crates mirroring the kernel (capability-core, store,
-  net, fleet, grants, conformance, etc.; 131 tests) + the SDK guide and
-  runnable example in `Docs/spec/sdk.md` and `aegis/crates/sdk-example/`
+  net, fleet, grants, conformance, orchestration, etc.; 136 tests) + the SDK
+  guide and runnable example in `Docs/spec/sdk.md` and `aegis/crates/sdk-example/`
 - `uefi-boot/` — UEFI loader + image build + QEMU demo scripts (22 tests)
 - `guest/` — the real Linux guest image (bzImage + BusyBox initramfs,
   build scripts, committed evidence)
@@ -163,12 +167,12 @@ loader respectively.
 
 - Run the full kernel suite:
   ```
-  cd aegis-kernel && cargo test --release            # 737 tests
-  cd aegis-kernel && cargo test --features vmx-demo  # 740 tests
+  cd aegis-kernel && cargo test --release            # 754 tests
+  cd aegis-kernel && cargo test --features vmx-demo  # 757 tests
   ```
 - Run the model crates:
   ```
-  cd aegis && cargo test --release                   # 131 tests
+  cd aegis && cargo test --release                   # 136 tests
   ```
 - Run the SDK example tour:
   ```
