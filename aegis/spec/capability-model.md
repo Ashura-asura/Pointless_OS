@@ -1218,3 +1218,40 @@ only, leaving the actual sample data path to the host audio hook. Both are
 register/state models; wiring them to real VM-exit events is the
 hardware-gated half in `vm.rs`. Everything is QEMU/OVMF-verified, UNTESTED on
 physical silicon.
+
+### Machine-checked verification (executable): the model SDK + licensing (§8 Phase AB/X)
+
+`aegis` workspace additions (3 more tests, **131 model total** across 17
+crates): the SDK crates become a documented, runnable surface.
+
+- **`sdk-example` (Phase AB)** — one `tour()` walks the role-grant lifecycle
+  end to end and is contract-tested verbatim, so the documented example
+  cannot drift from the model: a zero-capability agent is denied before it is
+  granted anything; `restart-service` is proposed, diff-reviewed and
+  confirmed task-scoped; the agent reads and restarts the service (READ +
+  CONTROL) but cannot escalate (the server cap carries no GRANT); time kills
+  the grant (I5); the high-risk `modify-security-policy` role requires two
+  distinct reviewers; the anomaly circuit breaker suspends — never revokes —
+  on an off-profile op; one root revoke removes the grant from everywhere
+  (I4); and every step, refusal included, is in the audit log. The tour is
+  also a printed demo (`cargo run -p sdk-example`).
+- **`sdk.md` (Phase AB)** — the SDK guide: the two-tier story (model vs
+  kernel vs the `conformance` oracle), the crate map by layer, dependency
+  guidance, and future-flexibility notes (workspace-versioned crates,
+  `publish = false`, new crates/steps are CI-covered by construction).
+- **`LICENSE` + `LICENSING.md` (Phase X)** — the licensing gate: all original
+  code is MIT OR Apache-2.0; the shipped Linux bzImage + BusyBox initramfs
+  are GPL-2.0-only (source offer satisfied by the committed `kernel.config`
+  + `build-guest.sh`); the font8x16 and Hinnant algorithm snippets are public
+  domain; build/runtime-only components (edk2/OVMF, QEMU, registry crates)
+  are never committed.
+
+**Verification.** `cargo test --workspace` = 131 passed; `cargo clippy
+--workspace --all-targets` with `-Dwarnings` clean; `cargo fmt --check`
+clean; `cargo run -p capability-audit` = 0 violations. The 3 `sdk-example`
+tests re-run the whole tour and assert it holds.
+
+**Honest limits.** The tour models authority on a host process; it is not the
+kernel's syscall path (that is `conformance`'s job, and only for the ops the
+kernel's trace emits). The SDK crates are `publish = false` — documentation
+of the *surface*, not a published crate set.

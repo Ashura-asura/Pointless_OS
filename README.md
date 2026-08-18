@@ -14,8 +14,11 @@ engineering experimentation.
 - Architecture notes: ARCHITECTURE.md
 - Design monograph: os-from-first-principles.md
 - Honest status and limits: HONEST_STATUS.md
+- Capability model + machine-checked verification: aegis/spec/capability-model.md
+- Model SDK guide + runnable example: aegis/spec/sdk.md (`cargo run -p sdk-example`)
 - Security audit notes: SECURITY_AUDIT.md
 - Project report: PROJECT_REPORT.md
+- Licensing + third-party notices: LICENSING.md
 
 ## Vision
 - Minimal trusted computing base: enforce isolation and capability semantics in a small kernel.
@@ -35,10 +38,10 @@ engineering experimentation.
 An active research prototype. **All 12 phases of the design-doc roadmap are
 implemented and closed**, with the core architectural claim — a role-granted,
 zero-capability AI agent that provably cannot self-escalate, running one real
-task — verified live under QEMU. The **full live test suite is 745 tests**:
-**595 in `aegis-kernel`** (contract tests over the real kernel,
-`cargo test --features chaos-demo`), **128 in the `aegis` model crates**, and
-**22 in `uefi-boot`** (loader + ELF parsing), fmt/clippy-clean.
+task — verified live under QEMU. The **full live test suite is 890 tests**:
+**737 in `aegis-kernel`** (contract tests over the real kernel, **740 with
+`--features vmx-demo`**), **131 in the `aegis` model crates**, and **22 in
+`uefi-boot`** (loader + ELF parsing), fmt/clippy-clean.
 
 What is real and live-verified (all under QEMU/OVMF, evidence committed as
 serial logs + framebuffer captures):
@@ -87,6 +90,25 @@ serial logs + framebuffer captures):
 - **Fleet / distributed**: a two-node link over real e1000e/socket-netdev
   frames — capability envelopes, consensus re-election, split-brain resolution,
   and remote invocation of a transferred capability.
+- **Hypervisor groundwork (hardware-gated)**: a resumable VMX run loop
+  (vmlaunch/vmresume, corrected SDM exit-reason map, EPT wired into the
+  VMCS, I/O emulation into in-guest device models), a real **Linux guest
+  image** (bzImage + static BusyBox initramfs, three standalone boot paths
+  verified), a 4-level EPT builder, and a growing guest device set —
+  virtio-blk, 8259 PIC / 16550 UART / 8254 PIT / PCI config, then **UHCI USB
+  (low-speed HID keyboard, full 7-TD enumeration live) and a Sound Blaster 16
+  DSP (reset handshake 0xAA, version 4.5, sample-rate playback live)**. The
+  Aegis-hosted guest run still needs a VMX-capable CPU — the bring-up
+  primitive compiles + contract-tests but has not run on one here.
+- **Host-side ACPI + SMP groundwork**: the kernel reads the *real* RSDP/RSDT/
+  MADT tables QEMU/OVMF expose (three-tier search; >4 GiB entries rejected by
+  the identity map) and enumerates the CPUs/APICs (`SMP: 2 processor(s)
+  enabled` on `-smp 2`), with a tested guest-ACPI encoder seam.
+- **Model SDK**: the `aegis` model crates are documented as an SDK
+  (`aegis/spec/sdk.md`) with a runnable, contract-tested example —
+  `cargo run -p sdk-example` walks the role-grant lifecycle end to end
+  (denial before grant, propose→diff→confirm, escalation refused, expiry,
+  two-party confirmation, circuit breaker, revocation, audit).
 - **Hardening**: a real-kernel chaos harness (2000 iterations, 0 fail-open),
   host-side fuzzing over the three kernel boundary parsers (180M inputs,
   0 panics), a TLA+ ceiling proof model-checked through TLC (5.64M states,
@@ -103,8 +125,9 @@ Limits section, split into *closed / reduced / inherent*):
   registers are programmed.
 - Networking is polled (no interrupts/MSI-X); TLS uses a fixed deterministic
   scalar (no CSPRNG in the guest); no certificate-chain verification.
-- Windows/Linux compat is translation-layer only; the VT-x bring-up primitive
-  compiles + contract-tests but has not run on a VMX-capable CPU.
+- Windows/Linux compat is translation-layer only; the hypervisor path (VMX
+  run loop, EPT, guest device models, real Linux guest image) compiles +
+  contract-tests but has not run on a VMX-capable CPU.
 - The kernel is single-threaded; contract tests prove the model, not
   production behavior.
 
@@ -116,15 +139,20 @@ Limits section, split into *closed / reduced / inherent*):
 
 ## Repository layout
 - `aegis-kernel/` — the real kernel: boot, drivers, netstack, TLS, store,
-  scheduler, supervision, desktop/compositor/editor, compat layers
-  (`cargo test --features chaos-demo` = 595 tests)
+  scheduler, supervision, desktop/compositor/editor, compat layers, ACPI/SMP,
+  and the hypervisor device models (`cargo test` = 737 tests; **740 with
+  `--features vmx-demo`**)
 - `aegis/` — model crates mirroring the kernel (capability-core, store,
-  net, fleet, etc.; 128 tests)
+  net, fleet, grants, conformance, etc.; 131 tests) + the SDK guide and
+  runnable example in `aegis/spec/sdk.md` and `aegis/crates/sdk-example/`
 - `uefi-boot/` — UEFI loader + image build + QEMU demo scripts (22 tests)
+- `guest/` — the real Linux guest image (bzImage + BusyBox initramfs,
+  build scripts, committed evidence)
 - `phase-m-fuzz/` — host-side boundary-parser fuzzing harness
-- `aegis/spec/` — TLA+ specs (capabilities + ceiling) and TLC configs
+- `aegis/spec/` — TLA+ specs (capabilities + ceiling), capability model, SDK
 - `os-from-first-principles.md`, `design/` — design monograph and roadmap
 - `docs/` — supplemental documentation
+- `LICENSE`, `LICENSING.md` — dual-license terms and third-party notices
 
 ## Build & run (high level)
 
@@ -134,11 +162,16 @@ loader respectively.
 
 - Run the full kernel suite:
   ```
-  cd aegis-kernel && cargo test --features chaos-demo --release
+  cd aegis-kernel && cargo test --release            # 737 tests
+  cd aegis-kernel && cargo test --features vmx-demo  # 740 tests
   ```
 - Run the model crates:
   ```
-  cd aegis && cargo test --release
+  cd aegis && cargo test --release                   # 131 tests
+  ```
+- Run the SDK example tour:
+  ```
+  cd aegis && cargo run -p sdk-example
   ```
 - Build the boot image and run the editor demo under QEMU (two boots, proves
   file persistence across a power cycle):
@@ -162,7 +195,9 @@ the demo scripts' headers.
 ## Roadmap (high level)
 1. Real-hardware certification (the single largest remaining gap).
 2. Real DMAR IOMMU programming and interrupt-driven (MSI-X) NIC paths.
-3. Hypervisor-based compat vehicles (VMX bring-up primitive exists).
+3. Aegis-hosted VM path: the hypervisor groundwork (VMX run loop, EPT, guest
+   device models incl. UHCI/SB16, real Linux guest image, guest-ACPI seam) is
+   built and contract-tested — it closes on a VMX-capable CPU.
 4. More desktop apps on the live desktop: multi-instance spawning (taskbar
    "launch" currently raises the one boot-time instance of each app) and a
    manifest-driven app model (the desktop roadmap itself is complete).
