@@ -17,6 +17,7 @@ members = [
     "crates/fleet",
     "crates/security-audit",
     "crates/conformance",
+    "crates/sdk-example",
 ]
 
 [workspace.package]

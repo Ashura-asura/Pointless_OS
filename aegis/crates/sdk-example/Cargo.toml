@@ -1,0 +1,12 @@
+[package]
+name = "sdk-example"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Aegis model SDK tour: the role-grant lifecycle end to end, runnable and contract-tested"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+capability-core = { path = "../capability-core" }
+grants = { path = "../grants" }
