@@ -96,11 +96,11 @@ pub fn op(num: u64, arg1: u64, arg2: u64, arg3: u64, _arg4: u64, result: i64) {
     };
     let (kind, id) = match caps.cap {
         Cap::None => ("-", 0u32),
-        Cap::Endpoint(i) => ("e", i),
-        Cap::Task(i) => ("t", i),
-        Cap::MemRegion(i) => ("m", i),
-        Cap::Channel(i) => ("c", i),
-        Cap::NetEndpoint(i) => ("n", i),
+        Cap::Endpoint(i) => ("e", i.index),
+        Cap::Task(i) => ("t", i.index),
+        Cap::MemRegion(i) => ("m", i.index),
+        Cap::Channel(i) => ("c", i.index),
+        Cap::NetEndpoint(i) => ("n", i.index),
         Cap::NetRoot => ("r", 0),
     };
     let y = if result >= 0 { "ok" } else { "denied" };

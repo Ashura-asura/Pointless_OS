@@ -16,6 +16,7 @@ pub mod supervisor;
 pub mod syscall;
 pub mod tasks;
 pub mod trace;
+pub mod user_ptr;
 pub mod vga;
 
 pub mod audit;

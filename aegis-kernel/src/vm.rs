@@ -1115,7 +1115,7 @@ mod tests {
         assert!(can_create_vm(&table));
         // A Vm reference to an existing VM is not a creation authority.
         table[0] = CapSlot {
-            cap: Cap::Vm(3),
+            cap: Cap::Vm(crate::cap::Oid::new(3, 0)),
             rights: Rights::CONTROL,
         };
         assert!(!can_create_vm(&table));

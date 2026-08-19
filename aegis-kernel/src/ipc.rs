@@ -40,6 +40,12 @@ enum EpState {
 #[derive(Clone, Copy)]
 struct Endpoint {
     active: bool,
+    /// Identity generation of this slot. `ipc_endpoint_create` bumps it on
+    /// every create so a capability minted against a previous incarnation of
+    /// this index cannot resolve to the replacement (generation-safe identity;
+    /// endpoints have no destroy syscall today, but the identity must not be
+    /// re-openable by a future one).
+    generation: u32,
     state: EpState,
     buf: [u8; IPC_BUF],
     msg_len: usize,
@@ -53,6 +59,7 @@ impl Endpoint {
     const fn new() -> Self {
         Endpoint {
             active: false,
+            generation: 0,
             state: EpState::Idle,
             buf: [0u8; IPC_BUF],
             msg_len: 0,
@@ -65,6 +72,16 @@ impl Endpoint {
 }
 
 static mut ENDPOINTS: [Endpoint; MAX_ENDPOINTS] = [Endpoint::new(); MAX_ENDPOINTS];
+
+/// Identity generation of the endpoint currently occupying index `id`.
+/// Bounds-guarded: an out-of-range index yields `u32::MAX`, which no
+/// capability's generation can equal, so every resolve fails closed.
+pub fn endpoint_generation(id: u32) -> u32 {
+    if (id as usize) >= MAX_ENDPOINTS {
+        return u32::MAX;
+    }
+    unsafe { ENDPOINTS[id as usize].generation }
+}
 
 /// Reserved kill-notification endpoint (Phase 5 supervision tree). The kernel
 /// parks the death of a ring-3 task here instead of only killing it, so a
@@ -116,17 +133,27 @@ pub fn notify_task_kill(child: usize, reason: u32) -> bool {
         ENDPOINTS[NOTIFY_EP].msg_len = len;
         if ENDPOINTS[NOTIFY_EP].state == EpState::RecvWaiting {
             let srv = ENDPOINTS[NOTIFY_EP].server;
-            copy_out(
+            if copy_out(
+                crate::tasks::task_user_pml4(srv),
                 &ENDPOINTS[NOTIFY_EP].buf[..len],
                 ENDPOINTS[NOTIFY_EP].server_recvbuf_va,
-            );
+            ) {
+                ENDPOINTS[NOTIFY_EP].server = usize::MAX;
+                ENDPOINTS[NOTIFY_EP].server_recvbuf_va = 0;
+                ENDPOINTS[NOTIFY_EP].state = EpState::Idle;
+                ENDPOINTS[NOTIFY_EP].caller = child;
+                set_ret(srv, ((child as u64) << 32) | (len as u64));
+                unblock_task(srv);
+                return true;
+            }
+            // The waiting server's buffer failed the pointer gate: reset the
+            // endpoint and park the record so a later serve can pick it up —
+            // a poisoned buffer must never corrupt kernel memory.
             ENDPOINTS[NOTIFY_EP].server = usize::MAX;
             ENDPOINTS[NOTIFY_EP].server_recvbuf_va = 0;
-            ENDPOINTS[NOTIFY_EP].state = EpState::Idle;
+            ENDPOINTS[NOTIFY_EP].state = EpState::SendWaiting;
             ENDPOINTS[NOTIFY_EP].caller = child;
-            set_ret(srv, ((child as u64) << 32) | (len as u64));
-            unblock_task(srv);
-            true
+            return false;
         } else {
             ENDPOINTS[NOTIFY_EP].state = EpState::SendWaiting;
             ENDPOINTS[NOTIFY_EP].caller = child;
@@ -143,16 +170,31 @@ unsafe fn set_ret(idx: usize, val: u64) {
     *f.add(112 / 8) = val;
 }
 
-unsafe fn copy_in(va: u64, dst: &mut [u8]) {
-    core::ptr::copy_nonoverlapping(va as *const u8, dst.as_mut_ptr(), dst.len());
+/// Copy `len` bytes from the caller's buffer at `va` into kernel `dst`,
+/// validating `va` against the address space rooted at `pml4_phys` first.
+/// False on an invalid range (nothing copied).
+unsafe fn copy_in(pml4_phys: u64, va: u64, dst: &mut [u8]) -> bool {
+    crate::user_ptr::copy_from_user(pml4_phys, dst, va)
 }
 
-unsafe fn copy_out(src: &[u8], va: u64) {
-    core::ptr::copy_nonoverlapping(src.as_ptr(), va as *mut u8, src.len());
+/// Copy `src` into the caller's buffer at `va`, validating `va` against the
+/// address space rooted at `pml4_phys` first (writable required). False on an
+/// invalid range (nothing copied).
+unsafe fn copy_out(pml4_phys: u64, src: &[u8], va: u64) -> bool {
+    crate::user_ptr::copy_to_user(pml4_phys, va, src)
 }
 
-unsafe fn copy_user(src_va: u64, dst_va: u64, len: usize) {
+/// Copy `len` bytes between two caller buffers, validating BOTH sides against
+/// their own address spaces (`pml4_src` for `src_va`, `pml4_dst` for
+/// `dst_va`). False on any invalid range (nothing copied).
+unsafe fn copy_user(pml4_src: u64, src_va: u64, pml4_dst: u64, dst_va: u64, len: usize) -> bool {
+    if !crate::user_ptr::validate_range(pml4_src, src_va, len, false)
+        || !crate::user_ptr::validate_range(pml4_dst, dst_va, len, true)
+    {
+        return false;
+    }
     core::ptr::copy_nonoverlapping(src_va as *const u8, dst_va as *mut u8, len);
+    true
 }
 
 /// Resolve a capability slot to an endpoint, requiring the caller to hold the
@@ -166,9 +208,14 @@ fn caps_endpoint(cur: usize, slot: u64, need: Rights) -> Option<usize> {
     }
     match task_cap(cur, slot as usize) {
         CapSlot {
-            cap: Cap::Endpoint(id),
+            cap: Cap::Endpoint(oid),
             rights,
-        } if rights.contains(need) && (id as usize) < MAX_ENDPOINTS => Some(id as usize),
+        } if rights.contains(need)
+            && (oid.index as usize) < MAX_ENDPOINTS
+            && endpoint_generation(oid.index) == oid.generation =>
+        {
+            Some(oid.index as usize)
+        }
         _ => None,
     }
 }
@@ -185,7 +232,11 @@ pub unsafe fn ipc_endpoint_create() -> i64 {
         Some(i) => i,
         None => return -1,
     };
+    // A create mints a NEW identity for this index: bump the generation so a
+    // stale capability (minted against a previous incarnation) fails closed.
+    let generation = ENDPOINTS[id].generation.wrapping_add(1);
     ENDPOINTS[id] = Endpoint::new();
+    ENDPOINTS[id].generation = generation;
     ENDPOINTS[id].active = true;
     let slot = (0..crate::tasks::MAX_CAPS).find(|&s| task_cap(cur, s).cap == Cap::None);
     let slot = match slot {
@@ -199,7 +250,7 @@ pub unsafe fn ipc_endpoint_create() -> i64 {
         cur,
         slot,
         CapSlot {
-            cap: Cap::Endpoint(id as u32),
+            cap: Cap::Endpoint(crate::cap::Oid::new(id as u32, generation)),
             rights: crate::cap::ENDPOINT_RIGHTS,
         },
     );
@@ -308,17 +359,41 @@ pub unsafe fn ipc_call(ep_slot: u64, msg_va: u64, len: u64, reply_va: u64) -> i6
         None => return -1,
     };
     let len = core::cmp::min(len as usize, IPC_BUF);
-    copy_in(msg_va, &mut ENDPOINTS[ep].buf[..len]);
+    if !copy_in(crate::user_ptr::current_user_pml4(), msg_va, &mut ENDPOINTS[ep].buf[..len]) {
+        crate::audit::record(cur, crate::audit::OpKind::Send, None, false);
+        return -1;
+    }
     ENDPOINTS[ep].msg_len = len;
 
     if ENDPOINTS[ep].state == EpState::RecvWaiting {
         let srv = ENDPOINTS[ep].server;
-        copy_out(&ENDPOINTS[ep].buf[..len], ENDPOINTS[ep].server_recvbuf_va);
+        // The waiting server's receive buffer is the SERVER's address space,
+        // not the caller's: validate the deferred copy against it.
+        if !copy_out(
+            crate::tasks::task_user_pml4(srv),
+            &ENDPOINTS[ep].buf[..len],
+            ENDPOINTS[ep].server_recvbuf_va,
+        ) {
+            crate::audit::record(cur, crate::audit::OpKind::Send, None, false);
+            return -1;
+        }
         ENDPOINTS[ep].server = usize::MAX;
         ENDPOINTS[ep].server_recvbuf_va = 0;
         ENDPOINTS[ep].state = EpState::Idle;
         // Caller now waits for the server's reply.
         ENDPOINTS[ep].caller = cur;
+        // The reply target is the CALLER's own buffer; validate it now (and
+        // again at reply time, against the caller's address space) so a
+        // poisoned pointer is refused before it can be stored.
+        if !crate::user_ptr::validate_range(
+            crate::user_ptr::current_user_pml4(),
+            reply_va,
+            IPC_BUF,
+            true,
+        ) {
+            crate::audit::record(cur, crate::audit::OpKind::Send, None, false);
+            return -1;
+        }
         ENDPOINTS[ep].caller_reply_va = reply_va;
         // Hand the server its return value and unblock it.
         set_ret(srv, ((cur as u64) << 32) | (len as u64));
@@ -330,6 +405,17 @@ pub unsafe fn ipc_call(ep_slot: u64, msg_va: u64, len: u64, reply_va: u64) -> i6
     } else {
         ENDPOINTS[ep].state = EpState::SendWaiting;
         ENDPOINTS[ep].caller = cur;
+        // Validate the reply target before storing it (same reasoning as the
+        // RecvWaiting fast path above).
+        if !crate::user_ptr::validate_range(
+            crate::user_ptr::current_user_pml4(),
+            reply_va,
+            IPC_BUF,
+            true,
+        ) {
+            crate::audit::record(cur, crate::audit::OpKind::Send, None, false);
+            return -1;
+        }
         ENDPOINTS[ep].caller_reply_va = reply_va;
         block_current(ep);
         switch_away_from(cur);
@@ -365,13 +451,33 @@ pub unsafe fn ipc_serve(ep_slot: u64, recvbuf_va: u64) -> i64 {
         EpState::SendWaiting => {
             let caller = ENDPOINTS[ep].caller;
             let len = ENDPOINTS[ep].msg_len;
-            copy_out(&ENDPOINTS[ep].buf[..len], recvbuf_va);
+            // The caller's message is delivered into the SERVER's buffer: the
+            // deferred copy is validated against the server's address space.
+            if !copy_out(
+                crate::user_ptr::current_user_pml4(),
+                &ENDPOINTS[ep].buf[..len],
+                recvbuf_va,
+            ) {
+                crate::audit::record(cur, crate::audit::OpKind::Recv, None, false);
+                return -1;
+            }
             // Caller stays blocked, now awaiting the reply.
             ENDPOINTS[ep].state = EpState::Idle;
             set_ret(cur, ((caller as u64) << 32) | (len as u64));
             (((caller as u64) << 32) | (len as u64)) as i64
         }
         _ => {
+            // Park the receive buffer only after the pointer gate approves it:
+            // a poisoned recvbuf_va must never be stored for a later copy_out.
+            if !crate::user_ptr::validate_range(
+                crate::user_ptr::current_user_pml4(),
+                recvbuf_va,
+                IPC_BUF,
+                true,
+            ) {
+                crate::audit::record(cur, crate::audit::OpKind::Recv, None, false);
+                return -1;
+            }
             ENDPOINTS[ep].state = EpState::RecvWaiting;
             ENDPOINTS[ep].server = cur;
             ENDPOINTS[ep].server_recvbuf_va = recvbuf_va;
@@ -413,7 +519,24 @@ pub unsafe fn ipc_reply(ep_slot: u64, caller_id: u64, reply_va: u64, rlen: u64) 
         return -1;
     }
     let rlen = core::cmp::min(rlen as usize, IPC_BUF);
-    copy_user(reply_va, ENDPOINTS[ep].caller_reply_va, rlen);
+    // The reply flows server buffer -> caller buffer: both sides are validated
+    // against their OWN address spaces (the caller's reply buffer belongs to
+    // the caller's space, even though the server is the one running).
+    if !copy_user(
+        crate::user_ptr::current_user_pml4(),
+        reply_va,
+        crate::tasks::task_user_pml4(caller),
+        ENDPOINTS[ep].caller_reply_va,
+        rlen,
+    ) {
+        crate::audit::record(
+            cur,
+            crate::audit::OpKind::Send,
+            Some(caller as u32),
+            false,
+        );
+        return -1;
+    }
     set_ret(caller, rlen as u64);
     ENDPOINTS[ep].caller = usize::MAX;
     ENDPOINTS[ep].caller_reply_va = 0;
@@ -446,7 +569,7 @@ mod tests {
             idx,
             0,
             CapSlot {
-                cap: Cap::Endpoint(7),
+                cap: Cap::Endpoint(crate::cap::Oid::new(7, 0)),
                 rights,
             },
         );
@@ -494,7 +617,7 @@ mod tests {
         crate::tasks::set_current_for_test(1);
         let mut caps = new_cap_table();
         caps[2] = CapSlot {
-            cap: Cap::Endpoint(3),
+            cap: Cap::Endpoint(crate::cap::Oid::new(3, 0)),
             rights: Rights::RECV.union(Rights::GRANT),
         };
         set_task_cap(1, 2, caps[2]);
@@ -539,7 +662,7 @@ mod tests {
             3,
             1,
             CapSlot {
-                cap: Cap::Task(1),
+                cap: Cap::Task(crate::cap::Oid::new(1, 0)),
                 rights: Rights::ALL,
             },
         );
@@ -547,7 +670,7 @@ mod tests {
             3,
             2,
             CapSlot {
-                cap: Cap::MemRegion(4),
+                cap: Cap::MemRegion(crate::cap::Oid::new(4, 0)),
                 rights: Rights::ALL,
             },
         );
@@ -577,7 +700,9 @@ mod tests {
         assert!(slot >= 0);
         let cap = task_cap(0, slot as usize);
         match cap.cap {
-            Cap::Endpoint(id) => assert_ne!(id as usize, NOTIFY_EP, "reserved slot leaks"),
+            Cap::Endpoint(id) => {
+                assert_ne!(id.index as usize, NOTIFY_EP, "reserved slot leaks")
+            }
             _ => unreachable!("endpoint create installs an Endpoint cap"),
         }
     }
@@ -655,7 +780,7 @@ mod tests {
             5,
             1,
             CapSlot {
-                cap: Cap::Task(2),
+                cap: Cap::Task(crate::cap::Oid::new(2, 0)),
                 rights: Rights::ALL,
             },
         );
@@ -680,7 +805,7 @@ mod tests {
         );
         assert_eq!(
             task_cap(3, 0).cap,
-            Cap::Task(2),
+            Cap::Task(crate::cap::Oid::new(2, 0)),
             "the valid grant must still land"
         );
     }
@@ -697,7 +822,7 @@ mod tests {
                 2,
                 0,
                 CapSlot {
-                    cap: Cap::Endpoint(0),
+                    cap: Cap::Endpoint(crate::cap::Oid::new(0, 0)),
                     rights: Rights::ALL,
                 },
             );

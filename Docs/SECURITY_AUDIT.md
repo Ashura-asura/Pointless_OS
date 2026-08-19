@@ -1,11 +1,12 @@
 # Security Audit & Certification Status — Pointless OS / Aegis
 
-*Status: 2026-08-10, fuzzing/ceiling rows updated 2026-08-16 (Phase M). This document
-is the honest certification matrix for Phase 12. No claim below outruns its test
-evidence; nothing here certifies production behavior.*
+*Status: 2026-08-10, fuzzing/ceiling rows updated 2026-08-16 (Phase M), totals and
+kernel-hardening rows updated 2026-08-19 (audit follow-up: ObjectID + pointer gate).
+This document is the honest certification matrix for Phase 12. No claim below outruns
+its test evidence; nothing here certifies production behavior.*
 
 *Partial-reconciliation note: the fuzzing, kernel-boundary-hardening, and totals rows were
-updated in this pass with real re-run numbers (kernel 754/757, workspace 136, bootloader
+updated in this pass with real re-run numbers (kernel 761/764, workspace 136, bootloader
 22). Several "NOT certified" rows below reflect real live-boot evidence gained in Phases
 J/K/L/G/T/P/Q/R/S/AA and re-checked in `HONEST_STATUS.md` (real VMware boots, real fleet
 networking, VT-d-style DMA gate, GOP-first display, live apps); the untouched rows below
@@ -19,11 +20,13 @@ just because this file was edited — the authoritative live status is `HONEST_S
 | Capability model invariants (I1-I6) | `aegis/crates/capability-core` | 20+ contract tests; TLA+ model-check (331k states, 2 tasks, 3 slots) |
 | Reachable-authority vs compiled manifests | `aegis/crates/capability-audit` + `security-audit` | `cargo run -p capability-audit` (CI); 10 aggregate contract tests (clean reference world, kernel-equivalent rejection, undeclared-holdings rejection, overhang-warns-not-fails, self-cap exclusion) |
 | Adaptive/AI ceiling (monotonic non-expansion) | `aegis-kernel/src/ceiling.rs` | 14 property tests; caught+fixed a real scope-expansion bug |
-| Parser/syscall total functions (no panic on garbage) | `aegis-kernel/src/hardening.rs` + `aegis-kernel/src/hardening_fuzz.rs` | 21 boundary tests over ELF/PE loaders, IPv4/Ethernet/ARP/UDP/TCP parsers, both syscall ABIs, compat layers, shell/window/graph/input; plus **13 hardened fuzz tests (~1.2M seeded parse calls over ethernet/arp/ipv4/udp/tcp/tls record decryption + a syscall-boundary fuzz driving every syscall number with hostile task/slot/endpoint indices — 0 panics, 0 OOB, current task never moved)** |
+| Parser/syscall total functions (no panic on garbage) | `aegis-kernel/src/hardening.rs` + `aegis-kernel/src/hardening_fuzz.rs` | 21 boundary tests over ELF/PE loaders, IPv4/Ethernet/ARP/UDP/TCP parsers, both syscall ABIs, compat layers, shell/window/graph/input; plus **14 hardened fuzz tests (~1.2M seeded parse calls over ethernet/arp/ipv4/udp/tcp/tls record decryption + a syscall-boundary fuzz driving every syscall number with hostile task/slot/endpoint indices + a direct walk-fuzz of the user-pointer gate — 0 panics, 0 OOB, current task never moved)** |
 | Adaptive/AI ceiling under arbitrary interleaving (all 3 roles) | `aegis/spec/AegisCeiling.tla` | TLC model-check: 5,644,801 states / 147,456 distinct / 0 errors; negative control confirms non-vacuous |
 | Boundary-parser fuzzing (decode_entries, parse_elf, parse_pe) | `phase-m-fuzz/` links the real `aegis-kernel` crate | **180,000,000 inputs across 2 independent seeds (random + mutation-based from valid seeds), 0 panics, against the real in-crate functions**; the extracted-copy harness in `phase-m-fuzz/extracted/` reproduces the identical numbers, so there is no extraction drift; extraction validated by running all 23 of the parsers' own original unit tests unmodified |
-| Per-phase contracts | all crates | 912 total tests, 0 failures (754 kernel + 136 workspace + 22 bootloader: 13 ELF-contract + 9 fleet-CFG-contract); kernel also green at 757 with `--features vmx-demo` |
+| Per-phase contracts | all crates | 919 total tests, 0 failures (761 kernel + 136 workspace + 22 bootloader: 13 ELF-contract + 9 fleet-CFG-contract); kernel also green at 764 with `--features vmx-demo` |
 | Kernel-boundary hardening (external audit, 2026-08-19) | `aegis-kernel/src/{ipc,netif,tasks,supervisor,mem}.rs` | Bounds+identity checks added on `ipc_cap_grant`/`ipc_reply`/netif slot indices/raw task accessors/cap-resolved ids; 5 adversarial tests (`cap_grant_refuses_out_of_range_recipient`, `reply_refuses_forged_and_out_of_range_callers`, `net_syscalls_refuse_out_of_range_slots`, `raw_accessors_refuse_out_of_range_indices`, `syscall_boundary_rejects_hostile_indices`); fail-closed, never panic |
+| Generation-safe object identity (audit-follow-up, 2026-08-19) | `aegis-kernel/src/{cap,tasks,ipc,channel,netif,netstack,store,role,main,fleet,trace}.rs` | Every payloaded Cap carries `Oid { index, generation }`; every resolve is a single bounds+generation gate; slot reuse on a full table bumps the generation so a stale handle fails closed; **3 dedicated stale-cap tests** (`stale_task_cap_denied_after_slot_reuse`, `stale_channel_cap_denied_after_destroy_and_recreate`, `stale_socket_cap_denied_after_close_and_reopen`) |
+| Centralized user-pointer validation (audit-follow-up, 2026-08-19) | `aegis-kernel/src/user_ptr.rs` + write/ipc/mem/channel/netif copy paths | `validate_range`/`copy_from_user`/`copy_to_user` do a strict 4-level page walk (4 KiB/2 MiB/1 GiB) over the calling task's PML4; kernel context is a trusted bypass; deferred IPC copies validate against the owning task's PML4; **3 gate tests + a direct gate-walk fuzz**; pointer args now fuzzed with the gate (not a scratch buffer) as the defense |
 
 ## Certification status by claim
 

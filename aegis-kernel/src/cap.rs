@@ -81,27 +81,51 @@ impl core::fmt::Display for Rights {
     }
 }
 
+/// A kernel-object identity: the object's table index plus the generation the
+/// index was bound to when this reference was minted.
+///
+/// Generation-safe object identity (hostile-audit Phase 1): object tables can
+/// reuse a slot after its occupant dies (a Zombie task slot, a destroyed
+/// channel, a closed socket). A capability carries the generation that was
+/// live when it was minted, and every resolve validates the live object's
+/// generation before deref — so a stale capability (minted against a previous
+/// occupant of the same index) fails closed instead of silently re-targeting
+/// the replacement object. Bounds checks stay in the resolve paths; the
+/// generation is the *identity* half, the index bounds check is the *safety*
+/// half, and both must hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct Oid {
+    pub index: u32,
+    pub generation: u32,
+}
+
+impl Oid {
+    pub const fn new(index: u32, generation: u32) -> Oid {
+        Oid { index, generation }
+    }
+}
+
 /// A kernel-object reference held in a task's capability table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cap {
     None,
-    /// Reference to an IPC endpoint with the given id.
-    Endpoint(u32),
-    /// Reference to a task (execution context) with the given id.
-    Task(u32),
-    /// Reference to a memory region with the given id.
-    MemRegion(u32),
+    /// Reference to an IPC endpoint with the given identity.
+    Endpoint(Oid),
+    /// Reference to a task (execution context) with the given identity.
+    Task(Oid),
+    /// Reference to a memory region with the given identity.
+    MemRegion(Oid),
     /// Reference to an asynchronous message channel (FIFO box) with the given
-    /// id. The design's second IPC primitive (§8: an async notification/queue
-    /// primitive besides the synchronous rendezvous endpoint); the loopback
-    /// netstack's sockets ARE these objects.
-    Channel(u32),
-    /// Reference to a network endpoint (a socket) with the given id. The
+    /// identity. The design's second IPC primitive (§8: an async
+    /// notification/queue primitive besides the synchronous rendezvous
+    /// endpoint); the loopback netstack's sockets ARE these objects.
+    Channel(Oid),
+    /// Reference to a network endpoint (a socket) with the given identity. The
     /// design's §8 socket: holding a network capability means holding a
     /// specific, revocable right to talk to a *specific* endpoint — the socket
     /// is bound to one destination at creation and the kernel refuses any
     /// operation outside it. No ambient "open any socket" authority.
-    NetEndpoint(u32),
+    NetEndpoint(Oid),
     /// Phase F closure (master roadmap Phase E item 2): the single
     /// capability that authorizes calling `sys_net_socket` (syscall 19) at
     /// all — i.e. minting a *new* `NetEndpoint` bound to a caller-chosen
@@ -119,10 +143,10 @@ pub enum Cap {
     /// the socket directly via `netif::open_advisor_endpoint`, so an
     /// advisor-role agent needs no `NetRoot` and gets none).
     NetRoot,
-    /// Reference to a VM (a hypervisor guest) with the given id. Held by
+    /// Reference to a VM (a hypervisor guest) with the given identity. Held by
     /// the VM's owner; carrying it with CONTROL is what makes run/teardown
     /// of that specific VM possible.
-    Vm(u32),
+    Vm(Oid),
     /// Phase U (master roadmap Track A): the singleton capability that
     /// authorizes *creating* a VM at all (id is always 0). Mirrors `NetRoot`:
     /// only a task explicitly handed `VmRoot` may mint a new VM — there is
@@ -150,18 +174,24 @@ impl CapSlot {
 
 impl Cap {
     /// The object id a non-`None` cap names, if any. Used by the audit log to
-    /// attribute the target of an operation.
+    /// attribute the target of an operation (the index half of the identity —
+    /// the audit log is an attribution log, not a deref path).
     pub fn id(self) -> Option<u32> {
+        self.oid().map(|o| o.index)
+    }
+
+    /// The object identity a non-`None` cap names, if any.
+    pub fn oid(self) -> Option<Oid> {
         match self {
             Cap::None => None,
-            Cap::Endpoint(id) => Some(id),
-            Cap::Task(id) => Some(id),
-            Cap::MemRegion(id) => Some(id),
-            Cap::Channel(id) => Some(id),
-            Cap::NetEndpoint(id) => Some(id),
-            Cap::NetRoot => Some(0),
-            Cap::Vm(id) => Some(id),
-            Cap::VmRoot => Some(0),
+            Cap::Endpoint(o)
+            | Cap::Task(o)
+            | Cap::MemRegion(o)
+            | Cap::Channel(o)
+            | Cap::NetEndpoint(o)
+            | Cap::Vm(o) => Some(o),
+            Cap::NetRoot => Some(Oid::new(0, 0)),
+            Cap::VmRoot => Some(Oid::new(0, 0)),
         }
     }
 }

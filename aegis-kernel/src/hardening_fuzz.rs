@@ -364,13 +364,62 @@ fn network_parsers_are_total_under_mixed_input_streams() {
     }
 }
 
+/// Kernel-boundary fuzz (hostile-audit Phase 1, §4): the user-pointer gate
+/// itself must never panic on hostile (va, len, writable) triples, and must
+/// keep refusing kernel-only, unmapped, and overflowing ranges against a
+/// synthetic USER page table. This complements `syscall_boundary_...` above:
+/// there the pointer positions stay pinned to a live buffer; here the WALK
+/// that approves them is fuzzed directly.
+#[test]
+fn user_ptr_gate_never_panics_on_hostile_ranges() {
+    let _g = crate::kernel_state_guard();
+    // Minimal synthetic hierarchy (page-aligned like real tables): one USER
+    // writable page (VA 0x100000), one kernel-only page (VA 0x101000), and
+    // a 2 MiB region (VA 0x0020_0000) left unmapped.
+    #[repr(align(4096))]
+    struct Table([u64; 512]);
+    static mut F_PML4: Table = Table([0; 512]);
+    static mut F_PDPT: Table = Table([0; 512]);
+    static mut F_PD: Table = Table([0; 512]);
+    static mut F_PT: Table = Table([0; 512]);
+    let root = unsafe {
+        F_PML4.0[0] = core::ptr::addr_of!(F_PDPT) as u64 | 1 | 2 | 4;
+        F_PDPT.0[0] = core::ptr::addr_of!(F_PD) as u64 | 1 | 2 | 4;
+        F_PD.0[0] = core::ptr::addr_of!(F_PT) as u64 | 1 | 2 | 4;
+        F_PT.0[0x100] = 0x1000_0000 | 1 | 2 | 4; // user, writable
+        F_PT.0[0x101] = 0x2000_0000 | 1 | 2; // present, kernel-only
+        core::ptr::addr_of!(F_PML4) as u64
+    };
+    let mut rng = Rng(SEED ^ 0xA11_5E);
+    for _ in 0..2000 {
+        let va = match rng.pick(4) {
+            0 => rng.next(),
+            1 => 0x100000,      // user page
+            2 => 0x101000,      // kernel-only page
+            _ => 0x0020_0000,   // unmapped region
+        };
+        let len = (rng.next() as usize) % 8192;
+        let writable = rng.pick(2) == 0;
+        let _ = no_panic(|| crate::user_ptr::validate_range(root, va, len, writable));
+    }
+    // Deterministic invariants on the fixed pages: only the USER page passes,
+    // and only for ranges entirely inside it.
+    assert!(crate::user_ptr::validate_range(root, 0x100000, 4, true));
+    assert!(!crate::user_ptr::validate_range(root, 0x101000, 4, true));
+    assert!(!crate::user_ptr::validate_range(root, 0x101000, 4, false));
+    assert!(!crate::user_ptr::validate_range(root, 0x0020_0000, 4, false));
+    assert!(!crate::user_ptr::validate_range(root, 0x100000, 0x2000, false));
+    assert!(!crate::user_ptr::validate_range(root, u64::MAX - 3, 4, false));
+}
+
 /// Kernel-boundary fuzz (hostile-audit Phase 1): drive every syscall number
 /// with hostile *index-type* arguments (out-of-range task/slot/endpoint
 /// indices) and assert the dispatcher refuses them without panicking or
 /// touching the task table. Pointer arguments are pinned to a live scratch
-/// buffer, so the demo's documented "pointers are not validated" limitation
-/// is not exercised here — this test is about the table-index boundary, which
-/// is now bounds-guarded at both the syscall sites and the raw accessors.
+/// buffer (the user-pointer gate itself is fuzzed directly by
+/// `user_ptr_gate_never_panics_on_hostile_ranges`); this test is about the
+/// table-index boundary, which is now bounds-guarded at both the syscall
+/// sites and the raw accessors.
 #[test]
 fn syscall_boundary_rejects_hostile_indices() {
     let _g = crate::kernel_state_guard();

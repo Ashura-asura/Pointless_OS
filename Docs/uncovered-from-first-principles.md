@@ -41,12 +41,13 @@ unrelated IPC tests. The exclusion is asserted in the test source, not hidden.
 ## 2. DESIGNED / NOT REFACTORED — real gaps we are not half-fixing
 
 The audit's **HIGH** findings are real design flaws. We verified them in
-source, wrote the fix design, and chose **not** to refactor now: each touches
-the kernel-wide capability representation (~15 files), carries a real
-regression risk we cannot soak on physical hardware, and would land between
-the "found a bug" and "fixed a bug" states with no test that genuinely
-distinguishes them. This section records the design so the work is unambiguous
-when it is scheduled.
+source, wrote the fix design, and chose **not** to refactor at audit time:
+each touches the kernel-wide capability representation (~15 files), carries a
+real regression risk we cannot soak on physical hardware, and would land
+between the "found a bug" and "fixed a bug" states with no test that genuinely
+distinguishes them. This section records the design. **2.1 and 2.2 were
+implemented and test-closed in the same pass that shipped the audit's other
+fixes (kernel 761 plain / 764 vmx-demo); 2.3 remains a genuine backlog item.**
 
 ### 2.1 Generation-safe object identity (stale-handle risk)
 
@@ -58,19 +59,21 @@ when it is scheduled.
 - **Why it is low-risk today (not a fix):** capabilities minted by the kernel
   (`spawn`/`endpoint`/`region`) always point at live objects — the stub
   task/endpoint/region code paths are fixed functions, not user-extensible
-  allocators — and slot reuse requires exhausting 64 tasks first. So the
-  window is narrow. It is still a design flaw.
+  allocators — and slot reuse requires exhausting the table first. It is
+  still a design flaw.
 - **Fix design (ObjectID):** replace bare indices with
   `struct ObjectID { index: u32, generation: u32 }`; `spawn_impl` increments
   the slot's generation on reuse; every accessor
   (`task_state`, `task_cap`, `task_frame_ptr`, …) verifies
   `slots[id.index].generation == id.generation` before deref, so a stale
   handle fails closed instead of aliasing. The capability ABI carries the
-  generation; syscall-boundary fuzz must then fuzz `(index, generation)` pairs
-  (the hostile-index test already exists and would be extended).
-- **Scheduling note:** one sitting, ~15 files, all accessor call sites
-  audited, regression = full kernel suite at 754/757 plus a dedicated
-  "reuse-then-stale-handle-denied" test.
+  generation; syscall-boundary fuzz must then fuzz `(index, generation)` pairs.
+- **STATUS: IMPLEMENTED + TEST-CLOSED.** `Oid { index, generation }` (see
+  `cap.rs`, `tasks.rs`); payloaded caps carry it, every resolve does a
+  single bounds+generation gate, slot reuse bumps the generation, and three
+  dedicated stale-handle tests prove a reused slot's old cap is denied
+  (`tasks.rs`, `channel.rs`, `netif.rs`). The ABI deliberately passes raw
+  indices only — the generation never crosses to ring-3.
 
 ### 2.2 Centralized user-pointer validation
 
@@ -85,9 +88,12 @@ when it is scheduled.
   mapped range or not in user (ring-3) pages, and (c) never panics on a bad
   range. All syscall copy paths route through it; the fuzz test then fuzzes
   pointer args too, with the gate (not a scratch buffer) as the defense.
-- **Scheduling note:** smaller than 2.1 but touches the same raw-pointer
-  accessors; pair with the ObjectID pass so both land against one fuzz
-  regression run.
+- **STATUS: IMPLEMENTED + TEST-CLOSED.** `user_ptr.rs` provides
+  `validate_range`/`copy_from_user`/`copy_to_user` doing a strict 4-level
+  walk over the calling task's PML4 (kernel context is a trusted bypass); the
+  write/ipc/mem/channel/netif copy paths all route through it, deferred IPC
+  copies validate against the OWNING task's PML4, and a 3-test gate suite
+  plus a direct gate-walk fuzz exercise it adversarially.
 
 ### 2.3 Flat CSpace, no derivation tree (already admitted)
 
@@ -135,11 +141,11 @@ exhaustive:
 ## How to read this file
 
 - **CLOSED items need no action** beyond the regression suite that now
-  encodes them (754/757 kernel, 136 workspace, 22 bootloader).
+  encodes them (761/764 kernel, 136 workspace, 22 bootloader).
 - **DESIGNED/NOT REFACTORED items are the top of the real engineering
-  backlog**: 2.1 (ObjectID) first, then 2.2 (pointer gate), then 2.3
-  (derivation tree) as a follow-on subsystem — each lands with its own
-  fail-closed tests and a full-suite regression.
+  backlog**: 2.3 (derivation tree) is the only one left; 2.1 (ObjectID) and
+  2.2 (pointer gate) were closed in the audit-follow-up pass. It lands with
+  its own fail-closed tests and a full-suite regression.
 - **GATED items are ceilings, not laziness.** Each is a hard dependency on
   hardware, a proof methodology decision, or a model boundary the design doc
   itself defers. They are tracked in `master-roadmap.md` and

@@ -9,7 +9,7 @@
 1. [Core Design Principles](#core-design-principles)
 2. [Five Architectures Evaluated](#five-architectures-evaluated)
 3. [Why We Chose: Adaptive Capability Substrate](#why-we-chose-adaptive-capability-substrate)
-4. [The Kernel: seL4 Foundation](#the-kernel-sel4-foundation)
+4. [The Kernel: seL4-Lineage Architecture](#the-kernel-sel4-lineage-architecture)
 5. [Orchestration Layer: AI-Native Scheduling](#orchestration-layer-ai-native-scheduling)
 6. [Security Model: Capabilities Over Permissions](#security-model-capabilities-over-permissions)
 7. [Data Model: Objects, Not Files](#data-model-objects-not-files)
@@ -99,12 +99,12 @@ You can't verify everything. You **can** verify the isolation boundary.
 │ ┌──────────┐ ┌──────────────────┐   │
 │ │Buggy App │ │Malicious Code    │   │
 │ └──────────┘ └──────────────────┘   │
-├─ FORMALLY VERIFIED BOUNDARY ──────────┤
+├─ CAPABILITY BOUNDARY (MODEL-CHECKED) ──────┤
 │ ┌─────────────────────────────────┐   │
-│ │ Kernel (seL4)                   │   │ ← Proof: "If you're in capability
-│ │ Proven: Memory isolation        │   │   set X, you can only access
-│ │         Capability enforcement  │   │   resources in set X"
-│ │         IPC isolation           │   │
+│ │ Kernel (Custom Rust)            │   │ ← Model-checked (TLA+, finite
+│ │ Enforced: Memory isolation      │   │   instances), not an inductive
+│ │           Capability enforcement│   │   proof: "you can only access
+│ │           IPC isolation         │   │   resources in set X"
 │ └─────────────────────────────────┘   │
 └─────────────────────────────────────┘
 ```

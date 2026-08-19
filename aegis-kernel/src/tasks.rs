@@ -10,7 +10,7 @@
 use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::cap::{Cap, CapSlot, CapTable};
+use crate::cap::{Cap, CapSlot, CapTable, Oid};
 
 pub const TASK_STACK_SIZE: u64 = 16384;
 /// Task table capacity. Bumped to 12 in Phase 6: the Phase-6 demo adds a
@@ -158,6 +158,13 @@ impl TaskFrame {
 /// A scheduled kernel task.
 pub struct Task {
     pub name: &'static str,
+    /// Identity generation of this table slot. Bumped by `spawn_impl` every
+    /// time a slot is reused (a Zombie row re-occupied), so a capability minted
+    /// against the previous occupant no longer resolves to this task
+    /// (generation-safe object identity). `restart_task` deliberately keeps the
+    /// slot, the caps, and the generation — a supervised restart is the *same*
+    /// task identity, not a new one.
+    pub generation: u32,
     /// Entry point, remembered so a supervised restart can re-enter a task
     /// image (the supervision tree respawns against the same code, not a
     /// re-fork of arbitrary state).
@@ -188,6 +195,7 @@ impl Task {
     pub fn new(name: &'static str, entry: extern "sysv64" fn() -> !, stack_base: u64) -> Task {
         Task {
             name,
+            generation: 0,
             entry,
             frame: TaskFrame::fresh(entry, stack_base + TASK_STACK_SIZE),
             stack_base,
@@ -210,6 +218,7 @@ impl Task {
         let user_pml4 = unsafe { crate::page_tables::create_user_pml4(stack_base) };
         Task {
             name,
+            generation: 0,
             entry,
             frame: TaskFrame::fresh_user(entry, stack_base + TASK_STACK_SIZE),
             stack_base,
@@ -399,11 +408,17 @@ unsafe fn spawn_impl(
         // Full at the high-water mark: reuse a dead (Zombie) slot if any.
         let reuse = (0..MAX_TASKS).find(|&i| task_state(i) == TaskState::Zombie);
         let slot = reuse?;
-        let task = if cpl0_stack_base != 0 {
+        // The slot's identity changes: a NEW task occupies it. Bump the
+        // generation so every capability minted against the previous occupant
+        // fails resolution from here on (stale-handle denial), instead of
+        // silently re-targeting this task.
+        let generation = task_generation(slot).wrapping_add(1);
+        let mut task = if cpl0_stack_base != 0 {
             Task::new_user(name, entry, stack_base, cpl0_stack_base)
         } else {
             Task::new(name, entry, stack_base)
         };
+        task.generation = generation;
         core::ptr::write(
             core::ptr::addr_of_mut!(TASKS)
                 .cast::<core::mem::MaybeUninit<Task>>()
@@ -459,6 +474,7 @@ pub fn reset_table_for_test() {
         for i in 0..MAX_TASKS {
             let task = Task {
                 name: "",
+                generation: 0,
                 entry: tests_dummy,
                 frame: TaskFrame::fresh(tests_dummy, TASK_STACK_SIZE),
                 stack_base: 0,
@@ -545,6 +561,34 @@ fn task_state(idx: usize) -> TaskState {
             .cast::<TaskState>();
         *p
     }
+}
+
+/// Identity generation of the task currently occupying table slot `idx`.
+///
+/// Bounds-guarded: an out-of-range index yields `u32::MAX`, which no
+/// capability's generation can equal, so every resolve fails closed (the
+/// bounds check and the generation check are complementary halves of one
+/// gate — a stale OR out-of-range identity is denied).
+pub fn task_generation(idx: usize) -> u32 {
+    if idx >= MAX_TASKS {
+        return u32::MAX;
+    }
+    unsafe {
+        let p = core::ptr::addr_of_mut!(TASKS)
+            .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, generation))
+            .cast::<u32>();
+        *p
+    }
+}
+
+/// The `Oid` naming the task currently occupying slot `idx`, or `None` when
+/// `idx` is out of range. Minting sites use this so a freshly minted
+/// capability always names the *current* occupant of the slot.
+pub fn task_oid(idx: usize) -> Option<Oid> {
+    if idx >= MAX_TASKS {
+        return None;
+    }
+    Some(Oid::new(idx as u32, task_generation(idx)))
 }
 
 fn set_task_state(idx: usize, s: TaskState) {
@@ -869,6 +913,39 @@ pub(crate) fn context_pml4(idx: usize) -> u64 {
     }
 }
 
+/// The RAW per-user PML4 field of the current context, or 0 when it runs on
+/// the kernel page tables (kernel-resident task, idle, or the test harness).
+/// Distinct from `context_pml4`, which substitutes the kernel PML4 — pointer
+/// validation needs to know whether a caller is untrusted ring-3 at all.
+pub fn current_user_pml4_phys() -> u64 {
+    let cur = current_idx();
+    if cur >= MAX_TASKS {
+        return 0;
+    }
+    unsafe {
+        core::ptr::addr_of_mut!(TASKS)
+            .byte_add(cur * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, pml4_phys))
+            .cast::<u64>()
+            .read()
+    }
+}
+
+/// The RAW per-user PML4 field of task `idx`, or 0 for an out-of-range index
+/// or a kernel-context task. Used to validate pointers that belong to a task
+/// OTHER than the one currently running (a deferred IPC copy into a blocked
+/// caller's buffer, or the netstack's server-side delivery).
+pub fn task_user_pml4(idx: usize) -> u64 {
+    if idx >= MAX_TASKS {
+        return 0;
+    }
+    unsafe {
+        core::ptr::addr_of_mut!(TASKS)
+            .byte_add(idx * core::mem::size_of::<Task>() + core::mem::offset_of!(Task, pml4_phys))
+            .cast::<u64>()
+            .read()
+    }
+}
+
 /// Preemptive round-robin tick hook, called from the timer stub on every
 /// timer interrupt, with the interrupt frame on the current context's
 /// stack. Saves the interrupted context (including this call's own stub
@@ -1142,7 +1219,7 @@ mod tests {
             MAX_TASKS,
             0,
             CapSlot {
-                cap: Cap::Task(1),
+                cap: Cap::Task(crate::cap::Oid::new(1, 0)),
                 rights: Rights::ALL,
             },
         );
@@ -1150,7 +1227,7 @@ mod tests {
             0,
             MAX_CAPS,
             CapSlot {
-                cap: Cap::Task(1),
+                cap: Cap::Task(crate::cap::Oid::new(1, 0)),
                 rights: Rights::ALL,
             },
         );
@@ -1162,5 +1239,78 @@ mod tests {
         assert_eq!(grant_cap(MAX_TASKS, 0, 0), usize::MAX);
         assert_eq!(grant_cap(0, MAX_TASKS, 0), usize::MAX);
         assert_eq!(grant_cap(0, 0, MAX_CAPS), usize::MAX);
+    }
+
+    /// Kernel-boundary hardening (hostile-audit Phase 1, ObjectID): a task
+    /// capability minted against a previous occupant of a reused slot must be
+    /// DENIED by every gate, never silently re-targeted at the new task. The
+    /// real reuse path is exercised: fill the table, kill index 0, spawn again
+    /// so `spawn_impl` claims the Zombie slot and bumps its generation.
+    #[test]
+    fn stale_task_cap_denied_after_slot_reuse() {
+        let _g = crate::kernel_state_guard();
+        unsafe {
+            core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
+            for i in 0..MAX_TASKS {
+                let slot = core::ptr::addr_of_mut!(TASKS)
+                    .cast::<core::mem::MaybeUninit<Task>>()
+                    .add(i);
+                core::ptr::write(slot, core::mem::MaybeUninit::uninit());
+            }
+            for i in 0..MAX_TASKS {
+                assert!(
+                    spawn("t", dummy, 0x8000 + i as u64 * TASK_STACK_SIZE).is_some(),
+                    "table fills to capacity"
+                );
+            }
+            // Identity of the first occupant of index 0.
+            let old_oid = crate::cap::Oid::new(0, 0);
+            // Kill index 0, then spawn past the high-water mark: the full table
+            // must reuse the Zombie slot and mint a NEW identity for it.
+            kill_task(0);
+            assert!(spawn("replacement", dummy, 0x90000).is_some());
+            assert_eq!(task_generation(0), 1, "slot 0 got a new identity");
+            assert_eq!(
+                task_oid(0),
+                Some(crate::cap::Oid::new(0, 1)),
+                "the live identity is the bumped generation"
+            );
+            // A live task holds the STALE cap: every gate refuses it.
+            let holder = MAX_TASKS - 1;
+            set_current_for_test(holder);
+            set_task_cap(
+                holder,
+                0,
+                CapSlot {
+                    cap: Cap::Task(old_oid),
+                    rights: Rights::ALL,
+                },
+            );
+            assert_eq!(
+                crate::supervisor::task_state(0),
+                -1,
+                "a stale task capability must be denied, never re-targeted"
+            );
+            assert_eq!(
+                crate::supervisor::task_kill(0),
+                -1,
+                "kill through a stale capability is refused"
+            );
+            // The same slot with the CURRENT identity resolves.
+            set_task_cap(
+                holder,
+                0,
+                CapSlot {
+                    cap: Cap::Task(crate::cap::Oid::new(0, 1)),
+                    rights: Rights::ALL,
+                },
+            );
+            assert_eq!(
+                crate::supervisor::task_state(0),
+                1,
+                "the live identity resolves"
+            );
+            core::ptr::write(core::ptr::addr_of_mut!(SPAWNED), 0);
+        }
     }
 }

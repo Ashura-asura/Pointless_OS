@@ -1809,7 +1809,10 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 sup,
                 0,
                 aegis_kernel::cap::CapSlot {
-                    cap: aegis_kernel::cap::Cap::Endpoint(aegis_kernel::ipc::NOTIFY_EP as u32),
+                    cap: aegis_kernel::cap::Cap::Endpoint(aegis_kernel::cap::Oid::new(
+                        aegis_kernel::ipc::NOTIFY_EP as u32,
+                        aegis_kernel::ipc::endpoint_generation(aegis_kernel::ipc::NOTIFY_EP as u32),
+                    )),
                     rights: aegis_kernel::cap::Rights::RECV,
                 },
             );
@@ -1820,7 +1823,9 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 sup,
                 1,
                 aegis_kernel::cap::CapSlot {
-                    cap: aegis_kernel::cap::Cap::Task(IDX_ISO_TEST as u32),
+                    cap: aegis_kernel::cap::Cap::Task(
+                        aegis_kernel::tasks::task_oid(IDX_ISO_TEST).unwrap(),
+                    ),
                     rights: aegis_kernel::cap::Rights::CONTROL
                         .union(aegis_kernel::cap::Rights::READ),
                 },
@@ -1833,7 +1838,9 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 sup,
                 2,
                 aegis_kernel::cap::CapSlot {
-                    cap: aegis_kernel::cap::Cap::Task(IDX_SERVICE as u32),
+                    cap: aegis_kernel::cap::Cap::Task(
+                        aegis_kernel::tasks::task_oid(IDX_SERVICE).unwrap(),
+                    ),
                     rights: aegis_kernel::cap::Rights::CONTROL
                         .union(aegis_kernel::cap::Rights::READ),
                 },
@@ -2066,9 +2073,12 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                         IDX_PARENT_SUP as usize,
                         0,
                         aegis_kernel::cap::CapSlot {
-                            cap: aegis_kernel::cap::Cap::Endpoint(
+                            cap: aegis_kernel::cap::Cap::Endpoint(aegis_kernel::cap::Oid::new(
                                 aegis_kernel::ipc::NOTIFY_EP as u32,
-                            ),
+                                aegis_kernel::ipc::endpoint_generation(
+                                    aegis_kernel::ipc::NOTIFY_EP as u32,
+                                ),
+                            )),
                             rights: aegis_kernel::cap::Rights::RECV,
                         },
                     );
@@ -2076,7 +2086,9 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                         IDX_PARENT_SUP as usize,
                         1,
                         aegis_kernel::cap::CapSlot {
-                            cap: aegis_kernel::cap::Cap::Task(IDX_ISO_TEST as u32),
+                            cap: aegis_kernel::cap::Cap::Task(
+                                aegis_kernel::tasks::task_oid(IDX_ISO_TEST).unwrap(),
+                            ),
                             rights: aegis_kernel::cap::Rights::CONTROL
                                 .union(aegis_kernel::cap::Rights::READ),
                         },

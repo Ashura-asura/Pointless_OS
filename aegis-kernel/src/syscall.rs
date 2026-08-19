@@ -85,8 +85,10 @@ pub const fn clamp_write_len(raw: u64) -> usize {
 /// Dispatch a system call.
 /// Returns -1 for unimplemented syscalls, 0 for Yield and Write success.
 ///
-/// `arg1`..`arg4` are the raw user-supplied arguments (pointers are
-/// NOT validated — the demo kernel maps the whole first 1 GB with U/S).
+/// `arg1`..`arg4` are the raw user-supplied arguments. Every pointer argument
+/// is validated against the caller's page tables by `user_ptr` before it is
+/// dereferenced (hostile-audit Phase 1 §4: a ring-3 buffer must be present,
+/// user-accessible, and — for writes — writable).
 /// Register layout: arg1=rsi, arg2=rcx, arg3=rdx, arg4=r8.
 pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
     let ret = dispatch_impl(num, arg1, arg2, arg3, arg4);
@@ -99,9 +101,18 @@ fn dispatch_impl(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
         0 => -1, // Exit — not implemented
         1 => {
             // Write: print arg2 bytes from the buffer at arg1 to COM1
-            // (and mirror them to the VGA text console).
-            let buf =
-                unsafe { core::slice::from_raw_parts(arg1 as *const u8, clamp_write_len(arg2)) };
+            // (and mirror them to the VGA text console). The whole range must
+            // pass the user-pointer gate first.
+            let len = clamp_write_len(arg2) as usize;
+            if !crate::user_ptr::validate_range(
+                crate::user_ptr::current_user_pml4(),
+                arg1,
+                len,
+                false,
+            ) {
+                return -1;
+            }
+            let buf = unsafe { core::slice::from_raw_parts(arg1 as *const u8, len) };
             let mut w = crate::serial::SerialWriter;
             w.write_bytes(buf);
             crate::vga::vga_write_bytes(buf);

@@ -161,8 +161,13 @@ pub fn role_grant(role_id: u64, grantee: u64, target: u64, dst_slot: u64) -> i64
         }
     };
     // Bounds-check both tables before touching either (a malformed argument
-    // must be refused, never a panic).
-    if (grantee as usize) >= MAX_TASKS || (dst_slot as usize) >= MAX_CAPS {
+    // must be refused, never a panic). `target` too: it names a task table
+    // slot, and a stale or out-of-range target must never be minted into a
+    // capability.
+    if (grantee as usize) >= MAX_TASKS
+        || (dst_slot as usize) >= MAX_CAPS
+        || (target as usize) >= MAX_TASKS
+    {
         crate::audit::record(
             cur,
             crate::audit::OpKind::RoleGrant,
@@ -187,9 +192,17 @@ pub fn role_grant(role_id: u64, grantee: u64, target: u64, dst_slot: u64) -> i64
     };
     let authorized = (0..MAX_CAPS).any(|s| match task_cap(cur, s) {
         CapSlot {
-            cap: Cap::Task(t),
+            cap: Cap::Task(t_oid),
             rights,
-        } => t as usize == target as usize && rights.contains(required),
+        } => {
+            // The cap must name the target AND still be live (the generation
+            // must match the task that currently occupies the slot): a stale
+            // capability minted against a previous occupant of `target`'s
+            // index must not authorize a grant over whoever lives there now.
+            t_oid.index as usize == target as usize
+                && crate::tasks::task_generation(target as usize) == t_oid.generation
+                && rights.contains(required)
+        }
         _ => false,
     });
     if !authorized {
@@ -208,7 +221,7 @@ pub fn role_grant(role_id: u64, grantee: u64, target: u64, dst_slot: u64) -> i64
         // kernel mints the socket itself, bound to the one host it declares.
         // The agent has no code path that could choose a different
         // destination, because there is no argument here for it to supply.
-        let Some(id) = crate::netif::open_advisor_endpoint() else {
+        let Some(oid) = crate::netif::open_advisor_endpoint() else {
             crate::audit::record(
                 cur,
                 crate::audit::OpKind::RoleGrant,
@@ -221,16 +234,28 @@ pub fn role_grant(role_id: u64, grantee: u64, target: u64, dst_slot: u64) -> i64
             grantee as usize,
             dst_slot as usize,
             CapSlot {
-                cap: Cap::NetEndpoint(id as u32),
+                cap: Cap::NetEndpoint(oid),
                 rights: role.rights,
             },
         );
     } else {
+        // Mint the grantee's capability against the CURRENT identity of the
+        // target slot (bounds-checked above): the grantee must name the task
+        // that is actually there, with a live generation.
+        let Some(oid) = crate::tasks::task_oid(target as usize) else {
+            crate::audit::record(
+                cur,
+                crate::audit::OpKind::RoleGrant,
+                Some(target as u32),
+                false,
+            );
+            return -1;
+        };
         set_task_cap(
             grantee as usize,
             dst_slot as usize,
             CapSlot {
-                cap: Cap::Task(target as u32),
+                cap: Cap::Task(oid),
                 rights: role.rights,
             },
         );
@@ -290,7 +315,7 @@ mod tests {
                 grantor,
                 0,
                 CapSlot {
-                    cap: Cap::Task(svc as u32),
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
                     rights: Rights::READ.union(Rights::CONTROL),
                 },
             );
@@ -302,7 +327,7 @@ mod tests {
             // The grantee's slot 0 is exactly the role's set: Task(svc) with
             // READ|CONTROL and no GRANT.
             let got = task_cap(agent, 0);
-            assert_eq!(got.cap, Cap::Task(svc as u32));
+            assert_eq!(got.cap, Cap::Task(crate::cap::Oid::new(svc as u32, 0)));
             assert!(got.rights.contains(Rights::READ));
             assert!(got.rights.contains(Rights::CONTROL));
             assert!(!got.rights.contains(Rights::GRANT), "role never grants");
@@ -348,7 +373,7 @@ mod tests {
                 grantor,
                 0,
                 CapSlot {
-                    cap: Cap::Task(svc as u32),
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
                     rights: Rights::READ.union(Rights::CONTROL),
                 },
             );
@@ -379,7 +404,7 @@ mod tests {
                 agent,
                 1,
                 CapSlot {
-                    cap: Cap::Task(other as u32),
+                    cap: Cap::Task(crate::cap::Oid::new(other as u32, 0)),
                     rights: Rights::READ,
                 },
             );
@@ -448,7 +473,7 @@ mod tests {
                 grantor,
                 0,
                 CapSlot {
-                    cap: Cap::Task(svc as u32),
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
                     rights: Rights::READ,
                 },
             );
@@ -460,7 +485,7 @@ mod tests {
             // The grantee's slot 0 is exactly the role's set: Task(svc) with
             // READ only, no CONTROL, no GRANT.
             let got = task_cap(agent, 0);
-            assert_eq!(got.cap, Cap::Task(svc as u32));
+            assert_eq!(got.cap, Cap::Task(crate::cap::Oid::new(svc as u32, 0)));
             assert!(got.rights.contains(Rights::READ));
             assert!(
                 !got.rights.contains(Rights::CONTROL),
@@ -504,7 +529,7 @@ mod tests {
                 grantor,
                 0,
                 CapSlot {
-                    cap: Cap::Task(svc as u32),
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
                     rights: Rights::READ,
                 },
             );
@@ -569,7 +594,7 @@ mod tests {
                 grantor,
                 0,
                 CapSlot {
-                    cap: Cap::Task(svc as u32),
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
                     rights: Rights::READ.union(Rights::CONTROL),
                 },
             );
@@ -604,7 +629,7 @@ mod tests {
             );
             // No capability ever landed.
             assert_eq!(task_cap(agent, 0).cap, Cap::None);
-            assert_eq!(task_cap(grantor, 0).cap, Cap::Task(svc as u32));
+            assert_eq!(task_cap(grantor, 0).cap, Cap::Task(crate::cap::Oid::new(svc as u32, 0)));
         }
     }
 
@@ -630,7 +655,7 @@ mod tests {
                 grantor,
                 0,
                 CapSlot {
-                    cap: Cap::Task(svc as u32),
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
                     rights: Rights::READ,
                 },
             );
@@ -656,7 +681,7 @@ mod tests {
             // kernel-declared advisor host — not `svc`, not anything the
             // grantor or agent named.
             assert_eq!(
-                crate::netif::socket_remote(id as u16),
+                crate::netif::socket_remote(id.index as u16),
                 Some((
                     crate::netif::ADVISOR_HOST_IP,
                     crate::netif::ADVISOR_HOST_PORT
@@ -685,7 +710,7 @@ mod tests {
                 grantor,
                 0,
                 CapSlot {
-                    cap: Cap::Task(svc as u32),
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
                     rights: Rights::READ,
                 },
             );
@@ -704,7 +729,7 @@ mod tests {
             //    binding recorded on the live socket is still exactly the
             //    advisor host, unchanged, after the agent holds the cap.
             assert_eq!(
-                crate::netif::socket_remote(net_id as u16),
+                crate::netif::socket_remote(net_id.index as u16),
                 Some((
                     crate::netif::ADVISOR_HOST_IP,
                     crate::netif::ADVISOR_HOST_PORT

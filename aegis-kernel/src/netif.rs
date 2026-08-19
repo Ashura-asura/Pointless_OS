@@ -126,6 +126,11 @@ pub enum TcpState {
 /// count is bounded by the congestion window.
 pub struct Socket {
     pub id: u16,
+    /// Identity generation of this socket. Bumped by `socket_open` on every
+    /// open; a `NetEndpoint` capability carries it, so a stale capability
+    /// (minted against a previously closed socket whose id a later open
+    /// re-issued after the u16 counter wraps) fails resolution.
+    pub generation: u32,
     pub kind: SockKind,
     pub state: TcpState,
     /// The capability-scoped destination this socket was minted for.
@@ -157,6 +162,9 @@ pub struct NetIf {
     pub gw_ip: [u8; 4],
     pub arp: ArpTable,
     sockets: [Option<Socket>; MAX_SOCKETS],
+    /// Per-array-slot identity generations, kept across close/open so a
+    /// re-opened socket can never inherit the previous occupant's identity.
+    socket_gens: [u32; MAX_SOCKETS],
     next_socket: u16,
     next_local_port: u16,
     /// The stack's monotonic software clock (poll counter).
@@ -172,6 +180,7 @@ impl NetIf {
             gw_ip: GW_IP,
             arp: ArpTable::new(),
             sockets: [const { None }; MAX_SOCKETS],
+            socket_gens: [0; MAX_SOCKETS],
             next_socket: 1,
             next_local_port: 40000,
             polls: 0,
@@ -790,6 +799,17 @@ impl NetIf {
             .position(|s| s.as_ref().is_some_and(|sock| sock.id == id))
     }
 
+    /// Index of the live socket carrying the full identity `oid` (index AND
+    /// generation), or `None`. This is the authoritative capability resolve:
+    /// a stale or forged `NetEndpoint` capability whose generation no longer
+    /// matches the live socket is denied here, never re-targeted.
+    fn socket_index_oid(&self, oid: crate::cap::Oid) -> Option<usize> {
+        self.sockets.iter().position(|s| {
+            s.as_ref()
+                .is_some_and(|sock| sock.id == oid.index as u16 && sock.generation == oid.generation)
+        })
+    }
+
     /// The destination a socket is bound to — its capability scope — if the
     /// socket still exists. There is no corresponding setter: a socket's
     /// binding is fixed at `socket_open` and nothing in this module ever
@@ -831,10 +851,22 @@ impl NetIf {
         remote_ip: [u8; 4],
         remote_port: u16,
         local_port: Option<u16>,
-    ) -> Option<(u16, u16)> {
+    ) -> Option<(u16, u16, u32)> {
         let i = self.sockets.iter().position(|s| s.is_none())?;
         let id = self.next_socket;
+        // A capability must name exactly one socket: refuse an id that would
+        // collide with a live socket (the u16 counter can wrap after 65,536
+        // opens). Generation-safety for the wrap is belt-and-suspenders on
+        // top of this — an id is never minted onto a live socket.
+        if self.sockets.iter().flatten().any(|s| s.id == id) {
+            return None;
+        }
         self.next_socket = self.next_socket.wrapping_add(1);
+        // A new socket is a NEW identity for this array slot: bump the slot's
+        // generation so no capability minted against a previously closed
+        // occupant can resolve to this socket.
+        let generation = self.socket_gens[i].wrapping_add(1);
+        self.socket_gens[i] = generation;
         let local_port = match local_port {
             Some(p) => p,
             None => {
@@ -845,6 +877,7 @@ impl NetIf {
         };
         self.sockets[i] = Some(Socket {
             id,
+            generation,
             kind,
             state: TcpState::Closed,
             bound_ip: remote_ip,
@@ -867,7 +900,7 @@ impl NetIf {
             connected: false,
             peer_fin: false,
         });
-        Some((id, local_port))
+        Some((id, local_port, generation))
     }
 
     /// Connect a TCP socket: resolve the peer, send SYN, enter SYN-SENT.
@@ -1078,11 +1111,12 @@ fn seq_ge(a: u32, b: u32) -> bool {
 /// destination. This is the mint path `role::role_grant` uses for the
 /// `query-advisor` role — the agent never calls `sys_net_socket` itself for
 /// this capability, so it never gets to name the destination. Returns the new
-/// socket id, or `None` if the socket table is full.
-pub fn open_advisor_endpoint() -> Option<u16> {
+/// socket's full identity (index + generation), or `None` if the socket table
+/// is full.
+pub fn open_advisor_endpoint() -> Option<crate::cap::Oid> {
     unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }
         .socket_open(SockKind::Tcp, ADVISOR_HOST_IP, ADVISOR_HOST_PORT, None)
-        .map(|(id, _local_port)| id)
+        .map(|(id, _local_port, generation)| crate::cap::Oid::new(id as u32, generation))
 }
 
 /// The live destination bound to socket `id` on the shared kernel netif, if
@@ -1205,7 +1239,7 @@ pub unsafe fn sys_net_socket(kind: u64, ip_packed: u64, port: u64) -> i64 {
         record(false);
         return -1;
     };
-    let Some((id, _lp)) = netif.socket_open(kind, ip, port as u16, None) else {
+    let Some((id, _lp, generation)) = netif.socket_open(kind, ip, port as u16, None) else {
         record(false);
         return -1;
     };
@@ -1213,7 +1247,7 @@ pub unsafe fn sys_net_socket(kind: u64, ip_packed: u64, port: u64) -> i64 {
         cur,
         slot,
         CapSlot {
-            cap: Cap::NetEndpoint(id as u32),
+            cap: Cap::NetEndpoint(crate::cap::Oid::new(id as u32, generation)),
             rights: NET_RIGHTS,
         },
     );
@@ -1238,12 +1272,12 @@ pub unsafe fn sys_net_connect(slot: u64) -> i64 {
         return -1;
     }
     let cap = crate::tasks::task_cap(cur, slot as usize);
-    let Cap::NetEndpoint(id) = cap.cap else {
+    let Cap::NetEndpoint(oid) = cap.cap else {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
         return -1;
     };
     if !cap.rights.contains(Rights::SEND) {
-        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
         return -1;
     }
     let netif = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) };
@@ -1251,11 +1285,17 @@ pub unsafe fn sys_net_connect(slot: u64) -> i64 {
     // (SYN goes out over the wire), and no NIC means no wire. The distinct
     // error lets a caller treat "offline" differently from "denied".
     if !netif.is_online() {
-        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
         return ERR_NET_OFFLINE;
     }
-    let ok = netif.tcp_connect(id as u16);
-    crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), ok);
+    // Generation-safe resolve: a stale or forged socket capability names no
+    // live socket and is denied, never re-targeted.
+    if netif.socket_index_oid(oid).is_none() {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
+        return -1;
+    }
+    let ok = netif.tcp_connect(oid.index as u16);
+    crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), ok);
     if ok {
         0
     } else {
@@ -1279,25 +1319,42 @@ pub unsafe fn sys_net_send(slot: u64, va: u64, len: u64) -> i64 {
         return -1;
     }
     let cap = crate::tasks::task_cap(cur, slot as usize);
-    let Cap::NetEndpoint(id) = cap.cap else {
+    let Cap::NetEndpoint(oid) = cap.cap else {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
         return -1;
     };
     if !cap.rights.contains(Rights::SEND) {
-        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
         return -1;
     }
     // Fail closed with no NIC: `socket_send` transmits immediately (TCP flush
     // / UDP datagram) and would hit `nic_mut()`'s panic. Distinct offline
     // error, same as every other gate.
     if !unsafe { &*core::ptr::addr_of!(NETIF) }.is_online() {
-        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
         return ERR_NET_OFFLINE;
     }
     let len = core::cmp::min(len as usize, 2048);
+    // The message source is a caller buffer: approve the whole range through
+    // the user-pointer gate before reading a single byte.
+    if !crate::user_ptr::validate_range(
+        crate::user_ptr::current_user_pml4(),
+        va,
+        len,
+        false,
+    ) {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
+        return -1;
+    }
     let data = core::slice::from_raw_parts(va as *const u8, len);
-    let n = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_send(id as u16, data);
-    crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), n > 0);
+    let netif = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) };
+    // Generation-safe resolve: a stale or forged socket capability is denied.
+    if netif.socket_index_oid(oid).is_none() {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
+        return -1;
+    }
+    let n = netif.socket_send(oid.index as u16, data);
+    crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), n > 0);
     n as i64
 }
 
@@ -1317,29 +1374,46 @@ pub unsafe fn sys_net_recv(slot: u64, va: u64, len: u64) -> i64 {
         return -1;
     }
     let cap = crate::tasks::task_cap(cur, slot as usize);
-    let Cap::NetEndpoint(id) = cap.cap else {
+    let Cap::NetEndpoint(oid) = cap.cap else {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
         return -1;
     };
     if !cap.rights.contains(Rights::RECV) {
-        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
         return -1;
     }
     // Fail closed with no NIC: there is no wire to receive from, so an
     // authorized poll on a live NIC-less stack returns a distinct offline
     // error instead of a spurious 0/empty read.
     if !unsafe { &*core::ptr::addr_of!(NETIF) }.is_online() {
-        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
         return ERR_NET_OFFLINE;
     }
     let len = core::cmp::min(len as usize, 2048);
+    // Approve the whole destination buffer through the user-pointer gate
+    // (present, user-accessible, writable) before `socket_recv` writes a byte.
+    if !crate::user_ptr::validate_range(
+        crate::user_ptr::current_user_pml4(),
+        va,
+        len,
+        true,
+    ) {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
+        return -1;
+    }
     let out = core::slice::from_raw_parts_mut(va as *mut u8, len);
-    let result = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_recv(id as u16, out);
+    let netif = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) };
+    // Generation-safe resolve: a stale or forged socket capability is denied.
+    if netif.socket_index_oid(oid).is_none() {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
+        return -1;
+    }
+    let result = netif.socket_recv(oid.index as u16, out);
     // Both `Some(n)` and `None` (no bytes currently buffered) are an
     // authorized, successful poll of a cap the caller legitimately holds —
     // the syscall itself never returns an error code here, so the audit
     // record agrees: `ok=true` whenever the capability gate above passed.
-    crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), true);
+    crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), true);
     match result {
         Some(n) => n as i64,
         None => 0,
@@ -1362,19 +1436,25 @@ pub unsafe fn sys_net_close(slot: u64) -> i64 {
         return -1;
     }
     let cap = crate::tasks::task_cap(cur, slot as usize);
-    let Cap::NetEndpoint(id) = cap.cap else {
+    let Cap::NetEndpoint(oid) = cap.cap else {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, None, false);
         return -1;
     };
     // Fail closed with no NIC, same as every other net gate: nothing to close
     // on a wire that doesn't exist. Distinct offline error.
     if !unsafe { &*core::ptr::addr_of!(NETIF) }.is_online() {
-        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), false);
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
         return ERR_NET_OFFLINE;
     }
-    let ok = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) }.socket_close(id as u16);
+    let netif = unsafe { &mut *core::ptr::addr_of_mut!(NETIF) };
+    // Generation-safe resolve: a stale or forged socket capability is denied.
+    if netif.socket_index_oid(oid).is_none() {
+        crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
+        return -1;
+    }
+    let ok = netif.socket_close(oid.index as u16);
     crate::tasks::set_task_cap(cur, slot as usize, CapSlot::empty());
-    crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(id), ok);
+    crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), ok);
     if ok {
         0
     } else {
@@ -1561,12 +1641,50 @@ mod tests {
         );
     }
 
+    /// Kernel-boundary hardening (hostile-audit Phase 1, ObjectID): a socket
+    /// capability minted against a closed socket must never name a NEW socket
+    /// that reuses the same slot — the slot's generation bumps on every open,
+    /// so a stale handle is denied, not re-targeted.
+    #[test]
+    fn stale_socket_cap_denied_after_close_and_reopen() {
+        let _g = crate::kernel_state_guard();
+        let mut net = setup();
+        let (id, _lp, gen) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
+        let old_oid = crate::cap::Oid::new(id as u32, gen);
+        assert!(
+            net.socket_index_oid(old_oid).is_some(),
+            "the live handle resolves"
+        );
+        // Close: the socket dies, and the slot is reusable.
+        assert!(net.socket_close(id));
+        assert!(
+            net.socket_index_oid(old_oid).is_none(),
+            "a closed socket's identity no longer resolves"
+        );
+        // Reopen: the fresh socket gets a bumped generation on its slot, so
+        // even a counter collision can never make the stale cap name it.
+        let (id2, _lp2, gen2) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
+        assert!(
+            net.socket_index_oid(crate::cap::Oid::new(id2 as u32, gen2))
+                .is_some(),
+            "the new socket resolves under its own identity"
+        );
+        assert!(
+            net.socket_index_oid(old_oid).is_none(),
+            "the stale cap can never name the replacement"
+        );
+        assert!(
+            net.socket_index_oid(crate::cap::Oid::new(id2 as u32, gen)).is_none(),
+            "the replacement is a new identity, not a stale generation"
+        );
+    }
+
     #[test]
     fn tcp_handshake_syn_ack_establishes() {
         let _g = crate::kernel_state_guard();
         clear_tx();
         let mut net = setup();
-        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
+        let (id, _lp, _g) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
         assert!(net.tcp_connect(id));
         assert_eq!(net.sockets[0].as_ref().unwrap().state, TcpState::SynSent);
         // The SYN went out: eth + ipv4 + tcp, SYN set, ACK clear.
@@ -1604,7 +1722,7 @@ mod tests {
         let _g = crate::kernel_state_guard();
         clear_tx();
         let mut net = setup();
-        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
+        let (id, _lp, _g) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
         assert!(net.tcp_connect(id));
         assert_eq!(tx_log().len(), 1);
         net.advance(RTO_POLLS - 1);
@@ -1619,7 +1737,7 @@ mod tests {
         let _g = crate::kernel_state_guard();
         clear_tx();
         let mut net = setup();
-        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
+        let (id, _lp, _g) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
         assert!(net.tcp_connect(id));
         let frames = tx_log();
         let seg = TcpSegment::parse(&frames[0][34..], None, None).unwrap();
@@ -1670,7 +1788,7 @@ mod tests {
         let _g = crate::kernel_state_guard();
         clear_tx();
         let mut net = setup();
-        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
+        let (id, _lp, _g) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
         assert!(net.tcp_connect(id));
         let frames = tx_log();
         let seg = TcpSegment::parse(&frames[0][34..], None, None).unwrap();
@@ -1717,7 +1835,7 @@ mod tests {
         let _g = crate::kernel_state_guard();
         clear_tx();
         let mut net = setup();
-        let (id, _lp) = net.socket_open(SockKind::Udp, GW_IP, 9999, None).unwrap();
+        let (id, _lp, _g) = net.socket_open(SockKind::Udp, GW_IP, 9999, None).unwrap();
         assert_eq!(net.socket_send(id, b"ping"), 4);
         let frames = tx_log();
         let d = UdpDatagram::parse(&frames[0][34..], None, None).unwrap();
@@ -1755,7 +1873,7 @@ mod tests {
         let _g = crate::kernel_state_guard();
         clear_tx();
         let mut net = setup();
-        let (id, _lp) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
+        let (id, _lp, _g) = net.socket_open(SockKind::Tcp, GW_IP, 8080, None).unwrap();
         assert!(net.tcp_connect(id));
         let frames = tx_log();
         let seg = TcpSegment::parse(&frames[0][34..], None, None).unwrap();

@@ -25,7 +25,7 @@ pub const MAX_PORTS: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Port {
     port: u16,
-    channel: u32,
+    channel: crate::cap::Oid,
     svc_slot: u64,
 }
 
@@ -60,7 +60,7 @@ impl Netstack {
             return None;
         }
         let channel = match crate::tasks::task_cap(self.svc, slot as usize).cap {
-            Cap::Channel(id) => id,
+            Cap::Channel(oid) => oid,
             _ => return None,
         };
         let free = (0..crate::tasks::MAX_CAPS)

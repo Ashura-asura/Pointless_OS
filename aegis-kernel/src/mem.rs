@@ -24,6 +24,12 @@ pub use crate::cap::MEM_RIGHTS;
 #[derive(Clone, Copy)]
 struct MemRegion {
     active: bool,
+    /// Identity generation of this slot. `claim_region`/`mem_create` bump it
+    /// on every claim so a capability minted against a previous incarnation of
+    /// this index cannot resolve to the replacement (generation-safe identity;
+    /// regions have no destroy syscall today, but the identity must not be
+    /// re-openable by a future one).
+    generation: u32,
     /// Physical base of the first frame backing the region.
     base: u64,
     /// Size in bytes (always a multiple of the page size).
@@ -32,9 +38,25 @@ struct MemRegion {
 
 static mut REGIONS: [MemRegion; MAX_REGIONS] = [MemRegion {
     active: false,
+    generation: 0,
     base: 0,
     len: 0,
 }; MAX_REGIONS];
+
+/// Identity generation of the region currently occupying index `id`.
+/// Bounds-guarded: an out-of-range index yields `u32::MAX`, which no
+/// capability's generation can equal, so every resolve fails closed.
+pub fn region_generation(id: u32) -> u32 {
+    if (id as usize) >= MAX_REGIONS {
+        return u32::MAX;
+    }
+    unsafe {
+        let p = core::ptr::addr_of_mut!(REGIONS)
+            .cast::<MemRegion>()
+            .add(id as usize);
+        core::ptr::read(p).generation
+    }
+}
 
 /// Read region `id` into a local copy. Works through raw pointers so we never
 /// form a (potentially dangling) shared reference to the `static mut` — that
@@ -59,12 +81,15 @@ fn set_region(id: usize, r: MemRegion) {
     }
 }
 
-/// Release region `id` (no longer backed, slot reusable).
+/// Release region `id` (no longer backed, slot reusable). The generation is
+/// preserved so a later `claim_region` bumps it and stale capabilities fail.
 fn clear_region(id: usize) {
+    let generation = region_generation(id as u32);
     set_region(
         id,
         MemRegion {
             active: false,
+            generation,
             base: 0,
             len: 0,
         },
@@ -87,10 +112,13 @@ pub(crate) fn region_base_len(id: u32) -> Option<(u64, usize)> {
 /// region table is full.
 pub(crate) unsafe fn claim_region(base: u64, len: usize) -> Option<u32> {
     let id = (0..MAX_REGIONS).find(|&i| region(i).map(|r| !r.active).unwrap_or(false))?;
+    // A claim mints a NEW identity for this index: bump the generation.
+    let generation = region_generation(id as u32).wrapping_add(1);
     set_region(
         id,
         MemRegion {
             active: true,
+            generation,
             base,
             len,
         },
@@ -116,9 +144,14 @@ fn caps_region(cur: usize, slot: u64, need: Rights) -> Option<usize> {
     }
     match task_cap(cur, slot as usize) {
         CapSlot {
-            cap: Cap::MemRegion(id),
+            cap: Cap::MemRegion(oid),
             rights,
-        } if rights.contains(need) && (id as usize) < MAX_REGIONS => Some(id as usize),
+        } if rights.contains(need)
+            && (oid.index as usize) < MAX_REGIONS
+            && region_generation(oid.index) == oid.generation =>
+        {
+            Some(oid.index as usize)
+        }
         _ => None,
     }
 }
@@ -144,10 +177,13 @@ pub unsafe fn mem_create(frames: u64) -> i64 {
         Some(b) => b,
         None => return -1,
     };
+    // A create mints a NEW identity for this index: bump the generation.
+    let generation = region_generation(id as u32).wrapping_add(1);
     set_region(
         id,
         MemRegion {
             active: true,
+            generation,
             base,
             len: frames as usize * crate::frame::PAGE_SIZE as usize,
         },
@@ -165,7 +201,7 @@ pub unsafe fn mem_create(frames: u64) -> i64 {
         cur,
         slot,
         CapSlot {
-            cap: Cap::MemRegion(id as u32),
+            cap: Cap::MemRegion(crate::cap::Oid::new(id as u32, generation)),
             rights: MEM_RIGHTS,
         },
     );
@@ -230,11 +266,13 @@ pub unsafe fn mem_read(slot: u64, offset: u64, len: u64, dst_va: u64) -> i64 {
         crate::audit::record(cur, AuditedOp::MemRead, Some(id as u32), false);
         return -1;
     }
-    core::ptr::copy_nonoverlapping(
-        (r.base + offset) as *const u8,
-        dst_va as *mut u8,
-        len as usize,
-    );
+    // The read target is a caller buffer: it must pass the user-pointer gate
+    // (present, user-accessible, writable) before a single byte is written.
+    let src = core::slice::from_raw_parts((r.base + offset) as *const u8, len as usize);
+    if !crate::user_ptr::copy_to_user(crate::user_ptr::current_user_pml4(), dst_va, src) {
+        crate::audit::record(cur, AuditedOp::MemRead, Some(id as u32), false);
+        return -1;
+    }
     crate::audit::record(cur, AuditedOp::MemRead, Some(id as u32), true);
     len as i64
 }
@@ -273,9 +311,13 @@ pub unsafe fn mem_write(slot: u64, offset: u64, len: u64, src_va: u64) -> i64 {
         crate::audit::record(cur, AuditedOp::MemWrite, Some(id as u32), false);
         return -1;
     }
-    let dst = (r.base + offset) as *mut u8;
-    let src = src_va as *const u8;
-    core::ptr::copy_nonoverlapping(src, dst, len as usize);
+    // The write source is a caller buffer: it must pass the user-pointer gate
+    // (present, user-accessible) before a single byte is read.
+    let dst = core::slice::from_raw_parts_mut((r.base + offset) as *mut u8, len as usize);
+    if !crate::user_ptr::copy_from_user(crate::user_ptr::current_user_pml4(), dst, src_va) {
+        crate::audit::record(cur, AuditedOp::MemWrite, Some(id as u32), false);
+        return -1;
+    }
     crate::audit::record(cur, AuditedOp::MemWrite, Some(id as u32), true);
     0
 }
@@ -294,7 +336,7 @@ mod tests {
             idx,
             slot,
             CapSlot {
-                cap: Cap::MemRegion(id as u32),
+                cap: Cap::MemRegion(crate::cap::Oid::new(id as u32, 0)),
                 rights,
             },
         );
@@ -302,6 +344,7 @@ mod tests {
             id,
             MemRegion {
                 active: true,
+                generation: 0,
                 base,
                 len,
             },
@@ -451,7 +494,7 @@ mod tests {
             1,
             0,
             CapSlot {
-                cap: Cap::Endpoint(3),
+                cap: Cap::Endpoint(crate::cap::Oid::new(3, 0)),
                 rights: Rights::ALL,
             },
         );
@@ -459,7 +502,7 @@ mod tests {
             1,
             1,
             CapSlot {
-                cap: Cap::Task(4),
+                cap: Cap::Task(crate::cap::Oid::new(4, 0)),
                 rights: Rights::ALL,
             },
         );

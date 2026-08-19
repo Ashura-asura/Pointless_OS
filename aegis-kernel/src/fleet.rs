@@ -161,11 +161,11 @@ impl TokenObjectKind {
 pub fn kind_and_id(cap: Cap) -> Option<(TokenObjectKind, u32)> {
     match cap {
         Cap::None | Cap::NetRoot | Cap::Vm(_) | Cap::VmRoot => None,
-        Cap::Endpoint(id) => Some((TokenObjectKind::Endpoint, id)),
-        Cap::Task(id) => Some((TokenObjectKind::Task, id)),
-        Cap::MemRegion(id) => Some((TokenObjectKind::MemRegion, id)),
-        Cap::Channel(id) => Some((TokenObjectKind::Channel, id)),
-        Cap::NetEndpoint(id) => Some((TokenObjectKind::NetEndpoint, id)),
+        Cap::Endpoint(id) => Some((TokenObjectKind::Endpoint, id.index)),
+        Cap::Task(id) => Some((TokenObjectKind::Task, id.index)),
+        Cap::MemRegion(id) => Some((TokenObjectKind::MemRegion, id.index)),
+        Cap::Channel(id) => Some((TokenObjectKind::Channel, id.index)),
+        Cap::NetEndpoint(id) => Some((TokenObjectKind::NetEndpoint, id.index)),
     }
 }
 
@@ -828,7 +828,7 @@ pub fn open_link(peer_ip: [u8; 4]) -> Option<u16> {
                 FLEET_PORT,
                 Some(FLEET_PORT),
             )
-            .map(|(id, _local_port)| id)
+            .map(|(id, _local_port, _generation)| id)
         })
     }
 }

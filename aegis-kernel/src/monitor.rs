@@ -348,7 +348,7 @@ mod tests {
                 agent,
                 0,
                 CapSlot {
-                    cap: Cap::Task(svc as u32),
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
                     rights: Rights::READ,
                 },
             );
@@ -356,7 +356,7 @@ mod tests {
                 agent,
                 1,
                 CapSlot {
-                    cap: Cap::Task(svc as u32),
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
                     rights: Rights::GRANT,
                 },
             );
@@ -406,7 +406,10 @@ mod tests {
             // But the grant flow is frozen: a suspended agent cannot delegate
             // new authority, and its existing cap is untouched.
             assert_eq!(ipc_cap_grant(0, 1, 5), -1);
-            assert_eq!(task_cap(agent, 0).cap, Cap::Task(svc as u32));
+            assert_eq!(
+                task_cap(agent, 0).cap,
+                Cap::Task(crate::cap::Oid::new(svc as u32, 0))
+            );
         }
     }
 
@@ -426,7 +429,7 @@ mod tests {
                 agent,
                 0,
                 CapSlot {
-                    cap: Cap::Task(svc as u32),
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
                     rights: Rights::READ,
                 },
             );
@@ -434,7 +437,7 @@ mod tests {
                 agent,
                 1,
                 CapSlot {
-                    cap: Cap::Task(svc as u32),
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
                     rights: Rights::GRANT,
                 },
             );

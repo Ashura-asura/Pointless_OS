@@ -550,11 +550,16 @@ impl Store {
         let loc = self.blocks.iter().flatten().find(|b| b.id == *id)?;
         let free = (0..crate::tasks::MAX_CAPS)
             .find(|&s| crate::tasks::task_cap(recipient, s).cap == Cap::None)?;
+        // Mint against the region's CURRENT identity generation so the grant
+        // always names the live region, never a stale occupant of its index.
         crate::tasks::set_task_cap(
             recipient,
             free,
             CapSlot {
-                cap: Cap::MemRegion(loc.region),
+                cap: Cap::MemRegion(crate::cap::Oid::new(
+                    loc.region,
+                    crate::mem::region_generation(loc.region),
+                )),
                 rights: Rights::READ,
             },
         );

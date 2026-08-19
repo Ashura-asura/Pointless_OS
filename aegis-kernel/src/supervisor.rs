@@ -36,9 +36,14 @@ fn caps_task(cur: usize, slot: u64, need: Rights) -> Option<usize> {
     }
     match task_cap(cur, slot as usize) {
         CapSlot {
-            cap: Cap::Task(idx),
+            cap: Cap::Task(oid),
             rights,
-        } if rights.contains(need) && (idx as usize) < MAX_TASKS_TABLE => Some(idx as usize),
+        } if rights.contains(need)
+            && (oid.index as usize) < MAX_TASKS_TABLE
+            && crate::tasks::task_generation(oid.index as usize) == oid.generation =>
+        {
+            Some(oid.index as usize)
+        }
         _ => None,
     }
 }
@@ -418,7 +423,7 @@ mod tests {
             grantor,
             0,
             CapSlot {
-                cap: Cap::Task(target as u32),
+                cap: Cap::Task(crate::cap::Oid::new(target as u32, 0)),
                 rights: Rights::READ.union(Rights::GRANT),
             },
         );
@@ -453,7 +458,7 @@ mod tests {
             grantor,
             1,
             CapSlot {
-                cap: Cap::Task(target as u32),
+                cap: Cap::Task(crate::cap::Oid::new(target as u32, 0)),
                 rights: Rights::READ,
             },
         );
@@ -483,7 +488,7 @@ mod tests {
             grantor,
             0,
             CapSlot {
-                cap: Cap::Task(target as u32),
+                cap: Cap::Task(crate::cap::Oid::new(target as u32, 0)),
                 rights: Rights::READ,
             },
         );
@@ -498,7 +503,7 @@ mod tests {
             grantor,
             1,
             CapSlot {
-                cap: Cap::Task(target as u32),
+                cap: Cap::Task(crate::cap::Oid::new(target as u32, 0)),
                 rights: Rights::CONTROL,
             },
         );
