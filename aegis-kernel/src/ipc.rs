@@ -356,7 +356,10 @@ pub unsafe fn ipc_call(ep_slot: u64, msg_va: u64, len: u64, reply_va: u64) -> i6
     crate::sprintln!("Aegis: ipc_call cur={} ep_slot={}", cur, ep_slot);
     let ep = match caps_endpoint(cur, ep_slot, Rights::SEND) {
         Some(e) => e,
-        None => return -1,
+        None => {
+            crate::audit::record(cur, crate::audit::OpKind::Send, None, false);
+            return -1;
+        }
     };
     let len = core::cmp::min(len as usize, IPC_BUF);
     if !copy_in(crate::user_ptr::current_user_pml4(), msg_va, &mut ENDPOINTS[ep].buf[..len]) {
@@ -445,7 +448,10 @@ pub unsafe fn ipc_serve(ep_slot: u64, recvbuf_va: u64) -> i64 {
     crate::sprintln!("Aegis: ipc_serve cur={} ep_slot={}", cur, ep_slot);
     let ep = match caps_endpoint(cur, ep_slot, Rights::RECV) {
         Some(e) => e,
-        None => return -1,
+        None => {
+            crate::audit::record(cur, crate::audit::OpKind::Recv, None, false);
+            return -1;
+        }
     };
     match ENDPOINTS[ep].state {
         EpState::SendWaiting => {
@@ -500,7 +506,10 @@ pub unsafe fn ipc_reply(ep_slot: u64, caller_id: u64, reply_va: u64, rlen: u64) 
     let cur = current_idx();
     let ep = match caps_endpoint(cur, ep_slot, Rights::RECV) {
         Some(e) => e,
-        None => return -1,
+        None => {
+            crate::audit::record(cur, crate::audit::OpKind::Send, None, false);
+            return -1;
+        }
     };
     let caller = caller_id as usize;
     // The caller index is a ring-3 argument (the server echoes back the value

@@ -110,6 +110,12 @@ fn dispatch_impl(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
                 len,
                 false,
             ) {
+                crate::audit::record(
+                    crate::tasks::current_idx(),
+                    crate::audit::OpKind::Write,
+                    None,
+                    false,
+                );
                 return -1;
             }
             let buf = unsafe { core::slice::from_raw_parts(arg1 as *const u8, len) };

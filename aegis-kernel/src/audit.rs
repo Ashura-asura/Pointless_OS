@@ -56,11 +56,17 @@ pub enum OpKind {
     /// makes the `query-advisor` "the audit log attributes everything"
     /// claim actually true end to end, not just at the `RoleGrant` step.
     NetIo,
+    /// `syscall` Write gate refusal (the ring-3 `Write` pointer-gate: a
+    /// buffer that fails `user_ptr::validate_range`). Recorded on refusal
+    /// only — a successful debug-print is not a security event and would
+    /// flood the bounded ring, so Write success stays un-attributed. Target
+    /// is always `None` (a hostile buffer resolves to no object).
+    Write,
 }
 
 impl OpKind {
     /// Count of variants — the histogram width.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
 
     /// Stable index for fixed-size histograms.
     pub fn index(self) -> usize {
@@ -77,6 +83,7 @@ impl OpKind {
             OpKind::RoleGrant => 9,
             OpKind::NetOpen => 10,
             OpKind::NetIo => 11,
+            OpKind::Write => 12,
         }
     }
 
@@ -94,6 +101,7 @@ impl OpKind {
         OpKind::RoleGrant,
         OpKind::NetOpen,
         OpKind::NetIo,
+        OpKind::Write,
     ];
 }
 

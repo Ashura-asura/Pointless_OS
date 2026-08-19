@@ -94,6 +94,8 @@ pub mod hardening;
 
 pub mod hardening_fuzz;
 
+pub mod hardening_syscalls;
+
 pub mod serial;
 
 pub mod store;
