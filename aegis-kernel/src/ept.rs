@@ -456,8 +456,13 @@ mod tests {
     /// addresses, tracking them so `free_page` really releases them and the
     /// teardown count assertions are meaningful. A `budget` cap simulates
     /// memory pressure (the `OutOfPages` path).
+    ///
+    /// Each page is a raw allocation (`Box::into_raw`) reclaimed with
+    /// `Box::from_raw` on free, so the fake "phys" addresses remain valid
+    /// raw memory for the EPT's volatile reads/writes without an active
+    /// reference tag (Miri-clean under Stacked Borrows).
     struct TestAlloc {
-        pages: Vec<(u64, Box<Page>)>,
+        pages: Vec<(u64, *mut Page)>,
         budget: Option<usize>,
     }
 
@@ -481,6 +486,18 @@ mod tests {
         }
     }
 
+    impl Drop for TestAlloc {
+        fn drop(&mut self) {
+            // Reclaim any pages a test mapped but never unmapped (they were
+            // raw-allocated via `Box::into_raw`), so Miri sees no leak.
+            for (_, page) in self.pages.drain(..) {
+                unsafe {
+                    drop(Box::from_raw(page));
+                }
+            }
+        }
+    }
+
     impl PageAlloc for TestAlloc {
         fn alloc_page(&mut self) -> Option<u64> {
             if let Some(b) = self.budget {
@@ -488,8 +505,8 @@ mod tests {
                     return None;
                 }
             }
-            let page: Box<Page> = Box::new(Page([0; ENTRIES as usize]));
-            let phys = page.as_ref() as *const Page as u64;
+            let page = Box::into_raw(Box::new(Page([0; ENTRIES as usize])));
+            let phys = page as *const Page as u64;
             self.pages.push((phys, page));
             Some(phys)
         }
@@ -497,7 +514,10 @@ mod tests {
         fn free_page(&mut self, phys: u64) -> bool {
             match self.pages.iter().position(|(p, _)| *p == phys) {
                 Some(i) => {
-                    self.pages.remove(i);
+                    let (_, page) = self.pages.remove(i);
+                    unsafe {
+                        drop(Box::from_raw(page));
+                    }
                     true
                 }
                 None => false,

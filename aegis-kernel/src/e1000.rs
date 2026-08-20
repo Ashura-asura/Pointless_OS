@@ -625,6 +625,18 @@ fn read_desc(ring: &[u8], index: usize) -> LegacyDescriptor {
 mod tests {
     use super::*;
 
+    /// Descriptor ring storage, aligned like the real DMA rings (page
+    /// memory); `write_desc`/`read_desc` do aligned u32/u16 accesses through
+    /// the byte slice, so a plain `[u8; N]` would violate alignment under Miri.
+    #[repr(align(16))]
+    struct AlignedRing<const N: usize>([u8; N]);
+
+    impl<const N: usize> AlignedRing<N> {
+        fn new() -> Self {
+            Self([0u8; N])
+        }
+    }
+
     #[test]
     fn arp_request_layout() {
         let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -682,10 +694,10 @@ mod tests {
 
     #[test]
     fn tx_descriptor_layout() {
-        let mut ring = [0u8; TX_RING_LEN * DESC_BYTES];
+        let mut ring = AlignedRing::<{ TX_RING_LEN * DESC_BYTES }>::new();
         let d = LegacyDescriptor::tx(0xDEAD_BEEF, 42, DESC_CMD_EOP | DESC_CMD_IFCS);
-        write_desc(&mut ring, 2, &d);
-        let back = read_desc(&ring, 2);
+        write_desc(&mut ring.0, 2, &d);
+        let back = read_desc(&ring.0, 2);
         assert_eq!(back.addr, 0xDEAD_BEEF);
         assert_eq!(back.length, 42);
         assert_eq!(back.cmd, DESC_CMD_EOP | DESC_CMD_IFCS);
@@ -694,14 +706,14 @@ mod tests {
 
     #[test]
     fn rx_descriptor_done_uses_dd_bit() {
-        let mut ring = [0u8; RX_RING_LEN * DESC_BYTES];
+        let mut ring = AlignedRing::<{ RX_RING_LEN * DESC_BYTES }>::new();
         let d = LegacyDescriptor::rx(0x1000);
-        write_desc(&mut ring, 0, &d);
-        let mut back = read_desc(&ring, 0);
+        write_desc(&mut ring.0, 0, &d);
+        let mut back = read_desc(&ring.0, 0);
         assert!(!back.done());
         back.status = DESC_STATUS_DD | DESC_STATUS_RX_EOP;
-        write_desc(&mut ring, 0, &back);
-        let b2 = read_desc(&ring, 0);
+        write_desc(&mut ring.0, 0, &back);
+        let b2 = read_desc(&ring.0, 0);
         assert!(b2.done());
         assert_eq!(b2.status & DESC_STATUS_RX_EOP, DESC_STATUS_RX_EOP);
     }
@@ -721,19 +733,19 @@ mod tests {
         // rx_status is the completion poll and must observe DD alone, while
         // rx_length is only valid once DD is seen. Verify both offsets and
         // that a not-done descriptor reports DD clear.
-        let mut ring = [0u8; RX_RING_LEN * DESC_BYTES];
+        let mut ring = AlignedRing::<{ RX_RING_LEN * DESC_BYTES }>::new();
         let mut d = LegacyDescriptor::rx(0x6000);
         d.length = 1500;
         d.status = DESC_STATUS_DD | DESC_STATUS_RX_EOP;
-        write_desc(&mut ring, 1, &d);
-        assert_eq!(rx_status(&ring, 1) & DESC_STATUS_DD, DESC_STATUS_DD);
-        assert_eq!(rx_length(&ring, 1), 1500);
+        write_desc(&mut ring.0, 1, &d);
+        assert_eq!(rx_status(&ring.0, 1) & DESC_STATUS_DD, DESC_STATUS_DD);
+        assert_eq!(rx_length(&ring.0, 1), 1500);
         // Not-done: DD clear even though other status bits could be set.
         let mut idle = LegacyDescriptor::rx(0x6000);
         idle.status = DESC_STATUS_RX_EOP; // EOP alone must NOT read as done
-        write_desc(&mut ring, 1, &idle);
-        assert_eq!(rx_status(&ring, 1) & DESC_STATUS_DD, 0);
-        assert_eq!(rx_length(&ring, 1), 0);
+        write_desc(&mut ring.0, 1, &idle);
+        assert_eq!(rx_status(&ring.0, 1) & DESC_STATUS_DD, 0);
+        assert_eq!(rx_length(&ring.0, 1), 0);
     }
 
     #[test]
@@ -741,16 +753,16 @@ mod tests {
         // Simulate a consumed descriptor: DD set + payload length written by
         // the device. Rearming must clear DD and zero the length so the ring
         // can be handed back to hardware for reuse.
-        let mut ring = [0u8; RX_RING_LEN * DESC_BYTES];
+        let mut ring = AlignedRing::<{ RX_RING_LEN * DESC_BYTES }>::new();
         let mut d = LegacyDescriptor::rx(0x5000);
         d.status = DESC_STATUS_DD;
         d.length = 1500;
-        write_desc(&mut ring, 3, &d);
-        assert!(read_desc(&ring, 3).done());
+        write_desc(&mut ring.0, 3, &d);
+        assert!(read_desc(&ring.0, 3).done());
 
         let rearmed = LegacyDescriptor::rx(0x5000);
-        write_desc(&mut ring, 3, &rearmed);
-        let back = read_desc(&ring, 3);
+        write_desc(&mut ring.0, 3, &rearmed);
+        let back = read_desc(&ring.0, 3);
         assert!(!back.done());
         assert_eq!(back.length, 0);
         assert_eq!(back.addr, 0x5000);

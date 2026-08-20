@@ -363,13 +363,22 @@ mod tests {
             reset_table_for_test();
             clear_all_caps();
             crate::tasks::set_current_for_test(0);
+            let buf = [0u8; CHANNEL_BUF];
+            let mut out = [0u8; CHANNEL_BUF];
             // A fabricated slot carries no channel cap: -1.
-            assert_eq!(ch_send(0, 1, 0x1000), -1, "no cap, no send");
-            assert_eq!(ch_recv(0, 0x2000), -1, "no cap, no recv");
+            assert_eq!(ch_send(0, 1, buf.as_ptr() as u64), -1, "no cap, no send");
+            assert_eq!(ch_recv(0, out.as_mut_ptr() as u64), -1, "no cap, no recv");
             // An oversized message is refused even with a live channel.
             let slot = ch_create() as u64;
-            assert_eq!(ch_send(slot, (CHANNEL_BUF + 1) as u64, 0x1000), -1);
-            assert_eq!(ch_send(slot, 0, 0x1000), 0, "empty message is legal");
+            assert_eq!(
+                ch_send(slot, (CHANNEL_BUF + 1) as u64, buf.as_ptr() as u64),
+                -1
+            );
+            assert_eq!(
+                ch_send(slot, 0, buf.as_ptr() as u64),
+                0,
+                "empty message is legal"
+            );
         }
     }
 

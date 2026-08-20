@@ -111,3 +111,29 @@ jobs:
       - name: Bootloader release build (x86_64-unknown-uefi)
         run: cargo build --release --target x86_64-unknown-uefi --features uefi
         working-directory: uefi-boot
+
+  miri:
+    name: Miri (UB detection)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aegis
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly + Miri
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: miri
+
+      - name: Model workspace under Miri
+        run: cargo miri test --workspace
+
+      - name: Kernel host-testable modules under Miri
+        working-directory: aegis-kernel
+        run: |
+          for m in boot_info:: channel:: e1000:: ept:: ipc:: policy_engine:: hardening_fuzz:: hardening_syscalls::; do
+            echo "=== $m ==="
+            cargo miri test "$m" || exit 1
+          done

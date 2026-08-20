@@ -63,6 +63,7 @@ fn random_bytes(rng: &mut Rng, len: usize) -> Vec<u8> {
     (0..len).map(|_| rng.byte()).collect()
 }
 
+#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn ethernet_parse_never_panics_and_garbage_never_parses() {
     let mut rng = Rng(SEED);
@@ -80,6 +81,7 @@ fn ethernet_parse_never_panics_and_garbage_never_parses() {
     assert_eq!(ran, 200_000);
 }
 
+#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn ethernet_parse_survives_structured_attacks() {
     // Valid magic for IPv4/ARP/IPv6 ethertypes + garbage tails; the parser
@@ -116,6 +118,7 @@ fn ethernet_parse_survives_structured_attacks() {
     assert!(accepted > 0);
 }
 
+#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn arp_parse_never_panics_and_never_accepts_garbage() {
     let mut rng = Rng(SEED ^ 2);
@@ -133,6 +136,7 @@ fn arp_parse_never_panics_and_never_accepts_garbage() {
     assert_eq!(ran, 200_000);
 }
 
+#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn arp_parse_survives_structured_attacks() {
     // Valid ethernet/IPv4 ARP header prefix + garbage tails and absurd
@@ -164,6 +168,7 @@ fn arp_parse_survives_structured_attacks() {
     assert!(accepted > 0);
 }
 
+#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn ipv4_parse_never_panics_and_garbage_never_parses() {
     let mut rng = Rng(SEED ^ 4);
@@ -181,6 +186,7 @@ fn ipv4_parse_never_panics_and_garbage_never_parses() {
     assert_eq!(ran, 200_000);
 }
 
+#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn ipv4_parse_survives_structured_attacks() {
     // version=4/ihl=5 header prefix with absurd total_length and options
@@ -210,6 +216,7 @@ fn ipv4_parse_survives_structured_attacks() {
     assert!(accepted > 0);
 }
 
+#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn udp_parse_never_panics_with_and_without_ip_context() {
     let mut rng = Rng(SEED ^ 6);
@@ -231,6 +238,7 @@ fn udp_parse_never_panics_with_and_without_ip_context() {
     assert_eq!(ran, 200_000);
 }
 
+#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn udp_parse_survives_structured_attacks() {
     // Valid 8-byte header prefix; the length field is the attack surface —
@@ -255,6 +263,7 @@ fn udp_parse_survives_structured_attacks() {
     assert!(accepted > 0);
 }
 
+#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn tcp_parse_never_panics_with_and_without_ip_context() {
     let mut rng = Rng(SEED ^ 8);
@@ -276,6 +285,7 @@ fn tcp_parse_never_panics_with_and_without_ip_context() {
     assert_eq!(ran, 200_000);
 }
 
+#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn tcp_parse_survives_structured_attacks() {
     // Valid 20-byte header prefix; the data-offset nibble is the attack
@@ -298,6 +308,7 @@ fn tcp_parse_survives_structured_attacks() {
     assert!(accepted > 0);
 }
 
+#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn tls_record_decrypt_never_panics_and_never_authenticates_garbage() {
     // Fuzz `unprotect_record` (RFC 8446 §5.2 record decryption): a fixed
@@ -342,6 +353,7 @@ fn tls_record_decrypt_never_panics_and_never_authenticates_garbage() {
 /// The structured wing, driven through one mixed stream so the assertions are
 /// uniform: every target gets random bytes and valid-prefix+tail mutations,
 /// and must never panic on either.
+#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn network_parsers_are_total_under_mixed_input_streams() {
     let mut rng = Rng(SEED ^ 11);

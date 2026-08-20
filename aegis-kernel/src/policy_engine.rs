@@ -42,11 +42,6 @@ pub struct AuditEntry {
     pub timestamp: u64,
 }
 
-struct AuditSlot {
-    entry: AuditEntry,
-    used: bool,
-}
-
 struct RuleSlot {
     rule: PolicyRule,
     used: bool,
@@ -55,7 +50,7 @@ struct RuleSlot {
 pub struct PolicyEngine {
     rules: [RuleSlot; 16],
     rule_count: usize,
-    audit_log: [AuditSlot; 128],
+    audit_log: [AuditEntry; 128],
     log_count: usize,
 }
 
@@ -65,15 +60,12 @@ impl PolicyEngine {
             rule: PolicyRule::MaxSyscalls(0),
             used: false,
         };
-        const DEFAULT_AUDIT: AuditSlot = AuditSlot {
-            entry: AuditEntry {
-                agent_id: 0,
-                rule_description: "",
-                passed: false,
-                action_taken: "",
-                timestamp: 0,
-            },
-            used: false,
+        const DEFAULT_AUDIT: AuditEntry = AuditEntry {
+            agent_id: 0,
+            rule_description: "",
+            passed: false,
+            action_taken: "",
+            timestamp: 0,
         };
         Self {
             rules: [DEFAULT_RULE; 16],
@@ -155,28 +147,16 @@ impl PolicyEngine {
 
     fn log_entry(&mut self, entry: AuditEntry) {
         if self.log_count < self.audit_log.len() {
-            self.audit_log[self.log_count] = AuditSlot { entry, used: true };
+            self.audit_log[self.log_count] = entry;
             self.log_count += 1;
         }
     }
 
     pub fn audit_log(&self) -> &[AuditEntry] {
-        static EMPTY: [AuditEntry; 0] = [];
-        if self.log_count == 0 {
-            return &EMPTY;
-        }
-        unsafe {
-            core::slice::from_raw_parts(
-                &self.audit_log[0].entry as *const AuditEntry,
-                self.log_count,
-            )
-        }
+        &self.audit_log[..self.log_count]
     }
 
     pub fn clear_audit_log(&mut self) {
-        for slot in self.audit_log.iter_mut() {
-            slot.used = false;
-        }
         self.log_count = 0;
     }
 }
@@ -270,6 +250,14 @@ mod tests {
         engine.evaluate(&agent, &prof);
         let log = engine.audit_log();
         assert_eq!(log.len(), 2);
+        // Miri-caught regression: the audit log must be a contiguous slice of
+        // entries — the old `AuditSlot`-backed layout read interleaved
+        // `used` flags and padding as entry data past the first slot.
+        assert_eq!(log[0].agent_id, agent.id);
+        assert_eq!(log[0].rule_description, "MaxSyscalls");
+        assert!(log[0].passed);
+        assert_eq!(log[1].rule_description, "NoNetwork");
+        assert!(!log[1].passed);
     }
 
     #[test]

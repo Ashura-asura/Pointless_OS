@@ -844,16 +844,21 @@ mod tests {
             // reply on this endpoint must be refused too.
             assert_eq!(ipc_reply(0, 7, 0, 4), -1);
             // Only the matching blocked caller is accepted.
-            let src = [0xAAu8; 4];
-            let dst = [0u8; 16];
+            // Raw buffers (Box::into_raw) so `copy_user`'s integer->pointer
+            // write keeps valid provenance under Miri — an `as_ptr()`-derived
+            // address would point at a popped shared-ref tag.
+            let src = Box::into_raw(Box::new([0xAAu8; 4])) as *mut u8 as u64;
+            let dst = Box::into_raw(Box::new([0u8; 16])) as *mut u8 as u64;
             ENDPOINTS[0].caller = 7;
-            ENDPOINTS[0].caller_reply_va = dst.as_ptr() as u64;
-            assert_eq!(ipc_reply(0, 7, src.as_ptr() as u64, 4), 0);
+            ENDPOINTS[0].caller_reply_va = dst;
+            assert_eq!(ipc_reply(0, 7, src, 4), 0);
             assert_eq!(
-                &dst[..4],
-                &src,
+                core::slice::from_raw_parts(dst as *const u8, 4),
+                &[0xAAu8; 4],
                 "the reply bytes land in the caller's buffer"
             );
+            drop(Box::from_raw(src as *mut [u8; 4]));
+            drop(Box::from_raw(dst as *mut [u8; 16]));
         }
         assert_eq!(
             crate::audit::op_counts(2)[crate::audit::OpKind::Send.index()],

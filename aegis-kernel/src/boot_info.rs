@@ -535,10 +535,12 @@ mod tests {
     #[test]
     fn locate_at_reads_handoff_from_any_address() {
         let entries = sample_entries();
-        let img = build_image(&entries, 0x5_2000);
-        let (total, handoff_pages) = (img.len(), HANDOFF_PAGES);
+        let small = build_image(&entries, 0x5_2000);
+        let mut img = [0u8; (HANDOFF_PAGES * 4096) as usize];
+        img[..small.len()].copy_from_slice(&small);
+        let (total, handoff_pages) = (small.len(), HANDOFF_PAGES);
         assert!(total as u64 <= handoff_pages * 4096);
-        let info = unsafe { locate_at(&img as *const _ as u64) }.expect("handoff must locate");
+        let info = unsafe { locate_at(img.as_ptr() as u64) }.expect("handoff must locate");
         assert_eq!(info.entries.len(), 3);
         assert_eq!(info.image_end, 0x5_2000);
         assert_eq!(total_by_type(&info, TYPE_CONVENTIONAL), 0x1000 * 4096);
@@ -614,7 +616,7 @@ mod tests {
     fn fleet_at_reads_from_live_page() {
         let fleet = sample_fleet();
         let img = build_image_with_fleet(&sample_entries(), 0x5_2000, &fleet);
-        let parsed = unsafe { fleet_at(&img[0] as *const u8 as u64) }.expect("fleet must locate");
+        let parsed = unsafe { fleet_at(img.as_ptr() as u64) }.expect("fleet must locate");
         assert_eq!(parsed, fleet);
     }
 
@@ -731,7 +733,7 @@ mod tests {
     fn gop_at_reads_from_live_page() {
         let gop = sample_gop();
         let img = build_image_with_gop(&sample_entries(), 0x5_2000, &gop);
-        let parsed = unsafe { gop_at(&img[0] as *const u8 as u64) }.expect("gop must locate");
+        let parsed = unsafe { gop_at(img.as_ptr() as u64) }.expect("gop must locate");
         assert_eq!(parsed, gop);
     }
 }
