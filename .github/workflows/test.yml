@@ -137,3 +137,28 @@ jobs:
             echo "=== $m ==="
             cargo miri test "$m" || exit 1
           done
+
+  asan:
+    name: ASan (address sanitizer)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aegis
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - name: Model workspace under ASan
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: cargo test --workspace
+
+      - name: Kernel under ASan
+        working-directory: aegis-kernel
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: cargo test
