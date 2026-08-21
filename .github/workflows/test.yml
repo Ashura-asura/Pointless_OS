@@ -122,6 +122,10 @@ jobs:
     # the installed nightly + cargo-miri is actually used.
     env:
       RUSTUP_TOOLCHAIN: nightly
+      # Tests that touch wall-clock time / host calls (e.g. capability-audit's
+      # audit_fixtures) must not abort Miri; downgrade isolated-op failures to
+      # warnings so the UB gate still runs the whole workspace.
+      MIRIFLAGS: -Zmiri-isolation-error=warn
     defaults:
       run:
         working-directory: aegis
@@ -152,6 +156,10 @@ jobs:
     # -Zsanitizer=address is accepted by the compiler.
     env:
       RUSTUP_TOOLCHAIN: nightly
+      # Kernel-style code intentionally never frees global structures; at
+      # process exit LeakSanitizer would otherwise flag them. Keep real
+      # address-safety checks (overflow/UAF) but ignore exit-time leaks.
+      ASAN_OPTIONS: detect_leaks=0
     defaults:
       run:
         working-directory: aegis
