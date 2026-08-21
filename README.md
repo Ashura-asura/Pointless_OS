@@ -21,6 +21,7 @@ engineering experimentation.
 - Threat model (adversary classes, emulation vs real hardware): Docs/THREAT_MODEL.md
 - Hardware-evidence track (real firmware results, USB-canary status): Docs/HARDWARE_EVIDENCE.md
 - Bridge phase — resume guest-kernel compatibility growth: Docs/BRIDGE_PHASE.md
+- Bridge phase — gap inventory (flexible next-target options): Docs/BRIDGE_GAPS.md
 - Project report: Docs/PROJECT_REPORT.md
 - Licensing + third-party notices: Docs/LICENSING.md
 

@@ -52,4 +52,6 @@ This bridge phase is a **planning/next-step document**, not a deliverable that
 changes code. No guest-kernel growth was performed in this session; the
 hardening phases it depends on (AG, hardware evidence, AH) are what were
 completed. The first growth change should not start in parallel with those —
-they have now finished, so the bridge is unblocked.
+they have now finished, so the bridge is unblocked. The concrete gap
+enumeration that precedes any coding lives in
+[`Docs/BRIDGE_GAPS.md`](BRIDGE_GAPS.md).
