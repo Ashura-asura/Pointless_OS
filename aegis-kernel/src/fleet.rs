@@ -131,6 +131,7 @@ pub enum TokenObjectKind {
     MemRegion,
     Channel,
     NetEndpoint,
+    Object,
 }
 
 impl TokenObjectKind {
@@ -141,6 +142,7 @@ impl TokenObjectKind {
             TokenObjectKind::MemRegion => 2,
             TokenObjectKind::Channel => 3,
             TokenObjectKind::NetEndpoint => 4,
+            TokenObjectKind::Object => 5,
         }
     }
 
@@ -151,6 +153,7 @@ impl TokenObjectKind {
             2 => Some(TokenObjectKind::MemRegion),
             3 => Some(TokenObjectKind::Channel),
             4 => Some(TokenObjectKind::NetEndpoint),
+            5 => Some(TokenObjectKind::Object),
             _ => None,
         }
     }
@@ -160,12 +163,13 @@ impl TokenObjectKind {
 /// or `None` for `Cap::None`/`Cap::NetRoot` (see `TokenObjectKind` doc).
 pub fn kind_and_id(cap: Cap) -> Option<(TokenObjectKind, u32)> {
     match cap {
-        Cap::None | Cap::NetRoot | Cap::Vm(_) | Cap::VmRoot => None,
+        Cap::None | Cap::NetRoot | Cap::Vm(_) | Cap::VmRoot | Cap::ObjectRoot => None,
         Cap::Endpoint(id) => Some((TokenObjectKind::Endpoint, id.index)),
         Cap::Task(id) => Some((TokenObjectKind::Task, id.index)),
         Cap::MemRegion(id) => Some((TokenObjectKind::MemRegion, id.index)),
         Cap::Channel(id) => Some((TokenObjectKind::Channel, id.index)),
         Cap::NetEndpoint(id) => Some((TokenObjectKind::NetEndpoint, id.index)),
+        Cap::Object(id) => Some((TokenObjectKind::Object, id.index)),
     }
 }
 

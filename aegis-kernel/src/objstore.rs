@@ -89,7 +89,9 @@ impl ObjStore {
     }
 
     fn slot_of(&self, id: ObjId) -> Option<usize> {
-        self.objects.iter().position(|s| s.as_ref().is_some_and(|o| o.id == id))
+        self.objects
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|o| o.id == id))
     }
 
     /// Create an object with an optional parent (forming a tree). Errors if
@@ -286,7 +288,7 @@ mod tests {
         s.create(3, Some(1)).unwrap();
         let w1 = s.write(2, 10, hash_of("a")).unwrap(); // seq 1
         let _w2 = s.write(3, 5, hash_of("b")).unwrap(); // seq 2
-        // since before any write -> both changed
+                                                        // since before any write -> both changed
         let d = s.subtree_changed_since(1, 0);
         assert_eq!(d.members, 3);
         assert_eq!(d.changed_count, 2);

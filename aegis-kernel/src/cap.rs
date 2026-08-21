@@ -152,6 +152,21 @@ pub enum Cap {
     /// only a task explicitly handed `VmRoot` may mint a new VM — there is
     /// no ambient "make a virtual machine" authority.
     VmRoot,
+    /// Phase RoleLib (Track 1, §9.1): reference to an object-store subtree
+    /// root with the given identity. Holding it with `READ` means "may run the
+    /// `summarize-changes-in-subtree` task over this subtree"; holding it with
+    /// `WRITE` means "may apply an edit" (the irreversible action, two-party
+    /// gated at the grant path). There is no ambient "read any object"
+    /// authority — an agent only ever holds `Object` caps the kernel minted
+    /// for it via a role grant it did not assemble itself.
+    Object(Oid),
+    /// Phase RoleLib (Track 1): the singleton capability authorizing the
+    /// *grant* of `Object` capabilities / object roles at all (id always 0).
+    /// Mirrors `NetRoot`/`VmRoot`: only a task explicitly handed `ObjectRoot`
+    /// by boot policy (the human reviewer) may mint object grants — there is
+    /// no syscall an agent can reach that hands itself `ObjectRoot`. An agent
+    /// that holds an `Object` cap can never escalate to granting more.
+    ObjectRoot,
 }
 
 /// One occupied row of a capability table: the object and the rights held on it.
@@ -189,9 +204,11 @@ impl Cap {
             | Cap::MemRegion(o)
             | Cap::Channel(o)
             | Cap::NetEndpoint(o)
-            | Cap::Vm(o) => Some(o),
+            | Cap::Vm(o)
+            | Cap::Object(o) => Some(o),
             Cap::NetRoot => Some(Oid::new(0, 0)),
             Cap::VmRoot => Some(Oid::new(0, 0)),
+            Cap::ObjectRoot => Some(Oid::new(0, 0)),
         }
     }
 }
@@ -248,6 +265,21 @@ pub const VM_ROOT_RIGHTS: Rights = Rights::CONTROL;
 /// to touch the frames, GRANT to delegate it onward). Mirrors the model
 /// crate's `create_mem`.
 pub const MEM_RIGHTS: Rights = Rights::READ.union(Rights::WRITE).union(Rights::GRANT);
+
+/// Phase RoleLib (Track 1): the rights an `object-subtree-reader` role grants —
+/// `READ` to run the `summarize-changes-in-subtree` task over the granted
+/// subtree. No `GRANT`: an object role cap cannot be re-delegated.
+pub const OBJECT_RIGHTS: Rights = Rights::READ;
+
+/// Phase RoleLib (Track 1): the rights an `object-subtree-editor` role grants —
+/// `READ` to propose an edit, `WRITE` to apply it. The apply (`WRITE`) is the
+/// irreversible action and is two-party gated at the grant path. No `GRANT`.
+pub const OBJECT_EDIT_RIGHTS: Rights = Rights::READ.union(Rights::WRITE);
+
+/// The right required on `Cap::ObjectRoot` to mint object grants. `CONTROL`,
+/// reused deliberately (administrative authority, like `NetRoot`/`VmRoot`).
+/// Never `GRANT` — object-root cannot be re-delegated by an ordinary grant.
+pub const OBJECT_ROOT_RIGHTS: Rights = Rights::CONTROL;
 
 #[cfg(test)]
 mod tests {
@@ -308,6 +340,27 @@ mod tests {
         assert!(MEM_RIGHTS.contains(Rights::GRANT));
         assert!(!MEM_RIGHTS.contains(Rights::SEND));
         assert!(!MEM_RIGHTS.contains(Rights::CONTROL));
+    }
+
+    #[test]
+    fn object_rights_shape_is_read_only_role() {
+        assert!(OBJECT_RIGHTS.contains(Rights::READ));
+        assert!(!OBJECT_RIGHTS.contains(Rights::WRITE));
+        assert!(!OBJECT_RIGHTS.contains(Rights::GRANT));
+        // Editor adds WRITE (the "apply" irreversible action) but never GRANT.
+        assert!(OBJECT_EDIT_RIGHTS.contains(Rights::READ));
+        assert!(OBJECT_EDIT_RIGHTS.contains(Rights::WRITE));
+        assert!(!OBJECT_EDIT_RIGHTS.contains(Rights::GRANT));
+        assert_eq!(OBJECT_ROOT_RIGHTS, Rights::CONTROL);
+    }
+
+    #[test]
+    fn object_cap_identity_roundtrips() {
+        let c = Cap::Object(Oid::new(7, 3));
+        assert_eq!(c.oid(), Some(Oid::new(7, 3)));
+        assert_eq!(c.id(), Some(7));
+        assert_eq!(Cap::ObjectRoot.oid(), Some(Oid::new(0, 0)));
+        assert_eq!(Cap::ObjectRoot.id(), Some(0));
     }
 
     #[test]

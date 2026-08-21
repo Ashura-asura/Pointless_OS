@@ -59,8 +59,8 @@ mod tests {
         //     declared length must equal the on-disk length (no truncation and
         //     a passing ACPI checksum over the genuine firmware bytes).
         let names = [
-            "apic", "facp", "dmar", "mcfg", "hpet", "wsmt", "bgrt", "ssdt", "tpm2",
-            "dbg2", "fpdt", "lpit", "nhlt", "boot", "dbgp", "msdm", "ptdt", "slic", "uefi",
+            "apic", "facp", "dmar", "mcfg", "hpet", "wsmt", "bgrt", "ssdt", "tpm2", "dbg2", "fpdt",
+            "lpit", "nhlt", "boot", "dbgp", "msdm", "ptdt", "slic", "uefi",
         ];
         let mut total = 0usize;
         for n in names {
@@ -68,7 +68,12 @@ mod tests {
             let hdr = parse_sdt_header(&bytes)
                 .unwrap_or_else(|| panic!("parse_sdt_header failed for acpi-{}.bin", n));
             let sig = core::str::from_utf8(&hdr.signature).unwrap();
-            assert_eq!(sig, n.to_uppercase(), "signature mismatch for acpi-{}.bin", n);
+            assert_eq!(
+                sig,
+                n.to_uppercase(),
+                "signature mismatch for acpi-{}.bin",
+                n
+            );
             assert_eq!(
                 hdr.length as usize,
                 bytes.len(),
@@ -90,10 +95,7 @@ mod tests {
         assert_eq!(madt.lapic_address, 0xFEE00000, "standard LAPIC base");
         assert!(madt.cpu_count >= 1, "MADT must list >=1 LAPIC");
         assert!(madt.ioapic.is_some(), "real MADT should carry an IOAPIC");
-        println!(
-            "[hardware-evidence] host LAPIC entries: {}",
-            madt.cpu_count
-        );
+        println!("[hardware-evidence] host LAPIC entries: {}", madt.cpu_count);
         let mut enabled = 0usize;
         for i in 0..madt.cpu_count {
             if madt.cpus[i].enabled {

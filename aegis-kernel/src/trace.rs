@@ -102,6 +102,10 @@ pub fn op(num: u64, arg1: u64, arg2: u64, arg3: u64, _arg4: u64, result: i64) {
         Cap::Channel(i) => ("c", i.index),
         Cap::NetEndpoint(i) => ("n", i.index),
         Cap::NetRoot => ("r", 0),
+        Cap::Vm(i) => ("v", i.index),
+        Cap::VmRoot => ("V", 0),
+        Cap::Object(i) => ("o", i.index),
+        Cap::ObjectRoot => ("O", 0),
     };
     let y = if result >= 0 { "ok" } else { "denied" };
     let req = required(num).bits();

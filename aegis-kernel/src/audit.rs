@@ -44,6 +44,18 @@ pub enum OpKind {
     /// target task attributed; this is the append-only trail the Phase 6 grant
     /// flow is built on.
     RoleGrant,
+    /// §9.4: an agent *exercising* a role-derived capability (not just being
+    /// granted it). The capability-gated task records this with the target
+    /// object, so "what someone did with what they were given" is always
+    /// answerable after the fact — the audit trail that turns "we hope the
+    /// scoping was right" into "we can check whether the scoping was right."
+    RoleExercise,
+    /// §9.3: a request to *expand* authority beyond the current role's scope
+    /// (a scope expansion that must be human-confirmed before any cap is
+    /// minted). Recorded with `ok=false` when the request is made and blocked,
+    /// `ok=true` when a confirmed expansion mints the new cap. This is the
+    /// diff-confirmation trail: "what was being added" is attributable.
+    RoleExpand,
     /// `netif::sys_net_socket` (CONTROL on a `NetRoot` cap). Phase F
     /// closure: minting a *new* socket to a caller-chosen destination is
     /// itself an attributed, gated event — target is the destination IP's
@@ -66,7 +78,7 @@ pub enum OpKind {
 
 impl OpKind {
     /// Count of variants — the histogram width.
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 15;
 
     /// Stable index for fixed-size histograms.
     pub fn index(self) -> usize {
@@ -84,6 +96,8 @@ impl OpKind {
             OpKind::NetOpen => 10,
             OpKind::NetIo => 11,
             OpKind::Write => 12,
+            OpKind::RoleExercise => 13,
+            OpKind::RoleExpand => 14,
         }
     }
 
@@ -102,6 +116,8 @@ impl OpKind {
         OpKind::NetOpen,
         OpKind::NetIo,
         OpKind::Write,
+        OpKind::RoleExercise,
+        OpKind::RoleExpand,
     ];
 }
 
@@ -281,6 +297,16 @@ pub fn reset_for_test() {
     }
 }
 
+/// Test-only: advance the monotonic tick without appending a record, so
+/// ephemeral-grant expiry can be exercised deterministically.
+#[cfg(test)]
+pub fn advance_tick_for_test(n: u64) {
+    unsafe {
+        let t = core::ptr::read(core::ptr::addr_of_mut!(TICK));
+        core::ptr::write(core::ptr::addr_of_mut!(TICK), t + n);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +347,20 @@ mod tests {
         record(1, OpKind::Revoke, Some(9), false);
         assert_eq!(revoke_count(1), 2);
         assert_eq!(revoke_count(2), 0);
+    }
+
+    #[test]
+    fn role_exercise_and_expand_are_distinct_and_queryable() {
+        let _g = crate::kernel_state_guard();
+        reset_for_test();
+        // Exercise (success) and an expansion request that was blocked.
+        record(2, OpKind::RoleExercise, Some(5), true);
+        record(2, OpKind::RoleExpand, Some(7), false);
+        record(2, OpKind::RoleExpand, Some(7), true);
+        assert!(ever_succeeded(2, OpKind::RoleExercise, 5));
+        assert!(!ever_succeeded(2, OpKind::RoleExercise, 7));
+        assert!(ever_succeeded(2, OpKind::RoleExpand, 7));
+        assert_eq!(op_counts(2)[OpKind::RoleExpand.index()], 2);
+        assert_eq!(op_counts(2)[OpKind::RoleExercise.index()], 1);
     }
 }
