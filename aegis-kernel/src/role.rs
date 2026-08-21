@@ -629,7 +629,10 @@ mod tests {
             );
             // No capability ever landed.
             assert_eq!(task_cap(agent, 0).cap, Cap::None);
-            assert_eq!(task_cap(grantor, 0).cap, Cap::Task(crate::cap::Oid::new(svc as u32, 0)));
+            assert_eq!(
+                task_cap(grantor, 0).cap,
+                Cap::Task(crate::cap::Oid::new(svc as u32, 0))
+            );
         }
     }
 

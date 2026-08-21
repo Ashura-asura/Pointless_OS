@@ -61,19 +61,18 @@ fn user_page(pml4_phys: u64, va: u64, writable: bool) -> bool {
             return pd & PTE_USER != 0 && (!writable || pd & PTE_WRITABLE != 0);
         }
         let pt = *((pd & !0xFFF) as *const u64).add(pt_idx);
-        pt & PTE_PRESENT != 0
-            && pt & PTE_USER != 0
-            && (!writable || pt & PTE_WRITABLE != 0)
+        pt & PTE_PRESENT != 0 && pt & PTE_USER != 0 && (!writable || pt & PTE_WRITABLE != 0)
     }
 }
 
 /// Validate the range `[va, va+len)` against the address space rooted at
 /// `pml4_phys`. Returns true when:
-///   - `len == 0` (nothing to touch), or
-///   - the address space is the kernel's own (`pml4_phys == 0`): the caller
-///     is kernel-context and trusted (sanity: non-null only), or
-///   - every page the range crosses is present, USER, and (if `writable`)
-///     writable.
+///  - `len == 0` (nothing to touch), or
+///  - the address space is the kernel's own (`pml4_phys == 0`): the caller
+///    is kernel-context and trusted (sanity: non-null only), or
+///  - every page the range crosses is present, USER, and (if `writable`)
+///    writable.
+///
 /// An overflowing range or any non-conforming page is refused.
 pub fn validate_range(pml4_phys: u64, va: u64, len: usize, writable: bool) -> bool {
     if len == 0 {
@@ -166,13 +165,15 @@ mod tests {
     ///   VA 0x40201000 -> mid-page of the 2 MiB user huge page at PD index 1
     fn wired_root() -> u64 {
         unsafe {
-            T_PML4.0[0] = core::ptr::addr_of!(T_PDPT) as u64 | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            T_PML4.0[0] =
+                core::ptr::addr_of!(T_PDPT) as u64 | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
             T_PDPT.0[0] = core::ptr::addr_of!(T_PD) as u64 | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
             // PD[0] -> PT; PD[1] = a 2 MiB huge USER page (VA 0x0020_0000).
             T_PD.0[0] = core::ptr::addr_of!(T_PT) as u64 | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
             T_PD.0[1] = 0x0020_0000 | PTE_PRESENT | PTE_WRITABLE | PTE_USER | PTE_PAGE_SIZE;
             // PT[0x100] maps VA 0x100000 -> T_BUF, writable and user-accessible.
-            T_PT.0[0x100] = core::ptr::addr_of!(T_BUF) as u64 | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            T_PT.0[0x100] =
+                core::ptr::addr_of!(T_BUF) as u64 | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
             // PT[0x101] maps VA 0x101000 -> T_BUF too, but read-only (no
             // WRITABLE): reads pass, writes must be refused.
             T_PT.0[0x101] = core::ptr::addr_of!(T_BUF) as u64 | PTE_PRESENT | PTE_USER;
@@ -189,10 +190,16 @@ mod tests {
         assert!(validate_range(root, 0x100000, 8, false));
         assert!(validate_range(root, 0x100000, 8, true));
         // Crossing into an unmapped PT entry is refused.
-        assert!(!validate_range(root, 0x101000, 0x1000 + 1, false), "crosses into an unmapped page");
+        assert!(
+            !validate_range(root, 0x101000, 0x1000 + 1, false),
+            "crosses into an unmapped page"
+        );
         assert!(!validate_range(root, 0x102000, 4, false));
         // The 2 MiB huge page is user-accessible mid-page.
-        assert!(validate_range(root, 0x0020_1000, 0x1000, true), "2 MiB USER huge page");
+        assert!(
+            validate_range(root, 0x0020_1000, 0x1000, true),
+            "2 MiB USER huge page"
+        );
         // The read-only user page: reads pass, writes are refused.
         assert!(validate_range(root, 0x101000, 4, false));
         assert!(
@@ -226,7 +233,8 @@ mod tests {
                 ((buf_addr >> 21) & 0x1FF) as usize,
                 ((buf_addr >> 12) & 0x1FF) as usize,
             );
-            C_PML4.0[pm] = core::ptr::addr_of!(C_PDPT) as u64 | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            C_PML4.0[pm] =
+                core::ptr::addr_of!(C_PDPT) as u64 | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
             C_PDPT.0[pp] = core::ptr::addr_of!(C_PD) as u64 | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
             C_PD.0[pd] = core::ptr::addr_of!(C_PT) as u64 | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
             C_PT.0[pt] = buf_addr | PTE_PRESENT | PTE_WRITABLE | PTE_USER;

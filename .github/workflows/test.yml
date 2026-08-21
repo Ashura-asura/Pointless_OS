@@ -162,3 +162,65 @@ jobs:
         env:
           RUSTFLAGS: -Zsanitizer=address
         run: cargo test
+
+  fuzz-nightly:
+    name: Fuzz corpus growth (nightly)
+    # Phase AE: a long, coverage-broadening fuzz pass that grows the committed
+    # corpus. Runs nightly (not on every push) so the corpus evolves in git
+    # history without thrashing the repo on every commit. The push CI gate is
+    # the bounded `corpus_driven_fuzz_is_total_and_grows` run inside the kernel
+    # `test` job above.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so we can commit + push the grown corpus cleanly.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt
+
+      - name: Grow corpus (release budget) + commit
+        working-directory: aegis-kernel
+        env:
+          AEGIS_FUZZ_GROW: "1"
+          AEGIS_FUZZ_ITERS: "1000000"
+        run: |
+          rm -f Cargo.lock
+          cargo test --release fuzz_corpus::corpus_driven_fuzz_is_total_and_grows
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add fuzz-corpus
+          # Only commit if the corpus actually grew.
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(fuzz): grow committed corpus [nightly]"
+            git push
+          else
+            echo "corpus unchanged; nothing to commit"
+          fi
+
+  fuzz-push:
+    name: Fuzz bounded gate (push)
+    # Phase AE: a bounded, few-minute fuzz pass on every push/PR so the
+    # total-no-panic property is continuously enforced. The corpus harness is
+    # read-only here (no growth) — growth happens in the nightly job above.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: clippy, rustfmt
+
+      - name: Kernel fuzz gate (read-only corpus, bounded budget)
+        working-directory: aegis-kernel
+        run: |
+          rm -f Cargo.lock
+          cargo test --release fuzz_corpus::corpus_driven_fuzz_is_total_and_grows

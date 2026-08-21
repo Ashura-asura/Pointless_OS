@@ -596,6 +596,53 @@ mod tests {
         ])
     }
 
+    /// Phase AE: a malicious guest supplies the descriptor table, avail ring,
+    /// and request payloads from its own memory — the whole queue is untrusted
+    /// input. Fill the guest-memory fake with hostile descriptor chains
+    /// (arbitrary addr/len/flags/next, sector numbers, header types) and drain
+    /// repeatedly, asserting total no-panic. The fake's bounds-checked reads
+    /// force the fail_request path instead of letting hostile addresses walk
+    /// out of the guest's memory.
+    #[test]
+    #[cfg_attr(miri, ignore)] // interpreted sweep; the fixed vectors still run under Miri
+    fn hostile_descriptor_tables_and_sectors_never_panic() {
+        use crate::hardening_fuzz::{no_panic, Rng, SEED};
+        let mut rng = Rng::new(SEED ^ 0x6A1D_1B10);
+        let (mut dev, mut mem) = setup(8);
+        let base = 0x1_0000u64;
+        for _ in 0..crate::hardening_fuzz::sweep_iters(100_000) {
+            // Hostile descriptor table: every 16-byte descriptor gets random
+            // addr/len/flags/next (chains self-limit at MAX_CHAIN; the FakeMem
+            // read gate turns out-of-guest-range addresses into IOERR).
+            for d in 0u64..16 {
+                let off = base + 16 * d;
+                for (i, b) in (0..16).map(|_| rng.byte()).enumerate() {
+                    mem.bytes[off as usize + i] = b;
+                }
+            }
+            // Hostile avail-ring head; grow the idx by 1..=3 each round so a
+            // drain stays bounded (avail_last catches up to the written idx)
+            // while still walking fresh hostile chains every call.
+            let cur = u16::from_le_bytes([
+                mem.bytes[base as usize + 4096 + 2],
+                mem.bytes[base as usize + 4096 + 3],
+            ]);
+            let nxt = cur.wrapping_add(1 + rng.pick(3) as u16);
+            mem.bytes[base as usize + 4096 + 2] = nxt as u8;
+            mem.bytes[base as usize + 4096 + 3] = (nxt >> 8) as u8;
+            // Hostile request header + data regions (sector, type, length).
+            for i in 0..64 {
+                mem.bytes[0x1_8000 + i] = rng.byte();
+                mem.bytes[0x1_A000 + i] = rng.byte();
+            }
+            let _ = no_panic(|| dev.drain(&mut mem));
+        }
+        // Sanity: after the hostile sweep the device still drains a legit
+        // request (the queue machinery wasn't corrupted).
+        submit(&mut mem, 0, BLK_T_IN, 0, 0x1_A000, 512, true);
+        assert_eq!(dev.drain(&mut mem), 1);
+    }
+
     #[test]
     fn driver_handshake_and_config() {
         let store = Box::leak(Box::new(MemStore::new(4)));

@@ -28,18 +28,25 @@ use crate::arp::ArpPacket;
 use crate::ethernet::EthernetFrame;
 use crate::ipv4::{IPv4Address, IPv4Packet};
 use crate::tcp::TcpSegment;
-use crate::tls::{traffic_key_from_secret, unprotect_record};
+use crate::tls::{parse_record, parse_server_hello, traffic_key_from_secret, unprotect_record};
 use crate::udp::UdpDatagram;
 
-fn no_panic<T>(f: impl FnOnce() -> T) -> Option<T> {
+pub(crate) fn no_panic<T>(f: impl FnOnce() -> T) -> Option<T> {
     catch_unwind(AssertUnwindSafe(f)).ok()
 }
 
 /// Deterministic xorshift64* PRNG — same seed, same sequence, every run.
-struct Rng(u64);
+/// `pub(crate)` so the Phase AE device-emulation fuzz targets (vmx/vdev/
+/// virtio) and the corpus harness reuse the same RNG instead of drifting
+/// their own.
+pub(crate) struct Rng(u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn new(seed: u64) -> Self {
+        Rng(seed)
+    }
+
+    pub(crate) fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -48,22 +55,35 @@ impl Rng {
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
 
-    fn byte(&mut self) -> u8 {
+    pub(crate) fn byte(&mut self) -> u8 {
         (self.next() >> 32) as u8
     }
 
-    fn pick(&mut self, n: usize) -> usize {
+    pub(crate) fn pick(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 }
 
-const SEED: u64 = 0xAE6A_2026_1337_2A5A;
+pub(crate) const SEED: u64 = 0xAE6A_2026_1337_2A5A;
+
+/// Phase AE sweep budget: full budget in release builds (local runs and the
+/// nightly corpus-grow CI job); one quarter in debug builds so the every-push
+/// CI gate (which compiles `cargo test` unoptimized) stays a bounded few
+/// minutes while still sweeping hundreds of thousands of hostile inputs.
+pub(crate) fn sweep_iters(base: usize) -> usize {
+    if cfg!(debug_assertions) {
+        base / 4
+    } else {
+        base
+    }
+}
 
 fn random_bytes(rng: &mut Rng, len: usize) -> Vec<u8> {
     (0..len).map(|_| rng.byte()).collect()
 }
 
-#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn ethernet_parse_never_panics_and_garbage_never_parses() {
     let mut rng = Rng(SEED);
@@ -81,7 +101,8 @@ fn ethernet_parse_never_panics_and_garbage_never_parses() {
     assert_eq!(ran, 200_000);
 }
 
-#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn ethernet_parse_survives_structured_attacks() {
     // Valid magic for IPv4/ARP/IPv6 ethertypes + garbage tails; the parser
@@ -118,7 +139,8 @@ fn ethernet_parse_survives_structured_attacks() {
     assert!(accepted > 0);
 }
 
-#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn arp_parse_never_panics_and_never_accepts_garbage() {
     let mut rng = Rng(SEED ^ 2);
@@ -136,7 +158,8 @@ fn arp_parse_never_panics_and_never_accepts_garbage() {
     assert_eq!(ran, 200_000);
 }
 
-#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn arp_parse_survives_structured_attacks() {
     // Valid ethernet/IPv4 ARP header prefix + garbage tails and absurd
@@ -168,7 +191,8 @@ fn arp_parse_survives_structured_attacks() {
     assert!(accepted > 0);
 }
 
-#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn ipv4_parse_never_panics_and_garbage_never_parses() {
     let mut rng = Rng(SEED ^ 4);
@@ -186,7 +210,8 @@ fn ipv4_parse_never_panics_and_garbage_never_parses() {
     assert_eq!(ran, 200_000);
 }
 
-#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn ipv4_parse_survives_structured_attacks() {
     // version=4/ihl=5 header prefix with absurd total_length and options
@@ -216,7 +241,8 @@ fn ipv4_parse_survives_structured_attacks() {
     assert!(accepted > 0);
 }
 
-#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn udp_parse_never_panics_with_and_without_ip_context() {
     let mut rng = Rng(SEED ^ 6);
@@ -238,7 +264,8 @@ fn udp_parse_never_panics_with_and_without_ip_context() {
     assert_eq!(ran, 200_000);
 }
 
-#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn udp_parse_survives_structured_attacks() {
     // Valid 8-byte header prefix; the length field is the attack surface —
@@ -263,7 +290,8 @@ fn udp_parse_survives_structured_attacks() {
     assert!(accepted > 0);
 }
 
-#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn tcp_parse_never_panics_with_and_without_ip_context() {
     let mut rng = Rng(SEED ^ 8);
@@ -285,7 +313,8 @@ fn tcp_parse_never_panics_with_and_without_ip_context() {
     assert_eq!(ran, 200_000);
 }
 
-#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn tcp_parse_survives_structured_attacks() {
     // Valid 20-byte header prefix; the data-offset nibble is the attack
@@ -308,7 +337,8 @@ fn tcp_parse_survives_structured_attacks() {
     assert!(accepted > 0);
 }
 
-#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn tls_record_decrypt_never_panics_and_never_authenticates_garbage() {
     // Fuzz `unprotect_record` (RFC 8446 §5.2 record decryption): a fixed
@@ -350,10 +380,85 @@ fn tls_record_decrypt_never_panics_and_never_authenticates_garbage() {
     assert_eq!(accepted, 0);
 }
 
+/// Phase AE: fuzz the TLS *record framing* parser and the ServerHello
+/// handshake parser on top of the existing record-decryption sweep — a
+/// hostile network peer controls the record header (type/version/length) and
+/// the whole handshake body. `parse_record` must be total, its length field
+/// must never commit past the buffer, and `parse_server_hello` must refuse
+/// hostile lengths/extensions, not panic.
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[test]
+fn tls_record_framing_and_server_hello_never_panic() {
+    let mut rng = Rng(SEED ^ 12);
+    let mut framing_accepted = 0usize;
+    let mut hello_accepted = 0usize;
+    for _ in 0..sweep_iters(200_000) {
+        let len = rng.pick(2049);
+        let mut buf = random_bytes(&mut rng, len);
+        if rng.pick(2) == 0 && buf.len() >= 5 {
+            buf[0] = [0x14, 0x15, 0x16, 0x17, 0x01][rng.pick(5)];
+            buf[1] = 0x03;
+            buf[2] = 0x03;
+            // Hostile record length: larger than the buffer, boundary, huge.
+            let hdr_len = [0u16, 1, 5, len as u16, 0xFFFF][rng.pick(5)];
+            buf[3..5].copy_from_slice(&hdr_len.to_be_bytes());
+        }
+        // Record framing: total, and the fragment must never exceed the
+        // buffer the length field claims.
+        let res = no_panic(|| parse_record(&buf));
+        assert!(res.is_some(), "tls::parse_record panicked on {len} bytes");
+        if let Some((_, frag)) = res.unwrap() {
+            assert!(
+                frag.len() <= buf.len().saturating_sub(5),
+                "parse_record fragment outruns its buffer"
+            );
+            framing_accepted += 1;
+        }
+        // ServerHello: random handshake bodies + structured valid prefixes
+        // with hostile session-id lengths and extension lengths.
+        let hlen = rng.pick(600);
+        let hello = random_bytes(&mut rng, hlen);
+        if rng.pick(2) == 0 && hello.len() >= 39 {
+            let mut h = vec![0x03u8, 0x03];
+            h.extend_from_slice(&[0x42; 32]);
+            let sid = rng.pick(40);
+            h.push(sid as u8);
+            h.extend((0..sid).map(|_| rng.byte()));
+            let cs = [0x13u8, 0x01];
+            h.extend_from_slice(&cs);
+            h.push(0); // compression = 0, so the parser commits past the sid
+            let ext = rng.pick(300) as u16;
+            h.extend_from_slice(&ext.to_be_bytes());
+            h.extend((0..ext).map(|_| rng.byte()));
+            let res = no_panic(|| parse_server_hello(&h));
+            assert!(
+                res.is_some(),
+                "tls::parse_server_hello panicked on hostile ServerHello"
+            );
+            if res.unwrap().is_some() {
+                hello_accepted += 1;
+            }
+        } else {
+            let _ = no_panic(|| parse_server_hello(&hello));
+        }
+    }
+    // The sweep must genuinely reach both accepted paths, not just garbage.
+    assert!(
+        framing_accepted > 0,
+        "record framing never accepted a record"
+    );
+    assert!(
+        hello_accepted > 0,
+        "ServerHello parser never accepted a hello"
+    );
+}
+
 /// The structured wing, driven through one mixed stream so the assertions are
 /// uniform: every target gets random bytes and valid-prefix+tail mutations,
 /// and must never panic on either.
-#[cfg_attr(miri, ignore)] // 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
+#[cfg_attr(miri, ignore)]
+// 100k-200k interpreted iterations: fuzz sweeps stay native; Miri covers UB on the fixed adversarial inputs
 #[test]
 fn network_parsers_are_total_under_mixed_input_streams() {
     let mut rng = Rng(SEED ^ 11);
@@ -402,13 +507,13 @@ fn user_ptr_gate_never_panics_on_hostile_ranges() {
         F_PT.0[0x101] = 0x2000_0000 | 1 | 2; // present, kernel-only
         core::ptr::addr_of!(F_PML4) as u64
     };
-    let mut rng = Rng(SEED ^ 0xA11_5E);
+    let mut rng = Rng(SEED ^ 0xA115E);
     for _ in 0..2000 {
         let va = match rng.pick(4) {
             0 => rng.next(),
-            1 => 0x100000,      // user page
-            2 => 0x101000,      // kernel-only page
-            _ => 0x0020_0000,   // unmapped region
+            1 => 0x100000,    // user page
+            2 => 0x101000,    // kernel-only page
+            _ => 0x0020_0000, // unmapped region
         };
         let len = (rng.next() as usize) % 8192;
         let writable = rng.pick(2) == 0;
@@ -419,9 +524,21 @@ fn user_ptr_gate_never_panics_on_hostile_ranges() {
     assert!(crate::user_ptr::validate_range(root, 0x100000, 4, true));
     assert!(!crate::user_ptr::validate_range(root, 0x101000, 4, true));
     assert!(!crate::user_ptr::validate_range(root, 0x101000, 4, false));
-    assert!(!crate::user_ptr::validate_range(root, 0x0020_0000, 4, false));
-    assert!(!crate::user_ptr::validate_range(root, 0x100000, 0x2000, false));
-    assert!(!crate::user_ptr::validate_range(root, u64::MAX - 3, 4, false));
+    assert!(!crate::user_ptr::validate_range(
+        root,
+        0x0020_0000,
+        4,
+        false
+    ));
+    assert!(!crate::user_ptr::validate_range(
+        root, 0x100000, 0x2000, false
+    ));
+    assert!(!crate::user_ptr::validate_range(
+        root,
+        u64::MAX - 3,
+        4,
+        false
+    ));
 }
 
 /// Kernel-boundary fuzz (hostile-audit Phase 1): drive every syscall number

@@ -805,8 +805,9 @@ impl NetIf {
     /// matches the live socket is denied here, never re-targeted.
     fn socket_index_oid(&self, oid: crate::cap::Oid) -> Option<usize> {
         self.sockets.iter().position(|s| {
-            s.as_ref()
-                .is_some_and(|sock| sock.id == oid.index as u16 && sock.generation == oid.generation)
+            s.as_ref().is_some_and(|sock| {
+                sock.id == oid.index as u16 && sock.generation == oid.generation
+            })
         })
     }
 
@@ -1337,12 +1338,7 @@ pub unsafe fn sys_net_send(slot: u64, va: u64, len: u64) -> i64 {
     let len = core::cmp::min(len as usize, 2048);
     // The message source is a caller buffer: approve the whole range through
     // the user-pointer gate before reading a single byte.
-    if !crate::user_ptr::validate_range(
-        crate::user_ptr::current_user_pml4(),
-        va,
-        len,
-        false,
-    ) {
+    if !crate::user_ptr::validate_range(crate::user_ptr::current_user_pml4(), va, len, false) {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
         return -1;
     }
@@ -1392,12 +1388,7 @@ pub unsafe fn sys_net_recv(slot: u64, va: u64, len: u64) -> i64 {
     let len = core::cmp::min(len as usize, 2048);
     // Approve the whole destination buffer through the user-pointer gate
     // (present, user-accessible, writable) before `socket_recv` writes a byte.
-    if !crate::user_ptr::validate_range(
-        crate::user_ptr::current_user_pml4(),
-        va,
-        len,
-        true,
-    ) {
+    if !crate::user_ptr::validate_range(crate::user_ptr::current_user_pml4(), va, len, true) {
         crate::audit::record(cur, crate::audit::OpKind::NetIo, Some(oid.index), false);
         return -1;
     }
@@ -1674,7 +1665,8 @@ mod tests {
             "the stale cap can never name the replacement"
         );
         assert!(
-            net.socket_index_oid(crate::cap::Oid::new(id2 as u32, gen)).is_none(),
+            net.socket_index_oid(crate::cap::Oid::new(id2 as u32, gen))
+                .is_none(),
             "the replacement is a new identity, not a stale generation"
         );
     }

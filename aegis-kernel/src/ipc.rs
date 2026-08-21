@@ -153,7 +153,7 @@ pub fn notify_task_kill(child: usize, reason: u32) -> bool {
             ENDPOINTS[NOTIFY_EP].server_recvbuf_va = 0;
             ENDPOINTS[NOTIFY_EP].state = EpState::SendWaiting;
             ENDPOINTS[NOTIFY_EP].caller = child;
-            return false;
+            false
         } else {
             ENDPOINTS[NOTIFY_EP].state = EpState::SendWaiting;
             ENDPOINTS[NOTIFY_EP].caller = child;
@@ -362,7 +362,11 @@ pub unsafe fn ipc_call(ep_slot: u64, msg_va: u64, len: u64, reply_va: u64) -> i6
         }
     };
     let len = core::cmp::min(len as usize, IPC_BUF);
-    if !copy_in(crate::user_ptr::current_user_pml4(), msg_va, &mut ENDPOINTS[ep].buf[..len]) {
+    if !copy_in(
+        crate::user_ptr::current_user_pml4(),
+        msg_va,
+        &mut ENDPOINTS[ep].buf[..len],
+    ) {
         crate::audit::record(cur, crate::audit::OpKind::Send, None, false);
         return -1;
     }
@@ -538,12 +542,7 @@ pub unsafe fn ipc_reply(ep_slot: u64, caller_id: u64, reply_va: u64, rlen: u64) 
         ENDPOINTS[ep].caller_reply_va,
         rlen,
     ) {
-        crate::audit::record(
-            cur,
-            crate::audit::OpKind::Send,
-            Some(caller as u32),
-            false,
-        );
+        crate::audit::record(cur, crate::audit::OpKind::Send, Some(caller as u32), false);
         return -1;
     }
     set_ret(caller, rlen as u64);

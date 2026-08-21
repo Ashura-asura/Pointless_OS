@@ -216,7 +216,7 @@ mod exit_reason {
 /// the handled set is `Unhandled` and fails the run (never silently
 /// swallowed or re-entered).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExitClass {
+pub(crate) enum ExitClass {
     ExternalInterrupt,
     Hlt,
     IoInstruction,
@@ -224,7 +224,7 @@ enum ExitClass {
     Unhandled { reason: u16 },
 }
 
-fn classify_exit(reason: u16) -> ExitClass {
+pub(crate) fn classify_exit(reason: u16) -> ExitClass {
     match reason {
         exit_reason::EXTERNAL_INTERRUPT => ExitClass::ExternalInterrupt,
         exit_reason::HLT => ExitClass::Hlt,
@@ -1359,7 +1359,7 @@ unsafe fn setup_controls(use_ept: bool, ept_root: u64) -> Result<(), &'static st
 
 /// A decoded I/O VM-exit (SDM Table 27-5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct IoExit {
+pub(crate) struct IoExit {
     port: u16,
     out: bool,
     size: u8,
@@ -1370,7 +1370,7 @@ struct IoExit {
 /// operand size (0 = 1 byte, 1 = 2 bytes, 3 = 4 bytes), bit 3 = direction
 /// (0 = OUT, 1 = IN), bit 4 = string instruction, bits 31:16 = port number.
 /// Reserved size encodings (2) return `None` — refuse rather than guess.
-fn decode_io_exit(qualification: u64) -> Option<IoExit> {
+pub(crate) fn decode_io_exit(qualification: u64) -> Option<IoExit> {
     let size = match qualification & 0x7 {
         0 => 1u8,
         1 => 2u8,
@@ -1390,7 +1390,7 @@ fn decode_io_exit(qualification: u64) -> Option<IoExit> {
 /// bytes; EC/ED (IN DX) and EE/EF (OUT DX) are 1 byte. The run loop reads
 /// the opcode at guest RIP (via the EPT) to pick the length; anything else
 /// is refused.
-fn io_instruction_len(opcode: u8) -> Option<u8> {
+pub(crate) fn io_instruction_len(opcode: u8) -> Option<u8> {
     match opcode {
         0xE4..=0xE7 => Some(2),
         0xEC..=0xEF => Some(1),
@@ -1837,6 +1837,47 @@ mod tests {
         for op in [0x90u8, 0xF4, 0xCD, 0x00] {
             assert_eq!(io_instruction_len(op), None);
         }
+    }
+
+    /// Phase AE: a malicious guest controls the VM-exit qualification and the
+    /// instruction byte at guest RIP — both are untrusted input. Drive every
+    /// bit pattern through the decoders the run loop feeds on exit reason 30 /
+    /// 48 and assert total no-panic + fail-closed on reserved encodings.
+    #[test]
+    #[cfg_attr(miri, ignore)] // interpreted sweep; the fixed vectors still run under Miri
+    fn guest_controlled_exit_decodes_are_total_and_fail_closed() {
+        use crate::hardening_fuzz::{no_panic, Rng, SEED};
+        let mut rng = Rng::new(SEED ^ 0x1A6EA3);
+        let mut reserved_io_sizes = 0usize;
+        let mut unhandled = 0usize;
+        for _ in 0..crate::hardening_fuzz::sweep_iters(1_000_000) {
+            let q = rng.next();
+            // I/O exit qualification: every 32-bit pattern, structured and
+            // random. Reserved size encoding (2 in bits 2:0) must refuse.
+            match no_panic(|| decode_io_exit(q & 0xFFFF_FFFF)) {
+                Some(Some(_)) => {}
+                Some(None) => reserved_io_sizes += 1,
+                None => panic!("decode_io_exit panicked on qualification {q:#018x}"),
+            }
+            // Instruction length: total over all 256 opcodes (the run loop
+            // reads this byte from guest memory — fully guest-controlled).
+            let _ = no_panic(|| io_instruction_len(rng.byte()));
+            // EPT-violation qualification.
+            let _ = no_panic(|| decode_ept_violation_qualification(q));
+            // Exit reason: total over the whole u16 range, unhandled refused.
+            match no_panic(|| classify_exit((q >> 48) as u16)) {
+                Some(ExitClass::Unhandled { .. }) => unhandled += 1,
+                Some(_) => {}
+                None => panic!("classify_exit panicked on reason {}", (q >> 48) as u16),
+            }
+        }
+        // A fuzz sweep that never saw a reserved size encoding would prove
+        // nothing about the fail-closed path — the seeded RNG must hit it.
+        assert!(
+            reserved_io_sizes > 0,
+            "reserved size encoding never exercised"
+        );
+        assert!(unhandled > 0, "unhandled exit reasons never exercised");
     }
 
     #[test]

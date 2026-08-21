@@ -103,7 +103,7 @@ fn dispatch_impl(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
             // Write: print arg2 bytes from the buffer at arg1 to COM1
             // (and mirror them to the VGA text console). The whole range must
             // pass the user-pointer gate first.
-            let len = clamp_write_len(arg2) as usize;
+            let len = clamp_write_len(arg2);
             if !crate::user_ptr::validate_range(
                 crate::user_ptr::current_user_pml4(),
                 arg1,

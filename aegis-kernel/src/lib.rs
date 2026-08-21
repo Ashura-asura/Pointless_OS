@@ -94,6 +94,9 @@ pub mod hardening;
 
 pub mod hardening_fuzz;
 
+#[cfg(test)]
+mod fuzz_corpus;
+
 pub mod hardening_syscalls;
 
 pub mod serial;

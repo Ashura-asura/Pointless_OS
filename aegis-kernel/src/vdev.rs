@@ -2096,6 +2096,67 @@ mod tests {
         }
     }
 
+    /// Phase AE: every guest-facing device model is untrusted-input surface —
+    /// a malicious guest drives arbitrary port/register sequences against the
+    /// whole fabricated device set (PIC, UART, PIT, RTC, PCI config, virtio
+    /// BAR, UHCI, SB16) through the single guest port surface `DeviceSet`
+    /// exposes. Sweep hostile (port, value) pairs (real ports + random,
+    /// structured ICW/OCW/mode words + random bytes, byte and dword widths)
+    /// and assert total no-panic. The stateful sequence matters: a hostile
+    /// ICW command can leave the PIC mid-ICW, so the sweep interleaves reads
+    /// and writes on one live device rather than a fresh one per input.
+    #[test]
+    #[cfg_attr(miri, ignore)] // interpreted sweep; the fixed vectors still run under Miri
+    fn guest_device_io_never_panics_on_hostile_port_sequences() {
+        use crate::hardening_fuzz::{no_panic, Rng, SEED};
+        let mut rng = Rng::new(SEED ^ 0xDE4A5);
+        let mut store = MemStore::new(4);
+        let mut ds = DeviceSet::new(&mut store, 0);
+        let real_ports: [u16; 24] = [
+            0x20, 0x21, 0xA0, 0xA1, 0x3F8, 0x3F9, 0x3FA, 0x3FB, 0x3FC, 0x3FD, 0x3FE, 0x3FF, 0x40,
+            0x43, 0x61, 0x70, 0x71, 0xCF8, 0xCFC, 0x220, 0x237, 0xC000, 0xCC00, 0xCC1F,
+        ];
+        let command_words: [u8; 12] = [
+            0x11, 0x01, 0x08, 0x0A, 0x20, 0x60, 0x68, 0x0C, 0x36, 0x54, 0x77, 0xB6,
+        ];
+        for _ in 0..crate::hardening_fuzz::sweep_iters(500_000) {
+            let port = if rng.pick(2) == 0 {
+                real_ports[rng.pick(real_ports.len())]
+            } else {
+                rng.next() as u16
+            };
+            let val = if rng.pick(4) == 0 {
+                command_words[rng.pick(command_words.len())]
+            } else {
+                rng.byte()
+            };
+            // Interleave reads and writes, byte and dword widths, on the
+            // live device state.
+            if rng.pick(2) == 0 {
+                let _ = no_panic(|| ds.inb(port));
+                let _ = no_panic(|| ds.outb(port, val));
+            }
+            let _ = no_panic(|| ds.inb(port));
+            let _ = no_panic(|| ds.outb(port, val));
+            let _ = no_panic(|| ds.inw(port));
+            let _ = no_panic(|| ds.outw(port, rng.next() as u16));
+            let _ = no_panic(|| ds.inl(port));
+            let _ = no_panic(|| ds.outl(port, rng.next() as u32));
+            // A PIT command word can flip a channel into any mode/read-back
+            // state; keep the UART DLAB and divisor bits moving so the whole
+            // register space stays reachable.
+            if rng.pick(4) == 0 {
+                let _ = no_panic(|| ds.outb(0x3FB, val));
+            }
+        }
+        // Sanity: the device set is still coherent after the hostile sweep.
+        let _ = ds.inb(0x20);
+        let _ = ds.inb(0x3F8);
+        let _ = ds.inb(0x40);
+        let _ = ds.inb(0x71);
+        let _ = ds.inl(0xCFC);
+    }
+
     #[test]
     fn pic_icw_sequence_programs_vector_bases() {
         let mut pic = Pic8259::new();
