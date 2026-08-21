@@ -111,6 +111,11 @@ pub mod channel;
 pub mod netstack;
 pub mod role;
 
+// Track 1 foundation (RoleLib/§9): versioned object store — the data substrate
+// the "summarize changes in a subtree since a point" delegation task needs.
+// Capability/role wiring over this store is a later increment.
+pub mod objstore;
+
 pub mod aes;
 
 pub mod tls;
