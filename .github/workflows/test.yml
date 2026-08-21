@@ -123,9 +123,10 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: nightly
       # Tests that touch wall-clock time / host calls (e.g. capability-audit's
-      # audit_fixtures) must not abort Miri; downgrade isolated-op failures to
-      # warnings so the UB gate still runs the whole workspace.
-      MIRIFLAGS: -Zmiri-isolation-error=warn
+      # audit_fixtures calls SystemTime::now -> clock_gettime) must not abort
+      # Miri. Disable isolation so those host calls succeed; UB detection
+      # (memory/races) stays fully active.
+      MIRIFLAGS: -Zmiri-disable-isolation
     defaults:
       run:
         working-directory: aegis
