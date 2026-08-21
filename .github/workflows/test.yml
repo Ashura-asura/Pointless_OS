@@ -225,6 +225,33 @@ jobs:
             echo "corpus unchanged; nothing to commit"
           fi
 
+  soak:
+    name: Soak (10x chaos / combined subsystems)
+    # Phase AF: a bounded, continuous chaos/soak pass over the combined model
+    # subsystems (capability-core, orchestration policy+grants+supervision,
+    # supervision-tree, fleet, resources, capability-audit). Runs nightly ONLY
+    # so the 10x-density invariant battery is exercised continuously without
+    # slowing per-push CI. The per-push gate is the `soak_smoke_bounded` test
+    # inside `cargo test --workspace` (Test + Lint job).
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aegis
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: clippy, rustfmt
+
+      - name: Soak run (bounded, release)
+        run: |
+          rm -f Cargo.lock
+          cargo run -p soak --release -- --duration 600 --seed 0x50A50A0A
+
   fuzz-push:
     name: Fuzz bounded gate (push)
     # Phase AE: a bounded, few-minute fuzz pass on every push/PR so the

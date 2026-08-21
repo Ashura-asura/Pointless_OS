@@ -19,6 +19,7 @@ members = [
     "crates/conformance",
     "crates/sdk-example",
     "crates/orchestration",
+    "crates/soak",
 ]
 
 [workspace.package]
