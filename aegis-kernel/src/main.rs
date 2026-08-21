@@ -486,7 +486,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
 
                 // Open a TCP socket bound to exactly one destination (the host's
                 // demo server) and connect: sends a real SYN.
-                let Some((id, _lp)) = net.socket_open(
+                let Some((id, _lp, _gen)) = net.socket_open(
                     aegis_kernel::netif::SockKind::Tcp,
                     aegis_kernel::netif::GW_IP,
                     8080,
@@ -572,7 +572,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 // Certificate / CertificateVerify / server Finished, sends its
                 // own Finished, then exchanges real encrypted application data
                 // (an HTTP request and response).
-                let Some((tid, _)) = net.socket_open(
+                let Some((tid, _, _gen)) = net.socket_open(
                     aegis_kernel::netif::SockKind::Tcp,
                     aegis_kernel::netif::GW_IP,
                     8443,
@@ -1824,7 +1824,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 1,
                 aegis_kernel::cap::CapSlot {
                     cap: aegis_kernel::cap::Cap::Task(
-                        aegis_kernel::tasks::task_oid(IDX_ISO_TEST).unwrap(),
+                        aegis_kernel::tasks::task_oid(IDX_ISO_TEST as usize).unwrap(),
                     ),
                     rights: aegis_kernel::cap::Rights::CONTROL
                         .union(aegis_kernel::cap::Rights::READ),
@@ -1839,7 +1839,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 2,
                 aegis_kernel::cap::CapSlot {
                     cap: aegis_kernel::cap::Cap::Task(
-                        aegis_kernel::tasks::task_oid(IDX_SERVICE).unwrap(),
+                        aegis_kernel::tasks::task_oid(IDX_SERVICE as usize).unwrap(),
                     ),
                     rights: aegis_kernel::cap::Rights::CONTROL
                         .union(aegis_kernel::cap::Rights::READ),
@@ -2087,7 +2087,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                         1,
                         aegis_kernel::cap::CapSlot {
                             cap: aegis_kernel::cap::Cap::Task(
-                                aegis_kernel::tasks::task_oid(IDX_ISO_TEST).unwrap(),
+                                aegis_kernel::tasks::task_oid(IDX_ISO_TEST as usize).unwrap(),
                             ),
                             rights: aegis_kernel::cap::Rights::CONTROL
                                 .union(aegis_kernel::cap::Rights::READ),

@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Nightly growth of the committed fuzz corpus (Phase AE).
+    - cron: '23 4 * * *'
   workflow_dispatch:
 
 env:
@@ -115,6 +118,10 @@ jobs:
   miri:
     name: Miri (UB detection)
     runs-on: ubuntu-latest
+    # The root rust-toolchain.toml pins 1.97.1 (stable); override it here so
+    # the installed nightly + cargo-miri is actually used.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     defaults:
       run:
         working-directory: aegis
@@ -141,6 +148,10 @@ jobs:
   asan:
     name: ASan (address sanitizer)
     runs-on: ubuntu-latest
+    # The root rust-toolchain.toml pins 1.97.1 (stable); override it here so
+    # -Zsanitizer=address is accepted by the compiler.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     defaults:
       run:
         working-directory: aegis
@@ -166,10 +177,11 @@ jobs:
   fuzz-nightly:
     name: Fuzz corpus growth (nightly)
     # Phase AE: a long, coverage-broadening fuzz pass that grows the committed
-    # corpus. Runs nightly (not on every push) so the corpus evolves in git
-    # history without thrashing the repo on every commit. The push CI gate is
-    # the bounded `corpus_driven_fuzz_is_total_and_grows` run inside the kernel
-    # `test` job above.
+    # corpus. Runs nightly ONLY (gated by `schedule` below) so the corpus
+    # evolves in git history without thrashing the repo on every push. The
+    # push CI gate is the bounded `corpus_driven_fuzz_is_total_and_grows` run
+    # inside the kernel `test` job above.
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
       contents: write
