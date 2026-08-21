@@ -34,6 +34,7 @@ use std::sync::Mutex;
 
 use crate::arp::ArpPacket;
 use crate::ethernet::EthernetFrame;
+use crate::frame::fuzz_run as frame_fuzz_run;
 use crate::hardening_fuzz::{no_panic, Rng, SEED};
 use crate::ipv4::IPv4Packet;
 use crate::tcp::TcpSegment;
@@ -96,6 +97,15 @@ fn vmx_reason_run(b: &[u8]) -> bool {
             | Some(ExitClass::IoInstruction)
             | Some(ExitClass::EptViolation)
     )
+}
+
+fn allocator_run(b: &[u8]) -> bool {
+    // The allocator oracle asserts its own bookkeeping invariants on every
+    // step; a panic (caught by the harness's no_panic wrapper) is the signal
+    // that a double-free was accepted, the free count desynced, or an
+    // out-of-range/already-free frame mutated state. "Accepted" here means
+    // "completed without corrupting invariants".
+    frame_fuzz_run(b)
 }
 
 fn decode_io_exit_le(b: &[u8]) -> Option<crate::vmx::IoExit> {
@@ -245,6 +255,53 @@ fn structured_identity(_rng: &mut Rng, seed: &[u8]) -> Vec<u8> {
     seed.to_vec()
 }
 
+/// Base seeds for the allocator target: hand-crafted op streams that hit the
+/// boundary cases (alloc-to-exhaustion, contiguous runs of every small size,
+/// interleaved free/double-free, and a pure double-free storm) plus a few
+/// random ones. The op encoding is documented on `frame::fuzz_run`.
+fn base_allocator(rng: &mut Rng, out: &mut Vec<Vec<u8>>) {
+    out.push(vec![]);
+    // Exhaust then free-all: 200 allocs (op 0) then 200 frees (op 2).
+    out.push((0..200).map(|_| 0u8).collect());
+    out.push((0..200).map(|_| 2u8).collect());
+    // Interleaved single alloc/free.
+    out.push(
+        (0..120)
+            .map(|i| if i % 2 == 0 { 0u8 } else { 2u8 })
+            .collect(),
+    );
+    // Contiguous runs of each small size with trailing frees.
+    for n in 1u8..=8 {
+        let mut s = vec![1u8, n]; // alloc_contiguous(1 + n&7) => alloc_contiguous(1+n)
+        s.push(2); // free the base (a single tracked frame)
+        out.push(s);
+    }
+    // Double-free storms (op 3) interleaved with allocs.
+    out.push(
+        (0..60)
+            .map(|i| if i % 3 == 0 { 3u8 } else { 0u8 })
+            .collect(),
+    );
+    // A long random stream.
+    let len = 256 + rng.pick(769);
+    out.push((0..len).map(|_| rng.byte()).collect());
+}
+
+fn structured_allocator(rng: &mut Rng, seed: &[u8]) -> Vec<u8> {
+    // Keep the op stream shape but flip a few bits so the allocator sees
+    // different alloc/free/size decisions (including boundary sizes 1..=8).
+    let mut buf = seed.to_vec();
+    for _ in 0..=rng.pick(6) {
+        if buf.is_empty() {
+            buf.push(rng.byte());
+            continue;
+        }
+        let i = rng.pick(buf.len());
+        buf[i] ^= 1u8 << rng.pick(8);
+    }
+    buf
+}
+
 fn targets() -> Vec<Target> {
     vec![
         Target {
@@ -312,6 +369,12 @@ fn targets() -> Vec<Target> {
             run: vmx_reason_run,
             base: base_vmx_reason,
             structured: structured_identity,
+        },
+        Target {
+            name: "allocator",
+            run: allocator_run,
+            base: base_allocator,
+            structured: structured_allocator,
         },
     ]
 }

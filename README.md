@@ -17,6 +17,10 @@ engineering experimentation.
 - Capability model + machine-checked verification: Docs/spec/capability-model.md
 - Model SDK guide + runnable example: Docs/spec/sdk.md (`cargo run -p sdk-example`)
 - Security audit notes: Docs/SECURITY_AUDIT.md
+- Security policy + vulnerability reporting: SECURITY.md
+- Threat model (adversary classes, emulation vs real hardware): Docs/THREAT_MODEL.md
+- Hardware-evidence track (real firmware results, USB-canary status): Docs/HARDWARE_EVIDENCE.md
+- Bridge phase — resume guest-kernel compatibility growth: Docs/BRIDGE_PHASE.md
 - Project report: Docs/PROJECT_REPORT.md
 - Licensing + third-party notices: Docs/LICENSING.md
 

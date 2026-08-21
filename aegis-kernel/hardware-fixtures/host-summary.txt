@@ -1,0 +1,10 @@
+Manufacturer: Dell Inc.
+Model: Inspiron 7400
+BaseBoard: Dell Inc. 072W08
+BIOS: Dell Inc. DELL   - 2 (11/23/2024 05:45:00)
+CPU: 11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz / cores=4 / logical=8
+--- VT-x gate ---
+DeviceGuard: (Win32_DeviceGuard unavailable in this session)
+MemoryIntegrity (HVCI): enabled (default)
+VBS EnableVirtualizationBasedSecurity: 1
+VT-x VERDICT: firmware supports it, but WINDOWS blocks it (Memory Integrity / VBS reserves VMX). Disabling Core Isolation (Windows Security -> Device Security -> Core Isolation) should unblock nested VMX.

@@ -73,6 +73,7 @@ pub mod win_compat;
 // Phase Y (host-side ACPI discovery + SMP groundwork — pure, contract-tested
 // parsers/encoders; only the raw physical reads are unsafe, see module docs)
 pub mod acpi;
+pub mod hardware_evidence;
 
 // Phase K (VT-x bring-up primitive — see module docs for honest scope)
 pub mod vmx;

@@ -336,7 +336,13 @@ def create_disk_image(efi_path, output_path, fleet_cfg_path=None):
 
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    efi_path = os.path.join(script_dir, "target", "x86_64-unknown-uefi", "release", "uefi-boot.efi")
+    # Default to the normal loader; the canary build passes its own EFI so the
+    # canary image actually embeds the canary kernel (storage compiled out).
+    efi_path = (
+        sys.argv[2]
+        if len(sys.argv) > 2
+        else os.path.join(script_dir, "target", "x86_64-unknown-uefi", "release", "uefi-boot.efi")
+    )
     output_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(script_dir, "aegis-boot.img")
     fleet_cfg_path = os.path.join(script_dir, "FLEET.CFG")
     if not os.path.exists(efi_path):

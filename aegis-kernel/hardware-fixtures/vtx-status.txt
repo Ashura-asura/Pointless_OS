@@ -1,0 +1,4 @@
+DeviceGuard: (Win32_DeviceGuard unavailable in this session)
+MemoryIntegrity (HVCI): enabled (default)
+VBS EnableVirtualizationBasedSecurity: 1
+VT-x VERDICT: firmware supports it, but WINDOWS blocks it (Memory Integrity / VBS reserves VMX). Disabling Core Isolation (Windows Security -> Device Security -> Core Isolation) should unblock nested VMX.

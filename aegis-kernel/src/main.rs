@@ -2329,6 +2329,9 @@ pub extern "sysv64" fn run_idle() -> ! {
 /// when absent, so a reboot (which proves the F2-saved memo edit) also proves
 /// the Phase AA payloads persist, and a user-replaced image or an installed
 /// package is never clobbered. Reports each seed honestly over serial.
+// Under the `canary` feature the storage path (NVMe/FAT/store) is compiled out,
+// so this seeding helper is intentionally unused there.
+#[cfg_attr(feature = "canary", allow(dead_code))]
 fn aa_seed(
     st: &mut aegis_kernel::nvme_store::Store,
     ctrl: &mut aegis_kernel::nvme::NvmeController,

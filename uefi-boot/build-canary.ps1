@@ -45,7 +45,7 @@ try {
     $needle = [System.Text.Encoding]::ASCII.GetBytes("CANARY: storage path compiled out")
     if (-not (ContainsBytes $bytes $needle)) { throw "aegis-canary.efi does not embed the canary kernel - aborting" }
 
-    python build_image.py aegis-canary.img
+    python build_image.py aegis-canary.img aegis-canary.efi
     python add_startup.py aegis-canary.img
 
     # Restore the normal loader + image (normal build in its own fresh dir).

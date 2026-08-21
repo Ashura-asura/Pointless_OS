@@ -145,7 +145,7 @@ jobs:
       - name: Kernel host-testable modules under Miri
         working-directory: aegis-kernel
         run: |
-          for m in boot_info:: channel:: e1000:: ept:: ipc:: policy_engine:: hardening_fuzz:: hardening_syscalls::; do
+          for m in boot_info:: channel:: e1000:: ept:: frame:: ipc:: policy_engine:: hardening_fuzz:: hardening_syscalls::; do
             echo "=== $m ==="
             cargo miri test "$m" || exit 1
           done
