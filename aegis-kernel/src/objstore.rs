@@ -49,6 +49,13 @@ pub struct Change {
     /// Versions appended at or after `since_seq` (0 if unchanged since).
     pub versions_since: u64,
     pub cur_len: usize,
+    /// NOT YET POPULATED — always `0` in this increment, regardless of the
+    /// object's actual previous length. The store only retains a version
+    /// *count* per object (see module "Reduced" note), not prior sizes, so
+    /// there is nothing correct to put here yet. Kept as a field now so the
+    /// `Change` shape doesn't need to break callers again once a bounded
+    /// version ring lands; do not read this as "previously empty" until
+    /// it's actually wired up.
     pub prev_len: usize,
 }
 
@@ -146,12 +153,18 @@ impl ObjStore {
     }
 
     /// Subtree membership by BFS over parent links. Returns the root itself
-    /// plus every descendant. Bounded to `MAX_OBJECTS` entries.
-    pub fn subtree_members(&self, root: ObjId) -> [ObjId; MAX_OBJECTS] {
+    /// plus every descendant, and how many of the fixed `MAX_OBJECTS` slots
+    /// are actually populated. Callers MUST use the returned count, not a
+    /// zero-sentinel scan — object id `0` is a valid id (nothing reserves
+    /// it), so `0` cannot double as an end-of-list marker. (An earlier
+    /// version of this function did exactly that and silently dropped
+    /// object `0` from every query whenever it existed — fixed here by
+    /// returning the real length instead of relying on the fill value.)
+    pub fn subtree_members(&self, root: ObjId) -> ([ObjId; MAX_OBJECTS], usize) {
         let mut out = [0u64; MAX_OBJECTS];
         let mut n = 0usize;
         if self.slot_of(root).is_none() {
-            return out;
+            return (out, 0);
         }
         out[n] = root;
         n += 1;
@@ -166,7 +179,7 @@ impl ObjStore {
                 }
             }
         }
-        out
+        (out, n)
     }
 
     /// Summarize what changed in `root`'s subtree since `since_seq`. An object
@@ -186,12 +199,9 @@ impl ObjStore {
                 prev_len: 0,
             }; MAX_OBJECTS],
         };
-        let members = self.subtree_members(root);
-        for &m in members.iter() {
-            if m == 0 {
-                continue;
-            }
-            diff.members += 1;
+        let (members, n) = self.subtree_members(root);
+        diff.members = n as u32;
+        for &m in members[..n].iter() {
             if let Some(o) = self.get(m) {
                 if o.last_seq > since_seq {
                     let idx = diff.changed_count as usize;
@@ -269,15 +279,52 @@ mod tests {
         s.create(2, Some(1)).unwrap();
         s.create(3, Some(1)).unwrap();
         s.create(4, Some(2)).unwrap();
-        let m = s.subtree_members(1);
-        let set: std::collections::BTreeSet<u64> = m.iter().copied().filter(|&x| x != 0).collect();
+        let (m, n) = s.subtree_members(1);
+        let set: std::collections::BTreeSet<u64> = m[..n].iter().copied().collect();
         assert_eq!(set, [1u64, 2, 3, 4].into_iter().collect());
         // subtree of a leaf is just itself
-        let leaf = s.subtree_members(4);
+        let (leaf, ln) = s.subtree_members(4);
+        assert_eq!(ln, 1);
         assert_eq!(leaf[0], 4);
-        assert_eq!(leaf[1], 0);
         // unknown root -> empty
-        assert_eq!(s.subtree_members(42)[0], 0);
+        let (_, un) = s.subtree_members(42);
+        assert_eq!(un, 0);
+    }
+
+    #[test]
+    fn object_id_zero_is_not_confused_with_an_empty_slot() {
+        // Regression test for the sentinel-collision bug: subtree_members
+        // used to fill unused array slots with 0u64 and rely on callers
+        // treating 0 as "no entry here" — which silently ate object id 0
+        // whenever it was real. This proves id 0 now round-trips correctly
+        // through both subtree_members and subtree_changed_since.
+        let mut s = ObjStore::new();
+        s.create(0, None).unwrap();
+        s.create(1, Some(0)).unwrap();
+
+        let (members, n) = s.subtree_members(0);
+        assert_eq!(n, 2, "object 0 must be counted, not treated as padding");
+        assert!(members[..n].contains(&0));
+        assert!(members[..n].contains(&1));
+
+        // A childless object 0 must still be distinguishable from "root
+        // doesn't exist" (both used to serialize to [0,0,0,...]).
+        let mut solo = ObjStore::new();
+        solo.create(0, None).unwrap();
+        let (solo_members, solo_n) = solo.subtree_members(0);
+        assert_eq!(solo_n, 1);
+        assert_eq!(solo_members[0], 0);
+        let (_, missing_n) = solo.subtree_members(999);
+        assert_eq!(missing_n, 0);
+
+        // And subtree_changed_since must report object 0 as changed, not
+        // silently drop it.
+        s.write(0, 4, 0xAA).unwrap();
+        let diff = s.subtree_changed_since(0, 0);
+        assert_eq!(diff.members, 2);
+        assert!(diff.changed[..diff.changed_count as usize]
+            .iter()
+            .any(|c| c.id == 0));
     }
 
     #[test]
