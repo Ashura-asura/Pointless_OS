@@ -87,6 +87,7 @@ pub enum PolicyEvent {
 /// One lightweight, capability-less observer of one agent. Construction is the
 /// only kernel-adjacent step (it reads the audit log); after that its only act
 /// is asking the ledger to flip suspension state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnomalyMonitor {
     agent: usize,
     profile: [Option<OpShape>; OpKind::COUNT],

@@ -53,6 +53,7 @@ use crate::audit;
 use crate::cap::{
     Cap, CapSlot, Rights, NET_RIGHTS, OBJECT_EDIT_RIGHTS, OBJECT_RIGHTS, OBJECT_ROOT_RIGHTS,
 };
+use crate::monitor::AnomalyMonitor;
 use crate::objstore::{ObjStore, SubtreeDiff};
 use crate::tasks::{current_idx, set_task_cap, task_cap, MAX_CAPS, MAX_TASKS};
 
@@ -406,6 +407,11 @@ pub enum DelegationError {
     /// Same as `ScopeMismatch`: a scope expansion was requested and must be
     /// confirmed before any capability is minted.
     ExpansionRequired,
+    /// The agent was suspended by the §9.5 anomaly circuit breaker (a
+    /// significant deviation from its role's trained op-shape). Caps already
+    /// minted keep working; only new delegation is frozen. Role exercise is
+    /// denied while suspended, pending human review.
+    Suspended,
 }
 
 /// §9.1 + §9.2 + §9.4: resolve and authorize an object capability at
@@ -456,10 +462,21 @@ pub fn objstore_subtree_summary(
     since_seq: u64,
     store: &ObjStore,
 ) -> Result<SubtreeDiff, DelegationError> {
+    // §9.5: a suspended agent's role exercise is denied outright. Its already-
+    // minted capabilities keep working, but the grant ledger freezes new
+    // delegation, so there is nothing more it can do under the role until a
+    // human resumes it.
+    if role_monitor_suspended(task) {
+        return Err(DelegationError::Suspended);
+    }
     match resolve_object_cap(task, slot, root, Rights::READ) {
         Ok(()) => {
             let diff = store.subtree_changed_since(root as u64, since_seq);
             audit::record(task, audit::OpKind::RoleExercise, Some(root), true);
+            // Observe the agent's role usage through the anomaly monitor so a
+            // significant deviation from its trained shape suspends it on the
+            // next pass (suspend-don't-revoke — this op already happened).
+            let _ = role_monitor_observe(task);
             Ok(diff)
         }
         Err(DelegationError::ExpansionRequired) => {
@@ -612,6 +629,56 @@ pub fn reader_shape_ok(task: usize) -> bool {
         && counts[audit::OpKind::TaskSpawn.index()] == 0
         && counts[audit::OpKind::NetOpen.index()] == 0
         && counts[audit::OpKind::Write.index()] == 0
+}
+
+/// §9.5 (mechanism 5, closed): the full suspend-don't-revoke anomaly circuit
+/// breaker from `monitor.rs`, wired directly to role grants. The monitor is a
+/// read-only observer of the kernel's attributed audit log; here it watches the
+/// agent's *role* usage. On significant deviation from the role's trained
+/// op-shape it suspends the agent in the grant ledger — never revoking a single
+/// capability, only freezing new delegation — pending human review. This is the
+/// piece `reader_shape_ok` (above) only flagged; now it actually suspends.
+///
+/// The monitor instance is stored per-task and trained by the supervisor after
+/// the agent has demonstrated its normal role behavior (the same "train from an
+/// observed baseline" contract `monitor::AnomalyMonitor::train` already has).
+static mut ROLE_MONITORS: [Option<AnomalyMonitor>; MAX_TASKS] = [None; MAX_TASKS];
+
+/// Mutable accessor for `ROLE_MONITORS` via `addr_of_mut!`, so we never form a
+/// direct `&mut` to the `static mut` (which the `static_mut_refs` lint rejects).
+pub(crate) fn role_monitor_slot(task: usize) -> &'static mut Option<AnomalyMonitor> {
+    // SAFETY: single-threaded kernel; the returned reference is not held across
+    // a context switch.
+    unsafe { &mut *core::ptr::addr_of_mut!(ROLE_MONITORS[task]) }
+}
+
+/// Train the anomaly monitor for `task` from its current audit-shape baseline.
+/// Called by the supervisor once the agent's normal role behavior is observed;
+/// mirroring `monitor::AnomalyMonitor::train`.
+pub fn role_monitor_train(task: usize) {
+    if task >= MAX_TASKS {
+        return;
+    }
+    *role_monitor_slot(task) = Some(AnomalyMonitor::train(task));
+}
+
+/// Observe `task`'s role usage through the anomaly monitor. Returns `true` if
+/// the agent was suspended for significant deviation (caps are not revoked; the
+/// ledger merely freezes new grants). No-op when no monitor is trained.
+pub fn role_monitor_observe(task: usize) -> bool {
+    if task >= MAX_TASKS {
+        return false;
+    }
+    if let Some(m) = role_monitor_slot(task).as_mut() {
+        return m.observe();
+    }
+    false
+}
+
+/// Is `task` currently suspended by the role anomaly monitor? The grant ledger
+/// freezes new delegation while this is true, and role exercise is denied.
+pub fn role_monitor_suspended(task: usize) -> bool {
+    task < MAX_TASKS && unsafe { crate::monitor::ledger().is_suspended(task) }
 }
 
 #[cfg(test)]
@@ -1519,6 +1586,82 @@ mod tests {
             // Off-shape: a write op appears in the agent's audit trail.
             crate::audit::record(agent, crate::audit::OpKind::MemWrite, Some(9), true);
             assert!(!reader_shape_ok(agent), "off-profile write is flagged");
+        }
+    }
+
+    /// Mechanism 5 (§9.5, closed): the full suspend-don't-revoke anomaly
+    /// circuit breaker (`monitor.rs`) is wired directly to role grants. A
+    /// read-only reader that stays inside its shape is fine; when it commits a
+    /// genuinely anomalous action (a mutating op a read-only grant could never
+    /// perform) the monitor SUSPENDS the agent in the grant ledger — not merely
+    /// flags it (that was the earlier reduced `reader_shape_ok` check). The
+    /// already-minted cap survives (no revocation); only new delegation is
+    /// frozen, and the agent's role exercise is denied until a human resumes.
+    #[test]
+    fn role_anomaly_monitor_suspends_not_just_flags() {
+        let _g = crate::kernel_state_guard();
+        clean_world();
+        // Unique task indices so this test's global monitor/ledger/audit state
+        // cannot leak into or be polluted by any other role test.
+        unsafe {
+            let (grantor, agent) = (5usize, 4usize);
+            spawn("grantor", dummy, 0x500000).unwrap();
+            spawn("agent", dummy, 0x400000).unwrap();
+            set_task_cap(
+                grantor,
+                0,
+                CapSlot {
+                    cap: Cap::ObjectRoot,
+                    rights: OBJECT_ROOT_RIGHTS,
+                },
+            );
+            set_current_for_test(grantor);
+            assert_eq!(role_grant(ROLE_OBJECT_READER as u64, agent as u64, 1, 0), 0);
+            set_current_for_test(agent);
+            let store = crate::objstore::ObjStore::new();
+            // Start from a clean monitor slot regardless of prior test state.
+            *role_monitor_slot(agent) = None;
+            // Establish normal behavior: exercise the read-only role.
+            assert!(objstore_subtree_summary(agent, 0, 1, 0, &store).is_ok());
+            assert!(objstore_subtree_summary(agent, 0, 1, 0, &store).is_ok());
+            // Train the anomaly monitor from the observed baseline shape.
+            role_monitor_train(agent);
+            assert!(!role_monitor_suspended(agent));
+            // Staying inside the shape: another read, no suspension.
+            assert!(objstore_subtree_summary(agent, 0, 1, 0, &store).is_ok());
+            assert!(!role_monitor_observe(agent));
+            assert!(!role_monitor_suspended(agent));
+            // Genuinely anomalous: a mutating op a read-only grant can never
+            // perform appears in the agent's audit trail (in reality this is a
+            // kernel-gated call refused at the gate, but the attempt is
+            // attributed — exactly the kernel truth the monitor reads).
+            crate::audit::record(agent, crate::audit::OpKind::MemWrite, Some(9), true);
+            // The monitor SUSPENDS — not merely flags.
+            assert!(role_monitor_observe(agent));
+            assert!(role_monitor_suspended(agent));
+            assert!(crate::monitor::ledger().is_suspended(agent));
+            // Suspension is not revocation: the minted cap still names root 1.
+            assert_eq!(
+                task_cap(agent, 0).cap,
+                Cap::Object(crate::cap::Oid::new(1, 0))
+            );
+            assert_eq!(crate::audit::revoke_count(agent), 0);
+            // And the now-suspended agent's role exercise is denied.
+            assert_eq!(
+                objstore_subtree_summary(agent, 0, 1, 0, &store),
+                Err(DelegationError::Suspended)
+            );
+            // Human review resumes; exercise works again — after clearing the
+            // trained monitor so the same anomalous op does not instantly
+            // re-suspend on the next observation pass.
+            crate::monitor::ledger().resume(agent);
+            assert!(!role_monitor_suspended(agent));
+            *role_monitor_slot(agent) = None;
+            assert!(objstore_subtree_summary(agent, 0, 1, 0, &store).is_ok());
+            // Clean up any residual ledger suspension so it cannot leak.
+            if crate::monitor::ledger().is_suspended(agent) {
+                crate::monitor::ledger().resume(agent);
+            }
         }
     }
 
