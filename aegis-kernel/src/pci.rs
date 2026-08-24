@@ -1,4 +1,5 @@
-// PCIe device enumeration
+//! PCIe device enumeration
+
 // PCI config register offsets
 pub const VENDOR_ID: u16 = 0x00;
 pub const DEVICE_ID: u16 = 0x02;
@@ -26,6 +27,26 @@ pub const CLASS_DISPLAY: u8 = 0x03;
 pub const CLASS_BRIDGE: u8 = 0x06;
 pub const SUBCLASS_NVME: u8 = 0x08;
 pub const SUBCLASS_AHCI: u8 = 0x06; // SATA controller (AHCI)
+pub const CLASS_SERIAL_BUS: u8 = 0x0C;
+pub const SUBCLASS_USB: u8 = 0x03;
+// USB host-controller Prog IF values (PCI class 0x0C, subclass 0x03).
+pub const PROG_IF_UHCI: u8 = 0x00;
+pub const PROG_IF_OHCI: u8 = 0x10;
+pub const PROG_IF_EHCI: u8 = 0x20;
+pub const PROG_IF_XHCI: u8 = 0x30;
+
+/// Finer-grained USB host-controller kind from Prog IF — `class_name`
+/// alone can't distinguish xHCI from EHCI/OHCI/UHCI since they share the
+/// same (class, subclass) pair.
+pub fn usb_prog_if_name(prog_if: u8) -> &'static str {
+    match prog_if {
+        PROG_IF_UHCI => "UHCI (USB 1.1)",
+        PROG_IF_OHCI => "OHCI (USB 1.1)",
+        PROG_IF_EHCI => "EHCI (USB 2.0)",
+        PROG_IF_XHCI => "xHCI (USB 3.x)",
+        _ => "unknown USB HCI",
+    }
+}
 
 /// Human-readable class name for scan reports.
 pub fn class_name(class: u8, subclass: u8) -> &'static str {
@@ -38,7 +59,7 @@ pub fn class_name(class: u8, subclass: u8) -> &'static str {
         (0x06, 0x00) => "host bridge",
         (0x06, 0x01) => "ISA bridge",
         (0x06, 0x04) => "PCI-PCI bridge",
-        (0x0C, 0x03) => "USB3 xHCI",
+        (0x0C, 0x03) => "USB controller",
         _ => "other",
     }
 }
@@ -146,8 +167,6 @@ pub unsafe fn enable_bus_mastering(address: PciAddress) {
 pub unsafe fn scan_live(list: &mut PciDeviceList) {
     for device in 0..32u8 {
         let function0 = PciAddress::new(0, device, 0);
-        // Reading the header of a nonexistent slot returns 0xFF (multifunction
-        // bit set), so the probe of function 0 catches it via the vendor check.
         let header_type = read_config_byte(function0, HEADER_TYPE);
         let function_count = if header_type & 0x80 != 0 { 8 } else { 1 };
         for function in 0..function_count {
@@ -289,6 +308,18 @@ impl PciDevice {
         self.class == CLASS_NETWORK
     }
 
+    pub fn is_usb_xhci(&self) -> bool {
+        self.class == CLASS_SERIAL_BUS
+            && self.subclass == SUBCLASS_USB
+            && self.prog_if == PROG_IF_XHCI
+    }
+
+    pub fn is_usb_ehci(&self) -> bool {
+        self.class == CLASS_SERIAL_BUS
+            && self.subclass == SUBCLASS_USB
+            && self.prog_if == PROG_IF_EHCI
+    }
+
     pub fn is_display(&self) -> bool {
         self.class == CLASS_DISPLAY
     }
@@ -363,6 +394,14 @@ impl PciDeviceList {
         self.iter().find(|d| d.is_network())
     }
 
+    pub fn find_usb_xhci(&self) -> Option<&PciDevice> {
+        self.iter().find(|d| d.is_usb_xhci())
+    }
+
+    pub fn find_usb_ehci(&self) -> Option<&PciDevice> {
+        self.iter().find(|d| d.is_usb_ehci())
+    }
+
     /// First display-class (`CLASS_DISPLAY`) device, if any. Phase H:
     /// `gpu::BochsGpu::probe` calls this, then confirms the device actually
     /// speaks the Bochs dispi register interface before using it — a
@@ -428,9 +467,6 @@ mod tests {
 
     #[test]
     fn bar_address_rejects_64bit_bar_at_last_index() {
-        // A device lying about a 64-bit BAR at the final slot (index 5) has
-        // no room for the high half. Must not index bar[6] (panic); treat the
-        // high half as absent and return the low part only.
         let dev = PciDevice {
             address: PciAddress::new(0, 0, 0),
             vendor_id: 0,
@@ -444,7 +480,6 @@ mod tests {
             interrupt_line: 0,
             interrupt_pin: 0,
         };
-        // index 5 is a 64-bit BAR with no high half: must not panic.
         assert_eq!(dev.bar_address(5), 0x1000_0000);
     }
 
@@ -532,6 +567,51 @@ mod tests {
         };
         list.push(net);
         assert!(list.find_network().is_some());
+    }
+
+    #[test]
+    fn find_usb_xhci_finds_xhci_not_ehci() {
+        let mut list = PciDeviceList::new();
+        let xhci = PciDevice {
+            address: PciAddress::new(0, 20, 0),
+            vendor_id: 0x8086,
+            device_id: 0x9c31,
+            class: CLASS_SERIAL_BUS,
+            subclass: SUBCLASS_USB,
+            prog_if: PROG_IF_XHCI,
+            revision: 0,
+            header_type: 0,
+            bar: [0x9000_0004, 0, 0, 0, 0, 0],
+            interrupt_line: 0,
+            interrupt_pin: 0,
+        };
+        let ehci = PciDevice {
+            address: PciAddress::new(0, 21, 0),
+            vendor_id: 0x8086,
+            device_id: 0x9c26,
+            class: CLASS_SERIAL_BUS,
+            subclass: SUBCLASS_USB,
+            prog_if: PROG_IF_EHCI,
+            revision: 0,
+            header_type: 0,
+            bar: [0; 6],
+            interrupt_line: 0,
+            interrupt_pin: 0,
+        };
+        list.push(ehci);
+        list.push(xhci);
+        let found = list.find_usb_xhci().unwrap();
+        assert_eq!(found.device_id, 0x9c31);
+        assert!(found.is_usb_xhci());
+        assert!(!found.is_usb_ehci());
+        assert!(list.find_usb_ehci().is_some());
+    }
+
+    #[test]
+    fn usb_prog_if_name_distinguishes_controllers() {
+        assert_eq!(usb_prog_if_name(PROG_IF_XHCI), "xHCI (USB 3.x)");
+        assert_eq!(usb_prog_if_name(PROG_IF_EHCI), "EHCI (USB 2.0)");
+        assert_eq!(usb_prog_if_name(0xFF), "unknown USB HCI");
     }
 
     #[test]

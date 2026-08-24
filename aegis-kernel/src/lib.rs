@@ -28,6 +28,7 @@ pub mod iommu;
 pub mod nvme;
 pub mod nvme_store;
 pub mod pci;
+pub mod usbhcd;
 
 pub mod arp;
 pub mod e1000;

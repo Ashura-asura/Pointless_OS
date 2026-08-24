@@ -38,7 +38,11 @@ static mut CUR_COL: usize = 0;
 /// no-ops (they must not reset the accumulated buffer).
 pub fn install(base: u64, width: u32, height: u32, stride_px: u32, bpp: u32) {
     unsafe {
-        if FB_BASE != 0 {
+        // Re-install only if the framebuffer changed (the kernel installs
+        // the same base at boot entry and again in the GPU block — the
+        // second call must not reset the accumulated log). Tests pass a
+        // fresh buffer each time, so they re-install.
+        if FB_BASE == base && base != 0 {
             return;
         }
         FB_BASE = base;
@@ -141,6 +145,9 @@ fn blit() {
     // The loader's identity map covers only the first 4 GiB. A framebuffer
     // above that is not writable at boot entry (the kernel maps it later via
     // the device-BAR window); blitting to it would fault, so defer silently.
+    // This check only applies to the kernel (the bare-metal identity map);
+    // host tests run in a flat address space and the guard does not apply.
+    #[cfg(not(test))]
     if base >= 0x1_0000_0000 {
         return;
     }
@@ -196,19 +203,23 @@ mod tests {
     use std::sync::Mutex;
 
     // The console's framebuffer + buffer are global statics, so the tests
-    // that touch them must not run concurrently.
+    // that touch them must not run concurrently. Poison-tolerant: a panic
+    // while holding the lock must not cascade into every other guarded test.
     static LOCK: Mutex<()> = Mutex::new(());
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn mirror_is_noop_before_install() {
-        let _g = LOCK.lock().unwrap();
+        let _g = lock();
         // No framebuffer yet: mirroring must be a safe no-op.
         mirror(format_args!("hello"));
     }
 
     #[test]
     fn mirror_renders_into_an_installed_buffer() {
-        let _g = LOCK.lock().unwrap();
+        let _g = lock();
         let mut fb = vec![0u8; 800 * 600 * 4];
         let base = fb.as_mut_ptr() as u64;
         install(base, 800, 600, 800, 32);
@@ -219,7 +230,7 @@ mod tests {
 
     #[test]
     fn scroll_drops_the_oldest_line() {
-        let _g = LOCK.lock().unwrap();
+        let _g = lock();
         let mut fb = vec![0u8; 800 * 600 * 4];
         let base = fb.as_mut_ptr() as u64;
         install(base, 800, 600, 800, 32);

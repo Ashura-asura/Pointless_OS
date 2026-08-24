@@ -1025,6 +1025,42 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         }
     }
 
+    // Live xHCI (USB) demo — Phase 1 (usbhcd.rs): bring the controller up
+    // and read the first connected device's descriptor. Read/probe only
+    // (no disk writes), so this runs unconditionally like the PCI scan
+    // above it rather than being gated behind `canary`.
+    {
+        use aegis_kernel::usbhcd::{
+            descriptor_class, descriptor_product_id, descriptor_vendor_id, EhciController,
+            XhciController,
+        };
+        if let Some(mut usb) = XhciController::probe(&pci) {
+            sprintln!(
+                "Aegis: xHCI: BAR {:#x} max_slots={} max_ports={}",
+                usb.bar_addr,
+                usb.max_slots(),
+                usb.max_ports()
+            );
+            if usb.enumerate_first_device() && usb.read_device_descriptor() {
+                let d = usb.device_descriptor;
+                sprintln!(
+                    "Aegis: xHCI: device descriptor: class={:02X} vid={:04X} pid={:04X} maxpkt0={} nconf={}",
+                    descriptor_class(&d),
+                    descriptor_vendor_id(&d),
+                    descriptor_product_id(&d),
+                    d[7],
+                    d[17],
+                );
+            } else {
+                sprintln!(
+                    "Aegis: xHCI: no device enumerated (nothing attached, or enumeration failed)"
+                );
+            }
+        } else if EhciController::probe(&pci).is_none() {
+            sprintln!("Aegis: xHCI: no USB host controller found");
+        }
+    }
+
     // Live NVMe demo: probe BAR0, reset, admin + IO queues, identify, read
     // LBA 0/1 and check the GPT signature (disk image is GPT-partitioned).
     // CANARY build (feature = "canary", real-hardware milestone 1): this
