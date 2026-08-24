@@ -2,6 +2,19 @@
 
 *Generated: 2026-08-19. Every claim below is verified by `cargo test` on the current commit.*
 
+## First real-hardware boot (2026-08-24)
+
+First-ever Aegis boot on real silicon: **ASUS TP201S**, booted from the
+Cruzer Blade USB stick (kernel `df7f038`, with the AHCI SATA driver and
+GOP scrolling console). The UEFI loader handed off cleanly — memory map
+(35 entries, ~1.8 GB conventional RAM), page tables (CR3 `0x74B45000`),
+kernel ELF parsed (36 MB, 4 segments), 386 relocations applied,
+`no FLEET.CFG @ kernel uses compile-time defaults`. Evidence:
+`Docs/test_runs/aegis-real-hardware-boot1-tp201s.log`. The kernel's own
+boot log (frame allocator, PCI scan, AHCI probe, probe battery) was not
+yet captured; the hardware RAM means the QEMU-only 61 MiB allocator limit
+does not apply here.
+
 ## Deep audit vs `os-from-first-principles.md` (2026-08-14)
 
 A phase-by-phase audit against the design doc's §7 roadmap, based on the

@@ -171,3 +171,18 @@ Real hardware DMA is coherent; final validation is a boot on the TP201S.
 Wi-Fi (QCA9377 / Intel / Realtek): not implemented — needs proprietary
 firmware, a USB host stack, and a full 802.11/WPA2 stack; QEMU cannot
 emulate Wi-Fi, so it is not verifiable here. Named future work.
+
+## First real-hardware boot (ASUS TP201S, 2026-08-24)
+
+First-ever Aegis boot on real silicon, from the Cruzer Blade USB stick
+(kernel `df7f038`). Evidence: `Docs/test_runs/aegis-real-hardware-boot1-tp201s.log`.
+
+The UEFI loader handed off cleanly: memory map (35 entries), page tables
+(CR3 `0x74B45000`), kernel ELF parsed (36 MB, 4 segments), 386 relocations
+applied, `no FLEET.CFG @ kernel uses compile-time defaults`. Notably the
+machine exposes **~1.8 GB of conventional RAM** — the QEMU-only 61 MiB
+frame-allocator limitation does not apply on this hardware, so the
+`memory_map` probe should pass and the 128 MiB guest-RAM allocation is
+feasible here. The kernel's own boot log (frame allocator, PCI scan, AHCI
+probe, probe battery) follows the captured portion on the physical screen;
+not yet transcribed.
