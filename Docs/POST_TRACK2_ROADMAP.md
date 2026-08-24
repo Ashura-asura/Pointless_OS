@@ -141,15 +141,24 @@ demonstrates that this project lacks:
    (`vdev.rs`) and run loop (`vmx.rs`) run *inside the kernel* with full
    authority; Genode runs each VMM as an unprivileged component with a tiny
    hypervisor TCB. This is the single biggest blast-radius reduction available
-   and the natural next hypervisor hardening phase. **Reduced → future
-   phase;** explicitly out of scope for the cheap research pass.
-2. **IOMMU DMA confinement per device.** Guest-driven DMA is not yet confined
-   to granted buffers. When an IOMMU layer exists, confine each device (and
-   each guest) to its own DMA region — Genode's strongest guest/host
-   guarantee. **Inherent-later;** hardware-dependent, separate phase.
+   and the natural next hypervisor hardening phase. **Design produced
+   2026-08-24** (`Docs/VMM_COMPONENT_SPLIT.md`): the pure device models are
+   relocation-ready today (they take `GuestMem`/`BlockStore`, touch no kernel
+   globals), the six-capability IPC surface is specified, and the tiny TCB
+   (VM-entry/exit + EPT + IRQ injection + IOMMU) is named. Code split is a
+   real future phase (needs the user-space runtime/IPC), not started.
+2. **IOMMU DMA confinement per device.** Guest-driven DMA confined to granted
+   buffers, per device and per guest — Genode's strongest guest/host
+   guarantee. **Advanced 2026-08-24:** the IOMMU layer (`iommu.rs`, already
+   the NVMe/e1000 DMA gate) gained `confine_device_to_grant`, the per-device
+   confinement primitive, with tests bounding each real VM device (virtio-blk
+   BDF 0:6:0, virtio-rng BDF 0:7:0) to its own grant and denying misdirected
+   cross-device DMA at the IOMMU boundary. Known limit, named honestly: the
+   flat page table caps at 64 mappings/domain, so whole-guest-RAM confinement
+   needs hierarchical IOMMU page tables (future item).
 
-Both are recorded as candidates, not adopted, per the research pass's cap of
-≤2 cheap changes (only the per-VM allow-list was adopted).
+Both were research candidates; item 2's primitive is now real and test-proven,
+item 1 has a precise design, and the remaining work is genuinely future.
 
 ## Phase D — grow the role library toward the §11.F real-task battery
 
@@ -272,7 +281,10 @@ folded in.
     test-proven** (5 tests); the rest (full distro, Windows guest, more USB
     classes) is real remaining work, not started.
   - Phase C (Genode: separate VMM component + IOMMU DMA confinement):
-    architectural research candidates, deferred, not started.
+    **advanced 2026-08-24** — `confine_device_to_grant` primitive + real-BDF
+    confinement tests (IOMMU item), and a precise component-split design
+    (`Docs/VMM_COMPONENT_SPLIT.md`). The code split itself is a genuine
+    future phase (needs a user-space runtime/IPC), not started.
 
 - **Notes:** git identity set locally in the Default Project repo
   (`user.email=asura27@pointless.os`, `user.name=asura27`). Remote switched from

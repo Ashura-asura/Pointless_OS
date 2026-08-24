@@ -298,6 +298,33 @@ impl Iommu {
         true
     }
 
+    /// The per-device (and per-guest) DMA-confinement primitive — the Phase C
+    /// Genode-modeled guarantee made concrete: create a fresh domain, assign
+    /// exactly one device to it, and identity-map *only* the pages of one
+    /// memory grant. After this, any DMA by that device to an address outside
+    /// the grant faults at the IOMMU boundary (`AddressNotMapped`), and no
+    /// other device can reach the grant (its own domain does not contain it).
+    ///
+    /// Returns the new domain id, or `None` if a domain slot or a mapping
+    /// slot is unavailable. (On failure the freshly-created domain may remain
+    /// allocated — bounded at the fixed 32-domain / 64-mapping capacities;
+    /// callers treat this as a fatal provisioning error.)
+    pub fn confine_device_to_grant(
+        &mut self,
+        bdf: u32,
+        grant_base: u64,
+        frames: u64,
+        flags: u32,
+    ) -> Option<u32> {
+        let id = self.create_domain()?;
+        if !self.assign_device(id, bdf)
+            || !self.identity_map(id, grant_base, frames.saturating_mul(4096), flags)
+        {
+            return None;
+        }
+        Some(id)
+    }
+
     fn domain_for_device(&self, bdf: u32) -> Option<u32> {
         for slot in self.domains.iter().flatten() {
             if slot.devices[..slot.device_count].contains(&bdf) {
@@ -573,5 +600,79 @@ mod tests {
         assert!(iommu.translate(dev, 0x4000_1000, PAGE_READ).is_ok());
         assert!(iommu.translate(dev, 0x4000_2FFF, PAGE_READ).is_ok());
         assert!(iommu.translate(dev, 0x4000_3000, PAGE_READ).is_err());
+    }
+
+    // --- Phase C: per-device DMA confinement for the real VM device set ----
+
+    /// The Phase C headline: the actual guest-visible virtio devices each get
+    /// their own domain confined to exactly their own memory grant, so
+    /// misdirected DMA — a corrupted descriptor or a compromised device —
+    /// cannot reach another device's (or the host's) memory.
+    #[test]
+    fn confine_device_to_grant_bounds_each_vm_device_to_its_own_grant() {
+        use crate::vdev::{RNG_SLOT, VIRTIO_SLOT};
+        let mut iommu = Iommu::new();
+
+        let blk_bdf = bdf(0, VIRTIO_SLOT as u8, 0); // virtio-blk (slot 6)
+        let rng_bdf = bdf(0, RNG_SLOT as u8, 0); // virtio-rng (slot 7)
+
+        // A 64 KiB grant (16 frames) per device, at distinct addresses. (The
+        // flat page table caps at MAX_MAPPINGS_PER_DOMAIN — hierarchical
+        // IOMMU page tables for whole-guest grants are the honest future
+        // hardening item, called out in the Phase C docs.)
+        let blk_dom = iommu
+            .confine_device_to_grant(blk_bdf, 0x1000_0000, 16, PAGE_READ | PAGE_WRITE)
+            .unwrap();
+        let rng_dom = iommu
+            .confine_device_to_grant(rng_bdf, 0x2000_0000, 16, PAGE_READ | PAGE_WRITE)
+            .unwrap();
+        assert_ne!(blk_dom, rng_dom);
+
+        // Each device's DMA inside its own grant is allowed (page offset
+        // preserved).
+        assert_eq!(
+            iommu.translate(blk_bdf, 0x1000_0FFF, PAGE_READ | PAGE_WRITE),
+            Ok(0x1000_0FFF)
+        );
+        assert_eq!(
+            iommu.translate(rng_bdf, 0x2000_1000, PAGE_READ),
+            Ok(0x2000_1000)
+        );
+        assert_eq!(iommu.fault_count(), 0);
+
+        // Misdirected: blk DMA into rng's grant — denied at the IOMMU, not
+        // by any device-side bounds check.
+        assert_eq!(
+            iommu.translate(blk_bdf, 0x2000_0000, PAGE_READ),
+            Err(IommuFault::AddressNotMapped)
+        );
+        // Misdirected: rng DMA into blk's grant — denied.
+        assert_eq!(
+            iommu.translate(rng_bdf, 0x1000_0000, PAGE_READ),
+            Err(IommuFault::AddressNotMapped)
+        );
+        // DMA outside both grants entirely — denied.
+        assert_eq!(
+            iommu.translate(rng_bdf, 0x0000_1000, PAGE_READ),
+            Err(IommuFault::AddressNotMapped)
+        );
+        assert_eq!(iommu.fault_count(), 3);
+    }
+
+    #[test]
+    fn confine_device_to_grant_respects_permission_flags() {
+        use crate::vdev::VIRTIO_SLOT;
+        let mut iommu = Iommu::new();
+        let dev = bdf(0, VIRTIO_SLOT as u8, 0);
+        iommu
+            .confine_device_to_grant(dev, 0x4000_0000, 4, PAGE_READ)
+            .unwrap();
+        // Read inside the grant: allowed.
+        assert!(iommu.translate(dev, 0x4000_0000, PAGE_READ).is_ok());
+        // Write inside the grant: denied — the grant was read-only.
+        assert_eq!(
+            iommu.translate(dev, 0x4000_0000, PAGE_READ | PAGE_WRITE),
+            Err(IommuFault::PermissionDenied)
+        );
     }
 }
