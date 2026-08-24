@@ -138,6 +138,12 @@ fn blit() {
     let height = unsafe { FB_HEIGHT };
     let stride = unsafe { FB_STRIDE };
     let bpp = unsafe { FB_BPP };
+    // The loader's identity map covers only the first 4 GiB. A framebuffer
+    // above that is not writable at boot entry (the kernel maps it later via
+    // the device-BAR window); blitting to it would fault, so defer silently.
+    if base >= 0x1_0000_0000 {
+        return;
+    }
     let bpp_bytes = (bpp / 8) as usize;
     if bpp_bytes == 0 {
         return;
