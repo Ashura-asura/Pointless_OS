@@ -643,10 +643,13 @@ fn pending_mut() -> &'static mut [Option<PendingExpand>; MAX_PENDING] {
 /// the request is recorded as a blocked `RoleExpand` and nothing is minted. The
 /// "diff" shown to the human is exactly this addition
 /// (`Cap::Object(root)`/`Cap::Task(root)` with `need`), not the agent's whole
-/// accumulated set. A `need` containing `WRITE` is flagged `high_risk` (the
-/// irreversible "apply" action) and will require a second, distinct confirmer.
+/// accumulated set. A `need` containing `WRITE` or `CONTROL` is flagged
+/// `high_risk` (an irreversible/control action — the "apply" edit or a restart)
+/// and will require a second, distinct confirmer. This extends the §9.5
+/// two-party gate beyond `WRITE`-only to `CONTROL`/irreversible control actions
+/// (Phase E), so the irreversible framing in §9.5 matches practice.
 pub fn request_expansion(task: usize, root: u32, need: Rights, kind: ExpansionKind) -> u64 {
-    let high_risk = need.contains(Rights::WRITE);
+    let high_risk = need.contains(Rights::WRITE) || need.contains(Rights::CONTROL);
     let id = unsafe {
         let seq = core::ptr::read(core::ptr::addr_of_mut!(PENDING_SEQ));
         let id = seq + 1;
@@ -940,15 +943,18 @@ pub fn demo_track15() {
             crate::tasks::set_task_cap(i, s, CapSlot::empty());
         }
     }
-    let (svc, other, grantor, agent) = (0usize, 1usize, 2usize, 3usize);
+    let (svc, other, grantor, agent, reviewer2) = (0usize, 1usize, 2usize, 3usize, 4usize);
     unsafe {
         crate::tasks::spawn("svc", demo_dummy, 0x100000).unwrap();
         crate::tasks::spawn("other", demo_dummy, 0x200000).unwrap();
         crate::tasks::spawn("grantor", demo_dummy, 0x300000).unwrap();
         crate::tasks::spawn("agent", demo_dummy, 0x400000).unwrap();
+        crate::tasks::spawn("reviewer2", demo_dummy, 0x500000).unwrap();
     }
     // Grantor holds READ|CONTROL over svc (to grant the role) and CONTROL over
-    // `other` (to confirm the later expansion to it).
+    // `other` (to confirm the later expansion to it). A distinct second reviewer
+    // also holds CONTROL over `other` so the CONTROL expansion satisfies the
+    // two-party gate (Phase E: two-party now covers CONTROL/irreversible acts).
     crate::tasks::set_task_cap(
         grantor,
         0,
@@ -960,6 +966,14 @@ pub fn demo_track15() {
     crate::tasks::set_task_cap(
         grantor,
         1,
+        CapSlot {
+            cap: Cap::Task(crate::cap::Oid::new(other as u32, 0)),
+            rights: Rights::CONTROL,
+        },
+    );
+    crate::tasks::set_task_cap(
+        reviewer2,
+        0,
         CapSlot {
             cap: Cap::Task(crate::cap::Oid::new(other as u32, 0)),
             rights: Rights::CONTROL,
@@ -989,10 +1003,12 @@ pub fn demo_track15() {
         }
         _ => crate::sprintln!("Aegis: Track1.5: ERROR: out-of-scope restart was not blocked"),
     }
-    // Reviewer (holding CONTROL over `other`) confirms.
-    crate::sprintln!("Aegis: Track1.5: reviewer confirms expansion to other");
+    // Two distinct reviewers (each holding CONTROL over `other`) confirm the
+    // CONTROL expansion — the Phase E two-party gate now covers CONTROL acts.
+    crate::sprintln!("Aegis: Track1.5: reviewer confirms expansion to other (two-party)");
     let pid = request_expansion(agent, other as u32, Rights::CONTROL, ExpansionKind::Task);
     let _ = confirm_expansion(grantor, pid, 1);
+    let _ = confirm_expansion(reviewer2, pid, 1);
     match supervise_restart(agent, 1, other) {
         Ok(()) => crate::sprintln!("Aegis: Track1.5: expanded cap now restarts other"),
         Err(e) => crate::sprintln!("Aegis: Track1.5: ERROR: expanded cap refused: {e:?}"),
@@ -2027,12 +2043,15 @@ mod tests {
         let _g = crate::kernel_state_guard();
         clean_world();
         unsafe {
-            // svc = task 0, other = task 1, grantor = task 2, agent = task 3.
-            let (svc, other, grantor, agent) = (0usize, 1usize, 2usize, 3usize);
+            // svc = task 0, other = task 1, grantor = task 2, agent = task 3,
+            // reviewer2 = task 4 (a distinct second confirmer for two-party).
+            let (svc, other, grantor, agent, reviewer2) =
+                (0usize, 1usize, 2usize, 3usize, 4usize);
             spawn("svc", dummy, 0x100000).unwrap();
             spawn("other", dummy, 0x200000).unwrap();
             spawn("grantor", dummy, 0x300000).unwrap();
             spawn("agent", dummy, 0x400000).unwrap();
+            spawn("reviewer2", dummy, 0x500000).unwrap();
             set_task_cap(
                 grantor,
                 0,
@@ -2044,10 +2063,20 @@ mod tests {
             // The reviewer must also hold CONTROL over the *expansion target*
             // (`other`) to confirm the new scope — the same bar the grantor
             // gate uses. For an object-scoped expansion this would be
-            // `ObjectRoot`; here it is a `Task` cap over `other`.
+            // `ObjectRoot`; here it is a `Task` cap over `other`. A distinct
+            // second reviewer (reviewer2) holds the same, so the CONTROL
+            // expansion meets the two-party gate (Phase E: no longer WRITE-only).
             set_task_cap(
                 grantor,
                 1,
+                CapSlot {
+                    cap: Cap::Task(crate::cap::Oid::new(other as u32, 0)),
+                    rights: Rights::CONTROL,
+                },
+            );
+            set_task_cap(
+                reviewer2,
+                0,
                 CapSlot {
                     cap: Cap::Task(crate::cap::Oid::new(other as u32, 0)),
                     rights: Rights::CONTROL,
@@ -2074,10 +2103,12 @@ mod tests {
                 crate::audit::OpKind::RoleExpand,
                 other as u32
             ));
-            // Request + confirm the expansion (single confirmation suffices for a
-            // CONTROL expansion — see the honest note: two-party is WRITE-gated).
+            // Request + confirm the expansion. A CONTROL expansion is now
+            // high_risk (Phase E), so two DISTINCT confirmers are required before
+            // the cap mints: first returns 0 (awaiting second), second mints.
             let pid = request_expansion(agent, other as u32, Rights::CONTROL, ExpansionKind::Task);
             assert_eq!(confirm_expansion(grantor, pid, 1), 0);
+            assert_eq!(confirm_expansion(reviewer2, pid, 1), 0);
             let minted = task_cap(agent, 1);
             assert_eq!(
                 minted.cap,
@@ -2090,7 +2121,7 @@ mod tests {
             // The expanded cap now authorizes the restart.
             assert_eq!(supervise_restart(agent, 1, other), Ok(()));
             assert!(crate::audit::ever_succeeded(
-                grantor,
+                reviewer2,
                 crate::audit::OpKind::RoleExpand,
                 other as u32
             ));

@@ -22,7 +22,7 @@ honestly per Ground Rule 6.*
 | §9.2 ephemeral-by-default grants | **closed** | `set_grant_expiry` at grant + mint (`role.rs:352,773`); `grant_valid` enforces, `Expired` refused (`386-392,442,607`) |
 | §9.3 diff-confirmation at scope expansion | closed (object + task) | `request_expansion`/`confirm_expansion`; Track 1.5 adds `ExpansionKind::Task` |
 | §9.4 persistent audit trail w/ queryable identity | **closed** | `OpKind::{RoleGrant,RoleExercise,RoleExpand}` (`audit.rs:46-58`); emitted on grant/exercise/expand, queryable via `op_counts` |
-| §9.5 anomaly circuit-break + two-party irreversible | reduced | two-party + suspend implemented & test-proven, but **two named limits**: (a) two-party is `WRITE`-keyed not `CONTROL` (`role.rs:649,731-746`); (b) `role_monitor_train` only called in tests, never in the production grant flow, so the suspend breaker is dormant until a supervisor trains it (`role.rs:1872,2136` only). See `SECTION9_CLOSURE_AUDIT.md` |
+| §9.5 anomaly circuit-break + two-party irreversible | reduced → two-party closed | two-party + suspend implemented & test-proven. Limit (a) **resolved 2026-08-24**: two-party now covers `CONTROL` *and* `WRITE` (`role.rs:657,731-746`). Limit (b) remains: `role_monitor_train` only called in tests, never in the production grant flow, so the suspend breaker is dormant until a supervisor trains it (`role.rs:1872,2136` only) — see Phase E item 1 for the design constraint. See `SECTION9_CLOSURE_AUDIT.md` |
 | Per-VM guest device scoping | closed (this session) | `DevicePolicy` allow-list, `vdev.rs` |
 | VMM TCB separation (microhypervisor) | inherent-later | not adopted; flagged below |
 | IOMMU DMA confinement | inherent-later | not adopted; flagged below |
@@ -157,12 +157,23 @@ action, and add new real-task roles.
 production wiring, per `SECTION9_CLOSURE_AUDIT.md`:
 
 1. **Auto-train the anomaly monitor** when a role is granted (or have the
-   supervisor train it as part of delegating a role) — today `role_monitor_
-   train` is only called in tests (`role.rs:1872,2136`), so the suspend
-   circuit-breaker is dormant until a supervisor trains it.
+   supervisor train it as part of delegating a role) — `role_monitor_train` is
+   still only called in tests (`role.rs:1872,2136`), so the suspend circuit-
+   breaker is dormant in production until a supervisor trains it.
+   *Status (2026-08-24): NOT auto-wired into `role_grant`.* Training captures
+   the agent's *current* op profile and `observe` suspends on any off-profile
+   op, so training at grant time (empty/active baseline) falsely suspends on
+   the first legitimate op and breaks the expansion contract. The correct hook
+   is a supervisor-driven train **after** observing normal behavior — a
+   policy/integration decision, not a one-line; requires updating the existing
+   tests that assume an untrained agent. Left open deliberately.
 2. **Extend two-party gating** from `WRITE`-only to `CONTROL`/irreversible
    control actions (e.g. restart), so the irreversible framing in §9.5 matches
-   practice.
+   practice. **DONE (2026-08-24):** `request_expansion` now flags `CONTROL`
+   (and `WRITE`) as `high_risk`, so CONTROL expansions require two distinct
+   confirmers. `demo_track15` and `supervisor_role_out_of_scope_requires_
+   expansion` updated to perform two-party confirmation; kernel suite green at
+   818 (`cargo test` in `aegis-kernel`).
 3. (Optional, larger) persist the audit trail to stable storage for forensic
    durability across reboots.
 
