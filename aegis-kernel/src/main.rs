@@ -68,7 +68,15 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             h.stride_px,
             h.bpp,
         );
-        sprintln!("Aegis: GOP console installed at boot entry");
+        // `GopHandoff` is packed; copy fields out before formatting.
+        let (fb, w, hgt, bpp) = (h.framebuffer_base, h.width, h.height, h.bpp);
+        sprintln!(
+            "Aegis: GOP console installed at boot entry (base={:#x} {}x{} bpp={})",
+            fb,
+            w,
+            hgt,
+            bpp
+        );
     } else {
         sprintln!("Aegis: no GOP handoff for the on-screen console");
     }
