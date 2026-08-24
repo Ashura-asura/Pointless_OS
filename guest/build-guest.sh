@@ -47,6 +47,17 @@ rm -rf "$REPO_GUEST/initramfs/bin"
 make CONFIG_PREFIX="$REPO_GUEST/initramfs" install >/dev/null
 echo "==> busybox installed: $(ls "$REPO_GUEST/initramfs/bin" | wc -l) applets"
 
+# KNOWN GATE (Track 2, AEGIS_USEFUL_PROMPT.md §3 DoD): BusyBox does NOT
+# provide python3 / git / vim / nano / gcc / make. The battery needs those
+# real binaries in the guest rootfs. Options, none of which BusyBox covers:
+#   * drop statically-linked binaries of each into $REPO_GUEST/initramfs/bin
+#     (simplest; works because the kernel is statically-linked-BusyBox-friendly), or
+#   * switch the rootfs build to Buildroot and select those packages.
+# This script currently produces a BusyBox-only image; the contract harness
+# (battery-contract.py) asserts each battery item and will report MISSING
+# until the binaries above are present. CONFIG_NET/E1000E are now enabled so
+# the e1000e clone path the §3 DoD requires is at least kernel-possible.
+
 # ---- Linux kernel build --------------------------------------------------
 cd "$WORK"
 if [ ! -d linux-$LINUX_VER ]; then
@@ -72,8 +83,11 @@ make defconfig >/dev/null
     --enable RTC_DRV_CMOS \
     --enable PRINTK \
     --enable TTY \
+    --enable NET \
+    --enable INET \
+    --enable PCI \
+    --enable E1000E \
     --disable MODULES \
-    --disable NET \
     --disable SOUND \
     --disable USB \
     --disable X86_5LEVEL \

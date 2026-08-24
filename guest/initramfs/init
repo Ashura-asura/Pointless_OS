@@ -13,12 +13,16 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 
+# Populate /dev from the sysfs device tree (closes the sparse-/dev gap in
+# TRACK2_GUEST_BATTERY.md: /dev/null, /dev/zero, /dev/random, ...).
+mdev -s 2>/dev/null || true
+
 # Console plumbing. If devtmpfs was not mounted (it isn't before /init on
 # every config), create the two nodes we need by hand: PID 1 runs with full
 # capabilities, so mknod is allowed even without devtmpfs.
 mkdir -p /dev
 [ -c /dev/console ] || mknod /dev/console c 5 1
-[ -c /dev/ttyS0 ] || mknod /dev/ttyS0 c 4 64
+[ -c /dev/ttyS0 ]   || mknod /dev/ttyS0 c 4 64
 
 say "Aegis guest: initramfs up, device tree:"
 ls -l /dev/ttyS0 > /dev/ttyS0 2>&1 || true
@@ -26,6 +30,11 @@ say "Aegis guest: uname: $(uname -a)"
 say "Aegis guest: shell: $(busybox --help 2>&1 | head -1)"
 say "Aegis guest: invoking interactive shell on ttyS0 (this is the Phase U DoD point)"
 
-# Interactive session on the virtual serial console. Explicit redirection so
-# the shell lives on ttyS0 regardless of what the kernel gave /init as stdio.
-exec /bin/sh </dev/ttyS0 >/dev/ttyS0 2>&1
+# Interactive session on the virtual serial console. We start the shell under
+# `setsid` so it becomes a session leader with no controlling tty, then the
+# kernel assigns /dev/ttyS0 as its controlling terminal when the shell opens
+# it (open-by-session-leader-with-no-controlling-tty acquires the tty). That
+# is what turns job control (fg/bg/Ctrl-Z) ON — without it BusyBox sh prints
+# "can't access tty; job control turned off". Explicit redirection keeps the
+# shell on ttyS0 regardless of what the kernel gave /init as stdio.
+exec setsid /bin/sh </dev/ttyS0 >/dev/ttyS0 2>&1

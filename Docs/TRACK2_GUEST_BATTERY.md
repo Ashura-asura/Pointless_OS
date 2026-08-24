@@ -68,6 +68,38 @@ All outcomes below are verbatim guest responses captured in
 The verifiable artifact on this machine is therefore this gap inventory plus the
 captured serial logs — not a passing contract test.
 
+## Prepared improvements (code ready, run-gated on this host)
+
+The following changes are committed and reviewable on the Windows/VBS dev box,
+but their *effect* can only be observed when the guest is rebuilt and booted
+under QEMU on a Linux host (the same environment gate as §"Why the §3 DoD is
+not yet met"). They advance the battery toward its DoD without claiming a
+passing live run here:
+
+- **`guest/build-guest.sh`**: `CONFIG_NET` + `CONFIG_INET` + `CONFIG_PCI` +
+  `CONFIG_E1000E` are now enabled, so the §3 e1000e clone path is at least
+  kernel-possible. A documented KNOWN GATE notes that `python3`/`git`/`vim`/
+  `nano`/`gcc`/`make` are *not* BusyBox applets and require a rootfs
+  enrichment step (static binaries or Buildroot) before the contract tests
+  for those items can pass.
+- **`guest/initramfs/init`**: `mdev -s` populates `/dev` (closes the sparse-
+  `/dev` gap); the interactive shell now starts under `setsid` so the kernel
+  assigns `/dev/ttyS0` as its controlling terminal, turning job control
+  (fg/bg/Ctrl-Z) ON (the prior "job control turned off" PARTIAL).
+- **`guest/battery-init.sh`**: added `mdev -s` so the non-interactive battery
+  path also sees a full `/dev`.
+- **`guest/battery-contract.py`** (new): an automated, CI-ready harness that
+  boots QEMU, drives every §3 battery item over the serial console, and exits
+  non-zero on any FAIL. Run on a capable host with:
+
+  ```
+  python3 guest/battery-contract.py
+  QEMU=/usr/bin/qemu-system-x86_64 python3 guest/battery-contract.py
+  ```
+
+  It is the automated form of the manual probes below and is the artifact
+  that should be wired into CI once the environment gate lifts.
+
 ## What IS proven
 - The guest kernel + initramfs boots under QEMU and presents a working BusyBox
   `/bin/sh` on the serial console (the Phase U DoD point). Background-process

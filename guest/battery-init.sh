@@ -12,6 +12,7 @@ mkdir -p /dev
 [ -c /dev/ttyS0 ]   || mknod /dev/ttyS0 c 4 64
 mount -t proc  proc  /proc 2>/dev/null || true
 mount -t sysfs sysfs /sys  2>/dev/null || true
+mdev -s 2>/dev/null || true   # populate /dev (null/zero/random/...)
 
 say "=== Track2 battery begin ==="
 say "uname: $(uname -a)"
