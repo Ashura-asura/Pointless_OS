@@ -43,19 +43,23 @@ Reachable *as code now*, live-run only on a Linux + VT-x box:
 the guest; each closed gap named + contract-tested. (Carried verbatim from
 `AEGIS_USEFUL_PROMPT.md` §3.)
 
-## Phase B — un-defer Track 3 (now legitimate per §4's own gate)
+## Phase B — Track 3 stays deferred (per prompt §3.2 gate, NOT started)
 
-`AEGIS_USEFUL_PROMPT.md` §4 parked Track 3 "until Track 1 has a real DoD
-result." That gate is met. Un-defer, but keep it *scoped to Track 2's battery
-needs*, not open-ended breadth:
+Correction to an earlier draft: `AEGIS_USEFUL_PROMPT.md` §4's deferral gate
+is re-asserted by the master prompt's item 3.2 as **"until Track 2's real DoD
+result exists"** — *not* Track 1. So Track 3 is **not** un-deferred by Track
+1/1.5 shipping. It remains parked, matching the same gate-condition discipline
+used to authorize Track 2 itself:
 
-- Fuller distro image (beyond BusyBox) only insofar as it exercises the
-  syscall/device surface the battery implies.
-- Windows guest: a separate, explicitly-scoped effort (different VMM path);
-  start only after Phase A is solid, and treat it as its own Track with its
-  own DoD — not a continuation of Track 2.
-- More device-model breadth (virtio devices, USB classes) *only* when a
-  battery item actually demands it.
+- Fuller distro image (beyond BusyBox).
+- Windows guest (different VMM path; its own Track + DoD if/when authorized).
+- Broader device-model breadth (more virtio devices, more USB classes).
+
+Do **not** start any of these until Track 2's `git`/`python3` DoD is actually
+met (live, evidenced) — i.e., after Phase A lands on a Linux+QEMU host. This
+is a deliberate sequencing decision, not abandonment: the work is real and
+well-tested where it exists; it is simply not the current priority until the
+core usefulness claim (Track 1 + Track 2) is proven end-to-end.
 
 **Closed/reduced:** Track 3 breadth remains **reduced** by design (§11.G:
 compatibility breadth is premature relative to the core claim even after Track
