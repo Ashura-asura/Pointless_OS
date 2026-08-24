@@ -23,14 +23,11 @@
 //! hardware-gated half (real VMX entry with this boot state loaded into a
 //! VMCS, real exit-reason 30/1 handling) lives in `vmx.rs` + `main.rs`
 //! behind the `vmx-demo` feature; live verification requires a host that
-//! OWNS VMX — Aegis booted as the host OS with VT-x present and no other
-//! hypervisor holding it (KVM / Core Isolation off). The pre-flight in
-//! `vmx.rs` (`vmx_host_readiness`) reports exactly why a given host cannot
-//! host a guest; see `Docs/VMX_LIVE_HOSTING.md`. On this session's host
-//! `/proc/cpuinfo` reports VT-x, but Aegis runs under another hypervisor and
-//! the in-process CPUID probe sees the VMX bit clear (sandbox-masked), so the
-//! host half is exercised by contract tests and the pre-flight, not by a
-//! live launch. Timekeeping is honest but
+//! OWNS VMX — bare metal, or a guest hypervisor under nested virtualization
+//! (KVM `nested=Y`, QEMU `-cpu host`) where VT-x is exposed to it. The
+//! pre-flight in `vmx.rs` (`vmx_host_readiness`) reports exactly why a given
+//! host cannot host a guest; see `Docs/VMX_LIVE_HOSTING.md`. Timekeeping is
+//! honest but
 //! coarse: one host tick = one virtual second for the CMOS RTC, and the
 //! virtual PIT advances by a fixed host-tick rate (`host_hz`, a run-loop
 //! parameter) — no wall-clock drift correction (a later refinement).

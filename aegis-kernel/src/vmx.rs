@@ -23,10 +23,12 @@
 //! image (bzImage + initramfs, embedded into the kernel) under that run
 //! loop, stopping when the guest reaches its shell on the emulated 16550.
 //!
-//! The hardware half is verified on a host that owns VMX; in a non-owner
-//! environment (e.g. a Linux/KVM guest, where VT-x is present but already
-//! held by KVM) the pre-flight reports `UnderAnotherHypervisor` with the
-//! remediation to boot Aegis as the host. VMCS field encodings below are the
+//! The hardware half is verified on a host that owns VMX — bare metal or a
+//! guest hypervisor under nested virtualization (KVM `nested=Y`), where VT-x
+//! is exposed and Aegis can own it for its own guests. The pre-flight
+//! (`vmx_host_readiness`) blocks only on the CPU-level disqualifiers and
+//! reports `Ready` whenever VT-x is present and feature control permits
+//! VMXON. VMCS field encodings below are the
 //! standard Intel SDM Vol. 3C Appendix B values used consistently across
 //! the reference literature (KVM's `vmcs.h`, the "Hypervisor From Scratch"
 //! / "SimpleVisor" tutorial lineage); the parts most likely to need
@@ -44,8 +46,8 @@
 //! `bringup_demo()` + `run_loop_demo()`) at the END of boot, after every
 //! other demo has spawned and the desktop is shown, before interrupts turn
 //! on and the idle loop owns the machine. On a host that cannot own VMX the
-//! pre-flight prints the exact reason (e.g. `UnderAnotherHypervisor` when
-//! running under KVM / Core Isolation) and returns before any `vmxon`.
+//! pre-flight prints the exact reason (no VT-x, or firmware-locked off) and
+//! returns before any `vmxon`.
 //! Normal builds (no `vmx-demo` feature) compile zero VMX
 //! code into the kernel image (the module itself stays compiled for its
 //! contract tests).
@@ -418,36 +420,47 @@ pub unsafe fn enable_vmx_operation() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------
 //
 // The single real obstacle to hosting a guest here is *ownership* of VMX,
-// not the presence of the silicon. VT-x can be present yet already held by
-// another hypervisor (KVM on Linux, or virtualization-based security /
-// Core Isolation on Windows) — in which case Aegis's `vmxon` fails with a
-// cryptic VM-instruction error instead of a useful diagnosis. This pre-
-// flight turns that into an exact, actionable message and is unit-tested
-// through the pure `classify_vmx_readiness` below (runs under
-// `--features vmx-demo`).
+// not the presence of the silicon. VT-x can be present yet firmware-locked
+// off, or (on a bare-metal host with another VMM loaded) already held —
+// in which case Aegis's `vmxon` fails with a cryptic VM-instruction error
+// instead of a useful diagnosis. This pre-flight turns that into an exact,
+// actionable message and is unit-tested through the pure
+// `classify_vmx_readiness` below.
+//
+// Important (found by actually attempting the nested path): running under
+// another hypervisor (CPUID.1:ECX[bit 31]) is NOT a disqualifier. With
+// nested virtualization enabled (KVM `nested=Y`, QEMU `-cpu host`), the
+// guest hypervisor is handed VT-x and can own it for its own guests. The
+// pre-flight therefore blocks only on the CPU-level disqualifiers (no VT-x,
+// firmware disabled); if a guest of another VMM wants to host, and VT-x is
+// exposed, it reports `Ready` and the attempt is the honest test.
 
 /// The result of checking whether this host can host a guest right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmxReadiness {
-    /// VT-x present, feature control permits VMXON, and we are not a guest
-    /// of another hypervisor. Aegis owns (or can own) VMX.
+    /// VT-x present, feature control permits VMXON. Aegis owns (or can
+    /// own) VMX — even under nested virtualization (CPUID.1:ECX[bit 31]
+    /// set is *not* a blocker; a guest hypervisor with nested VT-x exposed
+    /// can host its own guest).
     Ready,
     /// CPUID.1:ECX.VMX[bit 5] is clear — no Intel VT-x on this part.
     NoVtx,
     /// IA32_FEATURE_CONTROL is locked with VMXON-outside-SMX disabled.
     FeatureControlLockedDisabled,
-    /// We are running as a guest (CPUID.1:ECX[bit 31] set), so another
-    /// VMM already owns VMX. Aegis must be the host OS to host a guest.
-    UnderAnotherHypervisor,
 }
 
 /// Pure classifier — every branch is unit-testable without touching
 /// hardware. `feature_control_ok` is true when IA32_FEATURE_CONTROL either
 /// is unlocked or is locked with the VMXON-outside-SMX bit set.
+///
+/// Deliberately does NOT treat "running under another hypervisor" as a
+/// failure: under nested virtualization (KVM `nested=Y` / QEMU `-cpu host`),
+/// a guest hypervisor is given VT-x and *can* own it for its own guests.
+/// If nested VMX is not exposed, the VMX bit reads 0 and this reports
+/// `NoVtx` — the honest signal either way.
 pub const fn classify_vmx_readiness(
     vmx_present: bool,
     feature_control_ok: bool,
-    under_hv: bool,
 ) -> VmxReadiness {
     if !vmx_present {
         return VmxReadiness::NoVtx;
@@ -455,14 +468,14 @@ pub const fn classify_vmx_readiness(
     if !feature_control_ok {
         return VmxReadiness::FeatureControlLockedDisabled;
     }
-    if under_hv {
-        return VmxReadiness::UnderAnotherHypervisor;
-    }
     VmxReadiness::Ready
 }
 
 /// CPUID.1:ECX[bit 31] — "hypervisor present". Set when we are a guest of
-/// another VMM, which means that VMM already owns VMX.
+/// another VMM. Kept as a public *diagnostic*: it does NOT disqualify a
+/// host (a guest hypervisor with nested VT-x exposed can host its own
+/// guest), but it explains to an operator *why* VMX is present while the
+/// machine is itself a guest.
 pub fn under_hypervisor() -> bool {
     let ecx: u32;
     unsafe {
@@ -493,14 +506,17 @@ pub fn vmx_host_readiness() -> VmxReadiness {
     const LOCK_BIT: u64 = 1 << 0;
     const VMXON_OUTSIDE_SMX: u64 = 1 << 2;
     let fc_ok = (fc & LOCK_BIT == 0) || (fc & VMXON_OUTSIDE_SMX != 0);
-    classify_vmx_readiness(true, fc_ok, under_hypervisor())
+    classify_vmx_readiness(true, fc_ok)
 }
 
 /// Human-readable remediation for each readiness state, used by the demo
 /// entry points so a wrong host fails loudly and correctly.
 pub fn readiness_advice(r: VmxReadiness) -> &'static str {
     match r {
-        VmxReadiness::Ready => "VMX host ready — Aegis owns VMX",
+        VmxReadiness::Ready => {
+            "VMX host ready — Aegis owns VMX (under nested virtualization, a guest \
+             hypervisor with VT-x exposed is a valid host for its own guests)"
+        }
         VmxReadiness::NoVtx => {
             "VT-x (VMX) absent from CPUID.1:ECX[bit5]: this CPU lacks Intel VT-x \
              (or is AMD without the equivalent). Aegis's hypervisor cannot run here."
@@ -508,13 +524,6 @@ pub fn readiness_advice(r: VmxReadiness) -> &'static str {
         VmxReadiness::FeatureControlLockedDisabled => {
             "IA32_FEATURE_CONTROL is locked by firmware/BIOS with VMXON-outside-SMX \
              disabled. Enable 'VT-x' / 'Virtualization Technology' in firmware setup."
-        }
-        VmxReadiness::UnderAnotherHypervisor => {
-            "Aegis is a guest under another hypervisor (CPUID.1:ECX[bit31] set), which \
-             already owns VMX. To host a guest, Aegis must run as the HOST OS: disable \
-             virtualization-based security / Core Isolation (Windows) or unload KVM \
-             (Linux: `modprobe -r kvm_intel kvm`; ensure no VBS/Hyper-V), then boot the \
-             Aegis vmx-demo image on hardware or a VMX-owner VM. See Docs/VMX_LIVE_HOSTING.md."
         }
     }
 }
@@ -1822,6 +1831,19 @@ pub unsafe fn bringup_demo() -> Result<(), &'static str> {
         reason,
         exit_reason_tag(reason)
     );
+    if reason == exit_reason::INVALID_GUEST_STATE {
+        // The guest never executed: VM-entry was rejected because the guest
+        // state failed an SDM §26.3.1 check. VM_INSTRUCTION_ERROR (0x4400)
+        // names the specific failing check — read and report it, then halt
+        // cleanly instead of reading meaningless guest GPRs (which under
+        // nested virtualization was faulting at RIP=0).
+        let err = vmread(field::VM_INSTRUCTION_ERROR);
+        crate::sprintln!(
+            "Aegis: [vmx] VM-entry rejected: VM_INSTRUCTION_ERROR={} (guest state invalid per SDM §26.3.1)",
+            err
+        );
+        return Err("guest state rejected at VM-entry — see VM_INSTRUCTION_ERROR above");
+    }
     crate::sprintln!(
         "Aegis: [vmx] guest RAX at exit = {:#x} (CPUID.EAX from real silicon)",
         VMX_EXIT_REGS_SYM[0]
@@ -1839,49 +1861,32 @@ mod tests {
 
     #[test]
     fn classify_vmx_readiness_covers_all_states() {
+        assert_eq!(classify_vmx_readiness(false, true), VmxReadiness::NoVtx);
         assert_eq!(
-            classify_vmx_readiness(false, true, false),
-            VmxReadiness::NoVtx
-        );
-        assert_eq!(
-            classify_vmx_readiness(true, false, false),
+            classify_vmx_readiness(true, false),
             VmxReadiness::FeatureControlLockedDisabled
         );
-        assert_eq!(
-            classify_vmx_readiness(true, true, true),
-            VmxReadiness::UnderAnotherHypervisor
-        );
-        assert_eq!(
-            classify_vmx_readiness(true, true, false),
-            VmxReadiness::Ready
-        );
+        assert_eq!(classify_vmx_readiness(true, true), VmxReadiness::Ready);
     }
 
     #[test]
     fn readiness_advice_is_actionable_per_state() {
         assert!(readiness_advice(VmxReadiness::NoVtx).contains("VT-x"));
         assert!(readiness_advice(VmxReadiness::FeatureControlLockedDisabled).contains("firmware"));
-        assert!(readiness_advice(VmxReadiness::UnderAnotherHypervisor).contains("Core Isolation"));
-        assert_eq!(
-            readiness_advice(VmxReadiness::Ready),
-            "VMX host ready — Aegis owns VMX"
-        );
+        assert!(readiness_advice(VmxReadiness::Ready).contains("VMX host ready"));
     }
 
     // The runtime pre-flight must always agree with the CPUID probe it
     // was built from. CPUID is a user-mode instruction, so this runs in a
-    // host test; the MSR-reading half (`vmx_host_readiness`) is gated to
-    // vmx-demo because `rdmsr` needs CPL 0. (Note: this sandbox reports
-    // "vmx" in /proc/cpuinfo but masks CPUID.1:ECX.VMX to 0 in-process, so
-    // `vmx_supported()` legitimately reads false here and the pre-flight
-    // would report NoVtx.)
+    // host test; the MSR-reading half (`vmx_host_readiness`) is only called
+    // at CPL 0 because `rdmsr` needs privilege.
     #[test]
     fn readiness_agrees_with_the_cpuid_probe() {
-        let r = classify_vmx_readiness(vmx_supported(), true, under_hypervisor());
-        match (vmx_supported(), under_hypervisor()) {
-            (false, _) => assert_eq!(r, VmxReadiness::NoVtx),
-            (true, true) => assert_eq!(r, VmxReadiness::UnderAnotherHypervisor),
-            (true, false) => assert_eq!(r, VmxReadiness::Ready),
+        let r = classify_vmx_readiness(vmx_supported(), true);
+        if !vmx_supported() {
+            assert_eq!(r, VmxReadiness::NoVtx);
+        } else {
+            assert_eq!(r, VmxReadiness::Ready);
         }
     }
 
