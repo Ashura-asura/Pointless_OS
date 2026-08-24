@@ -29,19 +29,67 @@ fn main() -> Status {
     uefi::helpers::init().unwrap();
     serial::SerialWriter::init();
 
-    sprintln!("=== Aegis Phase 1: Real Hardware Boot ===");
-    uefi::println!("=== Aegis Phase 1: Real Hardware Boot ===");
+    sprintln!("=== Aegis Phase 1: Real Hardware Boot (loader 381b7db) ===");
+    uefi::println!("=== Aegis Phase 1: Real Hardware Boot (loader 381b7db) ===");
     sprintln!("Aegis: UEFI boot successful");
     uefi::println!("Aegis: UEFI boot successful");
 
     // Print UEFI memory map
     memory_map::print_memory_map();
 
+    // Query GOP BEFORE switching to our own page tables. The firmware's GOP
+    // boot services run with the firmware's page tables, which map ALL RAM
+    // including above 4 GiB (the TP201S has RAM up there). Once we switch to
+    // our 0-4 GiB identity map, the GOP query page-faults when firmware code
+    // touches high RAM — that is the crash after "no FLEET.CFG" on real hw.
+    uefi::println!("Aegis: GOP: querying display...");
+    sprintln!("Aegis: GOP: querying display...");
+    let gop_config = gop::query();
+    match &gop_config {
+        Some(h) => {
+            let (w, hgt, stride, fmt, base, size) = (
+                h.width,
+                h.height,
+                h.stride_px,
+                if h.pixel_format == 1 { "BGRX" } else { "RGBX" },
+                h.framebuffer_base,
+                h.framebuffer_size,
+            );
+            sprintln!(
+                "Aegis: GOP: framebuffer {w}x{hgt} stride {stride} fmt {fmt} @ {base:#x} ({size} bytes)"
+            );
+            uefi::println!(
+                "Aegis: GOP: framebuffer {}x{} stride {} fmt {} @ {:#x} ({} bytes)",
+                w,
+                hgt,
+                stride,
+                fmt,
+                base,
+                size
+            );
+        }
+        None => {
+            sprintln!("Aegis: GOP: no usable framebuffer - kernel falls back to Bochs VBE probe");
+            uefi::println!("Aegis: GOP: no usable framebuffer - kernel falls back to Bochs VBE probe");
+        }
+    }
+
     // Set up 4-level identity-mapped page tables
     uefi::println!("Aegis: Setting up page tables...");
     sprintln!("Aegis: Setting up page tables...");
     unsafe {
         page_tables::setup_identity_mapping();
+    }
+    // Make the framebuffer visible to the kernel: if it sits above 4 GiB,
+    // map its 1 GiB window(s) into our tables (the base map covers GB0-3).
+    if let Some(h) = &gop_config {
+        let start_gb = h.framebuffer_base >> 30;
+        let end_gb = ((h.framebuffer_base + h.framebuffer_size + 0x3FFF_FFFF) >> 30).min(8);
+        if start_gb >= 4 && start_gb < 8 {
+            for gb in start_gb..end_gb.min(8) {
+                unsafe { page_tables::map_gb(gb) };
+            }
+        }
     }
     let cr3 = page_tables::read_cr3();
     uefi::println!("Aegis: Page tables configured, CR3 = 0x{:016X}", cr3);
@@ -149,59 +197,7 @@ fn main() -> Status {
             // disarmed, and the memory map is finalized. From this point on
             // only raw hardware (serial, LAPIC, paging) remains usable, so
             // all remaining prints go to the polled COM1 port only.
-            //
-            // Query the Graphics Output Protocol BEFORE this point: it is
-            // a boot service and dies with the rest of firmware. The
-            // framebuffer it hands out survives (it is device memory),
-            // so the kernel can keep drawing to it after handover.
-            let gop_config = gop::query();
-            match &gop_config {
-                Some(h) => {
-                    // Make the framebuffer visible to the kernel: if it sits
-                    // above 4 GiB, map its 1 GiB window(s) into the identity
-                    // page tables so the on-screen console can blit to it at
-                    // boot entry (the base map covers only GB0-3).
-                    let base = h.framebuffer_base;
-                    let size = h.framebuffer_size;
-                    let start_gb = base >> 30;
-                    let end_gb = ((base + size + 0x3FFF_FFFF) >> 30).min(8);
-                    if start_gb >= 4 && start_gb < 8 {
-                        for gb in start_gb..end_gb.min(8) {
-                            unsafe { page_tables::map_gb(gb) };
-                        }
-                    }
-                    // `GopHandoff` is packed; copy fields out before
-                    // formatting (no unaligned references).
-                    let (w, hgt, stride, fmt, _base, _size) = (
-                        h.width,
-                        h.height,
-                        h.stride_px,
-                        if h.pixel_format == 1 { "BGRX" } else { "RGBX" },
-                        base,
-                        size,
-                    );
-                    sprintln!(
-                        "Aegis: GOP: framebuffer {w}x{hgt} stride {stride} fmt {fmt} @ {base:#x} ({size} bytes)"
-                    );
-                    uefi::println!(
-                        "Aegis: GOP: framebuffer {}x{} stride {} fmt {} @ {:#x} ({} bytes)",
-                        w,
-                        hgt,
-                        stride,
-                        fmt,
-                        base,
-                        size
-                    );
-                }
-                None => {
-                    sprintln!(
-                        "Aegis: GOP: no usable framebuffer - kernel falls back to Bochs VBE probe"
-                    );
-                    uefi::println!(
-                        "Aegis: GOP: no usable framebuffer - kernel falls back to Bochs VBE probe"
-                    );
-                }
-            }
+            // (The GOP query was already done before the page-table switch.)
 
             uefi::println!("Aegis: Calling ExitBootServices...");
             let final_map = unsafe {
