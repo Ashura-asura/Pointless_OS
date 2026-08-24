@@ -1,0 +1,39 @@
+name: Track 2 Guest Battery
+
+# Phase A step 4: wire the guest-app battery contract into CI. The enriched
+# guest image (guest/out/{bzImage,initramfs.cpio.gz}) is committed, so this
+# job only needs QEMU + Python to boot it and assert every AEGIS_USEFUL_PROMPT.md
+# §3 item. battery-contract.py exits non-zero on any FAIL, which fails the job.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  battery:
+    name: Guest app battery (QEMU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU + Python
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y qemu-system-x86 python3
+
+      - name: Sanity-check committed guest artifacts
+        run: |
+          test -s guest/out/bzImage || { echo "missing bzImage"; exit 1; }
+          test -s guest/out/initramfs.cpio.gz || { echo "missing initramfs"; exit 1; }
+
+      - name: Run battery contract
+        run: python3 guest/battery-contract.py
+
+      - name: Upload evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: battery-contract-log
+          path: guest/out/battery-contract-kali.log
