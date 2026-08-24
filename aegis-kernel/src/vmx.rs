@@ -774,7 +774,7 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
         .ok_or("frame allocator: out of memory for guest code page")?;
 
     let mut store = RamDiskStore { data: [0; 512] };
-    let devices = crate::vdev::DeviceSet::new(&mut store, 0);
+    let devices = crate::vdev::DeviceSet::new(&mut store, 0, crate::vdev::DevicePolicy::all());
     let grant = crate::ept::MemGrant::new(0, (CODE_GPA >> 12) + 1);
     let mut vm = Vm::new(0, grant, devices, 0, 100);
 
@@ -965,7 +965,7 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
     );
 
     let mut store = RamDiskStore { data: [0; 512] };
-    let devices = crate::vdev::DeviceSet::new(&mut store, 0);
+    let devices = crate::vdev::DeviceSet::new(&mut store, 0, crate::vdev::DevicePolicy::all());
     let grant = crate::ept::MemGrant::new(0, frames);
     let mut vm = Vm::new(0, grant, devices, guest_ram, 1000);
 

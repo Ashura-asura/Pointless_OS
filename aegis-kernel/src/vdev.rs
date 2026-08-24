@@ -1856,6 +1856,41 @@ impl Sb16Dsp {
 /// reflect device lines into the PIC. Generic over the virtio-blk block
 /// store so the same emulation serves the kernel's object-store-backed disk
 /// and the contract tests' memory disk.
+/// Per-VM device allow-list (Track 1.5 / Genode research pass). This is the
+/// guest-capability boundary made *explicit and policy-scoped*, mirroring
+/// Genode's per-guest session routing: a guest may only reach the device
+/// classes its policy declares. Essential bootstrap devices (PIC / UART / PIT
+/// / RTC) are always present — a VM without them cannot boot — so they are not
+/// part of the allow-list. The optional device classes are gated here so a VM's
+/// device surface is a deliberate grant, not an implicitly-fixed full set:
+///
+/// - `usb`: the UHCI controller + HID keyboard.
+/// - `audio`: the Sound Blaster 16 DSP.
+/// - `virtio`: the virtio-blk (legacy PCI) block device.
+///
+/// Default is `all()` (every class enabled), which preserves the historical
+/// behavior exactly; disabling a class makes the guest's accesses to that
+/// class's ports return the floating-bus default (as if the device were
+/// absent), so a policy can shrink a VM's attack surface without special
+/// VM-exit handling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DevicePolicy {
+    pub usb: bool,
+    pub audio: bool,
+    pub virtio: bool,
+}
+
+impl DevicePolicy {
+    /// Enable every device class — the pre-policy behavior.
+    pub const fn all() -> DevicePolicy {
+        DevicePolicy {
+            usb: true,
+            audio: true,
+            virtio: true,
+        }
+    }
+}
+
 pub struct DeviceSet<'a, S: BlockStore> {
     pub pic: Pic8259,
     pub uart: Uart16550,
@@ -1873,10 +1908,12 @@ pub struct DeviceSet<'a, S: BlockStore> {
     pub audio: Sb16Dsp,
     /// Port 0x61 refresh-flag state (bit 5 toggles on every read).
     pit61_refresh: bool,
+    /// The per-VM device allow-list (see [`DevicePolicy`]).
+    pub policy: DevicePolicy,
 }
 
 impl<'a, S: BlockStore> DeviceSet<'a, S> {
-    pub fn new(store: &'a mut S, rtc_epoch_seconds: u64) -> DeviceSet<'a, S> {
+    pub fn new(store: &'a mut S, rtc_epoch_seconds: u64, policy: DevicePolicy) -> DeviceSet<'a, S> {
         let capacity = store.capacity_sectors();
         let mut ds = DeviceSet {
             pic: Pic8259::new(),
@@ -1888,6 +1925,7 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
             usb: UhciUsb::new(),
             audio: Sb16Dsp::new(),
             pit61_refresh: false,
+            policy,
         };
         ds.pci.init(capacity);
         ds
@@ -1909,10 +1947,14 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
                 out2 | refresh | 0x10
             }
             0x70 | 0x71 => self.rtc.inb(port),
-            0x220..=0x237 => self.audio.inb(port),
+            0x220..=0x237 if self.policy.audio => self.audio.inb(port),
             _ => {
                 let bar = self.pci.virtio_bar();
-                if bar != 0 && (port as u32) >= bar as u32 && (port as u32) < bar as u32 + 0x100 {
+                if self.policy.virtio
+                    && bar != 0
+                    && (port as u32) >= bar as u32
+                    && (port as u32) < bar as u32 + 0x100
+                {
                     self.virtio.legacy_inb(port - bar)
                 } else {
                     0xFF
@@ -1928,10 +1970,14 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
             0x3F8..=0x3FF => self.uart.outb(port, val),
             0x40..=0x43 => self.pit.outb(port, val),
             0x70 | 0x71 => self.rtc.outb(port, val),
-            0x220..=0x237 => self.audio.outb(port, val),
+            0x220..=0x237 if self.policy.audio => self.audio.outb(port, val),
             _ => {
                 let bar = self.pci.virtio_bar();
-                if bar != 0 && (port as u32) >= bar as u32 && (port as u32) < bar as u32 + 0x100 {
+                if self.policy.virtio
+                    && bar != 0
+                    && (port as u32) >= bar as u32
+                    && (port as u32) < bar as u32 + 0x100
+                {
                     self.virtio.legacy_outb(port - bar, val);
                 }
             }
@@ -1943,11 +1989,15 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
     /// set is byte- or dword-oriented, so 16-bit accesses to other ranges
     /// return the floating-bus value.
     pub fn inw(&mut self, port: u16) -> u16 {
-        if (UHCI_BASE..UHCI_BASE + 0x20).contains(&port) {
+        if self.policy.usb && (UHCI_BASE..UHCI_BASE + 0x20).contains(&port) {
             return self.usb.inw(port);
         }
         let bar = self.pci.virtio_bar();
-        if bar != 0 && (port as u32) >= bar as u32 && (port as u32) < bar as u32 + 0x100 {
+        if self.policy.virtio
+            && bar != 0
+            && (port as u32) >= bar as u32
+            && (port as u32) < bar as u32 + 0x100
+        {
             self.virtio.legacy_inw(port - bar)
         } else {
             0xFFFF
@@ -1958,12 +2008,16 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
     /// (QUEUE_NUM / QUEUE_SEL / QUEUE_NOTIFY); other ranges are ignored
     /// (floating-bus).
     pub fn outw(&mut self, port: u16, val: u16) {
-        if (UHCI_BASE..UHCI_BASE + 0x20).contains(&port) {
+        if self.policy.usb && (UHCI_BASE..UHCI_BASE + 0x20).contains(&port) {
             self.usb.outw(port, val);
             return;
         }
         let bar = self.pci.virtio_bar();
-        if bar != 0 && (port as u32) >= bar as u32 && (port as u32) < bar as u32 + 0x100 {
+        if self.policy.virtio
+            && bar != 0
+            && (port as u32) >= bar as u32
+            && (port as u32) < bar as u32 + 0x100
+        {
             self.virtio.legacy_outw(port - bar, val);
         }
     }
@@ -1975,7 +2029,11 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
             0xCFC => self.pci.read_data(),
             _ => {
                 let bar = self.pci.virtio_bar();
-                if bar != 0 && (port as u32) >= bar as u32 && (port as u32) < bar as u32 + 0x100 {
+                if self.policy.virtio
+                    && bar != 0
+                    && (port as u32) >= bar as u32
+                    && (port as u32) < bar as u32 + 0x100
+                {
                     self.virtio.legacy_inl(port - bar)
                 } else {
                     0xFFFF_FFFF
@@ -1991,7 +2049,11 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
             0xCFC => self.pci.write_data(val),
             _ => {
                 let bar = self.pci.virtio_bar();
-                if bar != 0 && (port as u32) >= bar as u32 && (port as u32) < bar as u32 + 0x100 {
+                if self.policy.virtio
+                    && bar != 0
+                    && (port as u32) >= bar as u32
+                    && (port as u32) < bar as u32 + 0x100
+                {
                     self.virtio.legacy_outl(port - bar, val);
                 }
             }
@@ -2096,6 +2158,57 @@ mod tests {
         }
     }
 
+    /// Track 1.5 / Genode research pass: the per-VM device allow-list is the
+    /// guest-capability boundary made explicit. With a class disabled, the
+    /// guest's accesses to that class's ports return the floating-bus default
+    /// (as if the device were absent) — the VM's device surface is a deliberate
+    /// grant, not an implicitly-fixed full set. With the class enabled, the
+    /// device responds. Mirrors Genode's per-guest session routing.
+    #[test]
+    fn device_policy_gates_optional_classes() {
+        let mut store = MemStore::new(64);
+        // Program the virtio-blk I/O BAR to a known base via the PCI config
+        // path (the guest does exactly this at boot; PCI config is not part of
+        // the allow-list because device discovery is essential).
+        let program_virtio_bar = |ds: &mut DeviceSet<'_, MemStore>| {
+            ds.outl(0xCF8, (1u32 << 31) | (VIRTIO_SLOT as u32) << 11 | 0x10);
+            ds.outl(0xCFC, 0x200 | 1);
+        };
+        // Enabled policy: the device classes respond.
+        {
+            let mut ds = DeviceSet::new(&mut store, 0, DevicePolicy::all());
+            program_virtio_bar(&mut ds);
+            assert_ne!(
+                ds.inw(0xCC00),
+                0xFFFF,
+                "usb (UHCI) enabled -> device responds, not floating"
+            );
+            assert_ne!(
+                ds.inb(0x200),
+                0xFF,
+                "virtio enabled -> device responds, not floating"
+            );
+        }
+        // Disabled policy: shrink the VM's device surface to the essentials.
+        let mut ds = DeviceSet::new(
+            &mut store,
+            0,
+            DevicePolicy {
+                usb: false,
+                audio: false,
+                virtio: false,
+            },
+        );
+        program_virtio_bar(&mut ds);
+        assert_eq!(ds.inb(0x220), 0xFF, "audio disabled -> floating read");
+        assert_eq!(ds.inb(0x200), 0xFF, "virtio disabled -> floating read");
+        assert_eq!(
+            ds.inw(0xCC00),
+            0xFFFF,
+            "usb (UHCI) disabled -> floating read"
+        );
+    }
+
     /// Phase AE: every guest-facing device model is untrusted-input surface —
     /// a malicious guest drives arbitrary port/register sequences against the
     /// whole fabricated device set (PIC, UART, PIT, RTC, PCI config, virtio
@@ -2111,7 +2224,7 @@ mod tests {
         use crate::hardening_fuzz::{no_panic, Rng, SEED};
         let mut rng = Rng::new(SEED ^ 0xDE4A5);
         let mut store = MemStore::new(4);
-        let mut ds = DeviceSet::new(&mut store, 0);
+        let mut ds = DeviceSet::new(&mut store, 0, crate::vdev::DevicePolicy::all());
         let real_ports: [u16; 24] = [
             0x20, 0x21, 0xA0, 0xA1, 0x3F8, 0x3F9, 0x3FA, 0x3FB, 0x3FC, 0x3FD, 0x3FE, 0x3FF, 0x40,
             0x43, 0x61, 0x70, 0x71, 0xCF8, 0xCFC, 0x220, 0x237, 0xC000, 0xCC00, 0xCC1F,
@@ -2417,7 +2530,7 @@ mod tests {
     #[test]
     fn device_set_unhandled_ports_float() {
         let mut store = MemStore::new(4);
-        let mut ds = DeviceSet::new(&mut store, 0);
+        let mut ds = DeviceSet::new(&mut store, 0, crate::vdev::DevicePolicy::all());
         assert_eq!(ds.inl(0x4000), 0xFFFF_FFFF);
         ds.outb(0x61, 0xFF); // speaker control writes are ignored
         ds.outl(0x4000, 0xDEAD_BEEF);
@@ -2426,7 +2539,7 @@ mod tests {
     #[test]
     fn device_set_pit2_status_port_and_peek() {
         let mut store = MemStore::new(4);
-        let mut ds = DeviceSet::new(&mut store, 0);
+        let mut ds = DeviceSet::new(&mut store, 0, crate::vdev::DevicePolicy::all());
         // Port 0x61: refresh flag (bit 5) toggles on every read; bit 7
         // (OUT2) is low while channel 2 has not expired; the other bits
         // read as the floating-bus-ish default.
@@ -2464,7 +2577,7 @@ mod tests {
     #[test]
     fn device_set_routes_pic_uart_pit_rtc() {
         let mut store = MemStore::new(4);
-        let mut ds = DeviceSet::new(&mut store, 0);
+        let mut ds = DeviceSet::new(&mut store, 0, crate::vdev::DevicePolicy::all());
         ds.outb(0x20, 0x11);
         ds.outb(0x21, 0x20);
         ds.outb(0x21, 0x04);
@@ -2929,7 +3042,7 @@ mod tests {
     #[test]
     fn device_set_routes_usb_and_audio_ports() {
         let mut store = MemStore::new(4);
-        let mut ds = DeviceSet::new(&mut store, 0);
+        let mut ds = DeviceSet::new(&mut store, 0, crate::vdev::DevicePolicy::all());
         // UHCI register access through the 16-bit path.
         assert_eq!(ds.inw(UHCI_BASE + 0x02), 0x0020);
         ds.outw(UHCI_BASE, 1);
@@ -2948,7 +3061,7 @@ mod tests {
     #[test]
     fn device_set_update_pic_raises_uhci_irq() {
         let mut store = MemStore::new(4);
-        let mut ds = DeviceSet::new(&mut store, 0);
+        let mut ds = DeviceSet::new(&mut store, 0, crate::vdev::DevicePolicy::all());
         ds.outb(0x20, 0x11);
         ds.outb(0x21, 0x20);
         ds.outb(0x21, 0x04);

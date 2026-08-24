@@ -1067,7 +1067,7 @@ mod tests {
     fn vm_load_linux_end_to_end_through_real_ept() {
         let img = fake_image(4096);
         let mut store = MemStore::new(64);
-        let devices = DeviceSet::new(&mut store, 1_700_000_000);
+        let devices = DeviceSet::new(&mut store, 1_700_000_000, crate::vdev::DevicePolicy::all());
         // Host RAM: a 32 MiB buffer standing in for the kernel's RAM.
         let (_backing, host_base) = aligned_ram(0x200_0000);
         let mut vm = Vm::new(0, grant(), devices, host_base, 62);
@@ -1124,7 +1124,7 @@ mod tests {
     #[test]
     fn handle_io_dispatches_byte_word_and_dword() {
         let mut store = MemStore::new(64);
-        let devices = DeviceSet::new(&mut store, 0);
+        let devices = DeviceSet::new(&mut store, 0, crate::vdev::DevicePolicy::all());
         let mut vm = Vm::new(0, grant(), devices, 0, 62);
         // UART console byte out.
         vm.handle_io(0x3F8, 1, true, b'A' as u32);
@@ -1151,7 +1151,7 @@ mod tests {
     #[test]
     fn advance_time_feeds_pit_and_rtc() {
         let mut store = MemStore::new(64);
-        let devices = DeviceSet::new(&mut store, 0);
+        let devices = DeviceSet::new(&mut store, 0, crate::vdev::DevicePolicy::all());
         let mut vm = Vm::new(0, grant(), devices, 0, 62);
         // Program PIT ch0: count 119318 (100 Hz IRQ0).
         vm.handle_io(0x43, 1, true, 0x36);
@@ -1170,7 +1170,7 @@ mod tests {
     fn teardown_releases_every_ept_page() {
         let img = fake_image(4096);
         let mut store = MemStore::new(64);
-        let devices = DeviceSet::new(&mut store, 0);
+        let devices = DeviceSet::new(&mut store, 0, crate::vdev::DevicePolicy::all());
         let (_backing, host_base) = aligned_ram(0x200_0000);
         let mut vm = Vm::new(0, grant(), devices, host_base, 62);
         let mut alloc = TestAlloc::new();
