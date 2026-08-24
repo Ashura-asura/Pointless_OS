@@ -76,8 +76,14 @@ const IA32_VMX_TRUE_ENTRY_CTLS: u32 = 0x490;
 // Secondary proc-based controls only exist with the TRUE MSRs (or the
 // legacy 0x482/0x483 if bit 55 of IA32_VMX_BASIC says so — the
 // `adjust_controls` helper picks the right one).
-const IA32_VMX_PROCBASED2_CTLS: u32 = 0x48A;
-const IA32_VMX_TRUE_PROCBASED2_CTLS: u32 = 0x49A;
+// Secondary proc-based controls (EPT / unrestricted guest / TSC offsetting).
+// The correct MSR is 0x48B (IA32_VMX_PROCBASED_CTLS2) — previously this was
+// 0x48A/0x49A (VMCS_ENUM and a nonexistent MSR), so `rdmsr` #GP'd the moment
+// the EPT path ran. There is no separate "TRUE" secondary-controls MSR; the
+// single 0x48B MSR always reports the full capability set (Linux
+// arch/x86/include/asm/msr-index.h confirms 0x48B).
+const IA32_VMX_PROCBASED2_CTLS: u32 = 0x48B;
+const IA32_VMX_TRUE_PROCBASED2_CTLS: u32 = 0x48B;
 
 // ---------------------------------------------------------------------
 // VMCS field encodings (SDM Vol. 3C, Appendix B) — the ones this minimal
@@ -202,12 +208,16 @@ mod proc_secondary {
     pub const UNRESTRICTED_GUEST: u32 = 1 << 3;
     /// Time-stamp-counter offsetting (per-VM TSC skew; needed once the
     /// guest measures time — the guest must never see the host's TSC).
+    // Used by the SDM-value contract test; deliberately not requested in the
+    // run-loop secondary controls (nested KVM does not emulate it for L2).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const TSC_OFFSETTING: u32 = 1 << 17;
 }
 
 /// Basic VM-exit reason codes the run loop dispatches (SDM §29.2.1,
 /// Table 29-1).
 mod exit_reason {
+    pub const EXCEPTION: u16 = 0;
     pub const EXTERNAL_INTERRUPT: u16 = 1;
     pub const HLT: u16 = 12;
     pub const CR_ACCESS: u16 = 28;
@@ -224,6 +234,7 @@ mod exit_reason {
 /// swallowed or re-entered).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExitClass {
+    Exception,
     ExternalInterrupt,
     Hlt,
     IoInstruction,
@@ -233,6 +244,7 @@ pub(crate) enum ExitClass {
 
 pub(crate) fn classify_exit(reason: u16) -> ExitClass {
     match reason {
+        exit_reason::EXCEPTION => ExitClass::Exception,
         exit_reason::EXTERNAL_INTERRUPT => ExitClass::ExternalInterrupt,
         exit_reason::HLT => ExitClass::Hlt,
         exit_reason::IO_INSTRUCTION => ExitClass::IoInstruction,
@@ -458,10 +470,7 @@ pub enum VmxReadiness {
 /// a guest hypervisor is given VT-x and *can* own it for its own guests.
 /// If nested VMX is not exposed, the VMX bit reads 0 and this reports
 /// `NoVtx` — the honest signal either way.
-pub const fn classify_vmx_readiness(
-    vmx_present: bool,
-    feature_control_ok: bool,
-) -> VmxReadiness {
+pub const fn classify_vmx_readiness(vmx_present: bool, feature_control_ok: bool) -> VmxReadiness {
     if !vmx_present {
         return VmxReadiness::NoVtx;
     }
@@ -544,6 +553,27 @@ unsafe fn alloc_vmx_region() -> Result<u64, &'static str> {
     let revision = (rdmsr(IA32_VMX_BASIC) & 0x7FFF_FFFF) as u32;
     core::ptr::write_volatile(phys as *mut u32, revision);
     Ok(phys)
+}
+
+/// Enter VMX root operation exactly once per boot. The three VMX demos
+/// (`bringup_demo`, `run_loop_demo`, `guest_boot_demo`) run serially at the
+/// end of boot; once one has done VMXON the processor is already in VMX root
+/// operation, and a second VMXON would fail (SDM: VMXON is rejected when VMX
+/// root operation is active). This latches the first successful VMXON so
+/// every demo shares a single root entry.
+unsafe fn ensure_vmx_root() -> Result<(), &'static str> {
+    static mut ACTIVE: bool = false;
+    if ACTIVE {
+        return Ok(());
+    }
+    enable_vmx_operation()?;
+    let vmxon_region = alloc_vmx_region()?;
+    if !vmxon(vmxon_region) {
+        return Err("VMXON failed — check IA32_FEATURE_CONTROL and CR0/CR4 fixed-bit MSRs");
+    }
+    crate::sprintln!("Aegis: [vmx] VMXON ok, region at {:#x}", vmxon_region);
+    ACTIVE = true;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -871,7 +901,7 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
     const CODE_GPA: u64 = 0x100000;
 
     // Phase A Problem 2 pre-flight: fail loudly and correctly if this host
-    // cannot own VMX (no VT-x, firmware-disabled, or another VMM owns it).
+    // cannot own VMX (no VT-x, firmware-disabled).
     let readiness = vmx_host_readiness();
     if readiness != VmxReadiness::Ready {
         let msg = readiness_advice(readiness);
@@ -879,13 +909,7 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
         return Err(msg);
     }
 
-    enable_vmx_operation()?;
-
-    let vmxon_region = alloc_vmx_region()?;
-    if !vmxon(vmxon_region) {
-        return Err("VMXON failed — check IA32_FEATURE_CONTROL and CR0/CR4 fixed-bit MSRs");
-    }
-    crate::sprintln!("Aegis: [vmx] VMXON ok, region at {:#x}", vmxon_region);
+    ensure_vmx_root()?;
 
     let vmcs_region = alloc_vmx_region()?;
     if !vmclear(vmcs_region) {
@@ -936,7 +960,7 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
         let mut mem = crate::vm::EptMem::new(&mut vm.ept);
         crate::vm::GuestBoot::write_setup_gdt(&mut mem, GDT_GPA, TSS_GPA)
             .map_err(|_| "guest GDT write failed")?;
-        mem.write(TSS_GPA, &[0u8; 4096])
+        mem.write(TSS_GPA, &[0u8; 0x80]) // TSS limit is 0x67; 0x80 bytes covers it within the GDT frame (0x2000–0x3000)
             .then_some(())
             .ok_or("guest TSS page write failed")?;
         mem.write(CODE_GPA, &RUN_LOOP_GUEST)
@@ -944,9 +968,53 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
             .ok_or("guest code write failed")?;
     }
 
+    // Identity page directory for the guest: KVM nested's CR0 validity
+    // check requires the guest to run with PG=1 (CR0_FIXED0 includes PG),
+    // so the guest needs real 32-bit page tables. A single 4 MiB-page
+    // directory maps the whole 4 GiB linear space identity, which the EPT
+    // then bounds to the host frames. PD frame at guest-physical 0x4000.
+    let pd_phys = crate::frame::alloc_contiguous_global(1)
+        .ok_or("frame allocator: out of memory for guest page directory")?;
+    {
+        let pd = pd_phys as *mut u64;
+        for i in 0..1024usize {
+            // 4 MiB page: PS | RW | P — identity (linear i*4MiB -> phys i*4MiB).
+            core::ptr::write_volatile(pd.add(i), ((i as u64) * 0x400_000) | 0x83);
+        }
+    }
+    const PD_GPA: u64 = 0x4000;
+    vm.ept
+        .map(
+            &mut crate::ept::KernelAlloc,
+            &grant,
+            PD_GPA,
+            pd_phys,
+            1,
+            crate::ept::EPT_DEFAULT_FLAGS,
+        )
+        .map_err(|_| "EPT map failed for guest page directory")?;
+
+    // A zeroed low-memory frame for guest-phys 0x0: the 4 MiB identity PDE
+    // covers linear 0x0, and the first instruction's page-walk touches the
+    // low page (interrupt-vector / null-page area). Map it so the guest's
+    // paging-walk A/D tracking and any low-page read succeed.
+    let low_phys = crate::frame::alloc_contiguous_global(1)
+        .ok_or("frame allocator: out of memory for guest low-memory page")?;
+    core::ptr::write_bytes(low_phys as *mut u8, 0, 4096);
+    vm.ept
+        .map(
+            &mut crate::ept::KernelAlloc,
+            &grant,
+            0x0,
+            low_phys,
+            1,
+            crate::ept::EPT_DEFAULT_FLAGS,
+        )
+        .map_err(|_| "EPT map failed for guest low-memory page")?;
+
     // Boot state mirroring GuestBoot::boot_state() at our hand-picked
     // addresses: flat 32-bit segments, GDT/TSS in the low page, stack at
-    // the standard guest stack top.
+    // the standard guest stack top, and identity paging (PG=1, CR3 -> PD).
     let boot = BootState {
         eip: CODE_GPA,
         esi: 0,
@@ -962,8 +1030,9 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
         tr: 0x18,
         tss_base: TSS_GPA,
         tss_limit: 0x67,
-        cr0: 0x31,   // PE | ET | NE
-        cr4: 0x2000, // VMXE mirror
+        cr0: 0xE000_0031, // PE | PG | CD | NW | ET | NE (PG required by KVM nested CR0 validity)
+        cr3: PD_GPA,
+        cr4: 0x2010, // VMXE | PSE (PSE required for the 4 MiB-page directory)
         rflags: 0x2,
     };
 
@@ -973,8 +1042,13 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
     let mut exits = 0u64;
     let mut ept_handler = |vm: &mut Vm<'_, RamDiskStore>, v: crate::ept::EptViolation| {
         crate::sprintln!(
-            "Aegis: [vmx] EPT violation {:#x} (isolation enforced — refused)",
-            v.guest_phys
+            "Aegis: [vmx] EPT violation at gpa {:#x} access={:?} present={} rip={:#x} cr3={:#x} qual={:#x} (isolation enforced — refused)",
+            v.guest_phys,
+            v.access,
+            v.present,
+            vmread(field::GUEST_RIP),
+            vmread(field::GUEST_CR3),
+            vmread(field::EXIT_QUALIFICATION)
         );
         let _ = vm;
         Ok::<bool, &'static str>(false)
@@ -1057,7 +1131,7 @@ const DOD_MARKER: &[u8] = b"Phase U DoD point";
 #[cfg(feature = "vmx-demo")]
 pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
     // Phase A Problem 2 pre-flight: fail loudly and correctly if this host
-    // cannot own VMX (no VT-x, firmware-disabled, or another VMM owns it).
+    // cannot own VMX (no VT-x, firmware-disabled).
     let readiness = vmx_host_readiness();
     if readiness != VmxReadiness::Ready {
         let msg = readiness_advice(readiness);
@@ -1065,13 +1139,7 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
         return Err(msg);
     }
 
-    enable_vmx_operation()?;
-
-    let vmxon_region = alloc_vmx_region()?;
-    if !vmxon(vmxon_region) {
-        return Err("VMXON failed — check IA32_FEATURE_CONTROL and CR0/CR4 fixed-bit MSRs");
-    }
-    crate::sprintln!("Aegis: [vmx] VMXON ok, region at {:#x}", vmxon_region);
+    ensure_vmx_root()?;
 
     let vmcs_region = alloc_vmx_region()?;
     if !vmclear(vmcs_region) {
@@ -1254,11 +1322,12 @@ unsafe fn setup_host_state() -> Result<(), &'static str> {
 }
 
 unsafe fn setup_guest_state(guest_code_phys: u64) -> Result<(), &'static str> {
-    // Real-address-mode guest: CR0.PE=0, CR0.PG=0. ET (bit4) and NE (bit5)
-    // set as the conventional minimal-reserved-safe value used across the
-    // tutorial lineage — cross-check against IA32_VMX_CR0_FIXED0/1 MSRs if
-    // entry fails on real hardware with a CR0-related error.
-    vmwrite(field::GUEST_CR0, 0x30);
+    // Real-address-mode guest: CR0.PE=0, CR0.PG=0. ET (bit4), NE (bit5),
+    // NW (bit30) and CD (bit29) set — the real-mode reset value shape
+    // (0x60000010 is CD|NW|ET). KVM nested's `nested_guest_cr0_valid`
+    // requires the guest CR0 to hold the fixed bits; both NW and CD must be
+    // present (CD alone with NW alone both fail its check in practice).
+    vmwrite(field::GUEST_CR0, 0x6000_0030);
     vmwrite(field::GUEST_CR3, 0);
     vmwrite(field::GUEST_CR4, 0x2000); // VMXE mirrored per SDM requirement for guest CR4 under VMX
     vmwrite(field::CR0_GUEST_HOST_MASK, 0);
@@ -1350,7 +1419,7 @@ unsafe fn setup_guest_state(guest_code_phys: u64) -> Result<(), &'static str> {
 /// intercepted at the CR level), CR3 is 0 (EPT owns translation).
 unsafe fn setup_guest_state_from_boot(boot: &BootState) -> Result<(), &'static str> {
     vmwrite(field::GUEST_CR0, boot.cr0);
-    vmwrite(field::GUEST_CR3, 0);
+    vmwrite(field::GUEST_CR3, boot.cr3);
     vmwrite(field::GUEST_CR4, boot.cr4);
     vmwrite(field::CR0_GUEST_HOST_MASK, 0);
     vmwrite(field::CR4_GUEST_HOST_MASK, 0);
@@ -1461,9 +1530,10 @@ unsafe fn setup_controls(use_ept: bool, ept_root: u64) -> Result<(), &'static st
     vmwrite(field::CPU_BASED_VM_EXEC_CONTROL, primary as u64);
 
     if use_ept {
-        let secondary_desired = proc_secondary::EPT_ENABLE
-            | proc_secondary::UNRESTRICTED_GUEST
-            | proc_secondary::TSC_OFFSETTING;
+        // TSC_OFFSETTING deliberately excluded from the desired set: under
+        // nested virtualization (KVM L0) it is not emulated for L2 and its
+        // presence in the secondary controls can make L2 entry fail.
+        let secondary_desired = proc_secondary::EPT_ENABLE | proc_secondary::UNRESTRICTED_GUEST;
         let secondary = adjust_controls(
             IA32_VMX_TRUE_PROCBASED2_CTLS,
             IA32_VMX_PROCBASED2_CTLS,
@@ -1487,7 +1557,9 @@ unsafe fn setup_controls(use_ept: bool, ept_root: u64) -> Result<(), &'static st
     let entry_ctrls = adjust_controls(IA32_VMX_TRUE_ENTRY_CTLS, IA32_VMX_ENTRY_CTLS, 0);
     vmwrite(field::VM_ENTRY_CONTROLS, entry_ctrls as u64);
 
-    vmwrite(field::EXCEPTION_BITMAP, 0);
+    // Intercept #GP (13) and #PF (14) so bring-up can report the guest's
+    // faulting instruction/address instead of a silent triple fault.
+    vmwrite(field::EXCEPTION_BITMAP, (1 << 13) | (1 << 14));
     Ok(())
 }
 
@@ -1689,6 +1761,17 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
 
         let reason = (vmread(field::VM_EXIT_REASON) & 0xFFFF) as u16;
         match classify_exit(reason) {
+            ExitClass::Exception => {
+                let qual = vmread(field::EXIT_QUALIFICATION);
+                let vector = (qual & 0xFF) as u8;
+                let rip = vmread(field::GUEST_RIP);
+                crate::sprintln!(
+                    "Aegis: [vmx] guest exception vector {} at rip {:#x}",
+                    vector,
+                    rip
+                );
+                return Err("guest exception (vector in log)");
+            }
             ExitClass::ExternalInterrupt => {
                 crate::cpu::lapic_eoi();
                 if !exit_hook(vm)? {
@@ -1747,7 +1830,10 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
                         "VM-exit reason 33: VM-entry failed (invalid guest state — see module docs)"
                     }
                     exit_reason::MSR_LOADING => "VM-exit reason 34: VM-entry failed (MSR loading)",
-                    _ => "unhandled VM-exit reason (not classified by the run loop)",
+                    r => {
+                        crate::sprintln!("Aegis: [vmx] unhandled VM-exit reason {}", r);
+                        "unhandled VM-exit reason (see log)"
+                    }
                 });
             }
         }
@@ -1776,7 +1862,7 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
 /// CPU (this is a single-VMCS, single-attempt bring-up, not a scheduler).
 pub unsafe fn bringup_demo() -> Result<(), &'static str> {
     // Phase A Problem 2 pre-flight: fail loudly and correctly if this host
-    // cannot own VMX (no VT-x, firmware-disabled, or another VMM owns it).
+    // cannot own VMX (no VT-x, firmware-disabled).
     let readiness = vmx_host_readiness();
     if readiness != VmxReadiness::Ready {
         let msg = readiness_advice(readiness);
@@ -1784,13 +1870,7 @@ pub unsafe fn bringup_demo() -> Result<(), &'static str> {
         return Err(msg);
     }
 
-    enable_vmx_operation()?;
-
-    let vmxon_region = alloc_vmx_region()?;
-    if !vmxon(vmxon_region) {
-        return Err("VMXON failed — check IA32_FEATURE_CONTROL and CR0/CR4 fixed-bit MSRs");
-    }
-    crate::sprintln!("Aegis: [vmx] VMXON ok, region at {:#x}", vmxon_region);
+    ensure_vmx_root()?;
 
     let vmcs_region = alloc_vmx_region()?;
     if !vmclear(vmcs_region) {
@@ -1955,6 +2035,7 @@ mod tests {
 
     #[test]
     fn classify_exit_maps_the_handled_set() {
+        assert_eq!(classify_exit(0), ExitClass::Exception);
         assert_eq!(classify_exit(1), ExitClass::ExternalInterrupt);
         assert_eq!(classify_exit(12), ExitClass::Hlt);
         assert_eq!(classify_exit(30), ExitClass::IoInstruction);
@@ -1962,7 +2043,6 @@ mod tests {
         // Everything outside the handled set is refused loudly, with the
         // real reason preserved for the error message.
         assert_eq!(classify_exit(28), ExitClass::Unhandled { reason: 28 });
-        assert_eq!(classify_exit(0), ExitClass::Unhandled { reason: 0 });
         assert_eq!(classify_exit(99), ExitClass::Unhandled { reason: 99 });
     }
 

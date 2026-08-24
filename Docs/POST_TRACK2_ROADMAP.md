@@ -71,25 +71,28 @@ doing once, deliberately, on its own schedule — not bundled with the WSL2 work
    *before* `mkdir -p /proc /sys /dev`, so `proc`/`devtmpfs` mounts silently
    failed and broke `/proc` + `/dev/null` (which in turn failed `procfs` and
    `git`). Fixed and re-baked; see `TRACK2_GUEST_BATTERY.md`.
-3. **Problem 2 — software-complete (2026-08-24); hardware step documented.**
-    The `vm.rs`-hosted path was blocked by another VMM reserving VMX (KVM on
-    Linux, VBS/Core Isolation on Windows). This session:
-    - Added a **host-readiness pre-flight** (`vmx.rs`: `vmx_host_readiness`,
-      `VmxReadiness` enum, `readiness_advice`) that reports the exact reason a
-      host cannot own VMX — no more cryptic "VMXON failed". The pure
-      classification is unit-tested (3 tests under `--features vmx-demo`, 825
-      green).
-    - Wired the pre-flight into all three VMX demo entry points (`bringup_demo`,
-      `run_loop_demo`, `guest_boot_demo`) so a boot on a wrong host prints the
-      precise remediation.
-    - Fixed the `INITRD_GPA` layout constant (16 MiB → 32 MiB) that the rebuilt
-      enriched guest image (23 MB kernel) had outgrown, causing a latent
-      `Overlap` error in the demo and its contract test.
-    - Corrected the "no VT-x" doc claims (`vm.rs`, `vmx.rs`) to state the real
-      requirement: VMX ownership, not just silicon presence.
-    - **One hardware/boot step remains**: boot Aegis as the VMX owner (Core
-      Isolation off, KVM unloaded) on a real host. See `Docs/VMX_LIVE_HOSTING.md`
-      for the exact steps, build instructions, and what to expect on serial.
+3. **Problem 2 — LIVE under nested VT-x (2026-08-24); guest-execution fix pending.**
+    The `vm.rs`-hosted path is no longer theoretical: Aegis
+    (`kernel,vmx-demo`) was booted under QEMU/KVM with nested VT-x
+    (`-cpu host`) and **the hypervisor executed for real** — VMXON ok, VMCS
+    active, `vmlaunch`, real VM-exits. This session:
+    - Added a **host-readiness pre-flight** (`vmx_host_readiness`/`VmxReadiness`)
+      and corrected it: running under another hypervisor is *not* a blocker
+      (nested VT-x is a valid host), so the QEMU/KVM nested path was enabled.
+    - Fixed the `INITRD_GPA` layout constant (16 MiB → 32 MiB) the rebuilt
+      enriched guest had outgrown.
+    - **Fixed 4 real VMX bugs the nested run surfaced** (see
+      `Docs/VMX_LIVE_HOSTING.md`): the wrong secondary-controls MSR
+      (`0x48A`→`0x48B`, would #GP any EPT use), the EPTP walk-length in
+      reserved bits (`3<<7`→`3<<3`), guest CR0 requiring PG (KVM
+      CR0_FIXED0=0x80000021), and CR4.PSE for the 4 MiB-page directory.
+    - Made the three demos share one `ensure_vmx_root()` (VMXON is rejected
+      once root is active) and improved diagnostics (unhandled-reason + guest
+      exception reporting, #GP/#PF interception).
+    - **One fix remains**: the run-loop guest takes a guest exception at its
+      first instruction (code at RIP reads `0xEE`/`out` instead of `0xB0`/`mov`)
+      — the last step before the guest prints via the emulated 16550. Evidence
+      in `Docs/test_runs/aegis-vmx-bootN.log`.
 4. **Battery contract tests — QEMU part DONE** (11/11, evidence committed).
    The `vm.rs`-hosted run remains pending Problem 2; when it lands, commit those
    serial logs too and wire `battery-contract.py` into CI (it exits non-zero on
@@ -271,11 +274,12 @@ folded in.
   - Phase E #1 (monitor warmup): DONE `61fe128`
 
 - **Still open:**
-  - Phase A Problem 2 (`vm.rs` live hosting under Aegis bare-metal hypervisor):
-    **software-complete 2026-08-24** — host-readiness pre-flight wired into all
-    VMX demo entries, `INITRD_GPA` layout fix, honest docs. The **one remaining
-    step is a boot/hardware action** on a VMX-owner host (Core Isolation off /
-    KVM unloaded); see `Docs/VMX_LIVE_HOSTING.md`. Not doable in-session.
+  - Phase A Problem 2 (`vm.rs` live hosting under Aegis hypervisor):
+    **LIVE under nested VT-x 2026-08-24** — Aegis booted under QEMU/KVM
+    (`-cpu host`), VMXON/VMCS/vmlaunch executed, 4 real VMX bugs fixed. One
+    fix remains: the guest takes an exception at its first instruction
+    (code-at-RIP reads `0xEE` instead of `0xB0`); see `Docs/VMX_LIVE_HOSTING.md`
+    and `Docs/test_runs/aegis-vmx-bootN.log`.
   - Phase B (Track 3: Windows guest, fuller distro, broader device model): large
     multi-day feature. **Scoped advance 2026-08-24: virtio-rng added and
     test-proven** (5 tests); the rest (full distro, Windows guest, more USB

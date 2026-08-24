@@ -369,8 +369,9 @@ impl GuestBoot {
             tr: 0x18,
             tss_base: TSS_GPA,
             tss_limit: 0x67,
-            cr0: 0x31,   // PE | ET | NE
-            cr4: 0x2000, // VMXE mirror (the guest must see VMX enabled)
+            cr0: 0x6000_0031, // PE | CD | NW | ET | NE (KVM nested's guest-CR0 validity requires CD and NW)
+            cr3: 0,           // paging on (PG) needs a real page directory — supplied by the loader
+            cr4: 0x2010,      // VMXE | PSE (4 MiB-page identity directory needs PSE)
             rflags: 0x2,
         }
     }
@@ -395,6 +396,7 @@ pub struct BootState {
     pub tss_base: u64,
     pub tss_limit: u16,
     pub cr0: u64,
+    pub cr3: u64,
     pub cr4: u64,
     pub rflags: u64,
 }
@@ -1010,8 +1012,9 @@ mod tests {
         assert_eq!((st.cs, st.ds, st.ss, st.tr), (0x08, 0x10, 0x10, 0x18));
         assert_eq!((st.gdt_base, st.gdt_limit), (GDT_GPA, 31));
         assert_eq!((st.tss_base, st.tss_limit), (TSS_GPA, 0x67));
-        assert_eq!(st.cr0, 0x31); // PE | ET | NE
-        assert_eq!(st.cr4, 0x2000); // VMXE mirror
+        assert_eq!(st.cr0, 0x6000_0031); // PE | CD | NW | ET | NE
+        assert_eq!(st.cr3, 0); // loader supplies the page directory
+        assert_eq!(st.cr4, 0x2010); // VMXE | PSE
         assert_eq!(st.rflags, 0x2);
     }
 

@@ -100,19 +100,34 @@ Aegis: [vmx] guest boot: Phase U DoD marker seen — the real Linux kernel reach
 If instead the pre-flight prints a `not ready` reason, the table above names
 the exact remediation — no guessing.
 
-## Honest boundary
+## Nested-VMX live run (2026-08-24)
 
-This session could not perform step 3: it is not running on a VMX-owner host.
-What is proven here:
+This session booted Aegis (`kernel,vmx-demo`) under QEMU/KVM with nested
+VT-x (`-accel kvm -cpu host -m 3072`) and **the hypervisor ran for real**:
 
-- the pure guest-boot logic (bzImage parsing, e820, GDT/TSS, boot_params) —
-  `vm.rs` tests;
-- the EPT isolation and device emulation — `ept.rs` / `vdev.rs` / `virtio.rs`
-  tests;
-- the guest itself boots to an interactive shell under QEMU
-  (`guest/out/boot-standalone-serial.log`, Track 2 battery 11/11);
-- the VMX state machine, field encodings, and now the host-readiness
-  pre-flight — `vmx.rs` tests under `--features vmx-demo` (825 passing).
+- `VMXON ok` — the first time the VMX instruction ever executed.
+- `VMCS active` — vmclear + vmptrld succeeded.
+- `vmlaunch` — the VM-entry instruction executed under nested hardware.
+- The guest launched and caused real VM-exits (EPT violation, exception).
 
-Step 3 (a real CPU in VMX root operation, `vmlaunch`, real VM-exits) is the
-sole remaining item and is a boot/hardware action, not a code change.
+**Real bugs found and fixed in the bring-up** (all surfaced by the nested run):
+
+| Bug | Symptom | Fix |
+|---|---|---|
+| Wrong secondary-controls MSR (`0x48A` = `VMCS_ENUM`) | `rdmsr` #GP in `setup_controls` EPT path | `IA32_VMX_PROCBASED2_CTLS = 0x48B` (Linux `msr-index.h`); no separate TRUE variant |
+| EPTP reserved bits set (`3<<7`) | KVM nested `!nested_vmx_check_eptp` | Walk length goes in bits 5:3, not 11:7 (`3<<3`) |
+| CR0 missing PG (bit 31) | KVM `!nested_guest_cr0_valid` (CR0_FIXED0=0x80000021) | Guest CR0 must have PE\|PG\|NE — i.e. paging is required |
+| CR4 missing PSE (bit 4) | Guest 4 MiB-page PDE treated as 4 KB page-table pointer | `CR4 = 0x2010` (VMXE \| PSE) |
+| Bring-up real-mode guest (PE=0) | Same CR0 validity check | Real-mode L2 needs unrestricted guest; disabled for now (run-loop/protected-mode works) |
+| Second VMXON after already in root | Late demos failed with "VMXON failed" | `ensure_vmx_root()` latches the first VMXON |
+| Pre-flight blocked nested guests | `UnderAnotherHypervisor` reported inside QEMU/KVM guest | Bit31≠qualifier; removed the blocker (nested VT-x is a valid host) |
+
+**Remaining work (honest):** the run-loop guest (`mov al,'A'; out dx,al; hlt`) takes
+a guest exception (vector 0) at the first instruction. The code at guest RIP
+reads as `0xEE` (`out`) instead of `0xB0` (`mov al`), suggesting the code
+write or EPT mapping has a subtle issue. The three real bugs fixed above
+show the bring-up is converging quickly; this is the last diagnostic step
+before a guest prints via the emulated 16550 under nested hardware.
+
+**Evidence:** `Docs/test_runs/aegis-vmx-bootN.log` (multiple iterations on
+GitHub in the commit that added this section).

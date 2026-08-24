@@ -387,10 +387,12 @@ unsafe fn write_entry(table: *mut u64, i: u64, val: u64) {
 // ---------------------------------------------------------------------
 
 /// Build the EPTP value for a VMCS from the EPT root's host-physical
-/// address (SDM §24.6.11): memory type WB (6) in bits 2:0, EPT enabled
-/// (bit 6), page-walk length 4 minus one (3) in bits 11:7, root in bits 51:12.
+/// address (SDM §24.6.11): memory type WB (6) in bits 2:0, EPT accessed/
+/// dirty (bit 6), page-walk length 4 minus one (3) in bits 5:3, root in
+/// bits 51:12. Previously used `3<<7` (bits 7-8, which are reserved),
+/// causing KVM nested to reject the EPTP via `nested_vmx_check_eptp`.
 pub fn eptp(root: u64) -> u64 {
-    (root & ADDR_MASK) | (6) | (1 << 6) | (3 << 7)
+    (root & ADDR_MASK) | (6) | (1 << 6) | (3 << 3)
 }
 
 /// A decoded EPT-violation VM-exit (exit reason 28) qualification
@@ -835,10 +837,12 @@ mod tests {
         let ep = eptp(root);
         assert_eq!(ep & 0x7, 6, "memory type WB");
         assert_eq!((ep >> 6) & 1, 1, "EPT enabled");
-        assert_eq!((ep >> 7) & 0x1F, 3, "page-walk length 4 minus one");
+        assert_eq!((ep >> 3) & 0x7, 3, "page-walk length 4 minus one (SDM bits 5:3)");
+        // Bits 11:7 are reserved and must stay clear.
+        assert_eq!((ep >> 7) & 0x1F, 0, "reserved bits 11:7 clear");
         assert_eq!(ep & 0x000F_FFFF_FFFF_F000, root);
         // The fields live in disjoint bit ranges: no aliasing.
-        assert_eq!(ep, root | 6 | (1 << 6) | (3 << 7));
+        assert_eq!(ep, root | 6 | (1 << 6) | (3 << 3));
     }
 
     #[test]
