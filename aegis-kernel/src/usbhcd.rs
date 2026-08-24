@@ -120,6 +120,40 @@ fn reg_write(base: *mut u8, off: u32, v: u32) {
     unsafe { core::ptr::write_volatile(base.add(off as usize) as *mut u32, v) }
 }
 
+/// Number of TRBs in the command and transfer rings (slot 15 is the link).
+const RING_TRBS: u32 = 16;
+
+/// Write one TRB into a 16-slot ring at `*enq`, advancing `*enq`. Slot 15 is
+/// a permanent Link TRB that wraps the ring to slot 0 with the cycle toggled
+/// (TC bit set), so multi-TRB sequences and repeated commands never collide
+/// with the wrap.
+fn ring_put(ring: u64, trb: [u32; 4], enq: &mut u32, ccs: &mut bool) {
+    let idx = *enq as usize;
+    let base = ring as *mut u32;
+    let mut t = trb;
+    t[3] = (t[3] & !1u32) | if *ccs { 1 } else { 0 };
+    unsafe {
+        core::ptr::copy_nonoverlapping(t.as_ptr(), base.add(idx * 4), 4);
+    }
+    if idx as u32 == RING_TRBS - 2 {
+        // Next free slot would be 15 (the Link slot): write the Link TRB,
+        // toggle the cycle, wrap to slot 0.
+        *ccs = !*ccs;
+        let link = [
+            (ring & 0xFFFF_FFC0) as u32,
+            (ring >> 32) as u32,
+            0,
+            (TRB_LINK << 10) | (1 << 1) | if *ccs { 1 } else { 0 }, // TC + new cycle
+        ];
+        unsafe {
+            core::ptr::copy_nonoverlapping(link.as_ptr(), base.add(15 * 4), 4);
+        }
+        *enq = 0;
+    } else {
+        *enq = (idx as u32 + 1) % RING_TRBS;
+    }
+}
+
 impl XhciController {
     pub fn probe(pci: &crate::pci::PciDeviceList) -> Option<Self> {
         let dev = pci.find_usb_xhci()?;
@@ -290,23 +324,7 @@ impl XhciController {
     /// Post one command TRB to the command ring and ring the doorbell.
     /// Returns the slot id from the command-completion event, or None.
     fn cmd(&mut self, trb: [u32; 4]) -> Option<u32> {
-        let idx = self.cmd_enq as usize;
-        let ring = self.buf.cmd_ring as *mut u32;
-        let mut t = trb;
-        // Set the cycle bit on DW3 (bit 0).
-        t[3] = (t[3] & !1u32) | if self.cmd_ccs { 1 } else { 0 };
-        unsafe {
-            core::ptr::copy_nonoverlapping(t.as_ptr(), ring.add(idx * 4), 4);
-        }
-        // Link TRB at the end.
-        self.cmd_enq = (self.cmd_enq + 1) % 16;
-        if self.cmd_enq == 0 {
-            self.cmd_ccs = !self.cmd_ccs;
-            let link = [(self.buf.cmd_ring & 0xFFFF_FFC0) as u32, 0, 0, TRB_LINK | 2];
-            unsafe {
-                core::ptr::copy_nonoverlapping(link.as_ptr(), ring.add(15 * 4), 4);
-            }
-        }
+        ring_put(self.buf.cmd_ring, trb, &mut self.cmd_enq, &mut self.cmd_ccs);
         self.ring_cmd_doorbell();
         // Poll the event ring for a command-completion event.
         self.poll_event()
@@ -356,7 +374,9 @@ impl XhciController {
     }
 
     /// Address the device in `slot` (command type 8) using the input context.
-    fn address_device(&mut self, slot: u32) -> bool {
+    /// `max_pkt0` is the device's EP0 max packet size (bytes) from the first
+    /// descriptor read; it goes into the EP0 context MaxPacketSize field.
+    fn address_device(&mut self, slot: u32, max_pkt0: u8) -> bool {
         // Input context: input-control (8 bytes: context flags), then slot
         // context, then EP0 context.
         let ic = self.buf.input_ctx as *mut u32;
@@ -372,9 +392,14 @@ impl XhciController {
             *slot_ctx.add(2) = 0;
             *slot_ctx.add(3) = 0;
             // EP0 context (offset +8 + 32): EP Type (bits 15:13) = 4 (control),
-            // Max Packet Size (bits 9:6) = 0 (8 bytes), all else 0.
+            // Max Packet Size (bits 9:6) = log2(max_pkt0)-3 (8->0, 64->3).
+            let mps = if max_pkt0 >= 8 {
+                ((max_pkt0 as u32).trailing_zeros().saturating_sub(3)).min(0xF)
+            } else {
+                0
+            };
             let ep0 = ic.add(2 + 8);
-            *ep0.add(0) = 4 << 13;
+            *ep0.add(0) = (4 << 13) | (mps << 6);
             *ep0.add(1) = 0;
             *ep0.add(2) = 0;
             *ep0.add(3) = 0;
@@ -405,59 +430,54 @@ impl XhciController {
         data_len: u16,
         dir_in: bool,
     ) -> bool {
-        let ring = self.buf.xfer_ring as *mut u32;
-        let mut enq = self.xfer_enq as usize;
-        let trb = |t: [u32; 4], ccs: bool| {
-            let mut v = t;
-            v[3] = (v[3] & !1u32) | if ccs { 1 } else { 0 };
-            v
-        };
-        // Setup stage TRB (type 5): TRB[0..1] = setup packet, TRB[2] =
-        // length + transfer type (IOC=1 in TRB[3] via bit 5).
+        // Setup stage TRB (type 5): TRB[0..1] = setup packet, DW2 bits 31:17 =
+        // transfer length, bit 16 = TRT (1=IN data stage, 2=OUT data stage).
         let mut s = [0u32; 4];
         s[0] = u32::from_le_bytes([setup[0], setup[1], setup[2], setup[3]]);
         s[1] = u32::from_le_bytes([setup[4], setup[5], setup[6], setup[7]]);
-        s[2] = (data_len as u32) << 17;
-        s[3] = (TRB_SETUP_STAGE << 10) | (1 << 5); // IOC (no IDT — the setup packet is in DW0-1)
-        unsafe {
-            core::ptr::copy_nonoverlapping(trb(s, self.xfer_ccs).as_ptr(), ring.add(enq * 4), 4);
-        }
-        enq = (enq + 1) % 16;
-        if enq == 0 {
-            self.xfer_ccs = !self.xfer_ccs;
-        }
+        let trt = if data_len == 0 {
+            0
+        } else if dir_in {
+            1
+        } else {
+            2
+        };
+        s[2] = (data_len as u32) << 17 | (trt << 16);
+        s[3] = (TRB_SETUP_STAGE << 10) | (1 << 5); // IOC
+        ring_put(
+            self.buf.xfer_ring,
+            s,
+            &mut self.xfer_enq,
+            &mut self.xfer_ccs,
+        );
+
         // Data stage (type 6) if requested.
         if data != 0 && data_len > 0 {
             let mut d = [0u32; 4];
             d[0] = data as u32;
             d[1] = (data >> 32) as u32;
-            d[2] = (data_len as u32) << 17 | if dir_in { 0 } else { 1 << 16 }; // DIR=1 for OUT
+            d[2] = (data_len as u32) << 17 | if dir_in { 0 } else { 1 << 16 }; // DIR=0 IN, 1 OUT
             d[3] = (TRB_DATA_STAGE << 10) | (1 << 5); // IOC
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    trb(d, self.xfer_ccs).as_ptr(),
-                    ring.add(enq * 4),
-                    4,
-                );
-            }
-            enq = (enq + 1) % 16;
-            if enq == 0 {
-                self.xfer_ccs = !self.xfer_ccs;
-            }
+            ring_put(
+                self.buf.xfer_ring,
+                d,
+                &mut self.xfer_enq,
+                &mut self.xfer_ccs,
+            );
         }
+
         // Status stage (type 7). DIR bit (bit 16) is the OPPOSITE of the data
         // stage: for a control IN (device->host) the status stage is OUT
         // (DIR=1); for a control OUT it is IN (DIR=0).
         let dir = if dir_in { 1 } else { 0 };
         let mut st = [0u32; 4];
         st[3] = (TRB_STATUS_STAGE << 10) | (1 << 5) | (dir << 16); // IOC
-        unsafe {
-            core::ptr::copy_nonoverlapping(trb(st, self.xfer_ccs).as_ptr(), ring.add(enq * 4), 4);
-        }
-        self.xfer_enq = ((enq + 1) % 16) as u32;
-        if self.xfer_enq == 0 {
-            self.xfer_ccs = !self.xfer_ccs;
-        }
+        ring_put(
+            self.buf.xfer_ring,
+            st,
+            &mut self.xfer_enq,
+            &mut self.xfer_ccs,
+        );
         // Ring the doorbell for this slot (doorbell offset + slot).
         reg_write(self.base, self.db_off + slot * 4, 1);
         // Poll the event ring for the transfer event (type 33). Completion
@@ -528,7 +548,20 @@ impl XhciController {
             }
         };
         self.slot = slot;
-        if !self.address_device(slot) {
+
+        // Read the first 8 bytes of the device descriptor at address 0 to
+        // learn bMaxPacketSize0 (byte 7), then address the device with the
+        // correct EP0 max packet size.
+        let setup8 = [0x80, GET_DESCRIPTOR, 0x00, 0x01, 0x00, 0x00, 8, 0];
+        if !self.control_transfer(slot, setup8, self.buf.desc, 8, true) {
+            crate::sprintln!(
+                "Aegis: xHCI: first descriptor read failed for slot {}",
+                slot
+            );
+            return false;
+        }
+        let max_pkt0 = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(7)) };
+        if !self.address_device(slot, max_pkt0) {
             crate::sprintln!("Aegis: xHCI: address-device failed for slot {}", slot);
             return false;
         }
@@ -676,6 +709,53 @@ mod tests {
         let data_dir_out: u32 = 1 << 16;
         let status_dir2 = if data_dir_out == 0 { 1 } else { 0 };
         assert_eq!(status_dir2, 0);
+    }
+
+    #[test]
+    fn max_packet_size_field_encoding() {
+        // MaxPacketSize field = log2(maxpkt)-3: 8->0, 16->1, 32->2, 64->3.
+        let f = |m: u8| {
+            if m >= 8 {
+                ((m as u32).trailing_zeros().saturating_sub(3)).min(0xF)
+            } else {
+                0
+            }
+        };
+        assert_eq!(f(8), 0);
+        assert_eq!(f(16), 1);
+        assert_eq!(f(32), 2);
+        assert_eq!(f(64), 3);
+        assert_eq!(f(0), 0);
+    }
+
+    #[test]
+    fn ring_put_writes_link_trb_and_wraps() {
+        let mut buf = [0u8; 4096];
+        let ring = buf.as_mut_ptr() as u64;
+        let mut enq = 14u32; // writing at slot 14 forces the link at 15 + wrap
+        let mut ccs = true;
+        ring_put(ring, [1, 2, 3, 0], &mut enq, &mut ccs);
+        // The command landed at slot 14 with cycle bit set.
+        let slot14 = unsafe { (ring as *const u32).add(14 * 4) };
+        assert_eq!(unsafe { *slot14.add(3) } & 1, 1);
+        // Link TRB at slot 15: type LINK(1)<<10 | TC(bit1) | new cycle.
+        let slot15 = unsafe { (ring as *const u32).add(15 * 4) };
+        let dw3 = unsafe { *slot15.add(3) };
+        assert_eq!((dw3 >> 10) & 0x3F, TRB_LINK);
+        assert_eq!(dw3 & 2, 2); // TC set
+        assert_eq!(dw3 & 1, 0); // cycle toggled off
+        assert_eq!(enq, 0);
+        assert!(!ccs); // toggled
+    }
+
+    #[test]
+    fn setup_trb_encodes_trt() {
+        // GET_DESCRIPTOR (IN): TRT=1. For an 18-byte transfer, length<<17.
+        let data_len = 18u16;
+        let trt = 1u32; // IN data stage
+        let dw2 = (data_len as u32) << 17 | (trt << 16);
+        assert_eq!(dw2 & 0x10000, 0x10000); // TRT bit
+        assert_eq!((dw2 >> 17) & 0x7FFF, 18); // length
     }
 
     #[test]
