@@ -177,3 +177,20 @@ Steps:
 What flips from "run-gated" to "done" here: the `git`/`python3` DoD
 (non-trivial ops inside the guest) becomes actually demonstrable, with serial
 logs committed as evidence per Ground Rule 7.
+
+### Keeping it portable (you'll return to Windows afterwards)
+
+Kali is only the build host for this one session — do **not** let the project
+become Kali-dependent. The produced artifacts (a standard `bzImage` +
+`initramfs.cpio.gz` + serial logs) are committed to the repo and pushed to
+GitHub, so Windows just `git pull`s them afterward. Nothing Kali-specific is
+baked in; the guest image runs under QEMU on any OS.
+
+- Work in Kali's native ext4, not the mounted Windows partition: a kernel
+  build uses symlinks heavily, which are slow/flaky on an NTFS mount. Clone
+  from GitHub into `~/` (e.g. `git clone <repo> ~/pointless`), build there.
+- The 100 GB Kali disk is ample (kernel build peaks ~5–15 GB of obj files).
+- Push results back: `git add guest/out/... && git commit && git push`. Then
+  the Windows side needs only a `git pull` — no artifact hand-copying.
+- Optional: delete `~/pointless` when done; nothing permanent is required on
+  Kali. The repo on GitHub is the single source of truth either way.
