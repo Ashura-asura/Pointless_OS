@@ -94,7 +94,20 @@ pub struct AnomalyMonitor {
     log: [Option<MonitorEvent>; MAX_POLICY_LOG],
     head: usize,
     len: usize,
+    /// Learning window: the first `WARMUP_OBSERVATIONS` calls to `observe`
+    /// re-baseline the profile to the agent's observed behavior instead of
+    /// suspending. This lets a supervisor train *after* delegating a role
+    /// (Phase E #1) without the monitor instantly freezing the agent on its
+    /// first legitimate op — the very first op is off-profile only because the
+    /// baseline was empty at grant time. After the window the profile is locked
+    /// and deviations suspend as before.
+    warmup: u32,
 }
+
+/// Number of `observe` calls treated as a learning window after `train`.
+/// Small and bounded; long enough to capture a role's normal op mix, short
+/// enough that a genuinely novel op after delegation still trips quickly.
+pub const WARMUP_OBSERVATIONS: u32 = 4;
 
 impl AnomalyMonitor {
     /// Train the role's shape from the agent's actual usage so far. The
@@ -120,9 +133,26 @@ impl AnomalyMonitor {
             log: [None; MAX_POLICY_LOG],
             head: 0,
             len: 0,
+            warmup: WARMUP_OBSERVATIONS,
         };
         m.push(MonitorEvent::Trained { shapes });
         m
+    }
+
+    /// Rebuild the baseline profile from the agent's *current* audit counts
+    /// (off-profile op kinds become part of the baseline). Used during the
+    /// warmup/learning window so the monitor learns the role's real shape
+    /// instead of freezing on the first op.
+    fn rebaseline(&mut self) {
+        let counts = op_counts(self.agent);
+        for (op, c) in OpKind::ALL.iter().zip(counts.iter()) {
+            if *c > 0 {
+                self.profile[op.index()] = Some(OpShape {
+                    op: *op,
+                    expected: *c as usize,
+                });
+            }
+        }
     }
 
     /// The deviation rule: an op kind more than doubled its baseline rate, or
@@ -150,7 +180,19 @@ impl AnomalyMonitor {
     /// with the grant ledger (never revoke anything). Suspension stays until a
     /// human resumes the agent — the monitor does not auto-restart; it
     /// contains and surfaces.
+    ///
+    /// During the warmup/learning window (see `warmup`), deviations do NOT
+    /// suspend — the profile is re-baselined to the observed behavior so the
+    /// first legitimate ops after delegation are learned, not punished.
     pub fn observe(&mut self) -> bool {
+        if self.warmup > 0 {
+            // Learning window: absorb the current behavior into the baseline
+            // rather than judging it. The agent's real role shape is whatever
+            // it actually does during this window.
+            self.rebaseline();
+            self.warmup -= 1;
+            return false;
+        }
         match self.deviation() {
             None => false,
             Some((op, seen, expected)) => {
@@ -373,10 +415,14 @@ mod tests {
                 Some(MonitorEvent::Trained { shapes: 1 })
             ));
 
-            // Still doing what its shape says: no deviation, no suspension.
-            assert_eq!(task_state(0), 1);
-            assert!(!monitor.observe());
-            assert!(!crate::monitor::ledger().is_suspended(agent));
+            // Exhaust the monitor's warmup window with normal role behavior so
+            // the baseline locks (Phase E #1 learning window): deviations during
+            // warmup are learned, not punished.
+            for _ in 0..WARMUP_OBSERVATIONS {
+                assert_eq!(task_state(0), 1);
+                assert!(!monitor.observe());
+                assert!(!crate::monitor::ledger().is_suspended(agent));
+            }
 
             // Significant deviation: the agent now does something its role
             // never does — memory reads. Refused ops still land in the kernel
@@ -446,6 +492,15 @@ mod tests {
             set_current_for_test(agent);
             assert_eq!(task_state(0), 1);
             let mut monitor = AnomalyMonitor::train(agent);
+
+            // Exhaust the monitor's warmup window with normal role behavior so
+            // the baseline locks (Phase E #1 learning window): deviations during
+            // warmup are learned, not punished.
+            for _ in 0..WARMUP_OBSERVATIONS {
+                assert_eq!(task_state(0), 1);
+                assert!(!monitor.observe());
+                assert!(!crate::monitor::ledger().is_suspended(agent));
+            }
 
             // Deviation: an op kind the profile never saw.
             let mut buf = [0u8; 4];

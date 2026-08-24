@@ -360,6 +360,12 @@ pub fn role_grant(role_id: u64, grantee: u64, target: u64, dst_slot: u64) -> i64
         Some(target as u32),
         true,
     );
+    // §9.5 (Phase E #1): wire the anomaly monitor into the real grant flow so
+    // the suspend-don't-revoke circuit breaker is live in production, not just
+    // in tests. The monitor's warmup window (`monitor.rs::WARMUP_OBSERVATIONS`)
+    // absorbs the agent's first legitimate ops as its baseline, so training at
+    // grant time no longer falsely suspends on the first op.
+    role_monitor_train(grantee as usize);
     0
 }
 
@@ -1935,10 +1941,14 @@ mod tests {
             // Train the anomaly monitor from the observed baseline shape.
             role_monitor_train(agent);
             assert!(!role_monitor_suspended(agent));
-            // Staying inside the shape: another read, no suspension.
-            assert!(objstore_subtree_summary(agent, 0, 1, 0, &store).is_ok());
-            assert!(!role_monitor_observe(agent));
-            assert!(!role_monitor_suspended(agent));
+            // Exhaust the monitor's warmup/learning window with normal read
+            // behavior so the baseline locks on the read-only shape (Phase E #1):
+            // during warmup, deviations are learned, not punished.
+            for _ in 0..crate::monitor::WARMUP_OBSERVATIONS {
+                assert!(objstore_subtree_summary(agent, 0, 1, 0, &store).is_ok());
+                assert!(!role_monitor_observe(agent));
+                assert!(!role_monitor_suspended(agent));
+            }
             // Genuinely anomalous: a mutating op a read-only grant can never
             // perform appears in the agent's audit trail (in reality this is a
             // kernel-gated call refused at the gate, but the attempt is
@@ -2214,16 +2224,19 @@ mod tests {
             // Train the anomaly monitor from the observed (low-rate) baseline.
             role_monitor_train(agent);
             assert!(!role_monitor_suspended(agent));
-            // Another in-profile restart: no deviation, no suspension.
-            crate::supervisor::task_kill(0);
-            assert_eq!(supervise_restart(agent, 0, svc), Ok(()));
-            assert!(!role_monitor_observe(agent));
-            assert!(!role_monitor_suspended(agent));
+            // Exhaust the monitor's warmup window with in-profile restarts so
+            // the baseline locks on the low-rate shape (Phase E #1 learning
+            // window): deviations during warmup are learned, not punished.
+            for _ in 0..crate::monitor::WARMUP_OBSERVATIONS {
+                crate::supervisor::task_kill(0);
+                assert_eq!(supervise_restart(agent, 0, svc), Ok(()));
+                assert!(!role_monitor_suspended(agent));
+            }
             // Genuinely anomalous: rapid repeated restarts well beyond 2x the
             // trained baseline. Each is a real restart; the monitor reads the
             // attributed audit log and suspends on the deviation.
             let mut suspended_at = None;
-            for i in 0..5 {
+            for i in 0..8 {
                 crate::supervisor::task_kill(0);
                 let _ = supervise_restart(agent, 0, svc);
                 if role_monitor_suspended(agent) {

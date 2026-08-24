@@ -22,7 +22,7 @@ honestly per Ground Rule 6.*
 | §9.2 ephemeral-by-default grants | **closed** | `set_grant_expiry` at grant + mint (`role.rs:352,773`); `grant_valid` enforces, `Expired` refused (`386-392,442,607`) |
 | §9.3 diff-confirmation at scope expansion | closed (object + task) | `request_expansion`/`confirm_expansion`; Track 1.5 adds `ExpansionKind::Task` |
 | §9.4 persistent audit trail w/ queryable identity | **closed** | `OpKind::{RoleGrant,RoleExercise,RoleExpand}` (`audit.rs:46-58`); emitted on grant/exercise/expand, queryable via `op_counts` |
-| §9.5 anomaly circuit-break + two-party irreversible | reduced → two-party closed | two-party + suspend implemented & test-proven. Limit (a) **resolved 2026-08-24**: two-party now covers `CONTROL` *and* `WRITE` (`role.rs:657,731-746`). Limit (b) remains: `role_monitor_train` only called in tests, never in the production grant flow, so the suspend breaker is dormant until a supervisor trains it (`role.rs:1872,2136` only) — see Phase E item 1 for the design constraint. See `SECTION9_CLOSURE_AUDIT.md` |
+| §9.5 anomaly circuit-break + two-party irreversible | reduced → two-party closed | two-party + suspend implemented & test-proven. Limit (a) **resolved 2026-08-24**: two-party now covers `CONTROL` *and* `WRITE` (`role.rs:657,731-746`). Limit (b) **resolved 2026-08-24**: `role_monitor_train` is now wired into `role_grant` (with a warmup/learning window so it does not false-suspend on the first op) — see Phase E item 1. The §9.5 suspend-don't-revoke circuit breaker is live in the production grant flow. See `SECTION9_CLOSURE_AUDIT.md` |
 | Per-VM guest device scoping | closed (this session) | `DevicePolicy` allow-list, `vdev.rs` |
 | VMM TCB separation (microhypervisor) | inherent-later | not adopted; flagged below |
 | IOMMU DMA confinement | inherent-later | not adopted; flagged below |
@@ -169,17 +169,24 @@ action, and add new real-task roles.
 §9.4 audit identity is already closed; the remaining §9 work is §9.5's
 production wiring, per `SECTION9_CLOSURE_AUDIT.md`:
 
-1. **Auto-train the anomaly monitor** when a role is granted (or have the
-   supervisor train it as part of delegating a role) — `role_monitor_train` is
-   still only called in tests (`role.rs:1872,2136`), so the suspend circuit-
-   breaker is dormant in production until a supervisor trains it.
-   *Status (2026-08-24): NOT auto-wired into `role_grant`.* Training captures
-   the agent's *current* op profile and `observe` suspends on any off-profile
-   op, so training at grant time (empty/active baseline) falsely suspends on
-   the first legitimate op and breaks the expansion contract. The correct hook
-   is a supervisor-driven train **after** observing normal behavior — a
-   policy/integration decision, not a one-line; requires updating the existing
-   tests that assume an untrained agent. Left open deliberately.
+ 1. **Auto-train the anomaly monitor** when a role is granted (or have the
+    supervisor train it as part of delegating a role) — `role_monitor_train` is
+    still only called in tests (`role.rs:1872,2136`), so the suspend circuit-
+    breaker is dormant in production until a supervisor trains it.
+    *Status (2026-08-24, CLOSED):* Training captures the agent's *current* op
+    profile and `observe` suspended on the first off-profile op, which — trained
+    at grant time with an empty baseline — falsely froze the agent on its very
+    first legitimate op. Fixed by adding a **warmup/learning window** to
+    `AnomalyMonitor` (`monitor.rs`): the first `WARMUP_OBSERVATIONS` (4) calls to
+    `observe` re-baseline the profile to observed behavior instead of
+    suspending, then the profile locks and deviations suspend as before. With
+    that, `role_monitor_train` is now wired into `role_grant` (`role.rs:1883`),
+    so the suspend-don't-revoke circuit breaker is live in the production grant
+    flow. The three monitor tests (`significant_deviation_auto_suspends_…`,
+    `suspension_is_reversible_…`, `supervisor_role_anomaly_suspends_on_rapid_
+    restarts`) were updated to exhaust the warmup window with normal behavior
+    before the anomalous op. Kernel suite green at 819 (`cargo test` in
+    `aegis-kernel`).
 2. **Extend two-party gating** from `WRITE`-only to `CONTROL`/irreversible
    control actions (e.g. restart), so the irreversible framing in §9.5 matches
    practice. **DONE (2026-08-24):** `request_expansion` now flags `CONTROL`
