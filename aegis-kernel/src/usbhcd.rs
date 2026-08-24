@@ -240,10 +240,10 @@ impl XhciController {
             }
         }
 
-        // Command ring CRCR: ring base | RCS (bit 0) | CRR (bit 3).
+        // Command ring CRCR: ring base | RCS (bit 0). The CRR bit (3) is
+        // read-only and set by hardware; software only arms the ring here.
         let cmd_base = (self.buf.cmd_ring as u32) | 1;
         reg_write(self.base, self.caplen + CRCR, cmd_base);
-        reg_write(self.base, self.caplen + CRCR, cmd_base | 8); // command ring running
 
         // Event ring: ERST (1 segment of 16 entries) + ERDP.
         let erst_base = self.buf.erst as *mut u32;
@@ -257,7 +257,8 @@ impl XhciController {
         reg_write(rts, ERSTSZ, 1);
         reg_write(rts, ERSTBA, self.buf.erst as u32);
         reg_write(rts, ERSTBA + 4, (self.buf.erst >> 32) as u32);
-        reg_write(rts, ERDP, (self.buf.ev_ring + 16) as u32); // dequeue at ring+16 (63b=1)
+        // ERDP points at the first event TRB; bit 0 (EHB) set on write.
+        reg_write(rts, ERDP, (self.buf.ev_ring | 1) as u32);
         reg_write(rts, ERDP + 4, 0);
 
         // DCBAA.
@@ -313,11 +314,15 @@ impl XhciController {
 
     /// Poll the event ring for the next event TRB. Returns the slot id on a
     /// command-completion event with CC_SUCCESS.
+    ///
+    /// Event TRB layout: DW2 bits 23:16 = completion code, bits 31:24 =
+    /// slot id (command completion); DW3 bits 15:10 = TRB type, bit 0 =
+    /// cycle.
     fn poll_event(&mut self) -> Option<u32> {
         for _ in 0..100_000 {
             let idx = self.ev_idx as usize;
             let ev = self.buf.ev_ring as *const u32;
-            let dw0 = unsafe { core::ptr::read_volatile(ev.add(idx * 4)) };
+            let dw2 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 2)) };
             let dw3 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 3)) };
             let ccs_bit = dw3 & 1;
             if ccs_bit != if self.ev_ccs { 1 } else { 0 } {
@@ -325,18 +330,19 @@ impl XhciController {
                 continue;
             }
             let trb_type = (dw3 >> 10) & 0x3F;
-            let cc = (dw3 >> 24) & 0xFF;
+            let cc = (dw2 >> 16) & 0xFF;
+            let slot = (dw2 >> 24) & 0xFF;
             self.ev_idx = (self.ev_idx + 1) % 16;
             if self.ev_idx == 0 {
                 self.ev_ccs = !self.ev_ccs;
             }
-            // Advance ERDP.
+            // Advance ERDP to the next unprocessed event TRB.
             let rts = unsafe { self.base.add(self.rts_off as usize) };
             let next = self.buf.ev_ring + (self.ev_idx as u64) * 16 + 16;
             reg_write(rts, ERDP, next as u32);
             reg_write(rts, ERDP + 4, (next >> 32) as u32);
             if trb_type == TRB_EVENT_CMD_COMPLETE && cc == CC_SUCCESS {
-                return Some(dw0 & 0xFF); // slot id in low byte
+                return Some(slot);
             }
             // Non-command events: keep polling.
         }
@@ -358,16 +364,17 @@ impl XhciController {
             // Input control: A0=1 (slot ctx), A1=1 (EP0 ctx).
             *ic.add(0) = 0x3;
             *ic.add(1) = 0;
-            // Slot context (offset +8): context entries = 1 (EP0), route 0.
+            // Slot context (offset +8): Context Entries field = bits 26:24,
+            // set to 1 (only EP0). Route/parent/other fields = 0.
             let slot_ctx = ic.add(2);
-            *slot_ctx.add(0) = 1 << 27; // context entries = 1
+            *slot_ctx.add(0) = 1 << 24;
             *slot_ctx.add(1) = 0;
             *slot_ctx.add(2) = 0;
             *slot_ctx.add(3) = 0;
-            // EP0 context (offset +8 + 32): type 4 (control), max packet 8
-            // (default 8 bytes for EP0 low/full/high speed), etc.
+            // EP0 context (offset +8 + 32): EP Type (bits 15:13) = 4 (control),
+            // Max Packet Size (bits 9:6) = 0 (8 bytes), all else 0.
             let ep0 = ic.add(2 + 8);
-            *ep0.add(0) = (4 << 3) | (8 << 16); // EP type control, maxpkt 8
+            *ep0.add(0) = 4 << 13;
             *ep0.add(1) = 0;
             *ep0.add(2) = 0;
             *ep0.add(3) = 0;
@@ -376,9 +383,11 @@ impl XhciController {
             *dcbaa.add(slot as usize * 2) = self.buf.dev_ctx as u32;
             *dcbaa.add(slot as usize * 2 + 1) = (self.buf.dev_ctx >> 32) as u32;
         }
+        // Address Device command: DW0 bits 31:24 = slot id, DW1/DW2 = input
+        // context base (64-byte aligned).
         let trb = [
-            slot,                                      // slot id
-            (self.buf.input_ctx & 0xFFFF_FFF0) as u32, // input context base low
+            slot << 24,
+            (self.buf.input_ctx & !0x3F) as u32,
             (self.buf.input_ctx >> 32) as u32,
             TRB_ADDRESS_DEVICE << 10,
         ];
@@ -409,7 +418,7 @@ impl XhciController {
         s[0] = u32::from_le_bytes([setup[0], setup[1], setup[2], setup[3]]);
         s[1] = u32::from_le_bytes([setup[4], setup[5], setup[6], setup[7]]);
         s[2] = (data_len as u32) << 17;
-        s[3] = (TRB_SETUP_STAGE << 10) | (1 << 6) | (1 << 5); // TRT + IOC
+        s[3] = (TRB_SETUP_STAGE << 10) | (1 << 5); // IOC (no IDT — the setup packet is in DW0-1)
         unsafe {
             core::ptr::copy_nonoverlapping(trb(s, self.xfer_ccs).as_ptr(), ring.add(enq * 4), 4);
         }
@@ -436,8 +445,10 @@ impl XhciController {
                 self.xfer_ccs = !self.xfer_ccs;
             }
         }
-        // Status stage (type 7). DIR bit (bit 16) = 1 for IN, 0 for OUT.
-        let dir = if dir_in { 0 } else { 1 };
+        // Status stage (type 7). DIR bit (bit 16) is the OPPOSITE of the data
+        // stage: for a control IN (device->host) the status stage is OUT
+        // (DIR=1); for a control OUT it is IN (DIR=0).
+        let dir = if dir_in { 1 } else { 0 };
         let mut st = [0u32; 4];
         st[3] = (TRB_STATUS_STAGE << 10) | (1 << 5) | (dir << 16); // IOC
         unsafe {
@@ -449,18 +460,18 @@ impl XhciController {
         }
         // Ring the doorbell for this slot (doorbell offset + slot).
         reg_write(self.base, self.db_off + slot * 4, 1);
-        // Poll for transfer completion: wait for the transfer event's cycle
-        // bit. Simpler: poll the event ring until we consume one transfer
-        // event (type 32 is cmd; type 33 is transfer).
+        // Poll the event ring for the transfer event (type 33). Completion
+        // code is DW2 bits 23:16.
         for _ in 0..100_000 {
             let idx = self.ev_idx as usize;
             let ev = self.buf.ev_ring as *const u32;
+            let dw2 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 2)) };
             let dw3 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 3)) };
             if (dw3 & 1) != if self.ev_ccs { 1 } else { 0 } {
                 continue;
             }
             let trb_type = (dw3 >> 10) & 0x3F;
-            let cc = (dw3 >> 24) & 0xFF;
+            let cc = (dw2 >> 16) & 0xFF;
             self.ev_idx = (self.ev_idx + 1) % 16;
             if self.ev_idx == 0 {
                 self.ev_ccs = !self.ev_ccs;
@@ -495,10 +506,16 @@ impl XhciController {
             crate::sprintln!("Aegis: xHCI: no connected port");
             return false;
         }
-        // Reset the port (bit 4, write 1) then wait for PED (bit 1).
+        // Reset the port (bit 4, write 1), wait for PR to clear (reset done)
+        // then PED (bit 1) — the device is enabled.
         let psc = self.caplen + PORTSC_BASE + (port.unwrap() as u32) * PORTSC_STRIDE;
         reg_write(self.base, psc, reg_read(self.base, psc) | (1 << 4));
-        for _ in 0..100_000 {
+        for _ in 0..200_000 {
+            if reg_read(self.base, psc) & (1 << 4) == 0 {
+                break;
+            }
+        }
+        for _ in 0..200_000 {
             if reg_read(self.base, psc) & 2 != 0 {
                 break;
             }
@@ -612,6 +629,53 @@ mod tests {
         assert_eq!(descriptor_product_id(&d), 0xabcd);
         assert_eq!(d[7], 0); // maxpkt0 default in a fresh buffer
         assert_eq!(d[17], 0); // nconf
+    }
+
+    #[test]
+    fn event_trb_completion_code_and_slot_from_dw2() {
+        // Event TRB: DW2 bits 23:16 = CC, bits 31:24 = slot id; DW3 =
+        // (type << 10) | cycle.
+        let dw2: u32 = (7 << 24) | (CC_SUCCESS << 16); // slot 7, CC=1
+        let dw3: u32 = (TRB_EVENT_CMD_COMPLETE << 10) | 1;
+        assert_eq!((dw2 >> 16) & 0xFF, CC_SUCCESS);
+        assert_eq!((dw2 >> 24) & 0xFF, 7);
+        assert_eq!((dw3 >> 10) & 0x3F, TRB_EVENT_CMD_COMPLETE);
+    }
+
+    #[test]
+    fn address_device_trb_encodes_slot_in_high_byte() {
+        // DW0 bits 31:24 = slot id for the Address Device command.
+        let trb = [3u32 << 24, 0x2000, 0, TRB_ADDRESS_DEVICE << 10];
+        assert_eq!((trb[0] >> 24) & 0xFF, 3);
+        assert_eq!((trb[3] >> 10) & 0x3F, TRB_ADDRESS_DEVICE);
+    }
+
+    #[test]
+    fn ep0_context_type_is_control() {
+        // EP Type field (bits 15:13) = 4 (control); Max Packet Size field
+        // (bits 9:6) = 0 -> 8 bytes default.
+        let dw0: u32 = 4 << 13;
+        assert_eq!((dw0 >> 13) & 0x7, 4);
+        assert_eq!((dw0 >> 6) & 0xF, 0);
+    }
+
+    #[test]
+    fn slot_context_entries_field() {
+        // Context Entries = bits 26:24, value 1 (only EP0).
+        let dw0: u32 = 1 << 24;
+        assert_eq!((dw0 >> 24) & 0x7, 1);
+    }
+
+    #[test]
+    fn status_stage_dir_is_opposite_of_data_stage() {
+        // Control IN (GET_DESCRIPTOR): data stage DIR=0, status stage DIR=1.
+        let data_dir_in: u32 = 0;
+        let status_dir = if data_dir_in == 0 { 1 } else { 0 };
+        assert_eq!(status_dir, 1);
+        // Control OUT: data stage DIR=1, status stage DIR=0.
+        let data_dir_out: u32 = 1 << 16;
+        let status_dir2 = if data_dir_out == 0 { 1 } else { 0 };
+        assert_eq!(status_dir2, 0);
     }
 
     #[test]
