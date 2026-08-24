@@ -837,7 +837,11 @@ mod tests {
         let ep = eptp(root);
         assert_eq!(ep & 0x7, 6, "memory type WB");
         assert_eq!((ep >> 6) & 1, 1, "EPT enabled");
-        assert_eq!((ep >> 3) & 0x7, 3, "page-walk length 4 minus one (SDM bits 5:3)");
+        assert_eq!(
+            (ep >> 3) & 0x7,
+            3,
+            "page-walk length 4 minus one (SDM bits 5:3)"
+        );
         // Bits 11:7 are reserved and must stay clear.
         assert_eq!((ep >> 7) & 0x1F, 0, "reserved bits 11:7 clear");
         assert_eq!(ep & 0x000F_FFFF_FFFF_F000, root);

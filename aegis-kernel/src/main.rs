@@ -458,6 +458,56 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         }
     }
 
+    // Bare-metal boot self-test battery (real-hardware boot procedure,
+    // Layer 2). Runs the fixed probe list over the live facts collected so
+    // far. Every probe is a total, non-panicking function, so any failure is
+    // reported as `FAIL - name: reason` and the battery keeps going. The
+    // summary is printed to serial and rendered to the physical GOP screen
+    // (Layer 1 — the reliable evidence channel on a UEFI laptop where the
+    // COM1 serial path is usually unwired).
+    {
+        use aegis_kernel::baremetal_probe::{format_summary, keep, run, LiveFacts};
+        let gop = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) };
+        let (total_frames, _free) = unsafe { aegis_kernel::frame::stats_global() };
+        let facts = LiveFacts {
+            pci_device_count: pci.len(),
+            nvme_found: found_nvme,
+            nvme_read_ok: found_nvme,
+            network_found: pci.find_network().is_some(),
+            display_found: pci.find_display().is_some(),
+            acpi_ok: aegis_kernel::acpi::discovered().is_some(),
+            gop_found: gop.is_some(),
+            ram_mib: total_frames * 4 / 1024,
+        };
+        let results = run(&facts);
+        for r in results.iter() {
+            if r.ok {
+                sprintln!("Aegis: [probe] ok - {}", r.name);
+            } else {
+                sprintln!("Aegis: [probe] FAIL - {}: {}", r.name, r.reason);
+            }
+        }
+        sprintln!(
+            "Aegis: [probe] boot self-test: {}/{} passed",
+            aegis_kernel::baremetal_probe::passed(&results),
+            results.len()
+        );
+        if let Some(h) = gop {
+            let mut buf = [0u8; 1024];
+            let n = format_summary(&results, &mut buf);
+            aegis_kernel::gop_console::render_text(
+                h.framebuffer_base,
+                h.width,
+                h.height,
+                h.stride_px,
+                h.bpp,
+                &buf[..n],
+            );
+            sprintln!("Aegis: [probe] summary rendered to the GOP screen");
+        }
+        keep(&results);
+    }
+
     // Live network stack demo: the q35 NIC (Intel 82574L/e1000e) is attached
     // to a QEMU `socket` netdev. The kernel brings the interface up, resolves
     // the host gateway (10.0.2.2) over real ARP, then opens a TCP socket to

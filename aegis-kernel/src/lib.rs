@@ -85,6 +85,11 @@ pub mod vdev;
 pub mod virtio;
 pub mod vm;
 
+// Bare-metal boot self-test battery (Layer 2 of the real-hardware boot
+// procedure) and GOP framebuffer console (Layer 1, on-screen evidence).
+pub mod baremetal_probe;
+pub mod gop_console;
+
 // Phase L (chaos testing — see module docs for the fail-open definitions
 // and the honest "iteration count, not wall-clock duration" scoping)
 pub mod chaos;

@@ -131,3 +131,24 @@ before a guest prints via the emulated 16550 under nested hardware.
 
 **Evidence:** `Docs/test_runs/aegis-vmx-bootN.log` (multiple iterations on
 GitHub in the commit that added this section).
+
+## Boot self-test battery + on-screen console (real-hardware evidence)
+
+For the bare-metal boot, a boot self-test battery (`baremetal_probe.rs`)
+runs a fixed list of non-panicking `Result` probes over the live hardware
+(PCI, NVMe, network, display, ACPI, memory map, framebuffer, serial) and
+prints/keeps a `battery-contract`-style summary. A GOP framebuffer console
+(`gop_console.rs`) renders that summary to the physical screen — the
+reliable evidence channel on a UEFI laptop where COM1 is unwired (the VGA
+text console renders nothing under GOP graphics mode). Verified under QEMU:
+the battery reports each subsystem (`ok - …` / `FAIL - …: reason`) and the
+summary is rendered to the GOP screen. The `memory_map` probe caught the
+real allocator limitation (kernel sees 61 MiB of RAM when OVMF loads the
+image high — the same constraint that blocks `guest_boot_demo`'s 128 MiB
+guest).
+
+Honest gap: writing the summary *to the USB stick itself* (the boot
+procedure's Layer 2) needs a USB mass-storage driver (Aegis has only UHCI
+HID emulation) plus a FAT writer (`fat.rs` is read-only) — real future
+work. Until then the evidence is the on-screen report (photograph) plus
+serial under QEMU.
