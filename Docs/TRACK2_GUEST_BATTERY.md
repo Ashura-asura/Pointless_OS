@@ -1,0 +1,88 @@
+# Track 2 — Guest Application Battery: Gap Inventory
+
+Status: **AUTHORIZED, in progress.** This document is the verifiable evidence for
+"what the Linux guest can do under QEMU right now" and the named gaps that stand
+between the current guest and the `AEGIS_USEFUL_PROMPT.md` §3 battery DoD.
+
+All outcomes below are verbatim guest responses captured in
+`guest/out/battery-standalone-serial.log` and `guest/out/battery-standalone-serial2.log`.
+
+## Method
+- Booted the existing standalone guest (`guest/out/bzImage`, Linux 6.12.103 +
+  BusyBox 1.37.0) under QEMU: `qemu-system-x86_64 -machine pc -cpu max -m 512
+  -display none -serial tcp::1234,server,nowait -kernel guest/out/bzImage
+  -append 'console=ttyS0'`. SeaBIOS (default, no OVMF) direct `-kernel` boot works.
+- The embedded initramfs runs `/init` → `exec /bin/sh </dev/ttyS0 >/dev/ttyS0 2>&1`
+  (the "Phase U DoD point" in the init script).
+- A Python harness (`drive.py` / `drive2.py`, run from the host) connected to the
+  TCP serial, waited for the shell prompt, and issued each probe. Output delimited
+  by `__BEGIN__/__END__` markers (and, for the second pass, by the `~ # ` prompt).
+
+## Results
+
+| Battery item (§3) | State | Verbatim evidence |
+|---|---|---|
+| Guest kernel + init boot | PASS | `Linux (none) 6.12.103 ... x86_64 GNU/Linux`; `/init` reaches `Aegis guest: initramfs up` |
+| Shell (`/bin/sh`) | PASS | `shell: BusyBox v1.37.0`; `SHELL=/bin/sh` |
+| Job control (bg `&` / `jobs`) | PARTIAL | `sleep 1 & jobs` → `[1]+ Running`; **but** `/bin/sh: can't access tty; job control turned off` (no fg/bg/Ctrl-Z) |
+| `/proc` mounted | FAIL | `ls: /proc: No such file or directory`; `head: /proc/meminfo: No such file or directory` |
+| `/dev` completeness | FAIL | `ls /dev` → only `console`, `ttyS0` (no `/dev/null`, `/dev/zero`, `/dev/random`, …) → side effect `can't open '/dev/null'` |
+| `python3` | FAIL | `/bin/sh: python3: not found` |
+| `git` | FAIL | `/bin/sh: git: not found` |
+| `vim` | FAIL | `/bin/sh: vim: not found` |
+| `nano` | FAIL | `/bin/sh: nano: not found` |
+| `gcc` | FAIL | `/bin/sh: gcc: not found` |
+| `make` | FAIL | `/bin/sh: make: not found` |
+| Networking (`ip`/`ifconfig`) | FAIL | `ls /sys/class/net` empty; `ifconfig: /proc/net/dev: No such file or directory`; `ifconfig: socket: Function not implemented` |
+
+## Per-item gap → contract test
+
+- **Job control (§3.1)**: missing a *controlling tty* on the serial console.
+  `/init` does `exec /bin/sh </dev/ttyS0` with no `setsid`/`ioctl(TIOCSCTTY)`.
+  Contract test: `fg`/`bg` and `Ctrl-Z` work (today: fails — "job control turned off").
+- **`/proc`**: initramfs `/init` never mounts `procfs`. Missing syscall surface:
+  `/proc`. Blocks `ps`/`top`/`free` and the §3.1 `ps`/`top`/`df` intent.
+  Contract test: `ls /proc/self` succeeds.
+- **`/dev`**: initramfs only creates `console` + `ttyS0`; no `mdev -s`/`devtmpfs`
+  population. Contract test: `test -c /dev/null && echo ok` succeeds.
+- **`python3`**: applet/binary absent from rootfs. Contract test: `python3 -c 'print(1)'` exits 0.
+- **`git`**: absent. Contract test: `git clone <url-over-e1000e>` writes a repo.
+- **`vim`/`nano`**: absent. Contract test: `vim --version` / `nano --version` succeed.
+- **`gcc`/`make`**: absent. Contract test: compile + link a trivial C program.
+- **Networking**: `guest/build-guest.sh:78` sets `CONFIG_NET=n`. No `lo`/`eth0`,
+  no `/proc/net`, `socket()` → `Function not implemented`. The §3 e1000e clone path
+  is impossible until `CONFIG_NET=y` + an e1000e NIC is present and driven.
+  Contract test: `ip link` lists `lo` + `eth0`.
+
+## Why the §3 DoD is not yet met on this machine (hardware/environment gates)
+
+1. **Guest enrichment** (add `python3`/`git`/`vim`/`nano`/`gcc`/`make`, mount
+   `/proc` + `/dev`, set `CONFIG_NET=y`) requires re-running `build-guest.sh`,
+   i.e. a Linux build environment (kernel + BusyBox toolchain). Not available on
+   this Windows/VBS host.
+2. **End-to-end DoD** ("`git`/`python3` do real ops, clone over e1000e, script
+   file I/O") also needs `vm.rs` to *host* the guest, which is hardware-gated by
+   Windows VBS/HVCI (VT-x is unavailable to the Aegis hypervisor here). So the
+   full e1000e path cannot be demonstrated on this box.
+
+The verifiable artifact on this machine is therefore this gap inventory plus the
+captured serial logs — not a passing contract test.
+
+## What IS proven
+- The guest kernel + initramfs boots under QEMU and presents a working BusyBox
+  `/bin/sh` on the serial console (the Phase U DoD point). Background-process
+  start + `jobs` works. This is the baseline every battery item builds on.
+
+## Next actions (when the environment allows)
+1. Fix `/init`: mount `proc`/`sys`, run `mdev -s` (or enable `devtmpfs`), and
+   `setsid` + `TIOCSCTTY` the shell for real job control.
+2. Rebuild the guest with `python3`/`git`/`vim`/`nano`/`gcc`/`make` and
+   `CONFIG_NET=y` (+ e1000e).
+3. Host via `vm.rs` on a VT-x (no-VBS) machine and run the contract tests above.
+4. Wire each contract test into the CI battery so the gaps are regression-gated.
+
+## Evidence artifacts (in repo)
+- `guest/out/battery-standalone-serial.log` — first probe pass (echo-on transcript).
+- `guest/out/battery-standalone-serial2.log` — clean networking/`/dev`/mounts pass.
+- `guest/battery-init.sh` — alternative init-based battery (kept for reuse).
+- `guest/battery-commands.txt` — probe command set.

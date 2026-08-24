@@ -1,0 +1,34 @@
+
+### item7_ip :: ip a 2>&1 | head -8
+, device tree:ip a 2>&1 | head -8
+
+crw-r--r--    1 0        0           4,  64 Aug 23 02:18 [1;35m/dev/ttyS0[m
+Aegis guest: uname: Linux (none) 6.12.103 #2 SMP PREEMPT_DYNAMIC Tue Aug 18 02:41:23 UTC 2026 x86_64 GNU/Linux
+Aegis guest: shell: BusyBox v1.37.0 (2026-08-18 01:32:08 UTC) multi-call binary.
+Aegis guest: invoking interactive shell on ttyS0 (this is the Phase U DoD point)
+/bin/sh: can't access tty; job control turned off
+
+### item7_ifconfig :: ifconfig 2>&1 | head -8
+ifconfig: /proc/net/dev: No such file or directory
+ifconfig: socket: Function not implemented
+
+### item8_dev :: ls /dev | head -40
+console
+ttyS0
+
+### item9_mounts :: mount | head -20
+mount: no /proc/mounts
+
+### item9_proc_mounts :: cat /proc/self/mounts 2>/dev/null | head -20
+
+
+### item7_dmesg :: dmesg 2>/dev/null | grep -i -E 'e1000|e1000e|eth|net|8139' | head
+[    1.350432] ACPI: Failed to create genetlink family for ACPI event
+
+### item7_sysnet :: ls /sys/class/net 2>/dev/null
+
+
+### item0_cmdline :: cat /proc/cmdline 2>/dev/null; echo
+
+
+### driver done

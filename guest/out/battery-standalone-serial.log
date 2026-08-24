@@ -1,0 +1,106 @@
+[boot-reached]
+
+### item0_uname :: uname -a
+echo __BEGIN__item0_uname; uname -a; echo __END__item0_uname
+### item0_shell :: echo SHELL=$0 PS1=[$PS1]
+
+__BEGIN__item0_uname
+Linux (none) 6.12.103 #2 SMP PREEMPT_DYNAMIC Tue Aug 18 02:41:23 UTC 2026 x86_64 GNU/Linux
+__END__item0_uname
+~ # echo __BEGIN__item0_shell; echo SHELL=$0 PS1=[$PS1]; echo __END__item0_shell
+### item1_jobcontrol :: echo jobcontrol_msg:$(sleep 1 & jobs; echo rc=$?)
+
+__BEGIN__item0_shell
+SHELL=/bin/sh PS1=[\w \$ ]
+__END__item0_shell
+~ # echo __BEGIN__item1_jobcontrol; echo jobcontrol_msg:$(sleep 1 & jobs; echo r
+c=$?); echo __END__item1_jobcontrol
+### item2_python3 :: python3 --version
+
+echo __BEGIN__item2_python3; python3 --version; echo __END__item2_python3
+### item2_python3_calc :: python3 -c 'print(2+2)'
+
+echo __BEGIN__item2_python3_calc; python3 -c 'print(2+2)'; echo __END__item2_python3_calc
+### item3_git :: git --version
+
+echo __BEGIN__item3_git; git --version; echo __END__item3_git
+### item3_which :: which git python3 vim nano gcc make 2>&1
+
+echo ___BEGIN__item1_jobcontrol
+_BEGIN__item3_which; which git python3 vim nano gcc make 2>&1; echo __END__item3_which
+### item4_vim :: vim --version | head -1
+
+echo __BEGIN__item4_vim; vim --version | head -1; echo __END__item4_vim
+### item4_nano :: nano --version | head -1
+
+/bin/sh: echo __BEGIN__item4_nano; nano --version | head -1; echo __END__item4_nano
+### item5_gcc :: gcc --version | head -1
+
+echo __BEGIN__item5_gcc; gcc --version | head -1; echo __END__item5_gcan't open '/dev/null': No such file or directory
+cc
+jobcontrol_msg:[1]+ Running rc=0
+__END__item1_jobcontrol
+~ # echo __BEGIN__item2_python3; python3 --version; echo __END__item2_python3
+__BEGIN__item2_python3
+/bin/sh: python3: not found
+__END__item2_python3
+~ # echo __BEGIN__item2_python3_calc; python3 -c 'print(2+2)'; echo __END__item2
+_python3_calc
+__BEGIN__item2_python3_calc
+/bin/sh: python3: not found
+__END__item2_python3_calc
+~ # echo __BEGIN__item3_git; git --version; echo __END__item3_git
+__BEGIN__item3_git
+/bin/sh: git: not found
+__END__item3_git
+~ # echo __BEGIN__item3_which; which git python3 vim nano gcc make 2>&1; echo __
+END__item3_which
+__BEGIN__item3_which
+__END__item3_which
+~ # echo __BEGIN__item4_vim; vim --version | head -1; echo __END__item4_vim
+__BEGIN__item4_vim
+/bin/sh: vim: not found
+__END__item4_vim
+~ # echo __BEGIN__item4_nano; nano --version | head -1; echo __END__item4_nano
+__BEGIN__item4_nano
+/bin/sh: nano: not found
+__END__item4_nano
+~ # echo __BEGIN__item5_gcc; gcc --version | head -1; echo __END__item5_gcc
+### item5_make :: make --version | head -1
+
+__BEGIN__item5_gcc
+/bin/sh: gcc: not found
+__END__item5_gcc
+~ # echo __BEGIN__item5_make; make --version | head -1; echo __END__item5_make
+### item6_proc :: ls /proc | head -8
+
+__BEGIN__item5_makeproc
+
+/bin/sh: make: not found
+__END__item5_make
+~ # echo __BEGIN__item6_proc; ls /proc | head -8; echo __END__item6_proc
+__BEGIN__item6_proc
+ls: /proc: No such file or directory
+
+### item6_meminfo :: head -3 /proc/meminfo
+echo __BEGIN__item6_meminfo; head -3 /proc/meminfo; echo __END__item6_meminfo
+### item9_mounts :: cat /proc/self/mounts 2>/dev/null | head; mount | head -20
+
+echo __BEGIN__item9_mounts; cat /proc/self/mounts 2>/dev/null | head; mount |__END__item6_proc
+~ # echo __BEGIN__item6_meminfo; head -3 /proc/meminfo; echo __END__item6_meminf
+o
+__BEGIN__item6_meminfo head -20; echo __END__item9_mounts
+### item7_ip :: ip a 2>&1 | head -8
+
+
+echo __BEGIN__item7_ip; ip a 2>&1 | head -8; echo __END__item7_ip
+### item7_ifconfig :: ifconfig 2>&1 | head -8
+
+echo __BEGIN__item7_ifconfig; ifconfig 2>&1 | head -8; echo __END__item7_ifconfig
+### item8_dev :: ls /dev | head -40
+
+echo __BEGIN__item8_dev; ls /dev | head -40; echo __END__item8_dev
+### item7_dmesg :: cat /proc/cmdline 2>/dev/null; echo; dmesg 2>/dev/null | grep -i -E 'e1000|eth|net' | head
+
+echo __BEGIN__item7_dmesg; cat /proc/cmdline 2>/dev/null; echo; dmesg 2>/dev/null | grep -i -E 'e1000|eth|net' | head; echo __END__item7_dmesg
+### driver done
