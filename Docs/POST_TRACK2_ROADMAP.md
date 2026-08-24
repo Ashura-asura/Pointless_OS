@@ -1,0 +1,127 @@
+# Post-Track-2 Roadmap (prompt item 3)
+
+*Sequencing note: this roadmap follows `AEGIS_USEFUL_PROMPT.md` §1's own
+"three tracks, keep all three alive" discipline and §4's deferral gate. Track
+1 (§9 RoleLib) has shipped a real Definition-of-Done result; Track 1.5 (this
+session) generalized it to a second write/control task; the Genode research
+pass (this session) added a per-VM device allow-list and named two larger
+hardening phases as future. Track 2 (guest app battery) is specified and
+gap-inventoried but its *live* run is environment-gated on this Windows/VBS
+host (no VT-x for `vm.rs` hosting, no Linux toolchain to rebuild the guest) —
+see `TRACK2_GUEST_BATTERY.md`. The phases below are ordered for "once the
+environment gate lifts," and each states closed / reduced / inherent
+honestly per Ground Rule 6.*
+
+## Where the load-bearing claim stands (status before Track 2 ships)
+
+| Capability | State | Evidence |
+|---|---|---|
+| §9.1 role-shaped grants | closed (generalized) | `role.rs` 19 tests; Track 1.5 `ExpansionKind` proves object *and* task grants |
+| §9.2 ephemeral-by-default grants | reduced | `expiry` plumbed end-to-end (`macaroon`/`CapabilityToken`); not yet wired into `role.rs` grant path |
+| §9.3 diff-confirmation at scope expansion | closed (object + task) | `request_expansion`/`confirm_expansion`; Track 1.5 adds `ExpansionKind::Task` |
+| §9.4 persistent audit trail w/ queryable identity | reduced | `audit.rs` exists & is used by every syscall gate; `OpKind` not yet extended for role-grant/exercise |
+| §9.5 anomaly circuit-break + two-party irreversible | reduced | generation-bump + restart-rate suspension exist (`tasks.rs`/`role.rs`); two-party confirmation still `WRITE`-gated (named limitation) |
+| Per-VM guest device scoping | closed (this session) | `DevicePolicy` allow-list, `vdev.rs` |
+| VMM TCB separation (microhypervisor) | inherent-later | not adopted; flagged below |
+| IOMMU DMA confinement | inherent-later | not adopted; flagged below |
+
+## Phase A — finish Track 2 the moment the env allows (closure of existing gaps)
+
+Reachable *as code now*, live-run only on a Linux + VT-x box:
+
+1. Guest `/init` fixes (no behavioral risk, pure userspace): mount `proc`+`sys`,
+   `mdev -s`/`devtmpfs` population, `setsid` + `TIOCSCTTY` the shell for real
+   job control. Closes the `/proc`, `/dev`, and job-control PARTIAL rows in
+   `TRACK2_GUEST_BATTERY.md`.
+2. Rebuild guest with `python3`/`git`/`vim`/`nano`/`gcc`/`make` and
+   `CONFIG_NET=y` + `e1000e` (the §3 DoD's clone-over-network path).
+3. Run the battery contract tests (shell→python3→git→vim/nano→gcc/make) and
+   commit the serial logs as evidence (Ground Rule 7).
+4. Wire each contract test into the CI battery so the gaps are regression-gated.
+
+**DoD (Track 2):** `git` and `python3` both run real, non-trivial ops inside
+the guest; each closed gap named + contract-tested. (Carried verbatim from
+`AEGIS_USEFUL_PROMPT.md` §3.)
+
+## Phase B — un-defer Track 3 (now legitimate per §4's own gate)
+
+`AEGIS_USEFUL_PROMPT.md` §4 parked Track 3 "until Track 1 has a real DoD
+result." That gate is met. Un-defer, but keep it *scoped to Track 2's battery
+needs*, not open-ended breadth:
+
+- Fuller distro image (beyond BusyBox) only insofar as it exercises the
+  syscall/device surface the battery implies.
+- Windows guest: a separate, explicitly-scoped effort (different VMM path);
+  start only after Phase A is solid, and treat it as its own Track with its
+  own DoD — not a continuation of Track 2.
+- More device-model breadth (virtio devices, USB classes) *only* when a
+  battery item actually demands it.
+
+**Closed/reduced:** Track 3 breadth remains **reduced** by design (§11.G:
+compatibility breadth is premature relative to the core claim even after Track
+1/2 — it is allowed now, not mandated).
+
+## Phase C — Genode-flagged hardening (this session's research, the two larger items)
+
+From `GENODE_COMPARISON.md`, the two real guest/host isolation upgrades Genode
+demonstrates that this project lacks:
+
+1. **Separate-user-level VMM component.** Today the device models
+   (`vdev.rs`) and run loop (`vmx.rs`) run *inside the kernel* with full
+   authority; Genode runs each VMM as an unprivileged component with a tiny
+   hypervisor TCB. This is the single biggest blast-radius reduction available
+   and the natural next hypervisor hardening phase. **Reduced → future
+   phase;** explicitly out of scope for the cheap research pass.
+2. **IOMMU DMA confinement per device.** Guest-driven DMA is not yet confined
+   to granted buffers. When an IOMMU layer exists, confine each device (and
+   each guest) to its own DMA region — Genode's strongest guest/host
+   guarantee. **Inherent-later;** hardware-dependent, separate phase.
+
+Both are recorded as candidates, not adopted, per the research pass's cap of
+≤2 cheap changes (only the per-VM allow-list was adopted).
+
+## Phase D — grow the role library toward the §11.F real-task battery
+
+Track 1.5 proved §9 generalizes; now grow *what the roles are for* beyond
+ops-demo + the restart task, against §11.F's named real tasks:
+
+- **Task 1 (read-only, lowest blast radius):** "summarize what changed in this
+  object-store subtree since a point" — exercises object store + capability
+  model together. Closes §9.2 (ephemeral grant) and §9.4 (audit identity) for
+  a real read task.
+- **Task 2 (write/irreversible, exercises §9.3 + §9.5):** "propose a named
+  edit to a named file; do not apply without confirmation" — `propose` and
+  `apply` are distinct capabilities; the diff-confirmation prompt and the
+  two-party irreversible path both get a real workout.
+- Each role ships with adversarial tests in the same commit (self-grant,
+  foreign-target, expansion-without-confirmation, expired-grant-reuse).
+
+**Goal:** close §9.2/§9.4 fully and move §9.5 from "reduced" toward "closed"
+against a real irreversible action.
+
+## Phase E — observable identity (close §9.4 properly)
+
+Extend `audit.rs`'s `OpKind` with role-grant and role-exercise records carrying
+stable identity (which grant, which task, which capability) so "what did this
+agent do with what it was given" is answerable by a real query post-hoc. This
+is the §9 piece the repo is *closest* to already having; finish it rather than
+rebuild it.
+
+## Sequencing principle (restated from §1)
+
+Validate the core claim first; let the guest/hypervisor substrate *serve* it
+rather than grow independently. Track 1 done; Track 2 = the "usefulness"
+validation; once both are real, breadth (Track 3) and hardening (Phase C) are
+legitimate. The two Genode hardening phases and Track 3 breadth are **not**
+prerequisites for the core claim — they are what the claim, once proven,
+earns the right to spend effort on.
+
+## Honest "not yet" summary
+
+Even after Track 2 ships, "actually useful" will **not** mean "general-purpose
+Linux/Windows replacement" (§6 of the prompt). It will mean: one real
+capability-scoped AI-agent task works (Track 1), a person can do real dev work
+in the guest (Track 2), and the guest/host boundary is explicit and policy-
+scoped (this session's `DevicePolicy`), with two clearly-named larger
+isolation upgrades queued as their own future phases rather than quietly
+folded in.
