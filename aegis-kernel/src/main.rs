@@ -54,6 +54,25 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // the display backend is chosen below — a pixel backend must not kill
     // the GOP framebuffer the firmware set up.
     aegis_kernel::vga::vga_init();
+
+    // Install the on-screen GOP scrolling console IMMEDIATELY so every
+    // kernel `sprintln!` from here on renders to the physical display. The
+    // loader's UEFI console services die at ExitBootServices; COM1 is
+    // unwired on the TP201S and VGA text mode does not render under GOP —
+    // this is the only visible channel until the desktop backend installs.
+    if let Some(h) = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) } {
+        aegis_kernel::gop_console::install(
+            h.framebuffer_base,
+            h.width,
+            h.height,
+            h.stride_px,
+            h.bpp,
+        );
+        sprintln!("Aegis: GOP console installed at boot entry");
+    } else {
+        sprintln!("Aegis: no GOP handoff for the on-screen console");
+    }
+
     sprintln!("=== Aegis Phase 2: Bare-Metal Kernel ===");
     sprintln!("Aegis: kernel started (loader handed off at entry)");
 

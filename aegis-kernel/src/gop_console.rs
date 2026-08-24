@@ -33,10 +33,14 @@ static mut BUF: [u16; COLS * ROWS] = [0; COLS * ROWS];
 static mut CUR_ROW: usize = 0;
 static mut CUR_COL: usize = 0;
 
-/// Point the console at the GOP framebuffer. Safe to call once, after the
-/// boot path parses the handoff; everything before is dropped.
+/// Point the console at the GOP framebuffer. Installed once at kernel entry
+/// so the whole boot log renders on the physical screen; later calls are
+/// no-ops (they must not reset the accumulated buffer).
 pub fn install(base: u64, width: u32, height: u32, stride_px: u32, bpp: u32) {
     unsafe {
+        if FB_BASE != 0 {
+            return;
+        }
         FB_BASE = base;
         FB_WIDTH = width;
         FB_HEIGHT = height;
