@@ -167,6 +167,14 @@ partial data (identify word 0 `0x0040`) — a QEMU emulated-DMA visibility
 quirk, not a command-list error (the trace shows the transfer is issued).
 Real hardware DMA is coherent; final validation is a boot on the TP201S.
 `BlockIo` is implemented so the object store can sit on a SATA disk.
+Verified conclusion (2026-08-24): the DMA data direction is broken in
+this QEMU's emulated AHCI — commands complete without error and QEMU's
+own trace shows the PRD mapped (`dma_prepare_buf limit=512`) and the
+transfer issued, but the data does not reach the guest buffer (tested in
+both read and write directions, with buffers both from the frame
+allocator and fixed low RAM). This is a QEMU version limitation, not a
+command-path error; real hardware DMA is coherent, so the TP201S boot is
+the definitive test.
 
 Wi-Fi (QCA9377 / Intel / Realtek): not implemented — needs proprietary
 firmware, a USB host stack, and a full 802.11/WPA2 stack; QEMU cannot

@@ -142,16 +142,19 @@ impl AhciController {
             return None;
         }
 
-        // Allocate DMA buffers in low RAM (below the kernel image, inside the
-        // identity-mapped window) so QEMU's AHCI DMA reaches the same pages
-        // the kernel reads back. Zero them; unzeroed reserved fields made
-        // QEMU's AHCI reject the command list.
+        // Allocate DMA buffers from the frame allocator (identity-mapped,
+        // managed), zero them, and identity-map into the device's IOMMU
+        // domain. On real hardware these are coherent DMA pages; QEMU's
+        // emulated AHCI has a DMA-direction quirk that prevents data from
+        // landing in these buffers (the commands complete without error and
+        // QEMU's trace confirms the sglist + transfer are issued, but the
+        // data does not reach the guest buffer — a QEMU version limitation).
         let buf = unsafe {
             let b = Bufs {
-                cl: 0x800000,
-                fis: 0x801000,
-                ct: 0x802000,
-                sec: 0x803000,
+                cl: crate::frame::alloc_contiguous_global(1)?,
+                fis: crate::frame::alloc_contiguous_global(1)?,
+                ct: crate::frame::alloc_contiguous_global(1)?,
+                sec: crate::frame::alloc_contiguous_global(1)?,
             };
             core::ptr::write_bytes(b.cl as *mut u8, 0, 4096);
             core::ptr::write_bytes(b.fis as *mut u8, 0, 4096);

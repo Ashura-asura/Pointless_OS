@@ -972,6 +972,9 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 ahci.sector_count,
                 ahci.sector_count * 512 / 1024 / 1024
             );
+            // Read LBA 0 and report the first bytes. On QEMU the emulated
+            // AHCI DMA direction quirk leaves this partial; on real hardware
+            // the DMA is coherent and the sector content appears.
             if ahci.read_lba(0) {
                 let d = ahci.lba_data();
                 let ascii: [u8; 8] = [d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]];
