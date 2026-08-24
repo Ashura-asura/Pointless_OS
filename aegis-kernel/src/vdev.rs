@@ -822,6 +822,10 @@ pub const MAX_SLOTS: usize = 32;
 pub const VIRTIO_SLOT: usize = 6;
 /// IRQ line assigned to the virtio-blk device (INTx#A -> PIC IRQ 11).
 pub const VIRTIO_IRQ: u8 = 11;
+/// Slot the virtio-rng device lives in (Track 3 breadth).
+pub const RNG_SLOT: usize = 7;
+/// IRQ line assigned to the virtio-rng device (INTx#A -> PIC IRQ 12).
+pub const RNG_IRQ: u8 = 12;
 
 fn put_u16(config: &mut [u8; 256], off: usize, v: u16) {
     config[off] = v as u8;
@@ -896,6 +900,20 @@ impl PciConfigBus {
         put_u8(uhci, 0x3C, UHCI_IRQ); // interrupt line: PIC IRQ 10
         put_u8(uhci, 0x3D, 0x01); // interrupt pin: INTx#A
         put_u16(uhci, 0x3E, 0x0000); // min_gnt/max_lat
+
+        let rng = &mut self.slots[RNG_SLOT].config;
+        put_u16(rng, 0x00, 0x1AF4); // vendor: Red Hat / virtio
+        put_u16(rng, 0x02, 0x1005); // device: virtio-rng (legacy)
+        put_u16(rng, 0x04, 0x0007); // command: I/O + memory + bus-master
+        put_u16(rng, 0x06, 0x0000); // status
+        put_u32(rng, 0x08, 0xFF000000); // class: unclassified/other
+        put_u16(rng, 0x0E, 0x0000); // header type 0
+        put_u32(rng, 0x10, 0x0000_0001); // BAR0: I/O space, size 0x100, base 0
+        put_u16(rng, 0x2C, 0x1AF4); // subsystem vendor
+        put_u16(rng, 0x2E, 0x0004); // subsystem id: virtio-rng
+        put_u8(rng, 0x3C, RNG_IRQ); // interrupt line: PIC IRQ 12
+        put_u8(rng, 0x3D, 0x01); // interrupt pin: INTx#A
+        put_u16(rng, 0x3E, 0x0000); // min_gnt/max_lat
     }
 
     /// The base port of the virtio-blk I/O BAR, once the guest programs it.
@@ -910,6 +928,15 @@ impl PciConfigBus {
     /// The base port of the fabricated UHCI I/O BAR (fixed at [`UHCI_BASE`]).
     pub fn uhci_bar(&self) -> u16 {
         let raw = u32_from(&self.slots[UHCI_SLOT].config, 0x10);
+        if raw & 1 == 0 {
+            return 0;
+        }
+        (raw & 0xFFFC) as u16
+    }
+
+    /// The base port of the virtio-rng I/O BAR, once the guest programs it.
+    pub fn rng_bar(&self) -> u16 {
+        let raw = u32_from(&self.slots[RNG_SLOT].config, 0x10);
         if raw & 1 == 0 {
             return 0;
         }
@@ -1899,6 +1926,10 @@ pub struct DeviceSet<'a, S: BlockStore> {
     pub pci: PciConfigBus,
     /// The virtio-blk device (legacy PCI, I/O BAR, INTx#A -> IRQ 11).
     pub virtio: crate::virtio::VirtioBlk<'a, S>,
+    /// The virtio-rng device (legacy PCI, I/O BAR, INTx#A -> IRQ 12),
+    /// Track 3 breadth. Seeded from the VM's RTC epoch; serves entropy from a
+    /// deterministic PRNG (see `virtio.rs` module docs for the honest note).
+    pub rng: crate::virtio::VirtioRng,
     /// The UHCI USB host controller with the HID keyboard (I/O BAR
     /// 0xCC00, INTx#A -> IRQ 10). The run loop drives the frame-list walk
     /// through [`DeviceSet::usb_process`].
@@ -1922,6 +1953,7 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
             rtc: CmosRtc::new(rtc_epoch_seconds),
             pci: PciConfigBus::new(),
             virtio: crate::virtio::VirtioBlk::new(store),
+            rng: crate::virtio::VirtioRng::new(rtc_epoch_seconds),
             usb: UhciUsb::new(),
             audio: Sb16Dsp::new(),
             pit61_refresh: false,
@@ -1957,7 +1989,16 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
                 {
                     self.virtio.legacy_inb(port - bar)
                 } else {
-                    0xFF
+                    let rbar = self.pci.rng_bar();
+                    if self.policy.virtio
+                        && rbar != 0
+                        && (port as u32) >= rbar as u32
+                        && (port as u32) < rbar as u32 + 0x100
+                    {
+                        self.rng.legacy_inb(port - rbar)
+                    } else {
+                        0xFF
+                    }
                 }
             }
         }
@@ -1979,6 +2020,15 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
                     && (port as u32) < bar as u32 + 0x100
                 {
                     self.virtio.legacy_outb(port - bar, val);
+                } else {
+                    let rbar = self.pci.rng_bar();
+                    if self.policy.virtio
+                        && rbar != 0
+                        && (port as u32) >= rbar as u32
+                        && (port as u32) < rbar as u32 + 0x100
+                    {
+                        self.rng.legacy_outb(port - rbar, val);
+                    }
                 }
             }
         }
@@ -2000,7 +2050,16 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
         {
             self.virtio.legacy_inw(port - bar)
         } else {
-            0xFFFF
+            let rbar = self.pci.rng_bar();
+            if self.policy.virtio
+                && rbar != 0
+                && (port as u32) >= rbar as u32
+                && (port as u32) < rbar as u32 + 0x100
+            {
+                self.rng.legacy_inw(port - rbar)
+            } else {
+                0xFFFF
+            }
         }
     }
 
@@ -2019,6 +2078,15 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
             && (port as u32) < bar as u32 + 0x100
         {
             self.virtio.legacy_outw(port - bar, val);
+        } else {
+            let rbar = self.pci.rng_bar();
+            if self.policy.virtio
+                && rbar != 0
+                && (port as u32) >= rbar as u32
+                && (port as u32) < rbar as u32 + 0x100
+            {
+                self.rng.legacy_outw(port - rbar, val);
+            }
         }
     }
 
@@ -2036,7 +2104,16 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
                 {
                     self.virtio.legacy_inl(port - bar)
                 } else {
-                    0xFFFF_FFFF
+                    let rbar = self.pci.rng_bar();
+                    if self.policy.virtio
+                        && rbar != 0
+                        && (port as u32) >= rbar as u32
+                        && (port as u32) < rbar as u32 + 0x100
+                    {
+                        self.rng.legacy_inl(port - rbar)
+                    } else {
+                        0xFFFF_FFFF
+                    }
                 }
             }
         }
@@ -2055,6 +2132,15 @@ impl<'a, S: BlockStore> DeviceSet<'a, S> {
                     && (port as u32) < bar as u32 + 0x100
                 {
                     self.virtio.legacy_outl(port - bar, val);
+                } else {
+                    let rbar = self.pci.rng_bar();
+                    if self.policy.virtio
+                        && rbar != 0
+                        && (port as u32) >= rbar as u32
+                        && (port as u32) < rbar as u32 + 0x100
+                    {
+                        self.rng.legacy_outl(port - rbar, val);
+                    }
                 }
             }
         }

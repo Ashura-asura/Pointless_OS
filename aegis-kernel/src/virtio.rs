@@ -409,6 +409,254 @@ impl<'a, S: BlockStore> VirtioBlk<'a, S> {
     }
 }
 
+// ---------------------------------------------------------------------
+// virtio-rng (Track 3 breadth: a second legacy virtio device)
+// ---------------------------------------------------------------------
+//
+// Device ID 0x1005 (virtio-rng, legacy PCI). Same transport as VirtioBlk —
+// a plain I/O-space BAR, no MSI-X, no indirect descriptors, one virtqueue.
+// A request is a descriptor chain whose device-writable (OUT) buffers the
+// device fills from an entropy source and hands back through the used ring
+// with `len` = bytes written. This is exactly the shape a Linux guest's
+// `virtio_rng` driver produces, so breadth is real rather than decorative.
+//
+// Emulation honesty: the entropy source is a deterministic xorshift64 PRNG,
+// seeded from the VM's RTC epoch at device construction. The guest receives
+// entropy-shaped bytes and the virtio protocol is exercised for real; a
+// production host should back this with a real entropy source (RDSEED).
+
+/// Deterministic PRNG backing virtio-rng (xorshift64).
+pub struct EntropySource {
+    state: u64,
+}
+
+impl EntropySource {
+    pub fn new(seed: u64) -> EntropySource {
+        EntropySource {
+            // A nonzero seed avoids the all-zero fixpoint.
+            state: seed | 1,
+        }
+    }
+
+    /// Fill `buf` with the next bytes from the stream.
+    pub fn fill(&mut self, buf: &mut [u8]) {
+        for b in buf.iter_mut() {
+            self.state ^= self.state << 13;
+            self.state ^= self.state >> 7;
+            self.state ^= self.state << 17;
+            *b = (self.state >> 32) as u8;
+        }
+    }
+}
+
+/// The legacy virtio-rng device (device ID 0x1005).
+pub struct VirtioRng {
+    src: EntropySource,
+    host_features: u32,
+    guest_features: u32,
+    status: u8,
+    isr: u8,
+    queue_sel: u16,
+    queue_size: u16,
+    queue_pfn: u32,
+    avail_last: u16,
+    notify_pending: bool,
+}
+
+impl VirtioRng {
+    pub fn new(seed: u64) -> VirtioRng {
+        VirtioRng {
+            src: EntropySource::new(seed),
+            host_features: 0,
+            guest_features: 0,
+            status: 0,
+            isr: 0,
+            queue_sel: 0,
+            queue_size: 0,
+            queue_pfn: 0,
+            avail_last: 0,
+            notify_pending: false,
+        }
+    }
+
+    /// Device status, as the guest reads it back.
+    pub fn status(&self) -> u8 {
+        self.status
+    }
+
+    /// The IRQ line is asserted while the ISR byte is set.
+    pub fn irq_line(&self) -> bool {
+        self.isr != 0
+    }
+
+    fn queue_base(&self) -> u64 {
+        (self.queue_pfn as u64) << 12
+    }
+
+    // ---- legacy I/O register interface (called by DeviceSet) ----
+
+    pub fn legacy_inl(&self, offset: u16) -> u32 {
+        match offset {
+            REG_HOST_FEATURES => self.host_features,
+            _ => 0,
+        }
+    }
+
+    pub fn legacy_outl(&mut self, offset: u16, val: u32) {
+        match offset {
+            REG_GUEST_FEATURES => {
+                self.guest_features = val & self.host_features;
+            }
+            REG_QUEUE_PFN => {
+                self.queue_pfn = val;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn legacy_inw(&self, offset: u16) -> u16 {
+        match offset {
+            REG_QUEUE_NUM => self.queue_size,
+            REG_QUEUE_NUM_MAX => QUEUE_NUM_MAX,
+            _ => 0,
+        }
+    }
+
+    pub fn legacy_outw(&mut self, offset: u16, val: u16) {
+        match offset {
+            REG_QUEUE_NUM => {
+                self.queue_size = val.min(QUEUE_NUM_MAX);
+            }
+            REG_QUEUE_SEL => {
+                self.queue_sel = val;
+            }
+            REG_QUEUE_NOTIFY if val == 0 => {
+                self.notify_pending = true;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn legacy_inb(&mut self, offset: u16) -> u8 {
+        match offset {
+            REG_STATUS => self.status,
+            REG_ISR => {
+                let v = self.isr;
+                self.isr = 0;
+                v
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn legacy_outb(&mut self, offset: u16, val: u8) {
+        if offset == REG_STATUS {
+            self.status = val;
+        }
+    }
+
+    /// Was QUEUE_NOTIFY written since the last drain?
+    pub fn notify_pending(&self) -> bool {
+        self.notify_pending
+    }
+
+    pub fn clear_notify(&mut self) {
+        self.notify_pending = false;
+    }
+
+    pub fn clear_isr(&mut self) {
+        self.isr = 0;
+    }
+
+    /// Process every newly-available request. Each writable buffer in a
+    /// chain is filled from the entropy source; the used ring records the
+    /// chain with `len` = total bytes written. Returns requests completed.
+    pub fn drain(&mut self, mem: &mut impl GuestMem) -> u32 {
+        self.notify_pending = false;
+        if self.queue_size == 0 || self.queue_pfn == 0 {
+            return 0;
+        }
+        let base = self.queue_base();
+        let avail_idx = match read_u16(mem, base + 4096 + 2) {
+            Some(v) => v,
+            None => return 0,
+        };
+        let mut processed = 0u32;
+        while self.avail_last != avail_idx {
+            let entry_off = base + 4096 + 4 + 2 * (self.avail_last as u64 % self.queue_size as u64);
+            let Some(head) = read_u16(mem, entry_off) else {
+                break;
+            };
+            self.avail_last = self.avail_last.wrapping_add(1);
+            self.process_chain(mem, base, head);
+            processed += 1;
+        }
+        if processed > 0 {
+            self.isr = 1;
+        }
+        processed
+    }
+
+    /// Fill every device-writable descriptor in one chain from the entropy
+    /// source, then record the completion. Malformed or unreadable chains
+    /// complete with whatever was written so far — the queue never stalls
+    /// and nothing panics (hostile input is total).
+    fn process_chain(&mut self, mem: &mut impl GuestMem, base: u64, head: u16) {
+        let mut written = 0u32;
+        let mut idx = head as u64;
+        let mut guard = 0u32;
+        loop {
+            if guard >= MAX_CHAIN as u32 {
+                break;
+            }
+            let off = base + 16 * idx;
+            let (Some(addr), Some(len), Some(flags)) = (
+                read_u64(mem, off),
+                read_u32(mem, off + 8),
+                read_u16(mem, off + 12),
+            ) else {
+                break;
+            };
+            if flags & DESC_F_WRITE != 0 && len > 0 {
+                let mut chunk = [0u8; 512];
+                let mut remaining = len;
+                let mut cur = addr;
+                while remaining > 0 {
+                    let n = remaining.min(512);
+                    self.src.fill(&mut chunk[..n as usize]);
+                    if !mem.write(cur, &chunk[..n as usize]) {
+                        break;
+                    }
+                    written += n;
+                    cur += n as u64;
+                    remaining -= n;
+                }
+            }
+            if flags & DESC_F_NEXT == 0 {
+                break;
+            }
+            let Some(next) = read_u16(mem, off + 14) else {
+                break;
+            };
+            idx = next as u64;
+            guard += 1;
+        }
+        self.complete(mem, base, head, written);
+    }
+
+    /// Record a completion in the used ring with the given `len`.
+    fn complete(&mut self, mem: &mut impl GuestMem, base: u64, head: u16, len: u32) {
+        let used_idx_off = base + 8192 + 2;
+        let used_idx = read_u16(mem, used_idx_off).unwrap_or(0);
+        let entry_off = base + 8192 + 4 + 8 * (used_idx as u64 % self.queue_size as u64);
+        let mut buf = [0u8; 8];
+        buf[..4].copy_from_slice(&(head as u32).to_le_bytes());
+        buf[4..].copy_from_slice(&len.to_le_bytes());
+        let _ = mem.write(entry_off, &buf);
+        let _ = mem.write(used_idx_off, &(used_idx.wrapping_add(1).to_le_bytes()));
+    }
+}
+
 fn read_u16(mem: &mut impl GuestMem, gpa: u64) -> Option<u16> {
     let mut b = [0u8; 2];
     mem.read(gpa, &mut b).then_some(u16::from_le_bytes(b))
@@ -815,5 +1063,170 @@ mod tests {
         let mut mem = FakeMem::new(0x1000);
         assert_eq!(dev.drain(&mut mem), 0);
         assert!(!dev.irq_line());
+    }
+
+    // ---- virtio-rng (Track 3 breadth) -------------------------------------
+
+    /// Build a virtio-rng device with the queue at GPA 0x1_0000, programmed
+    /// exactly as the Linux legacy driver programs it.
+    fn rng_setup(qsize: u16, seed: u64) -> (VirtioRng, FakeMem) {
+        let mut dev = VirtioRng::new(seed);
+        dev.legacy_outw(REG_QUEUE_SEL, 0);
+        assert_eq!(dev.legacy_inw(REG_QUEUE_NUM_MAX), QUEUE_NUM_MAX);
+        dev.legacy_outw(REG_QUEUE_NUM, qsize);
+        dev.legacy_outl(REG_QUEUE_PFN, 0x10); // queue at GPA 0x1_0000
+        assert_eq!(dev.queue_base(), 0x1_0000);
+        let mem = FakeMem::new(0x2_0000);
+        dev.legacy_outb(REG_STATUS, STATUS_ACK);
+        dev.legacy_outb(REG_STATUS, STATUS_ACK | STATUS_DRIVER);
+        assert_eq!(dev.legacy_inl(REG_HOST_FEATURES), 0);
+        dev.legacy_outl(REG_GUEST_FEATURES, 0);
+        dev.legacy_outb(REG_STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK);
+        dev.legacy_outb(
+            REG_STATUS,
+            STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
+        );
+        assert_eq!(dev.status(), 0x0F);
+        (dev, mem)
+    }
+
+    /// Insert a single-writable-descriptor rng request: desc `head` names a
+    /// device-writable buffer the device must fill.
+    fn rng_submit(mem: &mut FakeMem, head: u16, buf_gpa: u64, buf_len: u32) {
+        let base = 0x1_0000u64;
+        let mut d = [0u8; 16];
+        d[..8].copy_from_slice(&buf_gpa.to_le_bytes());
+        d[8..12].copy_from_slice(&buf_len.to_le_bytes());
+        d[12] = DESC_F_WRITE as u8; // writable, no NEXT
+        mem.write(base + 16 * head as u64, &d);
+        let avail_idx = u16::from_le_bytes([
+            mem.bytes[base as usize + 4096 + 2],
+            mem.bytes[base as usize + 4096 + 3],
+        ]);
+        let entry_off = base + 4096 + 4 + 2 * (avail_idx as u64 % 8);
+        mem.write(entry_off, &head.to_le_bytes());
+        mem.write(base + 4096 + 2, &avail_idx.wrapping_add(1).to_le_bytes());
+    }
+
+    /// The exact byte stream the device's xorshift64 source emits for `seed`.
+    fn expected_stream(seed: u64, n: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.push((state >> 32) as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn rng_request_fills_the_guest_buffer() {
+        let (mut dev, mut mem) = rng_setup(8, 1234);
+        let buf_gpa = 0x1_8000u64;
+        rng_submit(&mut mem, 0, buf_gpa, 32);
+        dev.legacy_outw(REG_QUEUE_NOTIFY, 0);
+        assert!(dev.notify_pending());
+        assert_eq!(dev.drain(&mut mem), 1);
+        assert!(!dev.notify_pending());
+        // Used ring advanced once with len 32 for head 0.
+        assert_eq!(used_count(&mem), 1);
+        let used_off = 0x1_0000 + 8192 + 4;
+        let head = u16::from_le_bytes([mem.bytes[used_off], mem.bytes[used_off + 1]]);
+        let len = u32::from_le_bytes([
+            mem.bytes[used_off + 4],
+            mem.bytes[used_off + 5],
+            mem.bytes[used_off + 6],
+            mem.bytes[used_off + 7],
+        ]);
+        assert_eq!(head, 0);
+        assert_eq!(len, 32);
+        // The buffer really was filled with the PRNG stream.
+        let expected = expected_stream(1234, 32);
+        assert_eq!(
+            &mem.bytes[buf_gpa as usize..buf_gpa as usize + 32],
+            &expected[..]
+        );
+        // Completion raised the IRQ; reading ISR clears it.
+        assert!(dev.irq_line());
+        assert_eq!(dev.legacy_inb(REG_ISR), 1);
+        assert!(!dev.irq_line());
+    }
+
+    #[test]
+    fn rng_multi_request_batch_advances_used_ring() {
+        let (mut dev, mut mem) = rng_setup(8, 99);
+        rng_submit(&mut mem, 0, 0x1_8000, 16);
+        rng_submit(&mut mem, 3, 0x1_8200, 16);
+        dev.legacy_outw(REG_QUEUE_NOTIFY, 0);
+        assert_eq!(dev.drain(&mut mem), 2);
+        assert_eq!(used_count(&mem), 2);
+        // Two distinct, PRNG-advanced fills.
+        let e = expected_stream(99, 32);
+        assert_eq!(&mem.bytes[0x1_8000..0x1_8000 + 16], &e[..16]);
+        assert_eq!(&mem.bytes[0x1_8200..0x1_8200 + 16], &e[16..]);
+    }
+
+    #[test]
+    fn rng_chain_without_writable_buffer_still_completes() {
+        let (mut dev, mut mem) = rng_setup(8, 7);
+        // A descriptor with no WRITE flag: nothing to fill, but the chain
+        // must still complete (len 0) so the queue never stalls.
+        let mut d = [0u8; 16];
+        d[..8].copy_from_slice(&0x1_8000u64.to_le_bytes());
+        d[8..12].copy_from_slice(&32u32.to_le_bytes());
+        d[12] = 0; // read-only, no NEXT
+        mem.write(0x1_0000, &d);
+        let avail_idx = u16::from_le_bytes([
+            mem.bytes[0x1_0000 + 4096 + 2],
+            mem.bytes[0x1_0000 + 4096 + 3],
+        ]);
+        mem.write(0x1_0000 + 4096 + 4, &0u16.to_le_bytes());
+        mem.write(
+            0x1_0000 + 4096 + 2,
+            &avail_idx.wrapping_add(1).to_le_bytes(),
+        );
+        dev.legacy_outw(REG_QUEUE_NOTIFY, 0);
+        assert_eq!(dev.drain(&mut mem), 1);
+        assert_eq!(used_count(&mem), 1);
+        let used_off = 0x1_0000 + 8192 + 4;
+        let len = u32::from_le_bytes([
+            mem.bytes[used_off + 4],
+            mem.bytes[used_off + 5],
+            mem.bytes[used_off + 6],
+            mem.bytes[used_off + 7],
+        ]);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn rng_drain_without_queue_is_a_noop() {
+        let mut dev = VirtioRng::new(1);
+        let mut mem = FakeMem::new(0x1000);
+        assert_eq!(dev.drain(&mut mem), 0);
+        assert!(!dev.irq_line());
+    }
+
+    /// Phase AE-style: hostile descriptor tables / avail rings / used rings
+    /// are untrusted guest memory; drain must never panic.
+    #[test]
+    #[cfg_attr(miri, ignore)] // interpreted sweep; the fixed vectors still run under Miri
+    fn rng_hostile_descriptor_tables_never_panic() {
+        use crate::hardening_fuzz::{no_panic, Rng, SEED};
+        let mut rng = Rng::new(SEED ^ 0x5EED_0007);
+        let (mut dev, mut mem) = rng_setup(8, 1234);
+        let base = 0x1_0000u64;
+        for _ in 0..crate::hardening_fuzz::sweep_iters(100_000) {
+            // Randomize the whole queue area (descriptor table + avail +
+            // used rings).
+            for i in 0..(8192u64 + 4096) {
+                mem.bytes[(base + i) as usize] = rng.byte();
+            }
+            dev.avail_last = 0;
+            no_panic(|| {
+                dev.drain(&mut mem);
+            });
+        }
     }
 }

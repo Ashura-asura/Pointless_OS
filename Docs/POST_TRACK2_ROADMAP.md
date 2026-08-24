@@ -121,9 +121,16 @@ is a deliberate sequencing decision, not abandonment: the work is real and
 well-tested where it exists; it is simply not the current priority until the
 core usefulness claim (Track 1 + Track 2) is proven end-to-end.
 
-**Closed/reduced:** Track 3 breadth remains **reduced** by design (§11.G:
-compatibility breadth is premature relative to the core claim even after Track
-1/2 — it is allowed now, not mandated).
+**Scoped advancement (2026-08-24):** Added a **second virtio device —
+virtio-rng** (device ID 0x1005, legacy PCI I/O BAR, INTx#A IRQ 12) wired
+into the existing `DeviceSet`/`PciConfigBus` fabric and tested against the
+same virtio legacy protocol. The device is self-contained in `virtio.rs`
+(`VirtioRng`), feeds a deterministic xorshift64 PRNG into the guest's
+writable descriptor buffers, and passes 5 new host-side contract tests
+(request fill, multi-batch, no-writable chain, no-queue noop, hostile
+descriptor fuzz). Track 3 breadth is no longer zero: a second device class
+is real and test-proven while Track 3 as a whole (full distro, Windows
+guest, USB classes beyond HID) remains gated on the same Track 2 DoD gate.
 
 ## Phase C — Genode-flagged hardening (this session's research, the two larger items)
 
@@ -261,7 +268,9 @@ folded in.
     step is a boot/hardware action** on a VMX-owner host (Core Isolation off /
     KVM unloaded); see `Docs/VMX_LIVE_HOSTING.md`. Not doable in-session.
   - Phase B (Track 3: Windows guest, fuller distro, broader device model): large
-    multi-day feature, deferred, not started (must not be faked).
+    multi-day feature. **Scoped advance 2026-08-24: virtio-rng added and
+    test-proven** (5 tests); the rest (full distro, Windows guest, more USB
+    classes) is real remaining work, not started.
   - Phase C (Genode: separate VMM component + IOMMU DMA confinement):
     architectural research candidates, deferred, not started.
 
@@ -272,6 +281,5 @@ folded in.
   remains on GitHub (user will delete manually; token has `keys=read` only,
   cannot delete via API).
 
-- **Next move:** all non-hardware/non-architectural phases done. Ask the user
-  whether to (a) start a scoped Track 3 spike (e.g. add one virtio device to
-  `aegis-kernel/src/vdev.rs`), (b) start a Genode research spike, or (c) stop.
+- **Next move:** Phase A Problem 2 software-complete, Phase B scoped (virtio-rng
+  done, rest deferred), Phase C next.
