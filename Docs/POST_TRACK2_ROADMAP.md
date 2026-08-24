@@ -17,10 +17,10 @@ honestly per Ground Rule 6.*
 | Capability | State | Evidence |
 |---|---|---|
 | §9.1 role-shaped grants | closed (generalized) | `role.rs` 19 tests; Track 1.5 `ExpansionKind` proves object *and* task grants |
-| §9.2 ephemeral-by-default grants | reduced | `expiry` plumbed end-to-end (`macaroon`/`CapabilityToken`); not yet wired into `role.rs` grant path |
+| §9.2 ephemeral-by-default grants | **closed** | `set_grant_expiry` at grant + mint (`role.rs:352,773`); `grant_valid` enforces, `Expired` refused (`386-392,442,607`) |
 | §9.3 diff-confirmation at scope expansion | closed (object + task) | `request_expansion`/`confirm_expansion`; Track 1.5 adds `ExpansionKind::Task` |
-| §9.4 persistent audit trail w/ queryable identity | reduced | `audit.rs` exists & is used by every syscall gate; `OpKind` not yet extended for role-grant/exercise |
-| §9.5 anomaly circuit-break + two-party irreversible | reduced | generation-bump + restart-rate suspension exist (`tasks.rs`/`role.rs`); two-party confirmation still `WRITE`-gated (named limitation) |
+| §9.4 persistent audit trail w/ queryable identity | **closed** | `OpKind::{RoleGrant,RoleExercise,RoleExpand}` (`audit.rs:46-58`); emitted on grant/exercise/expand, queryable via `op_counts` |
+| §9.5 anomaly circuit-break + two-party irreversible | reduced | two-party + suspend implemented & test-proven, but **two named limits**: (a) two-party is `WRITE`-keyed not `CONTROL` (`role.rs:649,731-746`); (b) `role_monitor_train` only called in tests, never in the production grant flow, so the suspend breaker is dormant until a supervisor trains it (`role.rs:1872,2136` only). See `SECTION9_CLOSURE_AUDIT.md` |
 | Per-VM guest device scoping | closed (this session) | `DevicePolicy` allow-list, `vdev.rs` |
 | VMM TCB separation (microhypervisor) | inherent-later | not adopted; flagged below |
 | IOMMU DMA confinement | inherent-later | not adopted; flagged below |
@@ -87,29 +87,39 @@ Both are recorded as candidates, not adopted, per the research pass's cap of
 ## Phase D — grow the role library toward the §11.F real-task battery
 
 Track 1.5 proved §9 generalizes; now grow *what the roles are for* beyond
-ops-demo + the restart task, against §11.F's named real tasks:
+ops-demo + the restart task, against §11.F's named real tasks. (Note from the
+closure audit: §9.1–§9.4 are already **closed**, so this phase is about *new
+tasks*, not finishing the mechanism.)
 
 - **Task 1 (read-only, lowest blast radius):** "summarize what changed in this
-  object-store subtree since a point" — exercises object store + capability
-  model together. Closes §9.2 (ephemeral grant) and §9.4 (audit identity) for
-  a real read task.
+  object-store subtree since a point" — already the Track 1 proven task; keep
+  as the regression baseline.
 - **Task 2 (write/irreversible, exercises §9.3 + §9.5):** "propose a named
   edit to a named file; do not apply without confirmation" — `propose` and
   `apply` are distinct capabilities; the diff-confirmation prompt and the
-  two-party irreversible path both get a real workout.
+  two-party irreversible path both get a real workout. This is the natural
+  vehicle to close §9.5's limitation (a): key two-party on `CONTROL`/
+  irreversible actions, not just `WRITE`.
 - Each role ships with adversarial tests in the same commit (self-grant,
   foreign-target, expansion-without-confirmation, expired-grant-reuse).
 
-**Goal:** close §9.2/§9.4 fully and move §9.5 from "reduced" toward "closed"
-against a real irreversible action.
+**Goal:** move §9.5 from "reduced" toward "closed" against a real irreversible
+action, and add new real-task roles.
 
-## Phase E — observable identity (close §9.4 properly)
+## Phase E — make §9.5 live in production (close the training gap)
 
-Extend `audit.rs`'s `OpKind` with role-grant and role-exercise records carrying
-stable identity (which grant, which task, which capability) so "what did this
-agent do with what it was given" is answerable by a real query post-hoc. This
-is the §9 piece the repo is *closest* to already having; finish it rather than
-rebuild it.
+§9.4 audit identity is already closed; the remaining §9 work is §9.5's
+production wiring, per `SECTION9_CLOSURE_AUDIT.md`:
+
+1. **Auto-train the anomaly monitor** when a role is granted (or have the
+   supervisor train it as part of delegating a role) — today `role_monitor_
+   train` is only called in tests (`role.rs:1872,2136`), so the suspend
+   circuit-breaker is dormant until a supervisor trains it.
+2. **Extend two-party gating** from `WRITE`-only to `CONTROL`/irreversible
+   control actions (e.g. restart), so the irreversible framing in §9.5 matches
+   practice.
+3. (Optional, larger) persist the audit trail to stable storage for forensic
+   durability across reboots.
 
 ## Sequencing principle (restated from §1)
 

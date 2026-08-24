@@ -77,6 +77,14 @@ task caught.
 - **The anomaly monitor is still a role-shape (op-count) check, not a learned
   model** — unchanged from Track 1; the deviation rule is the simple 2x-rate /
   unseen-op rule from `monitor.rs`.
+- **The suspend monitor is never auto-trained in the production flow (closure
+  audit, `SECTION9_CLOSURE_AUDIT.md`).** `role_monitor_train` is only called
+  in tests (`role.rs:1872,2136`); there is no production call site that trains
+  the monitor on role grant. `role_monitor_observe` is wired into every role
+  exercise (`role.rs:479,551`), so once trained the breaker fires — but until
+  a supervisor trains it, `observe()` is a no-op and the suspend circuit-
+  breaker is dormant in a real deployment. The logic is implemented and
+  test-proven; only the production training trigger is missing.
 - **The boot-log demo (`demo_track15`) runs under the test harness**, same as
   every other live-verified phase; wiring both Track 1 and Track 1.5 demos
   into the physical UEFI boot path is a shared follow-up.
@@ -86,7 +94,7 @@ task caught.
 ```
 cd aegis-kernel
 cargo test role::            # 19 tests: §9 x2 tasks + adversarial denial
-cargo test                  # full kernel suite (817 passed, 2 ignored)
+cargo test                  # full kernel suite (818 passed, 2 ignored)
 cargo clippy --all-targets  # clean (CI runs -Dwarnings)
 cargo fmt --check           # clean
 ```
