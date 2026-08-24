@@ -13,7 +13,7 @@
 //! Bochs-VBE PCI probe (QEMU) or the text backend alone.
 
 use uefi::boot::{locate_handle_buffer, open_protocol_exclusive, SearchType};
-use uefi::proto::console::gop::{GraphicsOutput, Mode, ModeInfo, PixelFormat};
+use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
 use uefi::Identify;
 
 /// Offset of the GOP block inside the handoff page: directly after the
@@ -76,28 +76,12 @@ pub fn query() -> Option<GopHandoff> {
     let handle = *handles.first()?;
     let mut gop = open_protocol_exclusive::<GraphicsOutput>(handle).ok()?;
 
-    // First: is the firmware's current mode directly CPU-writable?
-    let usable_current = usable_mode(&gop.current_mode_info());
-
-    // Prefer 800x600x32 when available; firmware default otherwise.
-    if usable_current {
-        let mut preferred: Option<Mode> = None;
-        for m in gop.modes() {
-            let info = m.info();
-            let (w, h) = info.resolution();
-            let format_ok = matches!(info.pixel_format(), PixelFormat::Bgr | PixelFormat::Rgb);
-            if format_ok && w == 800 && h == 600 {
-                preferred = Some(m);
-                break;
-            }
-        }
-        if let Some(m) = preferred {
-            if gop.set_mode(&m).is_ok() {
-                uefi::println!("Aegis: GOP: set mode 800x600x32");
-            }
-        }
-    }
-
+    // Use the firmware's CURRENT mode as-is. We deliberately do NOT call
+    // `set_mode` to switch to 800x600x32: on real hardware (the TP201S) the
+    // UEFI SetMode boot service faulted here and the loader crashed before
+    // the kernel ever started (the screen froze at "no FLEET.CFG"). The
+    // kernel centers its desktop in whatever mode the firmware already has,
+    // so the switch is not required for the boot path.
     let info = gop.current_mode_info();
     if !usable_mode(&info) {
         return None;
