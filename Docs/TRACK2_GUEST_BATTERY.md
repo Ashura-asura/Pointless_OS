@@ -118,3 +118,62 @@ passing live run here:
 - `guest/out/battery-standalone-serial2.log` — clean networking/`/dev`/mounts pass.
 - `guest/battery-init.sh` — alternative init-based battery (kept for reuse).
 - `guest/battery-commands.txt` — probe command set.
+- `guest/enrich-initramfs.sh` — closes the battery-binary KNOWN GATE (adds
+  python3/git/vim/nano/gcc/make + libs into the initramfs).
+
+## Native Linux (Kali) runbook — both environment blockers gone
+
+Booting the dual-boot Kali (bare-metal Linux) removes **both** gates at once:
+no CRLF/line-ending issue (native LF; `.gitattributes` now also forces
+`*.sh`/`*.py` to LF on every checkout), and VT-x is free for `vm.rs` hosting
+(Windows VBS/Core-Isolation does not exist here — just keep KVM unloaded so
+Aegis's hypervisor can take VMX). This is the path that actually *runs* Track
+2, not just prepares it.
+
+Prerequisites (one time):
+```
+sudo apt-get update
+sudo apt-get install -y build-essential ncurses-dev flex bison \
+  libssl-dev bc curl qemu-system-x86 python3 git vim nano
+# (build-essential provides gcc/make; the rest give the battery binaries + QEMU)
+```
+
+Steps:
+1. **Build the base guest** (downloads cached after first run; ~5–8 min):
+   ```
+   bash guest/build-guest.sh "$PWD/guest"
+   ```
+2. **Close the KNOWN GATE** — add the real battery binaries into the
+   initramfs (BusyBox alone does not have them):
+   ```
+   bash guest/enrich-initramfs.sh "$PWD/guest/initramfs"
+   ```
+3. **Re-bake the image with the enriched initramfs** (do NOT re-run
+   `build-guest.sh` — its `make install` would overwrite the enriched
+   `/bin`). Rebuild only the kernel embed + cpio:
+   ```
+   cd "$HOME/aegis-guest-build/linux-6.12.103"
+   make -j"$(nproc)" bzImage
+   cp arch/x86/boot/bzImage "$PWD/guest/out/bzImage"
+   (cd "$PWD/guest/initramfs" && find . | cpio -o -H newc | gzip > "$PWD/guest/out/initramfs.cpio.gz")
+   ```
+4. **Run the battery** under QEMU (KVM or TCG both work for the userspace
+   battery) and let the contract harness capture evidence:
+   ```
+   qemu-system-x86_64 -machine pc -cpu max -m 512 -display none \
+     -serial tcp::1234,server,nowait \
+     -kernel guest/out/bzImage -initrd guest/out/initramfs.cpio.gz \
+     -append 'console=ttyS0' &
+   python3 guest/battery-contract.py
+   ```
+   The harness prints `ok`/`FAIL` per item and exits non-zero on any FAIL.
+   Capture its output + the QEMU serial to `guest/out/` as evidence.
+5. **(Optional, strict §3 DoD)** host the guest under Aegis's own `vm.rs`
+   instead of QEMU: unload KVM first so VMX is free, then run the
+   `aegis-kernel` VM path against `guest/out/bzImage`. This exercises the
+   guest's e1000e driver against Aegis's virtual e1000e (the "clone over the
+   existing e1000e path" wording in `AEGIS_USEFUL_PROMPT.md` §3).
+
+What flips from "run-gated" to "done" here: the `git`/`python3` DoD
+(non-trivial ops inside the guest) becomes actually demonstrable, with serial
+logs committed as evidence per Ground Rule 7.

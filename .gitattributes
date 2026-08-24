@@ -1,0 +1,5 @@
+# Force LF line endings for scripts so they run unchanged on both Windows
+# (git checkout) and native Linux / WSL / Kali. The CRLF checkout on Windows
+# previously broke `build-guest.sh` under bash ( $'\r': command not found ).
+*.sh text eol=lf
+*.py text eol=lf
