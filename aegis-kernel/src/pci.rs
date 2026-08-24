@@ -25,6 +25,7 @@ pub const CLASS_NETWORK: u8 = 0x02;
 pub const CLASS_DISPLAY: u8 = 0x03;
 pub const CLASS_BRIDGE: u8 = 0x06;
 pub const SUBCLASS_NVME: u8 = 0x08;
+pub const SUBCLASS_AHCI: u8 = 0x06; // SATA controller (AHCI)
 
 /// Human-readable class name for scan reports.
 pub fn class_name(class: u8, subclass: u8) -> &'static str {
@@ -280,6 +281,10 @@ impl PciDevice {
         self.class == CLASS_MASS_STORAGE && self.subclass == SUBCLASS_NVME
     }
 
+    pub fn is_ahci(&self) -> bool {
+        self.class == CLASS_MASS_STORAGE && self.subclass == SUBCLASS_AHCI
+    }
+
     pub fn is_network(&self) -> bool {
         self.class == CLASS_NETWORK
     }
@@ -348,6 +353,10 @@ impl PciDeviceList {
 
     pub fn find_nvme(&self) -> Option<&PciDevice> {
         self.iter().find(|d| d.is_nvme())
+    }
+
+    pub fn find_ahci(&self) -> Option<&PciDevice> {
+        self.iter().find(|d| d.is_ahci())
     }
 
     pub fn find_network(&self) -> Option<&PciDevice> {

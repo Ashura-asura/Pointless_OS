@@ -416,6 +416,10 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                         if m.bgr { "BGRX" } else { "RGBX" },
                         base
                     );
+                    // On-screen scrolling console: every `sprintln!` from here
+                    // on is mirrored to the physical display (the evidence
+                    // channel on a UEFI laptop where COM1 is unwired).
+                    aegis_kernel::gop_console::install(base, h.width, h.height, h.stride_px, h.bpp);
                     backend = Some(GpuBackend::Gop(g));
                 }
             } else {
@@ -466,7 +470,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // (Layer 1 — the reliable evidence channel on a UEFI laptop where the
     // COM1 serial path is usually unwired).
     {
-        use aegis_kernel::baremetal_probe::{format_summary, keep, run, LiveFacts};
+        use aegis_kernel::baremetal_probe::{keep, run, LiveFacts};
         let gop = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) };
         let (total_frames, _free) = unsafe { aegis_kernel::frame::stats_global() };
         let facts = LiveFacts {
@@ -492,19 +496,8 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             aegis_kernel::baremetal_probe::passed(&results),
             results.len()
         );
-        if let Some(h) = gop {
-            let mut buf = [0u8; 1024];
-            let n = format_summary(&results, &mut buf);
-            aegis_kernel::gop_console::render_text(
-                h.framebuffer_base,
-                h.width,
-                h.height,
-                h.stride_px,
-                h.bpp,
-                &buf[..n],
-            );
-            sprintln!("Aegis: [probe] summary rendered to the GOP screen");
-        }
+        // The scrolling GOP console mirrors every probe line to the physical
+        // screen, so the report is captured by photographing the display.
         keep(&results);
     }
 
@@ -966,6 +959,41 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         not(feature = "fleet-j3")
     ))]
     aegis_kernel::fleet::run_boot_demo();
+
+    // Live AHCI (SATA) demo: probe the SATA controller, identify the disk,
+    // and read LBA 0 so a QEMU test can verify the driver by attaching a
+    // known disk image. Compiled out on canary builds (zero disk writes on
+    // physical hardware — a read-only probe is still a disk touch).
+    #[cfg(not(feature = "canary"))]
+    {
+        if let Some(mut ahci) = aegis_kernel::ahci::AhciController::probe(&pci) {
+            sprintln!(
+                "Aegis: AHCI: SATA disk identified: {} sectors ({} MiB)",
+                ahci.sector_count,
+                ahci.sector_count * 512 / 1024 / 1024
+            );
+            if ahci.read_lba(0) {
+                let d = ahci.lba_data();
+                let ascii: [u8; 8] = [d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]];
+                sprintln!(
+                    "Aegis: AHCI: LBA0 = {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} ({:?})",
+                    d[0],
+                    d[1],
+                    d[2],
+                    d[3],
+                    d[4],
+                    d[5],
+                    d[6],
+                    d[7],
+                    core::str::from_utf8(&ascii).unwrap_or("?")
+                );
+            } else {
+                sprintln!("Aegis: AHCI: LBA0 read failed");
+            }
+        } else {
+            sprintln!("Aegis: AHCI: no SATA controller found");
+        }
+    }
 
     // Live NVMe demo: probe BAR0, reset, admin + IO queues, identify, read
     // LBA 0/1 and check the GPT signature (disk image is GPT-partitioned).

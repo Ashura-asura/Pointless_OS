@@ -152,3 +152,22 @@ procedure's Layer 2) needs a USB mass-storage driver (Aegis has only UHCI
 HID emulation) plus a FAT writer (`fat.rs` is read-only) — real future
 work. Until then the evidence is the on-screen report (photograph) plus
 serial under QEMU.
+
+## AHCI (SATA) driver — status
+
+For the TP201S-class machine (Intel SATA controller `8086:22a3`, class
+`0106`, prog-if `01` AHCI, two ports ata1/ata2), an AHCI driver
+(`ahci.rs`) is implemented and **structurally verified under QEMU**:
+`AhciController::probe` finds the controller, maps ABAR (BAR5), brings
+port(s) up (spin-up, SATA link reset, `DET`=present, `BSY`/`DRQ` clear),
+and issues IDENTIFY/READ DMA commands with a command list + PRD. QEMU's
+trace confirms it maps the PRD (`dma_prepare_buf limit=512`) and runs the
+transfer. Honest QEMU finding: the DMA read-back in QEMU/KVM lands only
+partial data (identify word 0 `0x0040`) — a QEMU emulated-DMA visibility
+quirk, not a command-list error (the trace shows the transfer is issued).
+Real hardware DMA is coherent; final validation is a boot on the TP201S.
+`BlockIo` is implemented so the object store can sit on a SATA disk.
+
+Wi-Fi (QCA9377 / Intel / Realtek): not implemented — needs proprietary
+firmware, a USB host stack, and a full 802.11/WPA2 stack; QEMU cannot
+emulate Wi-Fi, so it is not verifiable here. Named future work.

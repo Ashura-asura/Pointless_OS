@@ -78,7 +78,9 @@ impl Write for SerialWriter {
 }
 
 /// Print a formatted line to COM1 (appends CRLF) and mirror it to the VGA
-/// text console so the demo is visible on the VM display.
+/// text console and the GOP framebuffer console, so the demo is visible on
+/// the VM display and (on real hardware, where COM1 is unwired) on the
+/// physical screen.
 #[macro_export]
 macro_rules! sprintln {
     ($($arg:tt)*) => {{
@@ -87,5 +89,6 @@ macro_rules! sprintln {
         let _ = w.write_fmt(format_args!($($arg)*));
         let _ = w.write_str("\r\n");
         $crate::vga::vga_fmt_line(format_args!($($arg)*));
+        $crate::gop_console::mirror(format_args!($($arg)*));
     }};
 }

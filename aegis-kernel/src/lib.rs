@@ -22,6 +22,7 @@ pub mod vga;
 pub mod audit;
 pub mod monitor;
 
+pub mod ahci;
 pub mod fat;
 pub mod iommu;
 pub mod nvme;
