@@ -25,6 +25,12 @@ static mut PD: PageTable = PageTable::new();
 static mut PD1: PageTable = PageTable::new();
 static mut PD2: PageTable = PageTable::new();
 static mut PD3: PageTable = PageTable::new();
+// PDs for the 4-7 GiB range, used to map a GOP framebuffer that sits above
+// the first 4 GiB (the loader's base identity map covers only GB0-3).
+static mut PD4: PageTable = PageTable::new();
+static mut PD5: PageTable = PageTable::new();
+static mut PD6: PageTable = PageTable::new();
+static mut PD7: PageTable = PageTable::new();
 
 /// Map a 1 GiB window [gb, gb+1) through pd_table with 2MB huge pages.
 unsafe fn map_1gb(pdpt: *mut PageTable, pd: *mut PageTable, gb: u64) {
@@ -66,6 +72,32 @@ pub unsafe fn setup_identity_mapping() {
         "mov cr3, rax",
         out("rax") _
     );
+}
+
+/// Map one 1 GiB window `[gb, gb+1)` into the identity map with 2 MB pages,
+/// so a device memory range above 4 GiB (e.g. the GOP framebuffer) is
+/// accessible. Only GB4-GB7 have static PD tables here.
+///
+/// # Safety
+/// Call once, before the kernel handoff, while the loader's page tables are
+/// current (a `mov cr3` reload makes it visible).
+pub unsafe fn map_gb(gb: u64) {
+    let pd: *mut PageTable = match gb {
+        4 => &raw mut PD4,
+        5 => &raw mut PD5,
+        6 => &raw mut PD6,
+        7 => &raw mut PD7,
+        _ => return, // only 4-7 GiB statics exist
+    };
+    let pd_ref = pd.as_mut().unwrap();
+    pd_ref.entries = [0; 512];
+    let pdpt = (&raw mut PDPT).as_mut().unwrap();
+    pdpt.entries[gb as usize] = pd as u64 | PRESENT | WRITABLE;
+    for i in 0..512u64 {
+        pd_ref.entries[i as usize] = ((gb << 30) | (i * 0x200000)) | PRESENT | WRITABLE | PAGE_SIZE;
+    }
+    // Reload CR3 so the new PDPT entry is used.
+    asm!("mov rax, cr3", "mov cr3, rax", out("rax") _);
 }
 
 /// Read current CR3 value

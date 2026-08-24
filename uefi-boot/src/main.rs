@@ -157,15 +157,28 @@ fn main() -> Status {
             let gop_config = gop::query();
             match &gop_config {
                 Some(h) => {
+                    // Make the framebuffer visible to the kernel: if it sits
+                    // above 4 GiB, map its 1 GiB window(s) into the identity
+                    // page tables so the on-screen console can blit to it at
+                    // boot entry (the base map covers only GB0-3).
+                    let base = h.framebuffer_base;
+                    let size = h.framebuffer_size;
+                    let start_gb = base >> 30;
+                    let end_gb = ((base + size + 0x3FFF_FFFF) >> 30).min(8);
+                    if start_gb >= 4 && start_gb < 8 {
+                        for gb in start_gb..end_gb.min(8) {
+                            unsafe { page_tables::map_gb(gb) };
+                        }
+                    }
                     // `GopHandoff` is packed; copy fields out before
                     // formatting (no unaligned references).
-                    let (w, hgt, stride, fmt, base, size) = (
+                    let (w, hgt, stride, fmt, _base, _size) = (
                         h.width,
                         h.height,
                         h.stride_px,
                         if h.pixel_format == 1 { "BGRX" } else { "RGBX" },
-                        h.framebuffer_base,
-                        h.framebuffer_size,
+                        base,
+                        size,
                     );
                     sprintln!(
                         "Aegis: GOP: framebuffer {w}x{hgt} stride {stride} fmt {fmt} @ {base:#x} ({size} bytes)"
