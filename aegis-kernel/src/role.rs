@@ -1719,7 +1719,11 @@ mod tests {
             );
             // First confirmation accepted, cap NOT yet minted.
             assert_eq!(confirm_expansion(grantor, pid, 1), 0);
-            assert_eq!(task_cap(agent, 1).cap, Cap::None, "awaiting second confirmer");
+            assert_eq!(
+                task_cap(agent, 1).cap,
+                Cap::None,
+                "awaiting second confirmer"
+            );
             // Distinct second reviewer confirms -> cap mints with CONTROL.
             assert_eq!(confirm_expansion(reviewer2, pid, 1), 0);
             let minted = task_cap(agent, 1);
@@ -2103,8 +2107,7 @@ mod tests {
         unsafe {
             // svc = task 0, other = task 1, grantor = task 2, agent = task 3,
             // reviewer2 = task 4 (a distinct second confirmer for two-party).
-            let (svc, other, grantor, agent, reviewer2) =
-                (0usize, 1usize, 2usize, 3usize, 4usize);
+            let (svc, other, grantor, agent, reviewer2) = (0usize, 1usize, 2usize, 3usize, 4usize);
             spawn("svc", dummy, 0x100000).unwrap();
             spawn("other", dummy, 0x200000).unwrap();
             spawn("grantor", dummy, 0x300000).unwrap();

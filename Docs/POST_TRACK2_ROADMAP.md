@@ -71,10 +71,25 @@ doing once, deliberately, on its own schedule — not bundled with the WSL2 work
    *before* `mkdir -p /proc /sys /dev`, so `proc`/`devtmpfs` mounts silently
    failed and broke `/proc` + `/dev/null` (which in turn failed `procfs` and
    `git`). Fixed and re-baked; see `TRACK2_GUEST_BATTERY.md`.
-3. **Problem 2 — OPEN (Core Isolation off on the Windows host).** The strict
-   `vm.rs`-hosted e1000e path is still blocked by VBS reserving VMX. The QEMU
-   userspace battery already exercises every §3 item; only the `vm.rs` hosting
-   is unproven. Flip Core Isolation off + reboot on its own schedule.
+3. **Problem 2 — software-complete (2026-08-24); hardware step documented.**
+    The `vm.rs`-hosted path was blocked by another VMM reserving VMX (KVM on
+    Linux, VBS/Core Isolation on Windows). This session:
+    - Added a **host-readiness pre-flight** (`vmx.rs`: `vmx_host_readiness`,
+      `VmxReadiness` enum, `readiness_advice`) that reports the exact reason a
+      host cannot own VMX — no more cryptic "VMXON failed". The pure
+      classification is unit-tested (3 tests under `--features vmx-demo`, 825
+      green).
+    - Wired the pre-flight into all three VMX demo entry points (`bringup_demo`,
+      `run_loop_demo`, `guest_boot_demo`) so a boot on a wrong host prints the
+      precise remediation.
+    - Fixed the `INITRD_GPA` layout constant (16 MiB → 32 MiB) that the rebuilt
+      enriched guest image (23 MB kernel) had outgrown, causing a latent
+      `Overlap` error in the demo and its contract test.
+    - Corrected the "no VT-x" doc claims (`vm.rs`, `vmx.rs`) to state the real
+      requirement: VMX ownership, not just silicon presence.
+    - **One hardware/boot step remains**: boot Aegis as the VMX owner (Core
+      Isolation off, KVM unloaded) on a real host. See `Docs/VMX_LIVE_HOSTING.md`
+      for the exact steps, build instructions, and what to expect on serial.
 4. **Battery contract tests — QEMU part DONE** (11/11, evidence committed).
    The `vm.rs`-hosted run remains pending Problem 2; when it lands, commit those
    serial logs too and wire `battery-contract.py` into CI (it exits non-zero on
@@ -215,3 +230,48 @@ in the guest (Track 2), and the guest/host boundary is explicit and policy-
 scoped (this session's `DevicePolicy`), with two clearly-named larger
 isolation upgrades queued as their own future phases rather than quietly
 folded in.
+
+## Status summary (2026-08-24)
+
+- **Phase E #1 — DONE, pushed `61fe128` (main, over SSH).** Auto-train anomaly
+  monitor without false suspension: `AnomalyMonitor` gained a `warmup: u32` field
+  and `pub const WARMUP_OBSERVATIONS: u32 = 4` (`monitor.rs`); first
+  `WARMUP_OBSERVATIONS` `observe()` calls re-baseline via new `rebaseline()`
+  instead of suspending, then the profile locks. `role_monitor_train` is wired
+  into `role_grant` (`role.rs:1883`), making the §9.5 suspend-don't-revoke
+  circuit breaker live in the production grant flow. Three monitor tests updated
+  to exhaust the warmup with normal behavior before the anomalous op
+  (`significant_deviation_auto_suspends_without_revoking`,
+  `suspension_is_reversible_logged_and_never_silent`,
+  `supervisor_role_anomaly_suspends_on_rapid_restarts` — rapid loop extended
+  `0..5`→`0..8`). `cargo test` in `aegis-kernel`: 819 passed, 0 failed.
+  `POST_TRACK2_ROADMAP.md` Phase E #1 marked closed; §9.5 limit (b) resolved.
+
+- **All non-hardware, non-architectural phases complete:**
+  - Phase A Problem 1 (guest battery, Linux): DONE `6bdff67`
+  - CI workflow: DONE `100d771`
+  - Phase E #2 (two-party CONTROL): DONE `794a20a`
+  - Phase D (adversarial two-party test): DONE `3a06471`
+  - Phase E #1 (monitor warmup): DONE `61fe128`
+
+- **Still open:**
+  - Phase A Problem 2 (`vm.rs` live hosting under Aegis bare-metal hypervisor):
+    **software-complete 2026-08-24** — host-readiness pre-flight wired into all
+    VMX demo entries, `INITRD_GPA` layout fix, honest docs. The **one remaining
+    step is a boot/hardware action** on a VMX-owner host (Core Isolation off /
+    KVM unloaded); see `Docs/VMX_LIVE_HOSTING.md`. Not doable in-session.
+  - Phase B (Track 3: Windows guest, fuller distro, broader device model): large
+    multi-day feature, deferred, not started (must not be faked).
+  - Phase C (Genode: separate VMM component + IOMMU DMA confinement):
+    architectural research candidates, deferred, not started.
+
+- **Notes:** git identity set locally in the Default Project repo
+  (`user.email=asura27@pointless.os`, `user.name=asura27`). Remote switched from
+  https to `git@github.com:Ashura-asura/Pointless_OS.git` (https push had no
+  credentials); SSH key `asura27@kali-pointless` added to GitHub. That key
+  remains on GitHub (user will delete manually; token has `keys=read` only,
+  cannot delete via API).
+
+- **Next move:** all non-hardware/non-architectural phases done. Ask the user
+  whether to (a) start a scoped Track 3 spike (e.g. add one virtio device to
+  `aegis-kernel/src/vdev.rs`), (b) start a Genode research spike, or (c) stop.

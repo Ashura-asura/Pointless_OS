@@ -22,9 +22,15 @@
 //! capability gate, I/O dispatch, virtual-time accounting. The
 //! hardware-gated half (real VMX entry with this boot state loaded into a
 //! VMCS, real exit-reason 30/1 handling) lives in `vmx.rs` + `main.rs`
-//! behind the `vmx-demo` feature; this machine has no VT-x
-//! (`VirtualizationFirmwareEnabled` is false), so live verification is
-//! pending hardware, exactly like Phase K. Timekeeping is honest but
+//! behind the `vmx-demo` feature; live verification requires a host that
+//! OWNS VMX — Aegis booted as the host OS with VT-x present and no other
+//! hypervisor holding it (KVM / Core Isolation off). The pre-flight in
+//! `vmx.rs` (`vmx_host_readiness`) reports exactly why a given host cannot
+//! host a guest; see `Docs/VMX_LIVE_HOSTING.md`. On this session's host
+//! `/proc/cpuinfo` reports VT-x, but Aegis runs under another hypervisor and
+//! the in-process CPUID probe sees the VMX bit clear (sandbox-masked), so the
+//! host half is exercised by contract tests and the pre-flight, not by a
+//! live launch. Timekeeping is honest but
 //! coarse: one host tick = one virtual second for the CMOS RTC, and the
 //! virtual PIT advances by a fixed host-tick rate (`host_hz`, a run-loop
 //! parameter) — no wall-clock drift correction (a later refinement).
@@ -54,8 +60,10 @@ pub const GUEST_STACK_TOP: u64 = 0x9F000;
 pub const RAM_TOP: u64 = 0x9FC00;
 /// 32-bit protected-mode entry point (`code32_start`).
 pub const CODE32_GPA: u64 = 0x100000;
-/// Initrd load address (16 MiB — safely above the kernel, inside RAM).
-pub const INITRD_GPA: u64 = 0x100_0000;
+/// Initrd load address (32 MiB — safely above the current 23 MB guest
+/// kernel image, inside RAM). Raised from 16 MiB when the enriched guest
+/// kernel outgrew the old window (Phase A Problem 2 layout fix).
+pub const INITRD_GPA: u64 = 0x200_0000;
 
 /// The 8254 PIT input clock (1.19318 MHz).
 pub const PIT_CLOCK_HZ: u64 = 1_193_180;
@@ -753,9 +761,9 @@ mod tests {
         ])
     }
 
-    /// 32 MiB grant at 0 (the kernel's own RAM convention).
+    /// 64 MiB grant at 0 (the kernel's own RAM convention).
     fn grant() -> MemGrant {
-        MemGrant::new(0, 8192)
+        MemGrant::new(0, 16384)
     }
 
     /// A heap page that is *really* 4 KiB aligned (see the identical arena
@@ -864,16 +872,17 @@ mod tests {
     #[test]
     fn build_rejects_overlapping_and_oversized_layouts() {
         let g = grant();
-        // Kernel that would run into the initrd slot.
-        let big = fake_image(0x100_0000);
+        // Kernel that would run into the initrd slot (initrd now at 32 MiB,
+        // so the offending kernel must exceed that window).
+        let big = fake_image(0x200_0000);
         assert_eq!(
             GuestBoot::build(&g, &big, Some(&[0u8; 4]), "x"),
             Err(VmError::Overlap)
         );
-        // Initrd that does not fit the grant (grant ends at 32 MiB).
+        // Initrd that does not fit the grant (grant ends at 64 MiB).
         let img = fake_image(4096);
         assert_eq!(
-            GuestBoot::build(&g, &img, Some(&[0u8; 0x100_0000 + 1]), "x"),
+            GuestBoot::build(&g, &img, Some(&[0u8; 0x200_0000 + 1]), "x"),
             Err(VmError::ImageTooBig)
         );
         // Command line that would overlap the EBDA region.
@@ -900,7 +909,7 @@ mod tests {
         assert_eq!(boot.initrd_len, 16);
         assert_eq!(boot.cmdline_gpa, CMDLINE_GPA);
         assert_eq!(boot.zero_page_gpa, ZERO_PAGE_GPA);
-        assert_eq!(boot.ram_end_gpa, 0x200_0000);
+        assert_eq!(boot.ram_end_gpa, 0x400_0000);
     }
 
     // ---- boot-parameter encoding ------------------------------------------
@@ -908,7 +917,7 @@ mod tests {
     #[test]
     fn write_all_encodes_boot_protocol_fields() {
         let img = fake_image(4096);
-        let mut mem = FakeMem::new(0x200_0000);
+        let mut mem = FakeMem::new(0x400_0000);
         let boot = GuestBoot::build(&grant(), &img, Some(&[0xAB; 16]), "console=ttyS0").unwrap();
         boot.write_all(&mut mem, &img, Some(&[0xAB; 16]), "console=ttyS0")
             .unwrap();
@@ -960,9 +969,9 @@ mod tests {
         assert_eq!(u64_at(&mem, e820 + 40), 0xA0000);
         assert_eq!(u64_at(&mem, e820 + 48), 0x60000);
         assert_eq!(u32_at(&mem, e820 + 56), 2);
-        // Entry 3: RAM to the end of the grant (32 MiB).
+        // Entry 3: RAM to the end of the grant (64 MiB).
         assert_eq!(u64_at(&mem, e820 + 60), 0x100000);
-        assert_eq!(u64_at(&mem, e820 + 68), 0x200_0000 - 0x100000);
+        assert_eq!(u64_at(&mem, e820 + 68), 0x400_0000 - 0x100000);
         assert_eq!(u32_at(&mem, e820 + 76), 1);
     }
 
@@ -1068,8 +1077,8 @@ mod tests {
         let img = fake_image(4096);
         let mut store = MemStore::new(64);
         let devices = DeviceSet::new(&mut store, 1_700_000_000, crate::vdev::DevicePolicy::all());
-        // Host RAM: a 32 MiB buffer standing in for the kernel's RAM.
-        let (_backing, host_base) = aligned_ram(0x200_0000);
+        // Host RAM: a 64 MiB buffer standing in for the kernel's RAM.
+        let (_backing, host_base) = aligned_ram(0x400_0000);
         let mut vm = Vm::new(0, grant(), devices, host_base, 62);
         assert_eq!(vm.state, VmState::Created);
         let mut alloc = TestAlloc::new();
