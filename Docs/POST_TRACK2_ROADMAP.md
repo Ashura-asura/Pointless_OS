@@ -147,6 +147,19 @@ tasks*, not finishing the mechanism.)
   irreversible actions, not just `WRITE`.
 - Each role ships with adversarial tests in the same commit (self-grant,
   foreign-target, expansion-without-confirmation, expired-grant-reuse).
+- **Adversarial coverage added (2026-08-24):** `object_editor_control_
+  expansion_requires_two_party` proves the per-role regression + the Phase E
+  #2 two-party gate on the object path (`ROLE_OBJECT_EDITOR` CONTROL expansion
+  needs two distinct confirmers). The `object_reader` self-escalation tests
+  already cover self-grant / foreign-target / expired-reuse.
+
+**Status (2026-08-24):** the *mechanism* Task 2 needs (two-party on a
+`CONTROL`/irreversible expansion) is now implemented and test-proven. The
+specific Task 2 *role* ("propose a named edit; do not apply without
+confirmation" with distinct `propose`/`apply` capabilities) still requires the
+editor `propose`/`apply` syscall plumbing (a new capability action in the
+object-store/editor path), which is a larger feature addition — deferred to a
+follow-up rather than shipped half-built.
 
 **Goal:** move §9.5 from "reduced" toward "closed" against a real irreversible
 action, and add new real-task roles.

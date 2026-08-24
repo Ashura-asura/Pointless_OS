@@ -1675,6 +1675,54 @@ mod tests {
         }
     }
 
+    /// Phase D adversarial (per-role regression) + Phase E #2 proof on the
+    /// object path: `ROLE_OBJECT_EDITOR` is an irreversible (WRITE/CONTROL)
+    /// role, so a scope expansion requesting `CONTROL` over a foreign subtree
+    /// now trips the two-party gate. One confirmation is accepted but the cap
+    /// is NOT minted until a distinct second reviewer also confirms — the
+    /// same bar the Task-shaped restart role already satisfies.
+    #[test]
+    fn object_editor_control_expansion_requires_two_party() {
+        let _g = crate::kernel_state_guard();
+        clean_world();
+        unsafe {
+            let (grantor, agent, reviewer2) = (1usize, 2usize, 3usize);
+            spawn("grantor", dummy, 0x200000).unwrap();
+            spawn("agent", dummy, 0x300000).unwrap();
+            spawn("reviewer2", dummy, 0x400000).unwrap();
+            // Two distinct human reviewers, each holding ObjectRoot.
+            for r in [grantor, reviewer2] {
+                set_task_cap(
+                    r,
+                    0,
+                    CapSlot {
+                        cap: Cap::ObjectRoot,
+                        rights: OBJECT_ROOT_RIGHTS,
+                    },
+                );
+            }
+            set_current_for_test(grantor);
+            assert_eq!(role_grant(ROLE_OBJECT_EDITOR as u64, agent as u64, 1, 0), 0);
+            set_current_for_test(agent);
+            // A CONTROL expansion to a foreign subtree is high_risk (Phase E #2).
+            let pid = request_expansion(
+                agent,
+                2,
+                Rights::WRITE.union(Rights::CONTROL),
+                ExpansionKind::Object,
+            );
+            // First confirmation accepted, cap NOT yet minted.
+            assert_eq!(confirm_expansion(grantor, pid, 1), 0);
+            assert_eq!(task_cap(agent, 1).cap, Cap::None, "awaiting second confirmer");
+            // Distinct second reviewer confirms -> cap mints with CONTROL.
+            assert_eq!(confirm_expansion(reviewer2, pid, 1), 0);
+            let minted = task_cap(agent, 1);
+            assert_eq!(minted.cap, Cap::Object(crate::cap::Oid::new(2, 0)));
+            assert!(minted.rights.contains(Rights::CONTROL));
+            assert!(minted.rights.contains(Rights::WRITE));
+        }
+    }
+
     /// Mechanism 2 (§9.2): an ephemeral grant lapses after GRANT_TTL and reuse
     /// is denied at the gate (Expired), with the denial audited.
     #[test]
