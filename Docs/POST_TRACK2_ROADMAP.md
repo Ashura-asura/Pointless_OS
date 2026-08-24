@@ -25,23 +25,57 @@ honestly per Ground Rule 6.*
 | VMM TCB separation (microhypervisor) | inherent-later | not adopted; flagged below |
 | IOMMU DMA confinement | inherent-later | not adopted; flagged below |
 
-## Phase A — finish Track 2 the moment the env allows (closure of existing gaps)
+## Phase A — finish Track 2 (the environment gate is *two* problems, not one)
 
-Reachable *as code now*, live-run only on a Linux + VT-x box:
+The earlier one-line gate ("a Linux + VT-x box") conflated two independent
+blockers. They have different causes, different fixes, and different schedules
+— separating them is what actually unblocks the plan:
 
-1. Guest `/init` fixes (no behavioral risk, pure userspace): mount `proc`+`sys`,
-   `mdev -s`/`devtmpfs` population, `setsid` + `TIOCSCTTY` the shell for real
-   job control. Closes the `/proc`, `/dev`, and job-control PARTIAL rows in
-   `TRACK2_GUEST_BATTERY.md`.
-2. Rebuild guest with `python3`/`git`/`vim`/`nano`/`gcc`/`make` and
-   `CONFIG_NET=y` + `e1000e` (the §3 DoD's clone-over-network path).
-3. Run the battery contract tests (shell→python3→git→vim/nano→gcc/make) and
-   commit the serial logs as evidence (Ground Rule 7).
-4. Wire each contract test into the CI battery so the gaps are regression-gated.
+**Problem 1 — rebuilding the guest image** (kernel + initramfs +
+`python3`/`git`/`vim`/`nano`/`gcc`/`make` + `CONFIG_NET=y` + `e1000e`) needs a
+Linux *build* environment. This does **not** require Aegis's own hypervisor to
+have VT-x — it is just cross-compiling a kernel and BusyBox userland.
+**WSL2 solves this today, on this machine, with no VT-x dependency**: WSL2 runs
+through Hyper-V, a separate virtualization path from the raw VMX access
+`vm.rs` needs, and is a one-command install (`wsl --install`) if not already
+present. Use WSL2 purely as a Linux build host: run `guest/build-guest.sh`
+there, produce `bzImage` + `initramfs.cpio.gz` (with the battery binaries
+added — see the KNOWN GATE note in that script), and hand that image to
+`vm.rs` to boot. The build step and the hosting step do **not** share the same
+blocker, so Problem 1 can close independently, today.
+
+**Problem 2 — live-hosting the rebuilt guest under `vm.rs`** needs real VT-x,
+and that is the one still blocked by Windows Memory Integrity / VBS reserving
+VMX (confirmed by the earlier hardware-evidence work, `vtx-status.txt`). This
+is a separate, reversible, one-setting change: Windows Security → Device
+Security → Core Isolation → **off**, then reboot. Per the earlier
+hardware-evidence prompt this is the same low-risk category as the USB canary
+boot: a real, bounded, reversible interruption, not a standing cost. Worth
+doing once, deliberately, on its own schedule — not bundled with the WSL2 work.
+
+**Concrete steps:**
+
+1. *(done as code, committed `9e34e1a`)* Guest `/init` fixes (mount `proc`+`sys`,
+   `mdev -s`, `setsid`+controlling-tty for real job control) and the
+   `battery-contract.py` CI harness. Closes the `/proc`/`/dev`/job-control
+   PARTIAL rows at script level.
+2. **Close Problem 1 via WSL2** (can happen today, independent of everything
+   else): build the enriched guest image there. This directly produces the
+   artifact step 4 needs.
+3. **Decide on Problem 2** (Core Isolation off) on its own schedule — the one
+   action that turns Phase A from "blocked" to "runnable" for live hosting.
+4. **Once both are done**, run the battery contract tests under `vm.rs`
+   hosting (shell→python3→git→vim/nano→gcc/make), commit the serial logs as
+   evidence (Ground Rule 7), and wire each test into CI. **No changes needed
+   here** — this part of the plan was already correct.
 
 **DoD (Track 2):** `git` and `python3` both run real, non-trivial ops inside
 the guest; each closed gap named + contract-tested. (Carried verbatim from
 `AEGIS_USEFUL_PROMPT.md` §3.)
+
+*Phases B–E below are unchanged by this split — only the one dependency
+standing between "the plan is written" and "the plan can actually run" is
+resolved here.*
 
 ## Phase B — Track 3 stays deferred (per prompt §3.2 gate, NOT started)
 
