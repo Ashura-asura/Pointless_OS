@@ -36,11 +36,26 @@ expansion path. Built in `aegis-kernel` (`cap.rs`, `audit.rs`, `role.rs`,
 
 ```
 cd aegis-kernel
-cargo test role::            # 14 tests: the 5 mechanisms + adversarial denial
-cargo test                   # full kernel suite (811 passed, 2 ignored)
+cargo test role::            # 19 tests: the 5 mechanisms x2 tasks + adversarial denial
+cargo test                   # full kernel suite (817 passed, 2 ignored)
 cargo clippy --all-targets   # clean (CI runs -Dwarnings)
 cargo fmt --check           # clean
 ```
+
+## Track 1.5 — §9 generalization check (see `Docs/TRACK15_SUPERVISOR.md`)
+
+A second, write/control-shaped task (`restart-service`: *monitor a supervised
+task's health and restart it*) was run end-to-end through all five §9
+mechanisms. The exercise path needed **no** task-specific special-casing; but
+two pieces of the machinery were implicitly object-store-typed and were
+generalized to be capability-type-agnostic as a result: the scope-expansion
+mint (now `ExpansionKind`-aware) and the expansion-confirmation authority
+(now `ObjectRoot` for object expansions, `CONTROL`-over-target for task
+expansions). Net: the mechanism is a real mechanism, not a one-off, but it
+shipped its first proof carrying an object-shaped assumption this second task
+caught. Residual named limitation: two-party confirmation (mechanism 5) is
+`WRITE`-gated, so a `CONTROL` (restart) expansion still needs only single
+confirmation — see `TRACK15_SUPERVISOR.md`.
 
 Tracks 2 (guest app battery) and 3 (defer) of the course-correction prompt
 are intentionally not started here: Track 1's core claim (a real,

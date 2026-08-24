@@ -492,6 +492,127 @@ pub fn objstore_subtree_summary(
     }
 }
 
+/// §9.3 (mechanism 3): what kind of capability a pending scope-expansion
+/// mints once confirmed. Track 1's first real task was object-store-shaped
+/// (`Object`), so the expansion path was originally written `Object`-only;
+/// Track 1.5 generalizes it to any role-shaped capability the kernel mints
+/// through `role_grant` — `Task` is the second shape (the restart/control
+/// role), proving the §9 mechanism is not overfit to the object-store task.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ExpansionKind {
+    /// Mint `Cap::Object(index)` — Track 1's read/apply subtree task.
+    Object,
+    /// Mint `Cap::Task(index)` with the live generation — Track 1.5's
+    /// monitor/restart task. The generation is taken at mint time so a stale
+    /// index never re-targets a replacement occupant (same generation-safety
+    /// discipline as `role_grant`).
+    Task,
+}
+
+/// §9.1 + §9.2 + §9.4 (the second real task, Track 1.5 — end-to-end):
+/// *monitor a supervised task's health and restart it* using the granted
+/// `restart-service` capability at `(task, slot)`. This is the deliberately
+/// write/control-shaped task the first real task (`object-subtree-reader`) was
+/// NOT: it kills and respawns a task, so it exercises mechanism 5 (anomaly
+/// suspension on a control-shaped op) for real. The capability gate is enforced
+/// here — the agent cannot restart a task it was not granted. Every outcome
+/// (success and refusal alike) is recorded as a `RoleExercise`/`RoleExpand`
+/// audit entry, exactly like `objstore_subtree_summary`, so "what did this
+/// agent do with what it was given" is answerable for control ops too.
+///
+/// `target` is the task the agent wants to (re)start. A cap naming a *different*
+/// task is a scope expansion → `ExpansionRequired` (mechanism 3), never a silent
+/// allow; missing rights or a lapsed (ephemeral) grant are refused; a suspended
+/// agent is denied outright (mechanism 5). On success the target is actually
+/// respawned against its remembered entry point (the granted capability is
+/// exercised for real), the op is audited, and the anomaly monitor observes the
+/// agent's role usage — a significant deviation from its trained op-shape
+/// suspends it on the next pass (suspend-don't-revoke).
+pub fn supervise_restart(task: usize, slot: usize, target: usize) -> Result<(), DelegationError> {
+    // §9.5: a suspended agent's role exercise is denied outright. Its already-
+    // minted capabilities keep working, but the grant ledger freezes new
+    // delegation, so there is nothing more it can do under the role until a
+    // human resumes it.
+    if role_monitor_suspended(task) {
+        return Err(DelegationError::Suspended);
+    }
+    // The restart action needs CONTROL over the named task.
+    match resolve_task_cap(task, slot, target, Rights::CONTROL) {
+        Ok(()) => {
+            // Exercise the granted capability for real: respawn the target
+            // against its remembered entry point. Requires the target to be a
+            // Zombie (dead) first — the same contract `supervisor::task_restart`
+            // enforces — so a granted restart never resurrects a live task.
+            crate::tasks::restart_task(target);
+            audit::record(task, audit::OpKind::RoleExercise, Some(target as u32), true);
+            // Observe the agent's role usage through the anomaly monitor so a
+            // significant deviation from its trained shape suspends it on the
+            // next pass (suspend-don't-revoke — this op already happened).
+            let _ = role_monitor_observe(task);
+            Ok(())
+        }
+        Err(DelegationError::ExpansionRequired) => {
+            // Scope expansion must be confirmed; the blocked request is on the
+            // record (mechanism 3's denied path).
+            audit::record(task, audit::OpKind::RoleExpand, Some(target as u32), false);
+            Err(DelegationError::ExpansionRequired)
+        }
+        Err(e) => {
+            audit::record(
+                task,
+                audit::OpKind::RoleExercise,
+                Some(target as u32),
+                false,
+            );
+            Err(e)
+        }
+    }
+}
+
+/// §9.1 + §9.2 + §9.4: resolve and authorize a task capability at
+/// `(task, slot)` for `target` with needed `rights`, enforcing (a) the cap
+/// actually names `target` (scope), (b) it carries `rights`, (c) its generation
+/// still matches the live task (a stale cap minted against a previous occupant
+/// of `target`'s index is refused), and (d) it has not lapsed (ephemeral).
+/// Returns `ExpansionRequired` when the cap names a *different* task — that is
+/// the signal for the diff-confirmation path, not a silent allow. This is the
+/// Task-shaped twin of `resolve_object_cap`; the two together prove the §9
+/// resolution path is capability-type-agnostic, not object-store-specific.
+fn resolve_task_cap(
+    task: usize,
+    slot: usize,
+    target: usize,
+    need: Rights,
+) -> Result<(), DelegationError> {
+    if task >= MAX_TASKS || slot >= MAX_CAPS {
+        return Err(DelegationError::NoCapability);
+    }
+    match task_cap(task, slot).cap {
+        Cap::Task(o) => {
+            if o.index as usize != target {
+                // Different task than the one granted: a scope expansion.
+                return Err(DelegationError::ExpansionRequired);
+            }
+            // Generation mismatch: the cap was minted against a prior occupant
+            // of `target`'s slot (or the task was reaped and respawned under a
+            // new identity). It no longer authorizes the live task — refuse
+            // closed, never re-target.
+            if crate::tasks::task_generation(target) != o.generation {
+                return Err(DelegationError::InsufficientRights);
+            }
+            let cs = task_cap(task, slot);
+            if !cs.rights.contains(need) {
+                return Err(DelegationError::InsufficientRights);
+            }
+            if !grant_valid(task, slot) {
+                return Err(DelegationError::Expired);
+            }
+            Ok(())
+        }
+        _ => Err(DelegationError::NoCapability),
+    }
+}
+
 /// §9.3 (mechanism 3): a pending scope-expansion request. Nothing is minted
 /// until `confirm_expansion` succeeds. `high_risk` marks WRITE/apply-style
 /// expansions, which additionally require two-party confirmation (mechanism 5).
@@ -502,6 +623,7 @@ struct PendingExpand {
     root: u32,
     need: Rights,
     high_risk: bool,
+    kind: ExpansionKind,
     confirmers: [Option<usize>; 2],
 }
 
@@ -516,13 +638,14 @@ fn pending_mut() -> &'static mut [Option<PendingExpand>; MAX_PENDING] {
     unsafe { &mut *core::ptr::addr_of_mut!(PENDING) }
 }
 
-/// §9.3: an agent asks to expand its authority to `root` with `need`. Returns a
-/// pending id; the request is recorded as a blocked `RoleExpand` and nothing is
-/// minted. The "diff" shown to the human is exactly this addition
-/// (`Cap::Object(root)` with `need`), not the agent's whole accumulated set.
-/// A `need` containing `WRITE` is flagged `high_risk` (the irreversible
-/// "apply" action) and will require a second, distinct confirmer.
-pub fn request_expansion(task: usize, root: u32, need: Rights) -> u64 {
+/// §9.3: an agent asks to expand its authority to `root` with `need`, of the
+/// capability `kind` the role-shaped grant would mint. Returns a pending id;
+/// the request is recorded as a blocked `RoleExpand` and nothing is minted. The
+/// "diff" shown to the human is exactly this addition
+/// (`Cap::Object(root)`/`Cap::Task(root)` with `need`), not the agent's whole
+/// accumulated set. A `need` containing `WRITE` is flagged `high_risk` (the
+/// irreversible "apply" action) and will require a second, distinct confirmer.
+pub fn request_expansion(task: usize, root: u32, need: Rights, kind: ExpansionKind) -> u64 {
     let high_risk = need.contains(Rights::WRITE);
     let id = unsafe {
         let seq = core::ptr::read(core::ptr::addr_of_mut!(PENDING_SEQ));
@@ -536,6 +659,7 @@ pub fn request_expansion(task: usize, root: u32, need: Rights) -> u64 {
                 root,
                 need,
                 high_risk,
+                kind,
                 confirmers: [None, None],
             });
         }
@@ -554,18 +678,50 @@ pub fn request_expansion(task: usize, root: u32, need: Rights) -> u64 {
 /// On success the capability is minted at `dst_slot` on the requester with an
 /// ephemeral expiry, and a `RoleExpand` success is recorded.
 pub fn confirm_expansion(confirm: usize, pending_id: u64, dst_slot: usize) -> i64 {
-    let authorized = (0..MAX_CAPS).any(|s| match task_cap(confirm, s) {
-        CapSlot {
-            cap: Cap::ObjectRoot,
-            rights,
-        } => rights.contains(OBJECT_ROOT_RIGHTS),
-        _ => false,
-    });
+    // The authorization bar must match the capability the expansion mints —
+    // this is what generalizes mechanism 3/5 beyond the object-store task.
+    // Object-scoped expansions still require the policy singleton
+    // `Cap::ObjectRoot` (the human reviewer / boot policy); task-scoped
+    // expansions (Track 1.5's restart role) require a `Cap::Task` over the
+    // *target* carrying CONTROL — exactly the same bar the grantor gate uses
+    // for the Task-shaped roles. A reviewer with no standing over the target
+    // is refused, whether the expansion is object- or task-shaped.
+    let mut kind_target: Option<(ExpansionKind, u32)> = None;
+    {
+        let pm = pending_mut();
+        for p in pm.iter().flatten() {
+            if p.id == pending_id {
+                kind_target = Some((p.kind, p.root));
+                break;
+            }
+        }
+    }
+    let authorized = match kind_target {
+        Some((ExpansionKind::Object, _)) => (0..MAX_CAPS).any(|s| match task_cap(confirm, s) {
+            CapSlot {
+                cap: Cap::ObjectRoot,
+                rights,
+            } => rights.contains(OBJECT_ROOT_RIGHTS),
+            _ => false,
+        }),
+        Some((ExpansionKind::Task, target)) => (0..MAX_CAPS).any(|s| match task_cap(confirm, s) {
+            CapSlot {
+                cap: Cap::Task(o),
+                rights,
+            } => {
+                o.index as usize == target as usize
+                    && crate::tasks::task_generation(target as usize) == o.generation
+                    && rights.contains(Rights::CONTROL)
+            }
+            _ => false,
+        }),
+        None => false,
+    };
     if !authorized {
         audit::record(confirm, audit::OpKind::RoleExpand, None, false);
         return -1;
     }
-    let mut mint: Option<(usize, u32, Rights)> = None;
+    let mut mint: Option<(usize, u32, Rights, ExpansionKind)> = None;
     let pm = pending_mut();
     for slot in pm.iter_mut() {
         if let Some(p) = slot {
@@ -589,26 +745,31 @@ pub fn confirm_expansion(confirm: usize, pending_id: u64, dst_slot: usize) -> i6
                     return 0;
                 }
             }
-            mint = Some((p.task, p.root, p.need));
+            mint = Some((p.task, p.root, p.need, p.kind));
             *slot = None;
             break;
         }
     }
-    let Some((task, root, need)) = mint else {
+    let Some((task, root, need, kind)) = mint else {
         audit::record(confirm, audit::OpKind::RoleExpand, None, false);
         return -1;
     };
     if dst_slot >= MAX_CAPS {
         return -1;
     }
-    set_task_cap(
-        task,
-        dst_slot,
-        CapSlot {
-            cap: Cap::Object(crate::cap::Oid::new(root, 0)),
-            rights: need,
-        },
-    );
+    // Mint the capability kind the expansion was requested for. Object-scoped
+    // grants mint `Cap::Object`; Task-scoped grants (Track 1.5's restart role)
+    // mint `Cap::Task` with the *live* generation so a stale index never
+    // re-targets a replacement occupant — the same generation-safety discipline
+    // `role_grant` itself uses for the Task-shaped roles.
+    let cap = match kind {
+        ExpansionKind::Object => Cap::Object(crate::cap::Oid::new(root, 0)),
+        ExpansionKind::Task => Cap::Task(crate::cap::Oid::new(
+            root,
+            crate::tasks::task_generation(root as usize),
+        )),
+    };
+    set_task_cap(task, dst_slot, CapSlot { cap, rights: need });
     set_grant_expiry(task, dst_slot, audit::tick() + GRANT_TTL);
     audit::record(confirm, audit::OpKind::RoleExpand, Some(root), true);
     0
@@ -744,7 +905,7 @@ pub fn demo_track1() {
 
     // Scope expansion: agent asks for subtree 2 (blocked until confirmed).
     crate::sprintln!("Aegis: Track1: agent requests expansion to subtree 2 (must block)");
-    let pid = request_expansion(agent, 2, Rights::READ);
+    let pid = request_expansion(agent, 2, Rights::READ, ExpansionKind::Object);
     match objstore_subtree_summary(agent, 0, 2, 0, &store) {
         Err(DelegationError::ExpansionRequired) => {
             crate::sprintln!("Aegis: Track1: expansion blocked (no cap until confirmation)")
@@ -761,6 +922,84 @@ pub fn demo_track1() {
 
     // Audit answers "what did the agent do?" after the fact.
     crate::sprintln!("Aegis: Track1: audit trail (kernel truth):");
+    crate::audit::dump_agent_flow(agent);
+}
+
+/// Boot-log demo for Track 1.5 (§9 generalization check): the second real
+/// task — *monitor a supervised task's health and restart it* — end-to-end
+/// through a role-shaped, ephemeral, audited grant, with an out-of-scope
+/// restart blocked as a scope expansion until confirmed, and the anomaly
+/// monitor wired to the (control-shaped) role usage. Exactly the prompt's
+/// Verify scenario for the second task. Exercised by `track15_boot_demo`.
+#[cfg(test)]
+pub fn demo_track15() {
+    crate::audit::reset_for_test();
+    crate::tasks::reset_table_for_test();
+    for i in 0..MAX_TASKS {
+        for s in 0..MAX_CAPS {
+            crate::tasks::set_task_cap(i, s, CapSlot::empty());
+        }
+    }
+    let (svc, other, grantor, agent) = (0usize, 1usize, 2usize, 3usize);
+    unsafe {
+        crate::tasks::spawn("svc", demo_dummy, 0x100000).unwrap();
+        crate::tasks::spawn("other", demo_dummy, 0x200000).unwrap();
+        crate::tasks::spawn("grantor", demo_dummy, 0x300000).unwrap();
+        crate::tasks::spawn("agent", demo_dummy, 0x400000).unwrap();
+    }
+    // Grantor holds READ|CONTROL over svc (to grant the role) and CONTROL over
+    // `other` (to confirm the later expansion to it).
+    crate::tasks::set_task_cap(
+        grantor,
+        0,
+        CapSlot {
+            cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
+            rights: Rights::READ.union(Rights::CONTROL),
+        },
+    );
+    crate::tasks::set_task_cap(
+        grantor,
+        1,
+        CapSlot {
+            cap: Cap::Task(crate::cap::Oid::new(other as u32, 0)),
+            rights: Rights::CONTROL,
+        },
+    );
+    crate::tasks::set_current_for_test(grantor);
+    crate::sprintln!("Aegis: Track1.5: granting restart-service to agent (role-shaped, ephemeral)");
+    let _ = role_grant(ROLE_RESTART_SERVICE as u64, agent as u64, svc as u64, 0);
+
+    crate::tasks::set_current_for_test(agent);
+    // Real exercise: the agent monitors health, kills, and restarts svc.
+    crate::sprintln!("Aegis: Track1.5: agent monitors svc (READ) and restarts it (CONTROL)");
+    crate::supervisor::task_kill(svc as u64);
+    match supervise_restart(agent, 0, svc) {
+        Ok(()) => crate::sprintln!("Aegis: Track1.5: agent restarted svc for real"),
+        Err(e) => crate::sprintln!("Aegis: Track1.5: restart refused: {e:?}"),
+    }
+
+    // Out-of-scope restart: cap names svc, agent asks to restart `other`.
+    crate::sprintln!("Aegis: Track1.5: agent requests restart of other (must block)");
+    crate::supervisor::task_kill(other as u64);
+    match supervise_restart(agent, 0, other) {
+        Err(DelegationError::ExpansionRequired) => {
+            crate::sprintln!(
+                "Aegis: Track1.5: out-of-scope restart blocked (no cap until confirmation)"
+            )
+        }
+        _ => crate::sprintln!("Aegis: Track1.5: ERROR: out-of-scope restart was not blocked"),
+    }
+    // Reviewer (holding CONTROL over `other`) confirms.
+    crate::sprintln!("Aegis: Track1.5: reviewer confirms expansion to other");
+    let pid = request_expansion(agent, other as u32, Rights::CONTROL, ExpansionKind::Task);
+    let _ = confirm_expansion(grantor, pid, 1);
+    match supervise_restart(agent, 1, other) {
+        Ok(()) => crate::sprintln!("Aegis: Track1.5: expanded cap now restarts other"),
+        Err(e) => crate::sprintln!("Aegis: Track1.5: ERROR: expanded cap refused: {e:?}"),
+    }
+
+    // Audit answers "what did the agent do?" after the fact.
+    crate::sprintln!("Aegis: Track1.5: audit trail (kernel truth):");
     crate::audit::dump_agent_flow(agent);
 }
 
@@ -1495,7 +1734,7 @@ mod tests {
             // Path A: inside granted scope (root 1) — no prompt needed.
             assert!(objstore_subtree_summary(agent, 0, 1, 0, &store).is_ok());
             // Path B: request expansion to root 2 — blocked until confirmed.
-            let pid = request_expansion(agent, 2, Rights::READ);
+            let pid = request_expansion(agent, 2, Rights::READ, ExpansionKind::Object);
             assert_eq!(
                 objstore_subtree_summary(agent, 0, 2, 0, &store),
                 Err(DelegationError::ExpansionRequired),
@@ -1543,7 +1782,12 @@ mod tests {
                 },
             );
             // Agent requests the high-risk (WRITE/apply) expansion to root 2.
-            let pid = request_expansion(agent, 2, Rights::READ.union(Rights::WRITE));
+            let pid = request_expansion(
+                agent,
+                2,
+                Rights::READ.union(Rights::WRITE),
+                ExpansionKind::Object,
+            );
             // First reviewer confirms: accepted but awaiting second party.
             assert_eq!(confirm_expansion(reviewer_a, pid, 1), 0);
             // Same party confirming again is refused (no self-two-party).
@@ -1676,5 +1920,264 @@ mod tests {
         crate::role::demo_track1();
         // After the demo: the agent's reader grant existed and was exercised.
         assert!(crate::audit::op_counts(2)[crate::audit::OpKind::RoleExercise.index()] >= 1);
+    }
+
+    /// Boot-log demo (prompt §1 Verify): runs the whole Track-1.5 flow against
+    /// real tasks, prints via the kernel log, asserted the same way every other
+    /// live-verified phase is. The agent restarts svc for real, an out-of-scope
+    /// restart of `other` is blocked as a scope expansion, the expansion is
+    /// confirmed and then works, and the audit trail answers "what did it do."
+    #[test]
+    fn track15_boot_demo() {
+        let _g = crate::kernel_state_guard();
+        clean_world();
+        crate::role::demo_track15();
+        // The agent restarted svc (in-scope) and `other` (after expansion):
+        // at least two real role exercises are on the agent's audit trail.
+        assert!(crate::audit::op_counts(3)[crate::audit::OpKind::RoleExercise.index()] >= 2);
+        // The out-of-scope restart of `other` only succeeded AFTER the
+        // confirmed expansion — prove both halves: the blocked attempt was a
+        // denied `RoleExpand` (never a successful exercise), and the post-
+        // expansion restart over `other` is now a real success.
+        assert!(!crate::audit::ever_succeeded(
+            3,
+            crate::audit::OpKind::RoleExpand,
+            1
+        ));
+        assert!(crate::audit::ever_succeeded(
+            3,
+            crate::audit::OpKind::RoleExercise,
+            1
+        ));
+    }
+
+    // === Track 1.5: the §9 mechanism against a SECOND, genuinely different
+    // task shape. Track 1's task (`object-subtree-reader`) is read-only and
+    // object-store-shaped. This second task — `restart-service`: *monitor a
+    // supervised task's health and restart it* — is write/control-shaped and
+    // Task-shaped. Running it through all five mechanisms is the
+    // generalization check: §9 must not be overfit to one task's shape. Every
+    // adversarial denial below is at the kernel capability gate, not in the
+    // agent's own code.
+
+    /// Mechanism 1 (§9.1) + the real task end-to-end: the `restart-service`
+    /// role expands to exactly `Cap::Task(svc)` with READ|CONTROL — the agent
+    /// asks for the role, the kernel mints the cap, the agent never assembles
+    /// its own capability list. The granted capability is then exercised for
+    /// real: the agent kills and respawns the supervised task, and the action
+    /// is audited as a `RoleExercise`.
+    #[test]
+    fn supervisor_role_runs_real_task_end_to_end() {
+        let _g = crate::kernel_state_guard();
+        clean_world();
+        unsafe {
+            // svc = task 0, grantor = task 1, agent = task 2.
+            let (svc, grantor, agent) = (0usize, 1usize, 2usize);
+            spawn("svc", dummy, 0x100000).unwrap();
+            spawn("grantor", dummy, 0x200000).unwrap();
+            spawn("agent", dummy, 0x300000).unwrap();
+            // Grantor holds READ|CONTROL over svc — the restart role's rights.
+            set_task_cap(
+                grantor,
+                0,
+                CapSlot {
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
+                    rights: Rights::READ.union(Rights::CONTROL),
+                },
+            );
+            set_current_for_test(grantor);
+            assert_eq!(
+                role_grant(ROLE_RESTART_SERVICE as u64, agent as u64, svc as u64, 0),
+                0
+            );
+            let got = task_cap(agent, 0);
+            assert_eq!(got.cap, Cap::Task(crate::cap::Oid::new(svc as u32, 0)));
+            assert!(got.rights.contains(Rights::CONTROL));
+            assert!(!got.rights.contains(Rights::GRANT), "role never grants");
+
+            set_current_for_test(agent);
+            // The agent monitors health (READ) and sees the service alive.
+            assert_eq!(crate::supervisor::task_state(0), 1);
+            // Exercise the granted control capability for real: kill then
+            // restart the supervised task.
+            crate::supervisor::task_kill(0);
+            assert!(!crate::tasks::is_task_alive(svc));
+            assert_eq!(supervise_restart(agent, 0, svc), Ok(()));
+            assert!(
+                crate::tasks::is_task_alive(svc),
+                "the agent restarted it for real"
+            );
+            assert!(crate::audit::ever_succeeded(
+                agent,
+                crate::audit::OpKind::RoleExercise,
+                svc as u32
+            ));
+        }
+    }
+
+    /// Mechanism 3 (§9.3): an out-of-scope restart is a scope expansion, not a
+    /// silent allow. The agent holds `Cap::Task(svc)`; attempting to restart a
+    /// *different* task returns `ExpansionRequired`, nothing is minted, and the
+    /// blocked request is on the record. After the human reviewer confirms the
+    /// expansion, a `Cap::Task(other)` (with the live generation) is minted and
+    /// the now-in-scope restart succeeds — proving the §9 expansion path is
+    /// capability-type-agnostic (it mints `Task` caps, not just `Object` caps).
+    #[test]
+    fn supervisor_role_out_of_scope_requires_expansion() {
+        let _g = crate::kernel_state_guard();
+        clean_world();
+        unsafe {
+            // svc = task 0, other = task 1, grantor = task 2, agent = task 3.
+            let (svc, other, grantor, agent) = (0usize, 1usize, 2usize, 3usize);
+            spawn("svc", dummy, 0x100000).unwrap();
+            spawn("other", dummy, 0x200000).unwrap();
+            spawn("grantor", dummy, 0x300000).unwrap();
+            spawn("agent", dummy, 0x400000).unwrap();
+            set_task_cap(
+                grantor,
+                0,
+                CapSlot {
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
+                    rights: Rights::READ.union(Rights::CONTROL),
+                },
+            );
+            // The reviewer must also hold CONTROL over the *expansion target*
+            // (`other`) to confirm the new scope — the same bar the grantor
+            // gate uses. For an object-scoped expansion this would be
+            // `ObjectRoot`; here it is a `Task` cap over `other`.
+            set_task_cap(
+                grantor,
+                1,
+                CapSlot {
+                    cap: Cap::Task(crate::cap::Oid::new(other as u32, 0)),
+                    rights: Rights::CONTROL,
+                },
+            );
+            set_current_for_test(grantor);
+            assert_eq!(
+                role_grant(ROLE_RESTART_SERVICE as u64, agent as u64, svc as u64, 0),
+                0
+            );
+            set_current_for_test(agent);
+            // In-scope restart works: cap names svc.
+            crate::supervisor::task_kill(0);
+            assert_eq!(supervise_restart(agent, 0, svc), Ok(()));
+            // Out-of-scope: cap names svc, agent asks to restart `other`.
+            crate::supervisor::task_kill(1);
+            assert_eq!(
+                supervise_restart(agent, 0, other),
+                Err(DelegationError::ExpansionRequired),
+                "a different task is a scope expansion, blocked"
+            );
+            assert!(!crate::audit::ever_succeeded(
+                agent,
+                crate::audit::OpKind::RoleExpand,
+                other as u32
+            ));
+            // Request + confirm the expansion (single confirmation suffices for a
+            // CONTROL expansion — see the honest note: two-party is WRITE-gated).
+            let pid = request_expansion(agent, other as u32, Rights::CONTROL, ExpansionKind::Task);
+            assert_eq!(confirm_expansion(grantor, pid, 1), 0);
+            let minted = task_cap(agent, 1);
+            assert_eq!(
+                minted.cap,
+                Cap::Task(crate::cap::Oid::new(
+                    other as u32,
+                    crate::tasks::task_generation(other)
+                ))
+            );
+            assert!(minted.rights.contains(Rights::CONTROL));
+            // The expanded cap now authorizes the restart.
+            assert_eq!(supervise_restart(agent, 1, other), Ok(()));
+            assert!(crate::audit::ever_succeeded(
+                grantor,
+                crate::audit::OpKind::RoleExpand,
+                other as u32
+            ));
+        }
+    }
+
+    /// Mechanism 5 (§9.5, closed) on the control-shaped task: a genuinely
+    /// anomalous pattern — rapid repeated restarts far outside the observed
+    /// profile — suspends the agent in the grant ledger (suspend-don't-revoke),
+    /// and the suspended agent's role exercise is then denied. This is the same
+    /// circuit breaker Track 1 proved on the read-only task, now driven by a
+    /// control op (`RoleExercise`/restart) instead of a read — the mechanism
+    /// fires on op-shape deviation regardless of the capability type.
+    #[test]
+    fn supervisor_role_anomaly_suspends_on_rapid_restarts() {
+        let _g = crate::kernel_state_guard();
+        clean_world();
+        unsafe {
+            // svc = task 0, grantor = task 5, agent = task 4 (unique indices).
+            let (svc, grantor, agent) = (0usize, 5usize, 4usize);
+            spawn("svc", dummy, 0x100000).unwrap();
+            spawn("grantor", dummy, 0x500000).unwrap();
+            spawn("agent", dummy, 0x400000).unwrap();
+            set_task_cap(
+                grantor,
+                0,
+                CapSlot {
+                    cap: Cap::Task(crate::cap::Oid::new(svc as u32, 0)),
+                    rights: Rights::READ.union(Rights::CONTROL),
+                },
+            );
+            set_current_for_test(grantor);
+            assert_eq!(
+                role_grant(ROLE_RESTART_SERVICE as u64, agent as u64, svc as u64, 0),
+                0
+            );
+            set_current_for_test(agent);
+            *role_monitor_slot(agent) = None;
+            // Establish a normal profile: one supervised restart cycle.
+            crate::supervisor::task_kill(0);
+            assert_eq!(supervise_restart(agent, 0, svc), Ok(()));
+            // Train the anomaly monitor from the observed (low-rate) baseline.
+            role_monitor_train(agent);
+            assert!(!role_monitor_suspended(agent));
+            // Another in-profile restart: no deviation, no suspension.
+            crate::supervisor::task_kill(0);
+            assert_eq!(supervise_restart(agent, 0, svc), Ok(()));
+            assert!(!role_monitor_observe(agent));
+            assert!(!role_monitor_suspended(agent));
+            // Genuinely anomalous: rapid repeated restarts well beyond 2x the
+            // trained baseline. Each is a real restart; the monitor reads the
+            // attributed audit log and suspends on the deviation.
+            let mut suspended_at = None;
+            for i in 0..5 {
+                crate::supervisor::task_kill(0);
+                let _ = supervise_restart(agent, 0, svc);
+                if role_monitor_suspended(agent) {
+                    suspended_at = Some(i);
+                    break;
+                }
+            }
+            assert!(
+                suspended_at.is_some(),
+                "rapid restarts triggered suspension"
+            );
+            assert!(crate::monitor::ledger().is_suspended(agent));
+            // Suspension is not revocation: the minted cap still names svc.
+            assert_eq!(
+                task_cap(agent, 0).cap,
+                Cap::Task(crate::cap::Oid::new(svc as u32, 0))
+            );
+            assert_eq!(crate::audit::revoke_count(agent), 0);
+            // The suspended agent's role exercise is now denied.
+            crate::supervisor::task_kill(0);
+            assert_eq!(
+                supervise_restart(agent, 0, svc),
+                Err(DelegationError::Suspended)
+            );
+            // Human review resumes; exercise works again (clear the trained
+            // monitor first so the same rate does not instantly re-suspend).
+            crate::monitor::ledger().resume(agent);
+            assert!(!role_monitor_suspended(agent));
+            *role_monitor_slot(agent) = None;
+            assert_eq!(supervise_restart(agent, 0, svc), Ok(()));
+            if crate::monitor::ledger().is_suspended(agent) {
+                crate::monitor::ledger().resume(agent);
+            }
+        }
     }
 }
