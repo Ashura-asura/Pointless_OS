@@ -1,0 +1,14 @@
+qemu-system-x86_64: terminating on signal 15 from pid 124034 (python3)
+ok - shell
+ok - job_control
+ok - procfs
+ok - dev_nodes
+ok - python3
+ok - git
+ok - vim
+ok - nano
+ok - gcc
+ok - make
+ok - networking
+
+# Track 2 battery: 11/11 passed

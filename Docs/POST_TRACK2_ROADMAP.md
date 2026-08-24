@@ -6,10 +6,12 @@
 session) generalized it to a second write/control task; the Genode research
 pass (this session) added a per-VM device allow-list and named two larger
 hardening phases as future. Track 2 (guest app battery) is specified and
-gap-inventoried but its *live* run is environment-gated on this Windows/VBS
-host (no VT-x for `vm.rs` hosting, no Linux toolchain to rebuild the guest) —
-see `TRACK2_GUEST_BATTERY.md`. The phases below are ordered for "once the
-environment gate lifts," and each states closed / reduced / inherent
+gap-inventoried; its *live* userspace run now **passes 11/11 under QEMU on
+native Linux** (2026-08-24 — see `TRACK2_GUEST_BATTERY.md` +
+`guest/out/battery-contract-kali.log`). Only the strict `vm.rs`-hosted e1000e
+path remains environment-gated by Windows VBS/VMX (Problem 2 below). The phases
+below are ordered for "once that last gate lifts," and each states closed /
+reduced / inherent
 honestly per Ground Rule 6.*
 
 ## Where the load-bearing claim stands (status before Track 2 ships)
@@ -59,15 +61,24 @@ doing once, deliberately, on its own schedule — not bundled with the WSL2 work
    `mdev -s`, `setsid`+controlling-tty for real job control) and the
    `battery-contract.py` CI harness. Closes the `/proc`/`/dev`/job-control
    PARTIAL rows at script level.
-2. **Close Problem 1 via WSL2** (can happen today, independent of everything
-   else): build the enriched guest image there. This directly produces the
-   artifact step 4 needs.
-3. **Decide on Problem 2** (Core Isolation off) on its own schedule — the one
-   action that turns Phase A from "blocked" to "runnable" for live hosting.
-4. **Once both are done**, run the battery contract tests under `vm.rs`
-   hosting (shell→python3→git→vim/nano→gcc/make), commit the serial logs as
-   evidence (Ground Rule 7), and wire each test into CI. **No changes needed
-   here** — this part of the plan was already correct.
+2. **Problem 1 — CLOSED (2026-08-24, native Linux).** Built the enriched guest
+   image on bare-metal Linux (Kali) — no VT-x needed, exactly the WSL2 role but
+   run directly. `build-guest.sh` + `enrich-initramfs.sh` + re-bake produced
+   `guest/out/{bzImage,initramfs.cpio.gz,kernel.config}`; `battery-contract.py`
+   under QEMU TCG reports **11/11 ok** (`guest/out/battery-contract-kali.log`).
+   The build step and the hosting step did *not* share a blocker, as predicted.
+   One real `/init` bug was found and fixed in this pass: the mount commands ran
+   *before* `mkdir -p /proc /sys /dev`, so `proc`/`devtmpfs` mounts silently
+   failed and broke `/proc` + `/dev/null` (which in turn failed `procfs` and
+   `git`). Fixed and re-baked; see `TRACK2_GUEST_BATTERY.md`.
+3. **Problem 2 — OPEN (Core Isolation off on the Windows host).** The strict
+   `vm.rs`-hosted e1000e path is still blocked by VBS reserving VMX. The QEMU
+   userspace battery already exercises every §3 item; only the `vm.rs` hosting
+   is unproven. Flip Core Isolation off + reboot on its own schedule.
+4. **Battery contract tests — QEMU part DONE** (11/11, evidence committed).
+   The `vm.rs`-hosted run remains pending Problem 2; when it lands, commit those
+   serial logs too and wire `battery-contract.py` into CI (it exits non-zero on
+   any FAIL, so it drops straight into a CI battery step).
 
 **DoD (Track 2):** `git` and `python3` both run real, non-trivial ops inside
 the guest; each closed gap named + contract-tested. (Carried verbatim from

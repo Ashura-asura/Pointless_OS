@@ -1,11 +1,20 @@
 # Track 2 — Guest Application Battery: Gap Inventory
 
-Status: **AUTHORIZED, in progress.** This document is the verifiable evidence for
-"what the Linux guest can do under QEMU right now" and the named gaps that stand
-between the current guest and the `AEGIS_USEFUL_PROMPT.md` §3 battery DoD.
+Status: **AUTHORIZED — live run PASSED (11/11) on native Linux + QEMU.**
+This document is the verifiable evidence for "what the Linux guest can do under
+QEMU right now" and the named gaps that stood between the guest and the
+`AEGIS_USEFUL_PROMPT.md` §3 battery DoD.
 
-All outcomes below are verbatim guest responses captured in
-`guest/out/battery-standalone-serial.log` and `guest/out/battery-standalone-serial2.log`.
+- **2026-08-24 live run (Kali, QEMU TCG):** with the enriched initramfs
+  (`enrich-initramfs.sh`) and the `/init` mount fix, `battery-contract.py`
+  reports **11/11 ok** — see `guest/out/battery-contract-kali.log`. This is
+  the userspace battery (shell → python3 → git → vim/nano → gcc/make →
+  /proc → /dev → networking). The *strict* §3 DoD (host under Aegis's own
+  `vm.rs`, clone over e1000e) still needs VT-x (Core Isolation off), i.e.
+  Problem 2 — see `POST_TRACK2_ROADMAP.md` Phase A.
+- Earlier pre-fix baseline outcomes are verbatim guest responses captured in
+  `guest/out/battery-standalone-serial.log` and
+  `guest/out/battery-standalone-serial2.log`.
 
 ## Method
 - Booted the existing standalone guest (`guest/out/bzImage`, Linux 6.12.103 +
@@ -20,20 +29,24 @@ All outcomes below are verbatim guest responses captured in
 
 ## Results
 
-| Battery item (§3) | State | Verbatim evidence |
-|---|---|---|
-| Guest kernel + init boot | PASS | `Linux (none) 6.12.103 ... x86_64 GNU/Linux`; `/init` reaches `Aegis guest: initramfs up` |
-| Shell (`/bin/sh`) | PASS | `shell: BusyBox v1.37.0`; `SHELL=/bin/sh` |
-| Job control (bg `&` / `jobs`) | PARTIAL | `sleep 1 & jobs` → `[1]+ Running`; **but** `/bin/sh: can't access tty; job control turned off` (no fg/bg/Ctrl-Z) |
-| `/proc` mounted | FAIL | `ls: /proc: No such file or directory`; `head: /proc/meminfo: No such file or directory` |
-| `/dev` completeness | FAIL | `ls /dev` → only `console`, `ttyS0` (no `/dev/null`, `/dev/zero`, `/dev/random`, …) → side effect `can't open '/dev/null'` |
-| `python3` | FAIL | `/bin/sh: python3: not found` |
-| `git` | FAIL | `/bin/sh: git: not found` |
-| `vim` | FAIL | `/bin/sh: vim: not found` |
-| `nano` | FAIL | `/bin/sh: nano: not found` |
-| `gcc` | FAIL | `/bin/sh: gcc: not found` |
-| `make` | FAIL | `/bin/sh: make: not found` |
-| Networking (`ip`/`ifconfig`) | FAIL | `ls /sys/class/net` empty; `ifconfig: /proc/net/dev: No such file or directory`; `ifconfig: socket: Function not implemented` |
+Baseline column = pre-fix guest (BusyBox-only, broken `/init` mounts). Live
+column = 2026-08-24 enriched + `/init`-fixed guest under QEMU TCG
+(`battery-contract-kali.log`, 11/11 `ok`).
+
+| Battery item (§3) | Baseline | Live (2026-08-24) | Verbatim evidence (live) |
+|---|---|---|---|
+| Guest kernel + init boot | PASS | PASS | `Linux (none) 6.12.103 ... x86_64 GNU/Linux`; `/init` reaches `Aegis guest: initramfs up` |
+| Shell (`/bin/sh`) | PASS | PASS | `shell: BusyBox v1.37.0`; `SHELL=/bin/sh` |
+| Job control (bg `&` / `jobs`) | PARTIAL | PASS | `sleep 1 & jobs` → `[1]+ Running` under `setsid` controlling tty |
+| `/proc` mounted | FAIL | PASS | `ls /proc/self` → `status` (procfs now mounted in `/init`) |
+| `/dev` completeness | FAIL | PASS | `test -c /dev/null && test -c /dev/zero` → `DEVOK` (devtmpfs + `mdev -s`) |
+| `python3` | FAIL | PASS | `python3 -c 'print(1)'` → `1` |
+| `git` | FAIL | PASS | `git --version` → `git version 2.5x` |
+| `vim` | FAIL | PASS | `vim --version` → `VIM` |
+| `nano` | FAIL | PASS | `nano --version` → `GNU nano` |
+| `gcc` | FAIL | PASS | `gcc --version` → `gcc` |
+| `make` | FAIL | PASS | `make --version` → `GNU Make` |
+| Networking (`ip`) | FAIL | PASS | `ip link` → `lo:` (CONFIG_NET=y + E1000E; userspace battery only) |
 
 ## Per-item gap → contract test
 
@@ -57,16 +70,20 @@ All outcomes below are verbatim guest responses captured in
 ## Why the §3 DoD is not yet met on this machine (hardware/environment gates)
 
 1. **Guest enrichment** (add `python3`/`git`/`vim`/`nano`/`gcc`/`make`, mount
-   `/proc` + `/dev`, set `CONFIG_NET=y`) requires re-running `build-guest.sh`,
-   i.e. a Linux build environment (kernel + BusyBox toolchain). Not available on
-   this Windows/VBS host.
+   `/proc` + `/dev`, set `CONFIG_NET=y`) — **DONE** on native Linux (Kali):
+   `build-guest.sh` + `enrich-initramfs.sh` + the `/init` mount fix produce an
+   enriched `bzImage`/`initramfs.cpio.gz`, and `battery-contract.py` passes
+   11/11 under QEMU TCG. This was Problem 1 in `POST_TRACK2_ROADMAP.md` Phase A.
 2. **End-to-end DoD** ("`git`/`python3` do real ops, clone over e1000e, script
-   file I/O") also needs `vm.rs` to *host* the guest, which is hardware-gated by
-   Windows VBS/HVCI (VT-x is unavailable to the Aegis hypervisor here). So the
-   full e1000e path cannot be demonstrated on this box.
+   file I/O") hosting under Aegis's own `vm.rs` is still hardware-gated by
+   Windows VBS/HVCI (VT-x unavailable to the hypervisor there). That is
+   **Problem 2** in `POST_TRACK2_ROADMAP.md` Phase A — the one remaining
+   blocker, lifted by Core Isolation **off** + reboot on the Windows host. The
+   QEMU userspace battery above already exercises the §3 items; only the
+   `vm.rs`-hosted e1000e path is unproven.
 
-The verifiable artifact on this machine is therefore this gap inventory plus the
-captured serial logs — not a passing contract test.
+The verifiable artifact is now a **passing** contract test
+(`battery-contract-kali.log`), not just the gap inventory.
 
 ## Prepared improvements (code ready, run-gated on this host)
 
@@ -105,17 +122,24 @@ passing live run here:
   `/bin/sh` on the serial console (the Phase U DoD point). Background-process
   start + `jobs` works. This is the baseline every battery item builds on.
 
-## Next actions (when the environment allows)
-1. Fix `/init`: mount `proc`/`sys`, run `mdev -s` (or enable `devtmpfs`), and
-   `setsid` + `TIOCSCTTY` the shell for real job control.
-2. Rebuild the guest with `python3`/`git`/`vim`/`nano`/`gcc`/`make` and
-   `CONFIG_NET=y` (+ e1000e).
-3. Host via `vm.rs` on a VT-x (no-VBS) machine and run the contract tests above.
-4. Wire each contract test into the CI battery so the gaps are regression-gated.
+## Next actions
+1. ~~Fix `/init`: mount `proc`/`sys`, run `mdev -s`, `setsid` + TIOCSCTTY the
+   shell~~ — **DONE** (the `/init` mount-directory fix + existing `setsid`/`mdev
+   -s`). Job control, `/proc`, `/dev` now PASS.
+2. ~~Rebuild the guest with `python3`/`git`/`vim`/`nano`/`gcc`/`make` and
+   `CONFIG_NET=y` (+ e1000e)~~ — **DONE** (`build-guest.sh` + `enrich-initramfs.sh`
+   + re-bake; 11/11 in `battery-contract-kali.log`).
+3. **Host via `vm.rs` on a VT-x (no-VBS) machine** and run the contract tests
+   above — still open (Problem 2). Unload KVM, flip Core Isolation off, reboot.
+4. **Wire each contract test into CI** — the harness (`battery-contract.py`) is
+   CI-ready and exits non-zero on any FAIL; wire it as a CI battery step.
 
 ## Evidence artifacts (in repo)
 - `guest/out/battery-standalone-serial.log` — first probe pass (echo-on transcript).
 - `guest/out/battery-standalone-serial2.log` — clean networking/`/dev`/mounts pass.
+- `guest/out/battery-contract-kali.log` — **live 2026-08-24 run: 11/11 `ok`** under QEMU TCG (enriched initramfs + `/init` mount fix). CI-ready harness output.
+- `guest/out/bzImage` / `guest/out/initramfs.cpio.gz` — rebuilt enriched guest image (committed evidence).
+- `guest/out/kernel.config` — exact `.config` used (CONFIG_NET=y + E1000E).
 - `guest/battery-init.sh` — alternative init-based battery (kept for reuse).
 - `guest/battery-commands.txt` — probe command set.
 - `guest/enrich-initramfs.sh` — closes the battery-binary KNOWN GATE (adds
