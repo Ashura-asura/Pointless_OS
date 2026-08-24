@@ -1,10 +1,9 @@
 #!/bin/bash
 # Phase U-1: build the real Linux guest image (kernel + embedded BusyBox
-# initramfs) for Aegis's hypervisor work, inside WSL.
+# initramfs) for Aegis's hypervisor work, on native Linux (Kali/WSL/etc.).
 #
-# Usage (from WSL, repo checked out at /mnt/c/...):
-#   bash /mnt/c/Users/<you>/Desktop/Pointless_OS/guest/build-guest.sh \
-#       /mnt/c/Users/<you>/Desktop/Pointless_OS/guest
+# Usage (clone the repo anywhere, e.g. ~/pointless):
+#   bash ~/pointless/guest/build-guest.sh ~/pointless/guest
 #
 # Produces, in <repo>/guest/out/:
 #   bzImage       — minimal x86_64 Linux kernel with the initramfs embedded
