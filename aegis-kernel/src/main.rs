@@ -53,6 +53,27 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // handlers are still active. Without `cli` they fire during early boot
     // (before the kernel's own IDT is installed) and crash the kernel.
     unsafe { core::arch::asm!("cli", options(nomem, preserves_flags)); }
+
+    // DIAGNOSTIC: draw a solid red block (100x100) at the top-left of the
+    // GOP framebuffer right at kernel entry. If the framebuffer is writable
+    // and the kernel started, the screen shows a red square. If the write
+    // hangs, the screen stays black (the loader's last line). This is the
+    // earliest possible framebuffer touch — before any console, font, or
+    // IDT setup — so it tells us whether writes to 0x90000000 work at all.
+    if let Some(h) = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) } {
+        let fb = h.framebuffer_base as *mut u8;
+        let stride = h.stride_px as usize;
+        let bpp = (h.bpp / 8) as usize;
+        for y in 0..100u32 {
+            for x in 0..100u32 {
+                let off = (y as usize * stride + x as usize) * bpp;
+                for k in 0..bpp.min(4) {
+                    unsafe { *fb.add(off + k) = if k == 2 { 0xFF } else { 0x00 }; }
+                }
+            }
+        }
+    }
+
     aegis_kernel::serial::SerialWriter::init();
     // Blank the VGA text buffer only: entering text mode (which disables
     // the firmware's Bochs-VBE/GOP display mode) is deferred until after
