@@ -247,6 +247,32 @@ pub fn pop_event() -> Option<InputEvent> {
     }
 }
 
+/// Inject a synthetic scancode from a non-PS/2 input source (the USB HID
+/// boot-keyboard poller in `usbhcd.rs`, on hardware like the TP201S tablet
+/// that has no PS/2 controller at all — `PS2=N`). Runs the byte through the
+/// same `Ps2State`/`KEY_BUF` pair the real IRQ1 handler uses, so USB and
+/// PS/2 keys are indistinguishable to `task_input`: the desktop and window
+/// manager need no USB-specific code path.
+///
+/// # Safety
+///
+/// Not synchronized against the real PS/2 IRQ1 handler beyond both callers
+/// disabling interrupts around their access (as `pop_event` already does);
+/// on real hardware only one of the two sources is ever live (PS/2 absent
+/// means no IRQ1 fires), so in practice there is no real race.
+pub unsafe fn inject_scancode(sc: u8) {
+    let buf = core::ptr::addr_of_mut!(KEY_BUF)
+        .as_mut()
+        .and_then(|o| o.as_mut());
+    if let Some(b) = buf {
+        let st = core::ptr::addr_of_mut!(PS2_STATE).as_mut().unwrap();
+        let _ = st.feed(b, sc);
+    }
+    // Reflect USB-HID-injected input on the diagnostic latch (the tablet has
+    // no PS/2 controller, so the real IRQ1 ISR never fires to set it).
+    crate::cpu::mark_key_fired();
+}
+
 /// Rust side of the keyboard IRQ: read one scancode (if the controller has
 /// one), translate it into the ring buffer, then EOI the master PIC.
 #[no_mangle]

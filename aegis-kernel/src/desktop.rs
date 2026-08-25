@@ -1383,6 +1383,63 @@ impl Desktop {
                 *c = desktop_bg;
             }
         }
+        self.render_diag();
+    }
+
+    /// Inject a one-line diagnostic status into the composited screen (row 0),
+    /// so it survives the per-frame blit. It shows: PS2 present?, USB XHCI
+    /// found?, keyboard/mouse ISR fired?, I/O APIC routing ok?, and the live
+    /// timer tick count (proves the LAPIC timer keeps firing under the
+    /// desktop). This is how we learn on real hardware (no serial) why input
+    /// works under QEMU but not on the tablet.
+    fn render_diag(&mut self) {
+        use core::fmt::Write;
+        struct W {
+            buf: [u8; SW],
+            len: usize,
+        }
+        impl core::fmt::Write for W {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for &b in s.as_bytes() {
+                    if self.len < self.buf.len() {
+                        self.buf[self.len] = b;
+                        self.len += 1;
+                    }
+                }
+                Ok(())
+            }
+        }
+        let ps2 = unsafe { crate::cpu::ps2_present() };
+        let usb = unsafe { crate::cpu::usb_xhci_found() };
+        let kf = unsafe { crate::cpu::key_fired() };
+        let mf = unsafe { crate::cpu::mouse_fired() };
+        let io = unsafe { crate::cpu::ioapic_ok() };
+        let t = crate::cpu::timer_ticks();
+        let (x2, sv, tc, lid) = unsafe { crate::cpu::lapic_diag() };
+        let mut w = W {
+            buf: [0u8; SW],
+            len: 0,
+        };
+        let _ = write!(
+            w,
+            "PS2={} USB={} KB={} MS={} IO={} T={} X2={} SV={} TC={} L={}",
+            if ps2 { "Y" } else { "N" },
+            if usb { "Y" } else { "N" },
+            if kf { "F" } else { "-" },
+            if mf { "F" } else { "-" },
+            if io { "Y" } else { "N" },
+            t,
+            if x2 { 1 } else { 0 },
+            if sv { 1 } else { 0 },
+            tc,
+            lid
+        );
+        let attr: u16 = 0x4F00; // white on blue, high contrast
+        for (i, &b) in w.buf[..w.len].iter().enumerate() {
+            if i < SW {
+                self.screen[i] = attr | b as u16;
+            }
+        }
     }
 
     /// Blit the current composited screen onto the real VGA display.
@@ -2780,6 +2837,17 @@ pub fn handle_mouse(me: MouseEvent) -> Option<MouseOutcome> {
     d.blit();
     gpu_blit(d.screen());
     Some(out)
+}
+
+/// Re-composite and re-blit the live desktop (both backends) without
+/// applying any new input. Used by the input task's periodic refresh so the
+/// diagnostic status line stays live even when no input arrives.
+pub fn refresh() {
+    if let Some(d) = unsafe { core::ptr::addr_of_mut!(DESKTOP).as_mut() }.and_then(|o| o.as_mut()) {
+        d.composite();
+        d.blit();
+        gpu_blit(d.screen());
+    }
 }
 
 #[cfg(test)]

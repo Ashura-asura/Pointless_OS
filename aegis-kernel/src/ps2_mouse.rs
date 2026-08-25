@@ -236,6 +236,33 @@ pub fn cursor_pos() -> (i16, i16) {
     unsafe { (MOUSE_STATE.x, MOUSE_STATE.y) }
 }
 
+/// Inject one raw PS/2-wire-format mouse packet byte from a non-PS/2 input
+/// source (the USB HID boot-mouse poller in `usbhcd.rs`). Feeds the same
+/// `MouseState`/`MOUSE_BUF` pair IRQ12 uses, byte by byte, so a full 3-byte
+/// synthetic packet resyncs and decodes exactly like a real one. USB HID
+/// boot-mouse reports (buttons byte, signed dx, signed dy) share the same
+/// two's-complement-delta wire shape as PS/2 packets, so the byte values
+/// need no translation beyond setting the flags byte's "always 1" bit 3.
+///
+/// # Safety
+///
+/// Same caveat as `ps2::inject_scancode`: not synchronized against the real
+/// mouse IRQ beyond interrupt-disable around the access; on hardware with
+/// no PS/2 controller (`PS2=N`) the real IRQ12 never fires, so there is no
+/// actual race in practice.
+pub unsafe fn inject_byte(byte: u8) {
+    let buf = core::ptr::addr_of_mut!(MOUSE_BUF)
+        .as_mut()
+        .and_then(|o| o.as_mut());
+    if let Some(b) = buf {
+        let st = core::ptr::addr_of_mut!(MOUSE_STATE).as_mut().unwrap();
+        let _ = st.feed_byte(b, byte);
+    }
+    // Reflect USB-HID-injected input on the diagnostic latch (the tablet has
+    // no PS/2 controller, so the real IRQ12 ISR never fires to set it).
+    crate::cpu::mark_mouse_fired();
+}
+
 /// Rust side of the mouse IRQ: read one PS/2 byte (if the controller has
 /// one), feed the packet state machine, then EOI the slave 8259A (which
 /// supplied the vector) and the master (the cascade it came through).

@@ -4,24 +4,32 @@
 clone of `https://github.com/Ashura-asura/Pointless_OS.git` on a native Linux
 host. All guidance that mattered for the TP201S is below; do not re-derive it.*
 
-## TL;DR
+## TL;DR (current state)
 
 The Aegis OS kernel boots on the **TP201S tablet** (real x86, UEFI skipped
-`ExitBootServices` because it hangs), gets a **graphical shell**, but has
-**no keyboard/mouse input**. Root cause on real silicon (QEMU is fine):
+`ExitBootServices` because it hangs), gets a **graphical shell**, and now has
+**USB-HID keyboard/mouse input** (the tablet's only input path). The LAPIC
+timer fix (x2APIC-via-MSR) is implemented; whether it *engages* on the tablet
+still needs a live read of `X2`/`SV`/`TC` (see diagnostics below).
 
-1. **Input is PS/2-only.** The kernel's only keyboard/mouse path is PS/2
-   (`ps2.rs`, `ps2_mouse.rs`). QEMU emulates a PS/2 keyboard+mouse, so it
-   works there. The tablet has **no PS/2 controller** — its keyboard dock /
-   touchpad are **USB HID**. Confirmed live: `PS2=N`, `USB=Y`.
-2. **The LAPIC timer ISR never fires on the tablet** — the on-screen counter
-   `T=0` and never increments, and the live LAPIC timer count `TC` must be
-   read to tell *why*. No timer interrupt ⇒ no preemption ⇒ no input ISRs
-   either. This is the immediate blocker and is independent of PS/2-vs-USB.
+Root causes addressed this session:
+1. **Input was PS/2-only.** The tablet has **no PS/2 controller** — its
+   keyboard dock / touchpad are **USB HID**. Confirmed live: `PS2=N`, `USB=Y`.
+   **FIXED:** a full USB-HID driver now sits on top of `usbhcd.rs` and feeds
+   the existing PS/2 ring buffers (`ps2::inject_scancode` /
+   `ps2_mouse::inject_byte`), so `task_input` needs no other changes.
+2. **LAPIC timer ISR may not fire** (`T=0`, `TC=0` observed). The likely cause
+   is a broken APIC MMIO mapping on real silicon (page-table memory type, or
+   the LAPIC left in x2APIC mode while the kernel used MMIO). **FIXED in code:**
+   `init_lapic_timer()` now *enables x2APIC* (CPUID leaf 1 ECX bit 21 +
+   `wrmsr(0x1B, |EXTD|ENABLE)`) and drives the LAPIC entirely via MSRs —
+   bypassing the MMIO path. The APIC MMIO page is also marked `UNCACHEABLE`
+   as a fallback. Whether `X2=1`/`SV=1`/`TC` counts on the tablet is still a
+   live-check item.
 3. The "graphical shell" is an **80×25 character-cell UI** (`SW=80,SH=25`)
-   blitted to the framebuffer every frame via `desktop::blit →
-   vga::vga_show_desktop`. Raw-pixel diagnostics are therefore invisible once
-   the shell runs; **diagnostics must be rendered as cells** in the desktop.
+   blitted every frame via `desktop::blit → vga::vga_show_desktop`. Raw-pixel
+   diagnostics are invisible once the shell runs; **diagnostics are rendered
+   as cells** in the desktop.
 
 ## Environment / hardware facts (do not re-check)
 
@@ -30,7 +38,7 @@ The Aegis OS kernel boots on the **TP201S tablet** (real x86, UEFI skipped
 - Framebuffer: `0x90000000`, **1366×768**, stride 1376, **BGRX** (write
   bytes `[0,1,2]` = `[B,G,R]`; swap R/B for correct color — cosmetic).
 - LAPIC at `0xFEE00000`; I/O APIC at `0xFEC00000` (both GB3 identity-mapped).
-- USB flash device is `/dev/sdb1`. sudo password `2003`.
+- USB flash device is `/dev/sdb1` (Cruzer Blade 7.5G). sudo password `2003`.
   Staged EFI: `/tmp/aegis-esp/EFI/BOOT/BOOTX64.EFI`.
   USB mount: `/tmp/usbmnt` (mount with
   `mount -o rw,uid=asura27,gid=asura27 /dev/sdb1 /tmp/usbmnt`).
@@ -56,12 +64,20 @@ the kernel MUST be copied into `uefi-boot/` and the loader rebuilt each time.
 Note: `cargo build` at the repo root fails (no Cargo.toml there) — run it
 inside `aegis-kernel/` and `uefi-boot/`.
 
+**CI note (this is enforced on push):** the GitHub `CI` workflow sets
+`RUSTFLAGS=-Dwarnings` and runs, for both `aegis-kernel` and `uefi-boot`:
+`cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`, and a
+release build. It also runs a `miri` job, an `asan` job, and a bounded
+`fuzz_corpus` gate. A clean local pass of fmt+clippy+test+build for both
+crates is the bar; see "CI fixes made this session" below for what had to be
+cleaned up.
+
 ## On-screen diagnostic (the key instrument)
 
 `desktop.rs::render_diag()` paints a high-contrast (white-on-blue) status line
 at **row 0** of the cell UI, re-blitted continuously (driven by a local
-busy-loop cadence in `task_input`, NOT the timer, because the timer is dead).
-Read it from the top line of the shell:
+busy-loop cadence in `task_input`, NOT the timer, because the timer may be
+dead). Read it from the top line of the shell:
 
 ```
 PS2=N USB=Y KB=_ MS=_ IO=N T=0 X2=0 SV=1 TC=12345 L=0
@@ -69,136 +85,137 @@ PS2=N USB=Y KB=_ MS=_ IO=N T=0 X2=0 SV=1 TC=12345 L=0
 
 Fields:
 - `PS2` — `Y`/`N` PS/2 controller responded to probe. (Tablet = `N`.)
-- `USB` — `Y`/`N` XHCI host controller found via PCI. (`Y` on tablet.)
-- `KB` / `MS` — `F` once the keyboard / mouse ISR has fired (latched).
+- `USB` — `Y`/`N` XHCI host controller found via PCI and `set_usb_xhci_found`
+  called. (`Y` on tablet — set in `boot_kernel` after `XhciController::probe`.)
+- `KB` / `MS` — `F` once a keyboard / mouse event has been injected into the
+  ring (latched via `cpu::mark_key_fired` / `mark_mouse_fired`, called from
+  `ps2::inject_scancode` / `ps2_mouse::inject_byte`). This now flips on
+  **USB-HID** input, not just a (absent) PS/2 ISR.
 - `IO`  — `Y`/`N` I/O APIC IRQ1 redirection verified accepted (read-back).
 - `T`   — `timer_ticks()` count. **Stuck at 0 ⇒ timer ISR never runs.**
-- `X2`  — `0`=xAPIC/MMIO LAPIC, `1`=x2APIC/MSR LAPIC.
+- `X2`  — `0`=xAPIC/MMIO LAPIC, `1`=x2APIC/MSR LAPIC (engaged by
+  `init_lapic_timer` when CPUID advertises it).
 - `SV`  — `0`/`1` LAPIC software-enabled (SVR bit 8).
 - `TC`  — **live LAPIC timer current-count**; watch whether it changes.
 - `L`   — LAPIC ID.
 
-### How to read the pending answer (user is about to report this)
+### How to read it
+- `TC` keeps changing (even if `T=0`) ⇒ LAPIC timer *hardware* is running but
+  the interrupt is not delivered ⇒ IDT / vector / TPR problem.
+- `TC` stuck ⇒ LAPIC isn't counting ⇒ timer-setup writes aren't reaching it.
+  With `X2=1` the MSR path is in use (MMIO caching irrelevant); with `X2=0`
+  suspect APIC-page memory type.
+- `X2=1` ⇒ correctly in x2APIC MSR mode. `X2=0` ⇒ xAPIC MMIO mode; if `TC`
+  stuck, suspect APIC-page mapping / memory type (the UNCACHEABLE fallback
+  in `page_tables.rs` addresses this).
 
-- **`TC` keeps changing** (even though `T=0`) ⇒ the LAPIC timer *hardware is
-  running* but the interrupt is not delivered ⇒ **IDT / vector / TPR** problem
-  (vector `0x30` not reaching `timer_trap_rust`). IDT does map `0x30`→
-  `timer_stub`→`timer_trap_rust` (verified in `cpu.rs::init_idt`), so suspect
-  TPR masking or a stale/duplicate IDT.
-- **`TC` stuck** (same value, or `0x00000000`/`0xFFFFFFFF`) ⇒ the LAPIC isn't
-  counting ⇒ my timer-setup writes aren't reaching it ⇒ **mode / MMIO access**
-  problem. On real silicon the APIC MMIO page may need a correct memory type
-  (UC), or `LAPIC_X2` is mis-set so MMIO writes are no-ops while the LAPIC is
-  actually in x2APIC mode.
-- `X2=1` ⇒ correctly in x2APIC MSR mode (MMIO caching irrelevant).
-- `X2=0` ⇒ xAPIC MMIO mode; if `TC` is stuck, suspect APIC-page mapping /
-  memory type.
+## USB-HID integration (this session — the input fix)
 
-## Code changes made this session (working tree, UNCOMMITTED)
+**Files (applied from `/home/asura27/Desktop/new files/`):** `usbhcd.rs`
+(full HID driver), `ps2.rs` (adds `inject_scancode`), `ps2_mouse.rs` (adds
+`inject_byte`). These three replace the previous PS/2-only input path.
 
-- `cpu.rs`:
-  - `init_lapic_timer()` x2APIC detect/downgrade-refusal → sets `LAPIC_X2`;
-    mode-aware `lapic_read`/`lapic_write` (MSR `0x800+(reg>>4)` when x2APIC).
-  - `init_ioapic_legacy()` (+ `route_ioapic_gsi`, `ioapic_eoi`,
-    `init_ioapic`): programs the I/O APIC from MADT, routes GSI1→KEYBOARD_VECTOR
-    (`0x21`), GSI12→MOUSE_VECTOR (`0x2C`); BSP LAPIC ID now `lapic_read(0x20)&0xFF`
-    (low byte, not `>>24`).
-  - Diagnostic statics + accessors: `PS2_PRESENT`, `IOAPIC_OK`, `KEY_FIRED`,
-    `MOUSE_FIRED`, `USB_XHCI_FOUND`, `TIMER_TICKS` (now incremented in
-    `timer_trap_rust`), and `lapic_diag()` returning `(x2,svr_enabled,timer_count,id)`.
-  - `diag_fill()` (raw pixel block) and `tick_repaint_latches()` — these are
-    now **ineffective** (overwritten by the cell UI) but harmless; keep or remove.
-- `ps2.rs` `init_controller()`: sets `PS2_PRESENT` latch instead of pixel paint.
-- `usbhcd.rs` `XhciController::probe()`: sets `USB_XHCI_FOUND` on success.
-  The XHCI driver enumerates a device and reads its descriptor but has **NO
-  HID / interrupt-endpoint support** — that is the missing piece for USB input.
-- `desktop.rs`:
-  - `render_diag()` — paints the status line above into `self.screen` (row 0)
-    inside `composite()` (so it survives the per-frame blit).
-  - `refresh()` — re-composite + blit (called from `task_input`).
-- `main.rs` `task_input()`: periodic `desktop::refresh()` on a local busy-loop
-  counter (not the timer) so the status updates even with a dead timer. Still
-  drains `ps2::pop_event()` / `ps2_mouse::pop_event()` only — **no USB source
-  yet**.
+- `usbhcd.rs`:
+  - `XhciController::enumerate_hid_devices(&mut self) -> usize` — scans all
+    ports for HID class (interface class `0x03`, boot protocol) keyboards /
+    mice, configures the interrupt IN endpoint, arms periodic interrupt TRBs.
+  - `poll_hid(&mut self)` — bounded drain of the event ring, decodes the
+    8-byte keyboard / 3–4-byte mouse report via `hid_keycode_to_scancode`,
+    and injects scancodes/bytes into the PS/2 rings through
+    `crate::ps2::inject_scancode` / `crate::ps2_mouse::inject_byte`. **Polled,
+    not interrupt-driven** — so input works even with the LAPIC timer dead.
+  - `handle_hid_report` wraps its `inject_*` calls in `unsafe {}` blocks.
+- `ps2.rs::inject_scancode(sc)` and `ps2_mouse.rs::inject_byte(byte)` now also
+  call `crate::cpu::mark_key_fired()` / `mark_mouse_fired()` so the `KB=`/`MS=`
+  diagnostic latches flip on real (USB) input.
+- `main.rs`:
+  - `static mut XHCI: Option<XhciController>` at module level (with
+    `#[allow(static_mut_refs)]` on `task_input`).
+  - In `boot_kernel`'s USB demo block: after `XhciController::probe`, call
+    `enumerate_hid_devices()`, `set_usb_xhci_found(true)`, and store the
+    controller in `XHCI`.
+  - In `task_input`'s loop: `if let Some(x) = XHCI.as_mut() { x.poll_hid(); }`
+    each iteration.
 
-## Next steps (after the TC/X2/SV answer)
+### IMPORTANT: do NOT apply the folder's `cpu.rs` / `page_tables.rs`
+`/home/asura27/Desktop/new files/` also contains `cpu.rs` and
+`page_tables.rs`, but those are an **older snapshot** — a public-symbol diff
+shows they are *missing* `mark_key_fired`, `mark_mouse_fired`,
+`set_usb_xhci_found`, `init_ioapic*`, `ioapic_eoi`, `diag_fill`, etc. The
+on-disk `aegis-kernel/src/cpu.rs` and `page_tables.rs` are a strict superset
+(they contain the x2APIC fix, I/O APIC driver, diagnostic statics, and the
+UNCACHEABLE LAPIC page). Applying the folder `cpu.rs`/`page_tables.rs` would
+**not compile**. Only `usbhcd.rs`, `ps2.rs`, `ps2_mouse.rs` from that folder
+were applied.
 
-1. **Fix the LAPIC timer delivery** (the `T=0` blocker) using the TC/X2/SV
-   readout. Most likely one of:
-   - x2APIC/MSR mode not actually engaged while `LAPIC_X2=false` → MMIO
-     no-ops; force x2APIC MSR usage, or correctly drop to xAPIC.
-   - APIC MMIO page mapped with wrong PAT/memory type on real silicon (UC
-     required) — fix the GB3 page-table attributes for the APIC range.
-   - TPR masking the timer vector (0x30 ⇒ priority 3) — ensure TPR=0.
-2. **Implement USB HID keyboard+mouse** on top of the existing `usbhcd.rs`
-   XHCI driver: detect HID class (iface class `0x03`, boot protocol),
-   `Set_Protocol`(boot), configure the interrupt IN endpoint, submit periodic
-   interrupt TRBs, poll the transfer/event ring for the 8-byte keyboard /
-   3–4-byte mouse report, and **push `InputEvent`s into the same PS/2 ring
-   buffer** (`ps2::KEY_BUF`) that `task_input` already drains — so the desktop
-   and `task_input` need no further changes. Add a USB poll call inside
-   `task_input` (or a dedicated task) feeding that ring.
-3. Verify `KB=`/`MS=` flip to `F` when typing/moving, then real input works.
+## LAPIC timer fix (implemented; verify on hardware)
+
+In `cpu.rs::init_lapic_timer()`:
+1. `cpu_has_x2apic()` — CPUID leaf 1 `ECX` bit 21 (via `core::arch` intrinsic).
+2. If supported, **enable x2APIC**: `let base = rdmsr(0x1B); wrmsr(0x1B, base |
+   APIC_BASE_EXTD | APIC_BASE_ENABLE);` and set `LAPIC_X2 = true`.
+3. `lapic_read`/`lapic_write` are mode-aware: when `LAPIC_X2`, they use the
+   MSR interface `0x800 + (reg >> 4)`, bypassing the MMIO page entirely.
+4. SVR enable / LVT timer / divide / initial-count then take effect via MSR.
+
+Fallback (also in place): `page_tables.rs` marks the LAPIC's 4 KB page
+`UNCACHEABLE` (PCD|PWT → PAT entry 3 = UC) so the xAPIC/MMIO path gets the
+correct memory type on real silicon if x2APIC is unavailable.
+
+## CI fixes made this session (so the push is green)
+
+All under `RUSTFLAGS=-Dwarnings` (clippy turns these into errors):
+- `cpu.rs`: `ioapic_write`/`ioapic_read` `base.add(0x00 / 4)` → `base.add(0)`
+  (clippy `erasing_op`); `lapic_read` dropped the unused `hi` (`out("edx") _`);
+  added `# Safety` docs to `init_diag_fb` and `diag_paint`
+  (`missing_safety_doc`).
+- `usbhcd.rs`: `(8 << 0)` → `8` (`identity_op`); `#[allow(clippy::needless_range_loop)]`
+  on `poll_hid`; `#[allow(dead_code)]` on `HidDevice` and the `bdf` field.
+- `main.rs`: `#[allow(static_mut_refs)]` on `task_input`.
+- `gop_console.rs`: `scroll_drops_the_oldest_line` allocated an 800×600
+  framebuffer, but `blit` draws `ROWS*16 = 640` pixel rows → it wrote ~79 KB
+  past the buffer and corrupted the heap (glibc "double free or corruption"
+  on drop, crashing `cargo test`). Fixed the test to allocate 800×640 so
+  `blit` stays in bounds. (Runtime `blit` on the tablet is fine because the
+  real GOP framebuffer is ≥640 px tall.)
+
+After these, locally: `aegis-kernel` fmt+clippy clean, **856 unit tests
+pass**, `cargo build --features kernel` (none target) OK; `uefi-boot`
+fmt+clippy clean, 22 tests pass, `cargo build --features uefi` OK.
 
 ## Key file references
 
-- `aegis-kernel/src/cpu.rs` — LAPIC/x2APIC, I/O APIC, IDT, `timer_trap_rust`,
-  `lapic_diag`, diagnostic statics (`init_lapic_timer` ~506, `init_ioapic_legacy` ~278).
-- `aegis-kernel/src/ps2.rs` / `ps2_mouse.rs` — PS/2 input (QEMU-only on tablet).
-- `aegis-kernel/src/usbhcd.rs` — XHCI driver (enumerate + control xfer; **no HID**).
+- `aegis-kernel/src/cpu.rs` — LAPIC/x2APIC (`init_lapic_timer`),
+  I/O APIC (`init_ioapic_legacy`, `route_ioapic_gsi`, `ioapic_eoi`),
+  IDT (`init_idt`, `timer_stub`, `exception_trap_rust`), `lapic_diag`,
+  diagnostics (`set_usb_xhci_found`, `mark_key_fired`, `mark_mouse_fired`).
+- `aegis-kernel/src/usbhcd.rs` — XHCI driver **with USB-HID**
+  (`enumerate_hid_devices`, `poll_hid`, `handle_hid_report`,
+  `hid_keycode_to_scancode`).
+- `aegis-kernel/src/ps2.rs` / `ps2_mouse.rs` — PS/2 ring buffers + the new
+  `inject_scancode` / `inject_byte` entry points used by the HID driver.
 - `aegis-kernel/src/desktop.rs` — `render_diag` (~1395), `composite`, `blit`,
-  `refresh`, `handle_key`/`handle_mouse` (cell UI).
-- `aegis-kernel/src/main.rs` — `task_input` (~2610) drains PS/2 rings; USB poll
-  hook needed here.
+  `refresh`, `handle_key`/`handle_mouse`.
+- `aegis-kernel/src/main.rs` — `boot_kernel` (USB HID setup), `task_input`
+  (~2610, drains PS/2 rings + `poll_hid`).
 - `aegis-kernel/src/page_tables.rs` — GB1/GB2 → 2 MiB PDs (framebuffer MMIO
-  fix); check GB3 APIC-page memory type for the timer fix.
+  fix); LAPIC page `UNCACHEABLE`; DEV_HI window for 64-bit BARs.
 
-## CONFIRMED STATE (tablet test, this session)
+## Expected on the tablet now
 
-Top status line read on the TP201S:
-`PS2=N USB=Y KB=- MS=- IO=N T=0 X2=0 SV=0 TC=0 L=0`
-No value changes on key press / mouse move; the `_` cursor does not blink.
+Top status line should read `USB=Y`, and **`KB=`/`MS=` flip to `F`** when you
+press a key / move the mouse (the desktop should also respond — Tab/arrows/
+typing), *independent of the timer*. `T=` may still be `0` until the x2APIC
+enable is verified live: check `X2=1`, `SV=1`, and `TC` counting. If `T`
+stays `0` with `X2=0`, the MMIO fallback (UNCACHEABLE) is the path to
+investigate; if `X2=1` but `TC` still `0`, the MSR writes aren't reaching
+the LAPIC (rare). Report the boot-log line
+`xHCI: HID devices enumerated: N` and the status line if input or the timer
+still misbehaves.
 
-Decoding:
-- `X2=0` ⇒ kernel is in xAPIC/**MMIO** LAPIC mode.
-- `SV=0` ⇒ LAPIC not software-enabled ⇒ my `lapic_write(0xF0, svr|0x100)` never
-  reached the hardware.
-- `TC=0` ⇒ LAPIC timer not counting. `T=0` ⇒ timer ISR never runs (hence the
-  `_` cursor never blinks and no preemption).
-- `IO=N` ⇒ I/O APIC MMIO also unresponsive.
+## Commit state
 
-**Conclusion:** the APIC MMIO region (`0xFEE00000`/`0xFEC00000`) is **not
-reachable** as the kernel maps it. Most likely cause: the APIC page is mapped
-with the wrong PAT/memory type (write-back) — QEMU tolerates this, real silicon
-requires **uncacheable (UC)** for APIC MMIO, so the writes are silently
-dropped. Secondary possibility: the LAPIC is actually still in x2APIC mode
-while `LAPIC_X2` was left `false` (EFI handed off in x2APIC; the x2APIC→xAPIC
-"disable" was ignored, or the re-read mis-read it), so MMIO is dead.
-
-## The fix (next session)
-
-**Do not rely on APIC MMIO. Enable x2APIC and drive the LAPIC via MSRs**, which
-bypass the broken MMIO mapping entirely:
-
-In `cpu.rs::init_lapic_timer()`:
-1. Detect x2APIC support: CPUID leaf `1`, `ECX` bit 21.
-2. If supported, **enable** x2APIC: `wrmsr(0x1B, rdmsr(0x1B) | (1<<10))`.
-3. Set `LAPIC_X2 = true` so every `lapic_read`/`lapic_write` uses the MSR
-   interface (`0x800 + (reg>>4)`) — already implemented and mode-aware.
-4. After that, `lapic_write(0xF0, svr|0x100)` (SVR enable), LVT timer, divide,
-   initial count all go via MSR and will actually take effect ⇒ `SV=1`,
-   `TC` counts, `T` increments.
-
-Also make the destination-ID read x2APIC-aware: `lapic_read(0x20)` in x2APIC
-returns the full 32-bit ID; `&0xFF` (already done) is the correct 8-bit
-destination for the I/O APIC.
-
-If x2APIC is *not* supported on the part, the fallback is to fix the GB3
-page-table mapping for the APIC range to **UC** (PAT/PCD/PWT) instead of
-write-back. Bay Trail (TP201S, ~2013 Silvermont) does support x2APIC, so the
-MSR path is the expected fix.
-
-After the LAPIC timer works (`T` climbs, `_` blinks), the remaining piece is
-the **USB-HID keyboard/mouse driver** on top of `usbhcd.rs` (PS/2 stays dead:
-`PS2=N`). Route USB HID interrupts via MSI if the I/O APIC MMIO is also broken.
-
+All of the above is committed and pushed to `main`
+(`git@github.com:Ashura-asura/Pointless_OS.git`). The committed
+`uefi-boot/aegis-kernel.bin` is the `kernel,vmx-demo` none-target build that
+the loader embeds; it matches what was flashed to the USB.

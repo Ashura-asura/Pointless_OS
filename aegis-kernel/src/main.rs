@@ -47,39 +47,59 @@ pub extern "sysv64" fn _start(handoff_addr: u64) -> ! {
     unsafe { aegis_kernel::cpu::switch_to_kernel_stack_and_jump(boot_kernel, handoff_addr) }
 }
 
+/// Draw a small 40x40 diagnostic block of `rgb` at framebuffer offset
+/// (x, y). Used to pinpoint where the TP201S kernel freezes (the framebuffer
+/// is known-writable — see the entry block — and no font/console is needed).
+///
+/// `slot` is a sequential index laid out in a right-edge grid (rows then
+/// columns growing leftward) so a large number of markers fit within any
+/// reasonable framebuffer height without the left-edge console text cursor
+/// ever touching them.
+fn paint(handoff_addr: u64, _x: u32, slot: u32, rgb: [u8; 3]) {
+    if let Some(h) = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) } {
+        let fb = h.framebuffer_base as *mut u8;
+        let stride = h.stride_px as usize;
+        let bpp = (h.bpp / 8) as usize;
+        let cell = 24u32;
+        let pitch = 30u32;
+        let rows = (h.height / pitch).max(1);
+        let row = slot % rows;
+        let col = slot / rows;
+        let x = h.width.saturating_sub(cell + 2) - col * pitch;
+        let y = row * pitch;
+        for dy in 0..cell {
+            for dx in 0..cell {
+                let off = ((y + dy) as usize * stride + (x + dx) as usize) * bpp;
+                for k in 0..bpp.min(4) {
+                    unsafe {
+                        *fb.add(off + k) = if k < 3 { rgb[k] } else { 0x00 };
+                    }
+                }
+            }
+        }
+    }
+}
+
 extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // Disable interrupts immediately: the loader skipped ExitBootServices
     // (TP201S firmware hangs on it), so the firmware's timer interrupt
     // handlers are still active. Without `cli` they fire during early boot
     // (before the kernel's own IDT is installed) and crash the kernel.
-    unsafe { core::arch::asm!("cli", options(nomem, preserves_flags)); }
-
-    // DIAGNOSTIC: draw a solid red block (100x100) at the top-left of the
-    // GOP framebuffer right at kernel entry. If the framebuffer is writable
-    // and the kernel started, the screen shows a red square. If the write
-    // hangs, the screen stays black (the loader's last line). This is the
-    // earliest possible framebuffer touch — before any console, font, or
-    // IDT setup — so it tells us whether writes to 0x90000000 work at all.
-    if let Some(h) = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) } {
-        let fb = h.framebuffer_base as *mut u8;
-        let stride = h.stride_px as usize;
-        let bpp = (h.bpp / 8) as usize;
-        for y in 0..100u32 {
-            for x in 0..100u32 {
-                let off = (y as usize * stride + x as usize) * bpp;
-                for k in 0..bpp.min(4) {
-                    unsafe { *fb.add(off + k) = if k == 2 { 0xFF } else { 0x00 }; }
-                }
-            }
-        }
+    unsafe {
+        core::arch::asm!("cli", options(nomem, preserves_flags));
     }
 
+    // DIAGNOSTIC: colored blocks at each boot step so the TP201S shows
+    // exactly where the kernel freezes. Each paint() is a small 40x40 block.
+    paint(handoff_addr, 0, 0, [0xFF, 0x00, 0x00]); // entry
     aegis_kernel::serial::SerialWriter::init();
-    // Blank the VGA text buffer only: entering text mode (which disables
-    // the firmware's Bochs-VBE/GOP display mode) is deferred until after
-    // the display backend is chosen below — a pixel backend must not kill
-    // the GOP framebuffer the firmware set up.
+    paint(handoff_addr, 0, 1, [0x00, 0xFF, 0x00]); // after serial init
+                                                   // Blank the VGA text buffer only: entering text mode (which disables
+                                                   // the firmware's Bochs-VBE/GOP display mode) is deferred until after
+                                                   // the display backend is chosen below — a pixel backend must not kill
+                                                   // the GOP framebuffer the firmware set up.
     aegis_kernel::vga::vga_init();
+    paint(handoff_addr, 0, 2, [0x00, 0x00, 0xFF]); // after vga_init
 
     // GOP console install was HERE — moved DOWN to after the IDT is loaded
     // (see below). The first `gop_console::mirror()` call does a real MMIO
@@ -134,8 +154,10 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     } else {
         sprintln!("Aegis: fleet cfg: absent — compile-time defaults");
     }
+    paint(handoff_addr, 0, 3, [0xFF, 0xFF, 0x00]); // boot-info located
     match boot_info.as_ref() {
         Some(info) => {
+            paint(handoff_addr, 0, 4, [0x00, 0xFF, 0xFF]); // frame allocator about to init
             let conv = aegis_kernel::boot_info::total_by_type(
                 info,
                 aegis_kernel::boot_info::TYPE_CONVENTIONAL,
@@ -215,11 +237,14 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     unsafe {
         aegis_kernel::cpu::init_gdt();
     }
+    paint(handoff_addr, 0, 5, [0xFF, 0x00, 0xFF]); // GDT done
     sprintln!("Aegis: GDT + TSS loaded (lgdt/ltr)");
 
+    paint(handoff_addr, 0, 6, [0xFF, 0xA5, 0x00]); // orange: about to init_idt
     unsafe {
         aegis_kernel::cpu::init_idt();
     }
+    paint(handoff_addr, 0, 7, [0xFF, 0xFF, 0xFF]); // white: IDT installed (returned)
     sprintln!("Aegis: IDT loaded (exception vectors 0-31 + timer at 0x30 + keyboard at 0x21)");
 
     // CR4 SMEP/SMAP disable now runs with the IDT installed, so a fault here
@@ -227,6 +252,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     unsafe {
         aegis_kernel::cpu::disable_smep_smap();
     }
+    paint(handoff_addr, 0, 8, [0x80, 0x00, 0x80]); // purple: SMEP/SMAP disabled
 
     // Install the on-screen GOP scrolling console now that GDT+IDT are live,
     // so every kernel `sprintln!` from here on renders to the physical
@@ -237,6 +263,9 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // GOP — this is the only visible channel until the desktop backend
     // installs.
     if let Some(h) = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) } {
+        unsafe {
+            aegis_kernel::cpu::init_diag_fb(h.framebuffer_base, h.stride_px, h.width, h.height);
+        }
         aegis_kernel::gop_console::install(
             h.framebuffer_base,
             h.width,
@@ -256,16 +285,19 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     } else {
         sprintln!("Aegis: no GOP handoff for the on-screen console");
     }
+    paint(handoff_addr, 0, 9, [0x80, 0x80, 0x80]); // gray: GOP console installed
 
     unsafe {
         aegis_kernel::cpu::mask_pic();
     }
+    paint(handoff_addr, 0, 10, [0x00, 0xC0, 0x00]); // dark green: PIC masked
     sprintln!("Aegis: legacy PIC masked");
 
     unsafe {
         aegis_kernel::page_tables::init_kernel_tables();
         aegis_kernel::page_tables::switch_to(aegis_kernel::page_tables::kernel_pml4_phys());
     }
+    paint(handoff_addr, 0, 11, [0xFF, 0x00, 0x80]); // pink: CR3 switched
     sprintln!("Aegis: CR3 switched to kernel page tables (identity with 4 KB LAPIC mapping)");
     match aegis_kernel::page_tables::kernel_text_window() {
         Some((ts, te)) => {
@@ -279,6 +311,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             sprintln!("Aegis: WARNING could not parse kernel ELF text window (NX state unknown)");
         }
     }
+    paint(handoff_addr, 0, 12, [0x80, 0x80, 0x00]); // olive: NX/text window parsed
 
     // Phase Y: host-side ACPI discovery + SMP groundwork. Reads the real
     // RSDP/RSDT/XSDT/MADT tables QEMU/OVMF expose (EBDA + F-seg search like
@@ -352,6 +385,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             sprintln!("Aegis: acpi: ACPI unavailable - running with legacy PIC/PIT (no MADT)");
         }
     }
+    paint(handoff_addr, 0, 13, [0x00, 0x80, 0x80]); // teal: ACPI discovery done
 
     // Phase Z: USB + audio guest device models (UHCI keyboard / SB16 DSP),
     // driven through a fixed byte arena exactly as the contract tests do —
@@ -458,6 +492,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     if found_nvme {
         sprintln!("Aegis: PCI: NVMe controller present");
     }
+    paint(handoff_addr, 0, 14, [0xC0, 0x40, 0x00]); // brown: PCI scan done
 
     // Phase H/T (roadmap §5): display backend selection. GOP first: the
     // bootloader queried the UEFI Graphics Output Protocol before
@@ -528,6 +563,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 install_gpu(b);
             }
             sprintln!("Aegis: GPU: framebuffer backend installed (desktop -> pixels too)");
+            paint(handoff_addr, 0, 15, [0x00, 0xFF, 0xFF]); // slot15: GPU backend installed
         } else {
             // No pixel backend: enter the legacy VGA text console (this
             // re-enables VGA and disables the Bochs-VBE/GOP mode, so it
@@ -574,6 +610,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         // screen, so the report is captured by photographing the display.
         keep(&results);
     }
+    paint(handoff_addr, 0, 16, [0xFF, 0x80, 0x00]); // slot16: baremetal probes done
 
     // Live network stack demo: the q35 NIC (Intel 82574L/e1000e) is attached
     // to a QEMU `socket` netdev. The kernel brings the interface up, resolves
@@ -1018,14 +1055,15 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         sprintln!("Aegis: e1000: no NIC found - driver skipped");
     }
 
-    // Phase I: two-node fleet demo. Runs only when the image is built as
-    // fleet node A or node B (mutually exclusive features); stripped out
-    // entirely on a normal build. When `fleet-j3` is also present, the
-    // Phase J-3 mesh demo (two-node consensus + remote invocation of a
-    // transferred capability) runs instead, still over the same two-node
-    // feature-gated images. The mesh demo is gated on `fleet-j3` alone: its
-    // two-node role comes from the runtime FLEET.CFG when present, else from
-    // the compile-time node feature.
+    paint(handoff_addr, 0, 17, [0x80, 0x00, 0xFF]); // slot17: entering fleet/IPC demo
+                                                    // Phase I: two-node fleet demo. Runs only when the image is built as
+                                                    // fleet node A or node B (mutually exclusive features); stripped out
+                                                    // entirely on a normal build. When `fleet-j3` is also present, the
+                                                    // Phase J-3 mesh demo (two-node consensus + remote invocation of a
+                                                    // transferred capability) runs instead, still over the same two-node
+                                                    // feature-gated images. The mesh demo is gated on `fleet-j3` alone: its
+                                                    // two-node role comes from the runtime FLEET.CFG when present, else from
+                                                    // the compile-time node feature.
     #[cfg(feature = "fleet-j3")]
     aegis_kernel::mesh::run_boot_demo();
     #[cfg(all(
@@ -1102,6 +1140,19 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 sprintln!(
                     "Aegis: xHCI: no device enumerated (nothing attached, or enumeration failed)"
                 );
+            }
+            // Bring up USB-HID input (keyboard + mouse) and keep the controller
+            // alive so `task_input` can poll it each iteration. The TP201S
+            // tablet has no PS/2 controller, so this is the only input path.
+            let n = usb.enumerate_hid_devices();
+            sprintln!("Aegis: xHCI: HID devices enumerated: {}", n);
+            // The new HID driver no longer sets the diagnostic USB= flag
+            // itself; keep it accurate here.
+            unsafe {
+                aegis_kernel::cpu::set_usb_xhci_found(true);
+            }
+            unsafe {
+                XHCI = Some(usb);
             }
         } else if EhciController::probe(&pci).is_none() {
             sprintln!("Aegis: xHCI: no USB host controller found");
@@ -1258,13 +1309,14 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             sprintln!("Aegis: FAT16: mount failed at LBA {}", ESP_START_LBA);
         }
 
-        // Phase 7: the object store graduates from an in-memory model to a
-        // write-through, content-addressed store over THIS live NVMe device.
-        // Identical bytes are the same block (dedup against the on-disk index),
-        // reads are digest-verified against the content hash, a flat directory
-        // is a COW store object (each mutation writes a NEW dir block; an id
-        // you already hold reads that version forever), and a deliberately
-        // corrupted on-disk block is detected by hash mismatch — no panic.
+        paint(handoff_addr, 0, 18, [0x00, 0x80, 0xFF]); // slot18: entering NVMe/object-store demo
+                                                        // Phase 7: the object store graduates from an in-memory model to a
+                                                        // write-through, content-addressed store over THIS live NVMe device.
+                                                        // Identical bytes are the same block (dedup against the on-disk index),
+                                                        // reads are digest-verified against the content hash, a flat directory
+                                                        // is a COW store object (each mutation writes a NEW dir block; an id
+                                                        // you already hold reads that version forever), and a deliberately
+                                                        // corrupted on-disk block is detected by hash mismatch — no panic.
         match aegis_kernel::nvme_store::Store::open(&mut ctrl) {
             Some(mut st) => {
                 use aegis_kernel::nvme_store::{DATA_BASE_LBA, STORE_START_LBA};
@@ -1461,15 +1513,16 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                     sprintln!("Aegis: system-update: full install -> stage -> health-gated activate -> rollback cycle persisted to the boot device");
                 }
 
-                // Phase P: the first real app window — a text editor whose
-                // buffer lives in THIS store. On first boot the editor writes
-                // the seed memo.txt into a fresh boot view and anchors the
-                // view's dir id in the store header; on a reboot it re-attaches
-                // to the anchored dir and reopens the SAME memo.txt, so a
-                // typed + F2-saved edit survives a power cycle. The store's
-                // hello block was deliberately corrupted above (data slot 0),
-                // so this seed runs AFTER that demo — its blocks always land
-                // strictly above the corrupted slot by construction.
+                paint(handoff_addr, 0, 19, [0xFF, 0x00, 0x40]); // slot19: entering editor/shell demo
+                                                                // Phase P: the first real app window — a text editor whose
+                                                                // buffer lives in THIS store. On first boot the editor writes
+                                                                // the seed memo.txt into a fresh boot view and anchors the
+                                                                // view's dir id in the store header; on a reboot it re-attaches
+                                                                // to the anchored dir and reopens the SAME memo.txt, so a
+                                                                // typed + F2-saved edit survives a power cycle. The store's
+                                                                // hello block was deliberately corrupted above (data slot 0),
+                                                                // so this seed runs AFTER that demo — its blocks always land
+                                                                // strictly above the corrupted slot by construction.
                 use aegis_kernel::editor::{seed_if_absent, EditorFs};
                 let anchor = st.anchor(&mut ctrl);
                 let mut eout = [0u8; 512];
@@ -1895,6 +1948,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
 
     unsafe {
         aegis_kernel::cpu::init_lapic_timer();
+        paint(handoff_addr, 0, 20, [0x40, 0xFF, 0x00]); // slot20: LAPIC timer armed
     }
     sprintln!("Aegis: LAPIC timer armed (periodic, vector 0x30)");
 
@@ -1907,6 +1961,13 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     sprintln!("Aegis: legacy PIC remapped; IRQ1 (keyboard) -> 0x21 via LAPIC LVT0 ExtINT");
     unsafe {
         aegis_kernel::cpu::init_legacy_pic_irq12();
+    }
+    // On real firmware the I/O APIC is the live controller (UEFI never handed
+    // off), so also route IRQ1/IRQ12 through it to the BSP. This is the
+    // "CPU selection" the boot was missing. Harmless when the legacy PIC is
+    // the actual source; EOI is sent to both in the ISRs.
+    unsafe {
+        aegis_kernel::cpu::init_ioapic_legacy();
     }
     sprintln!("Aegis: legacy PIC IRQ12 (mouse) unmasked on the slave; IRQ2 cascade unmasked on the master");
     unsafe {
@@ -1977,12 +2038,13 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         }
     }
 
-    // Phase 5 supervision tree: a ring-3 Supervisor task (policy out of the
-    // kernel). It holds two kernel-installed caps and nothing else: the
-    // reserved kill-notification endpoint (RECV) at slot 0, and a Task cap on
-    // its child (CONTROL|READ) at slot 1. The fault path parks every ring-3
-    // death on the notification channel; the supervisor observes, applies its
-    // bounded-restart policy, and escalates once the budget is spent.
+    paint(handoff_addr, 0, 21, [0x00, 0xFF, 0x40]); // slot21: entering supervision tree
+                                                    // Phase 5 supervision tree: a ring-3 Supervisor task (policy out of the
+                                                    // kernel). It holds two kernel-installed caps and nothing else: the
+                                                    // reserved kill-notification endpoint (RECV) at slot 0, and a Task cap on
+                                                    // its child (CONTROL|READ) at slot 1. The fault path parks every ring-3
+                                                    // death on the notification channel; the supervisor observes, applies its
+                                                    // bounded-restart policy, and escalates once the budget is spent.
     aegis_kernel::ipc::init_notify_endpoint();
     let stack_sup = unsafe {
         aegis_kernel::frame::alloc_contiguous_global(aegis_kernel::tasks::TASK_STACK_SIZE / 4096)
@@ -2438,21 +2500,22 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         }
     }
 
-    // Phase K + Phase U-6 + Phase U-7 (feature-gated): VT-x bring-up, the
-    // run-loop demo, and the real Linux guest boot.
-    // Last thing before interrupts turn on and the idle loop owns the
-    // machine. `vmx_supported()` is a cheap no-op CPUID check; the demos
-    // only run when VT-x is actually present. On a CPU without VT-x this
-    // prints and falls through to the normal idle boot — one `if` branch,
-    // zero behavior change. On a VMX-capable CPU: `bringup_demo()` proves
-    // one full round trip (vmlaunch -> guest -> VM-exit -> handled), then
-    // `run_loop_demo()` runs a resumable 32-bit guest under EPT that talks
-    // to the emulated 16550 and halts — and `guest_boot_demo()` (Phase
-    // U-7) boots the real committed Linux guest (bzImage + initramfs, ~11
-    // MiB embedded) under the same run loop, with the guest's serial
-    // console, timer and PIC emulated by Aegis, stopping when the guest
-    // reaches its shell (the Phase U DoD point). Each is bounded by its
-    // own exit budget, so the machine keeps booting afterward.
+    paint(handoff_addr, 0, 22, [0xC0, 0xC0, 0xC0]); // slot22: entering VT-x/VMX bring-up
+                                                    // Phase K + Phase U-6 + Phase U-7 (feature-gated): VT-x bring-up, the
+                                                    // run-loop demo, and the real Linux guest boot.
+                                                    // Last thing before interrupts turn on and the idle loop owns the
+                                                    // machine. `vmx_supported()` is a cheap no-op CPUID check; the demos
+                                                    // only run when VT-x is actually present. On a CPU without VT-x this
+                                                    // prints and falls through to the normal idle boot — one `if` branch,
+                                                    // zero behavior change. On a VMX-capable CPU: `bringup_demo()` proves
+                                                    // one full round trip (vmlaunch -> guest -> VM-exit -> handled), then
+                                                    // `run_loop_demo()` runs a resumable 32-bit guest under EPT that talks
+                                                    // to the emulated 16550 and halts — and `guest_boot_demo()` (Phase
+                                                    // U-7) boots the real committed Linux guest (bzImage + initramfs, ~11
+                                                    // MiB embedded) under the same run loop, with the guest's serial
+                                                    // console, timer and PIC emulated by Aegis, stopping when the guest
+                                                    // reaches its shell (the Phase U DoD point). Each is bounded by its
+                                                    // own exit budget, so the machine keeps booting afterward.
     #[cfg(feature = "vmx-demo")]
     {
         if aegis_kernel::vmx::vmx_supported() {
@@ -2552,6 +2615,13 @@ fn aa_seed(
     );
 }
 
+/// Live xHCI controller handle kept across boot so `task_input` can poll
+/// attached USB-HID keyboards/mice. `None` until `boot_kernel` brings the
+/// controller up and enumerates HID devices. The TP201S tablet has no PS/2
+/// controller, so this is the only input path.
+static mut XHCI: Option<aegis_kernel::usbhcd::XhciController> = None;
+
+#[allow(static_mut_refs)]
 /// Kernel input task: drains the PS/2 ring buffer and applies each keypress
 /// to the live desktop (Tab cycles focus, arrows move the focused window),
 /// re-compositing and re-blitting, then prints the outcome over serial —
@@ -2559,7 +2629,16 @@ fn aa_seed(
 /// forever like alpha/beta; the timer preempts it round-robin.
 extern "sysv64" fn task_input() -> ! {
     sprintln!("Aegis: [input] online (PS/2 -> desktop)");
+    let mut iter: u64 = 0;
     loop {
+        // Re-composite + blit on a local busy-loop cadence (NOT the timer tick,
+        // which may be dead) so the LAPIC diagnostic fields (notably the live
+        // timer count TC) update continuously and we can see whether the LAPIC
+        // timer is actually counting even when no interrupt is delivered.
+        iter = iter.wrapping_add(1);
+        if iter % 4000 == 0 {
+            aegis_kernel::desktop::refresh();
+        }
         while let Some(ev) = aegis_kernel::ps2::pop_event() {
             if let aegis_kernel::input::InputEvent::Key(ke) = ev {
                 if ke.pressed {
@@ -2818,6 +2897,14 @@ extern "sysv64" fn task_input() -> ! {
                         }
                     }
                 }
+            }
+        }
+        // Poll attached USB-HID keyboards/mice (the TP201S tablet has no PS/2
+        // controller, so this is the only input path). Polled, not
+        // interrupt-driven, so it works even with the LAPIC timer dead.
+        unsafe {
+            if let Some(x) = XHCI.as_mut() {
+                x.poll_hid();
             }
         }
         core::hint::spin_loop();

@@ -198,6 +198,139 @@ pub unsafe fn init_legacy_pic_irq12() {
     asm!("out dx, al", in("dx") 0xA1u16, in("al") 0xEFu8, options(nomem, preserves_flags));
 }
 
+/// I/O APIC register window (physical address). Identity-mapped in the
+/// kernel page tables — GB3 (0xC0000000–0xFFFFFFFF) covers 0xFEC00000. Zero
+/// until `init_ioapic` records the MADT address.
+static mut IOAPIC_BASE: u64 = 0;
+
+/// Record the I/O APIC's MMIO base for later redirection-entry programming.
+///
+/// # Safety
+/// Boot-only; called once during device interrupt setup.
+pub unsafe fn init_ioapic(base: u64) {
+    IOAPIC_BASE = base;
+}
+
+/// Indirect I/O APIC access: write the register index to IOREGSEL (+0x00),
+/// then read/write the data at IOWIN (+0x10). All registers are 32-bit.
+unsafe fn ioapic_write(reg: u32, val: u32) {
+    let base = IOAPIC_BASE as *mut u32;
+    core::ptr::write_volatile(base.add(0), reg);
+    core::ptr::write_volatile(base.add(0x10 / 4), val);
+}
+
+unsafe fn ioapic_read(reg: u32) -> u32 {
+    let base = IOAPIC_BASE as *mut u32;
+    core::ptr::write_volatile(base.add(0), reg);
+    core::ptr::read_volatile(base.add(0x10 / 4))
+}
+
+/// Route one global system interrupt (GSI) to `vector` on the BSP's LAPIC.
+/// Preserves the firmware-chosen polarity/trigger (bits 10–11 of the low
+/// dword) so the wiring matches the hardware; forces fixed delivery (bits
+/// 8–9 = 0) and un-masks the entry (bit 12 = 0).
+///
+/// # Safety
+/// Boot-only; called once during device interrupt setup.
+unsafe fn route_ioapic_gsi(gsi: u8, vector: u8, lapic_id: u8) {
+    if IOAPIC_BASE == 0 {
+        return;
+    }
+    let low = ioapic_read(0x10 + 2 * gsi as u32);
+    let polarity_trigger = low & 0x0C00; // bits 10 (polarity), 11 (trigger)
+    let new_low = (vector as u32) | polarity_trigger; // fixed delivery, unmasked
+    ioapic_write(0x10 + 2 * gsi as u32, new_low);
+    // Physical destination = the 8-bit LAPIC ID (low byte of the x2APIC ID).
+    let new_high = (lapic_id as u32) << 24;
+    ioapic_write(0x11 + 2 * gsi as u32, new_high);
+}
+
+/// Paint a solid `w`x`h` rectangle at (`x`,`y`); used for boot-time liveness
+/// indicators that must survive the desktop's full-frame repaint.
+///
+/// # Safety
+/// Framebuffer must be initialised (`init_diag_fb`).
+pub unsafe fn diag_fill(x: usize, y: usize, w: usize, h: usize, r: u8, g: u8, b: u8) {
+    if DIAG_FB == 0 {
+        return;
+    }
+    let fb = DIAG_FB as *mut u8;
+    let stride = DIAG_STRIDE as usize;
+    for dy in 0..h {
+        for dx in 0..w {
+            let off = (((y + dy) * stride) + (x + dx)) * 4;
+            core::ptr::write_volatile(fb.add(off), b);
+            core::ptr::write_volatile(fb.add(off + 1), g);
+            core::ptr::write_volatile(fb.add(off + 2), r);
+        }
+    }
+}
+
+/// Program the I/O APIC (parsed from the MADT; fallback 0xFEC00000) to deliver
+/// the PS/2 keyboard (IRQ1) and mouse (IRQ12) to the BSP via the kernel's
+/// fixed vectors. This is the "CPU selection" for those interrupts: the
+/// redirection entry's destination field now points at the BSP LAPIC instead
+/// of whatever the firmware left. MADT IRQ overrides are honoured when mapping
+/// a source IRQ to a GSI.
+///
+/// # Safety
+/// Boot-only; call after `init_idt` and `init_lapic_timer`.
+pub unsafe fn init_ioapic_legacy() {
+    let base = match crate::acpi::discovered().and_then(|d| d.smp.ioapic) {
+        Some(io) => io.address as u64,
+        None => 0xFEC0_0000,
+    };
+    init_ioapic(base);
+    // BSP LAPIC ID. In x2APIC the 32-bit ID's relevant 8 bits for I/O APIC
+    // physical destination are the LOW byte (not the high byte).
+    let bsp = (lapic_read(0x20) & 0xFF) as u8;
+
+    // Build a source-IRQ -> GSI map from MADT overrides (identity if absent).
+    let mut ov_src = [0u8; 8];
+    let mut ov_gsi = [0u32; 8];
+    let mut on = 0usize;
+    if let Some(m) = crate::acpi::discovered().and_then(|d| d.madt) {
+        on = m.override_count.min(8);
+        for i in 0..on {
+            ov_src[i] = m.overrides[i].source;
+            ov_gsi[i] = m.overrides[i].global_interrupt;
+        }
+    }
+    let gsi_for = |src: u8| -> u8 {
+        for i in 0..on {
+            if ov_src[i] == src {
+                return ov_gsi[i] as u8;
+            }
+        }
+        src
+    };
+
+    route_ioapic_gsi(gsi_for(1), crate::ps2::KEYBOARD_VECTOR, bsp);
+    route_ioapic_gsi(gsi_for(12), crate::ps2_mouse::MOUSE_VECTOR, bsp);
+
+    // Boot latch: read back IRQ1's redirection entry and confirm the I/O APIC
+    // accepted our routing (vector=KEYBOARD_VECTOR, unmasked, dest=BSP).
+    let g = gsi_for(1) as u32;
+    let low = ioapic_read(0x10 + 2 * g);
+    let high = ioapic_read(0x11 + 2 * g);
+    let ok = (low & 0xFF) == crate::ps2::KEYBOARD_VECTOR as u32
+        && (low & 0x1000) == 0
+        && (high >> 24) == bsp as u32;
+    set_ioapic_ok(ok);
+}
+
+/// EOI an I/O APIC interrupt (write to the I/O APIC EOI register). Harmless
+/// when the I/O APIC is not the active controller; pair with the PIC EOI.
+///
+/// # Safety
+/// Call only from an interrupt context delivered by the I/O APIC.
+pub unsafe fn ioapic_eoi() {
+    if IOAPIC_BASE != 0 {
+        let base = IOAPIC_BASE as *mut u32;
+        core::ptr::write_volatile(base.add(0x40 / 4), 0);
+    }
+}
+
 static mut KERNEL_GDT: crate::gdt::Gdt = crate::gdt::Gdt::new();
 
 /// Load the kernel GDT (and TSS).
@@ -290,6 +423,38 @@ pub unsafe fn init_idt() {
 
 static mut LAPIC_BASE: u64 = 0;
 
+/// Whether the local APIC is being driven via the x2APIC MSR interface
+/// (`true`) or the legacy xAPIC MMIO window (`false`). On many real machines
+/// the firmware enables x2APIC and the mode *cannot* be disabled in software
+/// without a reset, so any MMIO `lapic_write` is a silent no-op there — which
+/// is exactly why the timer (and therefore the scheduler) never armed. When
+/// this is `true` we translate every register access to its x2APIC MSR
+/// (0x800 + reg>>4) instead of touching the MMIO page.
+static mut LAPIC_X2: bool = false;
+
+// Framebuffer handle for the timer-ISR "alive" indicator (see `init_diag_fb`
+// and `timer_trap_rust`). Lets us prove on real hardware whether the LAPIC
+// timer ISR actually fires without needing serial capture.
+static mut DIAG_FB: u64 = 0;
+static mut DIAG_STRIDE: u32 = 0;
+static mut DIAG_W: u32 = 0;
+static mut DIAG_H: u32 = 0;
+
+/// Hand the timer ISR the framebuffer so it can paint a persistent "timer
+/// alive" block. Called once at boot from the GOP handoff.
+///
+/// # Safety
+///
+/// Must be called exactly once at boot (before any timer interrupt paints)
+/// with `base` equal to the identity-mapped framebuffer address from the
+/// GOP handoff.
+pub unsafe fn init_diag_fb(base: u64, stride: u32, w: u32, h: u32) {
+    DIAG_FB = base;
+    DIAG_STRIDE = stride;
+    DIAG_W = w;
+    DIAG_H = h;
+}
+
 /// Local APIC base address from MSR 0x1B (masked to the 4 KB page).
 fn lapic_base() -> u64 {
     let mut lo: u32;
@@ -301,11 +466,37 @@ fn lapic_base() -> u64 {
 }
 
 unsafe fn lapic_write(reg: u32, val: u32) {
-    core::ptr::write_volatile((LAPIC_BASE + reg as u64) as *mut u32, val);
+    if LAPIC_X2 {
+        // x2APIC register `reg` lives at MSR 0x800 + (reg >> 4); the full
+        // 32-bit value is the low dword of the MSR.
+        let msr = 0x800u32 + (reg >> 4);
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") val,
+            in("edx") 0u32,
+            options(nomem, preserves_flags)
+        );
+    } else {
+        core::ptr::write_volatile((LAPIC_BASE + reg as u64) as *mut u32, val);
+    }
 }
 
 unsafe fn lapic_read(reg: u32) -> u32 {
-    core::ptr::read_volatile((LAPIC_BASE + reg as u64) as *const u32)
+    if LAPIC_X2 {
+        let msr = 0x800u32 + (reg >> 4);
+        let mut lo: u32;
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") lo,
+            out("edx") _,
+            options(nomem, preserves_flags)
+        );
+        lo
+    } else {
+        core::ptr::read_volatile((LAPIC_BASE + reg as u64) as *const u32)
+    }
 }
 
 /// Enable the local APIC and arm its periodic timer at `TIMER_VECTOR`.
@@ -318,6 +509,30 @@ unsafe fn lapic_read(reg: u32) -> u32 {
 /// pages (QEMU TCG cannot take MMIO writes through a 1 GB huge page), and
 /// before `sti`.
 pub unsafe fn init_lapic_timer() -> u64 {
+    // The firmware (we skipped ExitBootServices on the TP201S because it
+    // hangs) may have left the local APIC in x2APIC mode (MSR 0x1B bit 10).
+    // This file programs the LAPIC via MMIO, which is DISABLED under x2APIC,
+    // so every `lapic_read`/`lapic_write` below would be a silent no-op and
+    // the timer would never arm (no scheduler -> no input, no blink). Drop
+    // back to xAPIC (MMIO) mode first; the switch x2APIC -> xAPIC is allowed
+    // by clearing the EXTD bit.
+    let mut lo: u32;
+    let mut hi: u32;
+    asm!("rdmsr", in("ecx") 0x1Bu32, out("eax") lo, out("edx") hi, options(nomem, preserves_flags));
+    if lo & (1u32 << 10) != 0 {
+        let disabled = lo & !(1u32 << 10);
+        asm!("wrmsr", in("ecx") 0x1Bu32, in("eax") disabled, in("edx") hi, options(nomem, preserves_flags));
+        // Re-read: x2APIC frequently cannot be turned off in software (no
+        // reset), so the firmware's enable bit may simply ignore our write.
+        // If it's still set, MMIO is dead and we must use the x2APIC MSR
+        // interface for every register access.
+        let mut lo2: u32;
+        let mut _hi2: u32;
+        asm!("rdmsr", in("ecx") 0x1Bu32, out("eax") lo2, out("edx") _hi2, options(nomem, preserves_flags));
+        if lo2 & (1u32 << 10) != 0 {
+            LAPIC_X2 = true;
+        }
+    }
     LAPIC_BASE = lapic_base();
     let svr = lapic_read(0xF0);
     lapic_write(0xF0, svr | 0x100); // software enable
@@ -485,11 +700,230 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
     }
 }
 
+/// Set when the keyboard ISR has fired at least once (latch, not cleared).
+/// The timer ISR repaints the red block every tick so it survives the
+/// desktop's full-frame repaint, proving the keyboard vector reached the CPU.
+static mut KEY_FIRED: bool = false;
+/// Same latch for the mouse IRQ12 ISR (green block).
+static mut MOUSE_FIRED: bool = false;
+/// Latch set when the PS/2 controller probe responds (true) or not (false).
+/// Repainted every tick so the user can tell PS/2 vs USB input at a glance.
+static mut PS2_PRESENT: bool = false;
+/// Latch set when the I/O APIC IRQ1 redirection entry verified as accepted.
+static mut IOAPIC_OK: bool = false;
+
+/// Latch that the keyboard vector fired (called from `keyboard_trap_rust`).
+///
+/// # Safety
+/// Called only from the keyboard interrupt context.
+pub unsafe fn mark_key_fired() {
+    KEY_FIRED = true;
+}
+
+/// Latch that the mouse vector fired (called from `mouse_trap_rust`).
+///
+/// # Safety
+/// Called only from the mouse interrupt context.
+pub unsafe fn mark_mouse_fired() {
+    MOUSE_FIRED = true;
+}
+
+/// Record whether a PS/2 controller responded to the probe.
+///
+/// # Safety
+/// Boot-time call.
+pub unsafe fn set_ps2_present(v: bool) {
+    PS2_PRESENT = v;
+}
+
+/// Record whether the I/O APIC IRQ1 routing verified as accepted.
+///
+/// # Safety
+/// Boot-time call.
+pub unsafe fn set_ioapic_ok(v: bool) {
+    IOAPIC_OK = v;
+}
+
+/// True if a PS/2 controller responded to the probe.
+///
+/// # Safety
+/// Read after boot init.
+pub unsafe fn ps2_present() -> bool {
+    PS2_PRESENT
+}
+
+/// True if the I/O APIC IRQ1 routing verified as accepted.
+///
+/// # Safety
+/// Read after boot init.
+pub unsafe fn ioapic_ok() -> bool {
+    IOAPIC_OK
+}
+
+/// True once the keyboard ISR has fired.
+///
+/// # Safety
+/// Read after boot init.
+pub unsafe fn key_fired() -> bool {
+    KEY_FIRED
+}
+
+/// True once the mouse ISR has fired.
+///
+/// # Safety
+/// Read after boot init.
+pub unsafe fn mouse_fired() -> bool {
+    MOUSE_FIRED
+}
+
+/// Set when an XHCI (USB) host controller is discovered.
+static mut USB_XHCI_FOUND: bool = false;
+
+/// Record whether an XHCI host controller was found.
+///
+/// # Safety
+/// Boot-time call.
+pub unsafe fn set_usb_xhci_found(v: bool) {
+    USB_XHCI_FOUND = v;
+}
+
+/// True if an XHCI host controller was discovered.
+///
+/// # Safety
+/// Read after boot init.
+pub unsafe fn usb_xhci_found() -> bool {
+    USB_XHCI_FOUND
+}
+
+/// Snapshot the LAPIC's health for the on-screen boot diagnostic: whether we
+/// are in x2APIC (MSR) mode, whether the LAPIC is software-enabled (SVR bit 8),
+/// the live timer current-count (if it changes, the timer is running even if
+/// the ISR is not firing), and the LAPIC ID.
+///
+/// # Safety
+/// Read after `init_lapic_timer`.
+pub unsafe fn lapic_diag() -> (bool, bool, u32, u32) {
+    let x2 = LAPIC_X2;
+    if LAPIC_BASE == 0 {
+        return (x2, false, 0, 0);
+    }
+    let svr = lapic_read(0xF0);
+    let sv = (svr & 0x100) != 0;
+    let tc = lapic_read(0x390);
+    let id = lapic_read(0x20);
+    (x2, sv, tc, id)
+}
+
+/// Paint a "timer alive" indicator that is impossible to miss: a thick,
+/// full-width horizontal bar that SWEEPS DOWN the screen and CYCLES color every
+/// tick. If the LAPIC timer keeps firing, this bar visibly travels down the
+/// display; if the system wedges after the first tick, it sits at one position
+/// (or the desktop erases it and it never returns). This disambiguates "timer
+/// alive" from "fired once then frozen" on real hardware with no serial output.
+unsafe fn diag_paint_timer(tick: u64) {
+    if DIAG_FB == 0 {
+        return;
+    }
+    let palette: [(u8, u8, u8); 6] = [
+        (0xFF, 0xFF, 0xFF), // white
+        (0xFF, 0x00, 0x00), // red
+        (0x00, 0xFF, 0x00), // green
+        (0x00, 0x00, 0xFF), // blue
+        (0xFF, 0xFF, 0x00), // yellow
+        (0x00, 0xFF, 0xFF), // cyan
+    ];
+    let (r, g, b) = palette[(tick % 6) as usize];
+    let fb = DIAG_FB as *mut u8;
+    let stride = DIAG_STRIDE as usize;
+    let h = DIAG_H as usize;
+    let w = DIAG_W as usize;
+    let bar_h = 30usize;
+    let span = h.saturating_sub(bar_h).max(1);
+    let y0 = ((tick as usize) * 3) % span;
+    for dy in 0..bar_h {
+        for dx in 0..w {
+            let off = (((y0 + dy) * stride) + dx) * 4;
+            core::ptr::write_volatile(fb.add(off), b);
+            core::ptr::write_volatile(fb.add(off + 1), g);
+            core::ptr::write_volatile(fb.add(off + 2), r);
+        }
+    }
+}
+
+/// Repaint the persistent diagnostic blocks from the timer ISR: the sweeping
+/// timer block, plus the red/green keyboard/mouse blocks if their vectors have
+/// fired. Repainting every tick keeps them visible despite the desktop's
+/// full-frame repaint.
+unsafe fn tick_repaint_latches() {
+    let w = DIAG_W as usize;
+    let h = DIAG_H as usize;
+    // PS/2 presence: blue (present) vs magenta (absent -> likely USB).
+    if PS2_PRESENT {
+        diag_fill(10, h - 100, 60, 60, 0x00, 0x00, 0xFF);
+    } else {
+        diag_fill(10, h - 100, 60, 60, 0xFF, 0x00, 0xFF);
+    }
+    // I/O APIC routing: yellow (accepted) vs cyan (failed).
+    if IOAPIC_OK {
+        diag_fill(w / 2 - 30, h - 100, 60, 60, 0xFF, 0xFF, 0x00);
+    } else {
+        diag_fill(w / 2 - 30, h - 100, 60, 60, 0x00, 0xFF, 0xFF);
+    }
+}
+
+unsafe fn diag_tick() {
+    let tick = crate::cpu::timer_ticks();
+    diag_paint_timer(tick);
+    if KEY_FIRED {
+        diag_paint(1);
+    }
+    if MOUSE_FIRED {
+        diag_paint(2);
+    }
+    tick_repaint_latches();
+}
+
 /// Rust side of the LAPIC timer stub: count the tick and send the EOI.
 #[no_mangle]
 pub extern "sysv64" fn timer_trap_rust() {
     unsafe {
+        TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
         lapic_write(0xB0, 0);
+        diag_tick();
+    }
+}
+
+/// Paint an 8x8 "alive" block for ISR `slot` at the top-right, spaced
+/// horizontally. Colors are written in BGR order so they render correctly
+/// on the TP201S BGRX framebuffer:
+///   0 = white (timer), 1 = red (keyboard IRQ1), 2 = green (mouse IRQ12).
+/// Used to prove on real hardware which interrupt vectors actually fire.
+///
+/// # Safety
+///
+/// Must only be called after `init_diag_fb` has set the framebuffer base
+/// (this guards `DIAG_FB == 0` internally, but the caller is responsible for
+/// the framebuffer being mapped).
+pub unsafe fn diag_paint(slot: u8) {
+    if DIAG_FB == 0 {
+        return;
+    }
+    let (r, g, b) = match slot {
+        0 => (0xFFu8, 0xFF, 0xFF),
+        1 => (0xFFu8, 0x00, 0x00),
+        2 => (0x00u8, 0xFF, 0x00),
+        _ => (0x00u8, 0x00, 0xFF),
+    };
+    let fb = DIAG_FB as *mut u8;
+    let stride = DIAG_STRIDE as usize;
+    let x = (DIAG_W.saturating_sub(10u32 + (slot as u32) * 12)) as usize;
+    for dy in 0..8u32 {
+        for dx in 0..8u32 {
+            let off = ((dy as usize) * stride + (x + dx as usize)) * 4;
+            core::ptr::write_volatile(fb.add(off), b);
+            core::ptr::write_volatile(fb.add(off + 1), g);
+            core::ptr::write_volatile(fb.add(off + 2), r);
+        }
     }
 }
 

@@ -70,7 +70,9 @@ fn main() -> Status {
         }
         None => {
             sprintln!("Aegis: GOP: no usable framebuffer - kernel falls back to Bochs VBE probe");
-            uefi::println!("Aegis: GOP: no usable framebuffer - kernel falls back to Bochs VBE probe");
+            uefi::println!(
+                "Aegis: GOP: no usable framebuffer - kernel falls back to Bochs VBE probe"
+            );
         }
     }
 

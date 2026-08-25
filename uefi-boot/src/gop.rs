@@ -12,7 +12,9 @@
 //! the loader writes `present = 0` and the kernel falls back to its
 //! Bochs-VBE PCI probe (QEMU) or the text backend alone.
 
-use uefi::boot::{locate_handle_buffer, open_protocol, OpenProtocolAttributes, OpenProtocolParams, SearchType};
+use uefi::boot::{
+    locate_handle_buffer, open_protocol, OpenProtocolAttributes, OpenProtocolParams, SearchType,
+};
 use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
 use uefi::Identify;
 

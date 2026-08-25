@@ -239,9 +239,12 @@ mod tests {
     #[test]
     fn scroll_drops_the_oldest_line() {
         let _g = lock();
-        let mut fb = vec![0u8; 800 * 600 * 4];
+        // Framebuffer must be tall enough for the full console (ROWS*16 = 640
+        // pixel rows); an 800x600 buffer is too short and `blit` would write
+        // past it and corrupt the heap.
+        let mut fb = vec![0u8; 800 * 640 * 4];
         let base = fb.as_mut_ptr() as u64;
-        install(base, 800, 600, 800, 32);
+        install(base, 800, 640, 800, 32);
         // Fill ROWS-1 lines, then one more forces a scroll.
         for i in 0..(ROWS as u32) {
             mirror(format_args!("line{}\n", i));

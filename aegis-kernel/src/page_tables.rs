@@ -2,10 +2,13 @@
 //! enforcement on every data page.
 //!
 //! Layout (kernel PML4):
-//! - Entries 0-2: 1 GB huge pages (identity). Entry 0 is broken into a PD
-//!   of 2 MB pages; the 2 MB regions containing the executable window (the
-//!   kernel image's R+X PT_LOAD, parsed from the ELF at runtime) are further
-//!   broken into 4 KB pages so the window can be the ONLY executable pages
+//! - Entries 0-2: identity-mapped via PDs of 2 MB huge pages (NOT 1 GB
+//!   PDPT-level huge pages — GB2 carries the GOP framebuffer on real
+//!   hardware, and 1 GB huge pages are documented elsewhere in this file
+//!   as unable to take MMIO writes reliably; see PD1/PD2 below). Entry 0's
+//!   PD is further broken into 4 KB pages for the 2 MB regions containing
+//!   the executable window (the kernel image's R+X PT_LOAD, parsed from
+//!   the ELF at runtime), so the window can be the ONLY executable pages
 //!   in the low map. The first 2 MB region is always split in ordinary
 //!   builds (kernel image + VGA text framebuffer live there); a kernel image
 //!   whose text links above 2 MB (large embedded payload, e.g. a guest OS
@@ -81,6 +84,21 @@ static mut KERNEL_PT_WIN: [PageTable; 2] = [PageTable::new(); 2];
 // perform MMIO writes through a 1 GB huge page and triple-faults).
 static mut SCRATCH_PD: PageTable = PageTable::new();
 static mut SCRATCH_PT: PageTable = PageTable::new();
+
+// GB1/GB2 (0x40000000-0xBFFFFFFF), broken from a single 1 GB huge PDPT entry
+// into a PD of 2 MB huge pages — same reason as SCRATCH_PD/SCRATCH_PT above.
+// The GOP framebuffer (0x90000000 on the TP201S, confirmed 2 MB-aligned)
+// lives in GB2; `create_user_pml4` below already assumes a GB1/2 PDPT entry
+// might be a 1 GB huge page and knows how to split one on demand for a user
+// stack, which is direct evidence this project has already hit the "1 GB
+// huge page can't take MMIO" class of bug once (see SCRATCH_PD) — it was
+// just never applied to the kernel's own mapping of the framebuffer region.
+// 2 MB is the granularity the *loader's* identity map already uses for this
+// same address range (uefi-boot/src/page_tables.rs::map_1gb) before the
+// kernel's CR3 switch, so this matches a mapping already exercised earlier
+// in the same boot.
+static mut PD1: PageTable = PageTable::new();
+static mut PD2: PageTable = PageTable::new();
 
 // 64-bit device BAR window: QEMU's q35 machine assigns the NVMe controller's
 // BAR0 above 4 GiB (0xC000000000 = 768 GiB). PML4[1] -> DEV_HI_PDPT (slot 256
@@ -302,10 +320,27 @@ pub unsafe fn init_kernel_tables() {
             core::ptr::addr_of!(KERNEL_PT_WIN[win_tables - 1]) as u64 | PRESENT | WRITABLE;
     }
 
-    // GBs 1-2: 1 GB huge pages, NX (no executable content lives there).
-    for i in 1..3 {
-        pdpt.entries[i] = (i as u64 * 0x4000_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX;
+    // GBs 1-2: PD of 2 MB huge pages, NX (no executable content lives
+    // there). NOT a single 1 GB PDPT-level huge page: the GOP framebuffer
+    // (GB2 on the TP201S) needs MMIO writes to actually land, and this
+    // project already has a documented case (SCRATCH_PD/SCRATCH_PT, GB3's
+    // LAPIC page) of a 1 GB huge page silently breaking MMIO. `create_user_pml4`
+    // below already special-cases "this GB1/2 PDPT entry might be a 1 GB huge
+    // page" for a different reason (per-task USER stack mapping) — that
+    // branch stays correct either way since it starts from `gb_entry`, not
+    // a hardcoded assumption.
+    let pd1 = (&raw mut PD1).as_mut().unwrap();
+    let pd2 = (&raw mut PD2).as_mut().unwrap();
+    pd1.clear();
+    pd2.clear();
+    for i in 0..512u64 {
+        pd1.entries[i as usize] =
+            (0x4000_0000 + i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX;
+        pd2.entries[i as usize] =
+            (0x8000_0000 + i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX;
     }
+    pdpt.entries[1] = core::ptr::addr_of!(PD1) as u64 | PRESENT | WRITABLE;
+    pdpt.entries[2] = core::ptr::addr_of!(PD2) as u64 | PRESENT | WRITABLE;
 
     // 4th GB (0xC0000000-0xFFFFFFFF): PD of 2 MB pages, NX, with the LAPIC
     // page broken out into a 4 KB page table (also NX — MMIO, never code).
