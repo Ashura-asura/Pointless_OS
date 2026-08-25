@@ -795,6 +795,68 @@ pub unsafe fn usb_xhci_found() -> bool {
     USB_XHCI_FOUND
 }
 
+// ---- USB-HID pipeline diagnostics (surfaced on the on-screen status line) ----
+// These let us see *where* the input pipeline breaks on real hardware that has
+// no serial output: did enumeration find boot HID devices? were any HID
+// interfaces present at all (vs. none / EHCI / hub)? do transfer completions
+// arrive, and do they decode+inject?
+static mut HID_ENUM_COUNT: usize = 0; // boot-HID devices armed for polling
+static mut HID_ANY_SEEN: bool = false; // any HID-class interface seen at all
+static mut HID_POLL_EVENTS: u64 = 0; // transfer events drained in poll_hid
+static mut HID_CC_FAIL: u64 = 0; // of those, completion code != success
+static mut HID_INJECTED: u64 = 0; // reports handed to the PS/2 ring
+
+/// # Safety
+/// Boot-time call from the USB-HID driver.
+pub unsafe fn set_hid_enum_count(n: usize) {
+    HID_ENUM_COUNT = n;
+}
+/// # Safety
+/// Boot-time call from the USB-HID driver.
+pub unsafe fn set_hid_any_seen(v: bool) {
+    HID_ANY_SEEN = v;
+}
+/// # Safety
+/// Called from the USB-HID driver's poll path.
+pub unsafe fn inc_hid_poll_event() {
+    HID_POLL_EVENTS += 1;
+}
+/// # Safety
+/// Called from the USB-HID driver's poll path.
+pub unsafe fn inc_hid_cc_fail() {
+    HID_CC_FAIL += 1;
+}
+/// # Safety
+/// Called from the USB-HID driver's report handler.
+pub unsafe fn inc_hid_injected() {
+    HID_INJECTED += 1;
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn hid_enum_count() -> usize {
+    HID_ENUM_COUNT
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn hid_any_seen() -> bool {
+    HID_ANY_SEEN
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn hid_poll_events() -> u64 {
+    HID_POLL_EVENTS
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn hid_cc_fail() -> u64 {
+    HID_CC_FAIL
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn hid_injected() -> u64 {
+    HID_INJECTED
+}
+
 /// Snapshot the LAPIC's health for the on-screen boot diagnostic: whether we
 /// are in x2APIC (MSR) mode, whether the LAPIC is software-enabled (SVR bit 8),
 /// the live timer current-count (if it changes, the timer is running even if

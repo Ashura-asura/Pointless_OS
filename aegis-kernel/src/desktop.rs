@@ -1416,13 +1416,18 @@ impl Desktop {
         let io = unsafe { crate::cpu::ioapic_ok() };
         let t = crate::cpu::timer_ticks();
         let (x2, sv, tc, lid) = unsafe { crate::cpu::lapic_diag() };
+        let hid = unsafe { crate::cpu::hid_enum_count() };
+        let he = unsafe { crate::cpu::hid_any_seen() };
+        let pe = unsafe { crate::cpu::hid_poll_events() };
+        let ce = unsafe { crate::cpu::hid_cc_fail() };
+        let inj = unsafe { crate::cpu::hid_injected() };
         let mut w = W {
             buf: [0u8; SW],
             len: 0,
         };
         let _ = write!(
             w,
-            "PS2={} USB={} KB={} MS={} IO={} T={} X2={} SV={} TC={} L={}",
+            "PS2={} USB={} KB={} MS={} IO={} T={} X2={} SV={} TC={} L={} HID={} HE={} PE={} CE={} IN={}",
             if ps2 { "Y" } else { "N" },
             if usb { "Y" } else { "N" },
             if kf { "F" } else { "-" },
@@ -1432,7 +1437,12 @@ impl Desktop {
             if x2 { 1 } else { 0 },
             if sv { 1 } else { 0 },
             tc,
-            lid
+            lid,
+            hid,
+            if he { 1 } else { 0 },
+            pe,
+            ce,
+            inj
         );
         let attr: u16 = 0x4F00; // white on blue, high contrast
         for (i, &b) in w.buf[..w.len].iter().enumerate() {

@@ -917,6 +917,9 @@ impl XhciController {
             if len == 0 {
                 continue;
             }
+            if Self::config_has_hid(self, len) {
+                unsafe { crate::cpu::set_hid_any_seen(true); }
+            }
             let Some((config_value, iface_num, kind, ep_addr, max_pkt, binterval)) =
                 Self::find_hid_boot_interface(self, len)
             else {
@@ -986,6 +989,7 @@ impl XhciController {
                 }
             }
         }
+        unsafe { crate::cpu::set_hid_enum_count(found); }
         found
     }
 
@@ -1040,6 +1044,30 @@ impl XhciController {
         None
     }
 
+    /// Cheap probe used purely for diagnostics: does this configuration
+    /// descriptor contain *any* HID-class interface (boot-protocol or not)?
+    /// Surfaces on the status line as `HE=` so we can tell "no HID at all"
+    /// (device on EHCI / behind a hub / not present) from "HID present but
+    /// not boot-protocol" (needs a non-boot driver).
+    fn config_has_hid(&self, len: usize) -> bool {
+        let d = unsafe { core::slice::from_raw_parts(self.buf.desc as *const u8, len) };
+        if d.len() < 9 || d[1] != 0x02 {
+            return false;
+        }
+        let mut i = 0usize;
+        while i + 2 <= d.len() {
+            let blen = d[i] as usize;
+            if blen < 2 || i + blen > d.len() {
+                break;
+            }
+            if d[i + 1] == DESC_INTERFACE && blen >= 6 && d[i + 5] == CLASS_HID {
+                return true;
+            }
+            i += blen;
+        }
+        false
+    }
+
     /// Non-blocking poll: drains whatever transfer-completion events are
     /// currently on the (single, shared-across-every-endpoint) event ring,
     /// routes each to the HID device it belongs to, decodes any completed
@@ -1060,6 +1088,12 @@ impl XhciController {
             };
             if slot_id == 0 {
                 continue; // sentinel: a non-transfer event, already consumed
+            }
+            unsafe {
+                crate::cpu::inc_hid_poll_event();
+                if !ok {
+                    crate::cpu::inc_hid_cc_fail();
+                }
             }
             for (i, dev_opt) in self.hid.iter().enumerate() {
                 if let Some(dev) = dev_opt {
@@ -1124,6 +1158,7 @@ impl XhciController {
     /// Decode one completed HID boot report and inject it into the
     /// existing PS/2 input pipeline.
     fn handle_hid_report(&self, dev: &mut HidDevice) {
+        unsafe { crate::cpu::inc_hid_injected(); }
         let mut report = [0u8; 8];
         let n = dev.report_len.min(8);
         unsafe {
