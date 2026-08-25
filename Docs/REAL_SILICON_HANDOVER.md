@@ -153,7 +153,52 @@ Fields:
 - `aegis-kernel/src/page_tables.rs` — GB1/GB2 → 2 MiB PDs (framebuffer MMIO
   fix); check GB3 APIC-page memory type for the timer fix.
 
-## Outstanding user question (answer drives the timer fix)
+## CONFIRMED STATE (tablet test, this session)
 
-> From the top status line after boot, report `X2=`, `SV=`, whether `TC=`
-> changes over ~2 s, `L=`, and confirm `T=0`, `PS2=N`, `USB=Y`, `KB=`/`MS=` stay `_`, `IO=N`.
+Top status line read on the TP201S:
+`PS2=N USB=Y KB=- MS=- IO=N T=0 X2=0 SV=0 TC=0 L=0`
+No value changes on key press / mouse move; the `_` cursor does not blink.
+
+Decoding:
+- `X2=0` ⇒ kernel is in xAPIC/**MMIO** LAPIC mode.
+- `SV=0` ⇒ LAPIC not software-enabled ⇒ my `lapic_write(0xF0, svr|0x100)` never
+  reached the hardware.
+- `TC=0` ⇒ LAPIC timer not counting. `T=0` ⇒ timer ISR never runs (hence the
+  `_` cursor never blinks and no preemption).
+- `IO=N` ⇒ I/O APIC MMIO also unresponsive.
+
+**Conclusion:** the APIC MMIO region (`0xFEE00000`/`0xFEC00000`) is **not
+reachable** as the kernel maps it. Most likely cause: the APIC page is mapped
+with the wrong PAT/memory type (write-back) — QEMU tolerates this, real silicon
+requires **uncacheable (UC)** for APIC MMIO, so the writes are silently
+dropped. Secondary possibility: the LAPIC is actually still in x2APIC mode
+while `LAPIC_X2` was left `false` (EFI handed off in x2APIC; the x2APIC→xAPIC
+"disable" was ignored, or the re-read mis-read it), so MMIO is dead.
+
+## The fix (next session)
+
+**Do not rely on APIC MMIO. Enable x2APIC and drive the LAPIC via MSRs**, which
+bypass the broken MMIO mapping entirely:
+
+In `cpu.rs::init_lapic_timer()`:
+1. Detect x2APIC support: CPUID leaf `1`, `ECX` bit 21.
+2. If supported, **enable** x2APIC: `wrmsr(0x1B, rdmsr(0x1B) | (1<<10))`.
+3. Set `LAPIC_X2 = true` so every `lapic_read`/`lapic_write` uses the MSR
+   interface (`0x800 + (reg>>4)`) — already implemented and mode-aware.
+4. After that, `lapic_write(0xF0, svr|0x100)` (SVR enable), LVT timer, divide,
+   initial count all go via MSR and will actually take effect ⇒ `SV=1`,
+   `TC` counts, `T` increments.
+
+Also make the destination-ID read x2APIC-aware: `lapic_read(0x20)` in x2APIC
+returns the full 32-bit ID; `&0xFF` (already done) is the correct 8-bit
+destination for the I/O APIC.
+
+If x2APIC is *not* supported on the part, the fallback is to fix the GB3
+page-table mapping for the APIC range to **UC** (PAT/PCD/PWT) instead of
+write-back. Bay Trail (TP201S, ~2013 Silvermont) does support x2APIC, so the
+MSR path is the expected fix.
+
+After the LAPIC timer works (`T` climbs, `_` blinks), the remaining piece is
+the **USB-HID keyboard/mouse driver** on top of `usbhcd.rs` (PS/2 stays dead:
+`PS2=N`). Route USB HID interrupts via MSI if the I/O APIC MMIO is also broken.
+
