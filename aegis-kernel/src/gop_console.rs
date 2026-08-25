@@ -155,12 +155,13 @@ fn blit() {
     if bpp_bytes == 0 {
         return;
     }
-    // Clear only the region the console owns (rows 0..N*16 of the display)
-    // — never the whole framebuffer, so the desktop compositor below it is
-    // left alone. Then draw the glyphs.
+    // Only touch the rows that actually have content (0..=CUR_ROW), NOT all
+    // ROWS. On real hardware the framebuffer can be slow MMIO: clearing and
+    // redrawing 40 rows per sprintln line froze the TP201S (it appeared to
+    // hang after the first line). Redrawing just the active rows makes each
+    // blit cheap.
     let cols = (width / 8) as usize;
-    let rows = (height / 16) as usize;
-    let nrows = rows.min(ROWS);
+    let nrows = (unsafe { CUR_ROW } + 1).min(ROWS);
     let fb = base as *mut u8;
     unsafe {
         for r in 0..nrows {

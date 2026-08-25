@@ -12,7 +12,7 @@
 //! the loader writes `present = 0` and the kernel falls back to its
 //! Bochs-VBE PCI probe (QEMU) or the text backend alone.
 
-use uefi::boot::{locate_handle_buffer, open_protocol_exclusive, SearchType};
+use uefi::boot::{locate_handle_buffer, open_protocol, OpenProtocolAttributes, OpenProtocolParams, SearchType};
 use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
 use uefi::Identify;
 
@@ -72,9 +72,25 @@ pub fn to_handoff_bytes(h: &GopHandoff) -> [u8; GOP_BLOCK_SIZE] {
 /// list (QEMU stdvga + real GPUs). If the switch fails the current mode is
 /// handed over unchanged and the kernel centers its 640x400 desktop in it.
 pub fn query() -> Option<GopHandoff> {
+    uefi::println!("GOP: locate");
     let handles = locate_handle_buffer(SearchType::ByProtocol(&GraphicsOutput::GUID)).ok()?;
     let handle = *handles.first()?;
-    let mut gop = open_protocol_exclusive::<GraphicsOutput>(handle).ok()?;
+    uefi::println!("GOP: open");
+    // Open with NO agent handle (BY_HANDLE_PROTOCOL): `open_protocol_exclusive`
+    // passes the loader's image handle as the agent, and that OpenProtocol
+    // call faults on the TP201S firmware (reboot). A raw BY_HANDLE_PROTOCOL
+    // open asks only for the interface, which this firmware handles.
+    let mut gop = unsafe {
+        open_protocol::<GraphicsOutput>(
+            OpenProtocolParams {
+                handle,
+                agent: uefi::boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    }
+    .ok()?;
 
     // Use the firmware's CURRENT mode as-is. We deliberately do NOT call
     // `set_mode` to switch to 800x600x32: on real hardware (the TP201S) the
@@ -82,6 +98,7 @@ pub fn query() -> Option<GopHandoff> {
     // the kernel ever started (the screen froze at "no FLEET.CFG"). The
     // kernel centers its desktop in whatever mode the firmware already has,
     // so the switch is not required for the boot path.
+    uefi::println!("GOP: mode");
     let info = gop.current_mode_info();
     if !usable_mode(&info) {
         return None;
@@ -95,6 +112,7 @@ pub fn query() -> Option<GopHandoff> {
         _ => return None,                  // Bitmask/BltOnly: not CPU-writable
     };
 
+    uefi::println!("GOP: fb");
     let mut fb = gop.frame_buffer();
     let framebuffer_base = fb.as_mut_ptr() as u64;
     let framebuffer_size = fb.size() as u64;

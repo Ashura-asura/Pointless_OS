@@ -51,8 +51,12 @@ impl SerialWriter {
     fn putc(&mut self, c: u8) {
         #[cfg(not(test))]
         unsafe {
-            // Wait for the transmit-holding-register-empty bit (bit 5 of LSR).
-            loop {
+            // Wait for the transmit-holding-register-empty bit (bit 5 of LSR),
+            // but BOUNDED: on machines with no COM1 wired up (e.g. the TP201S),
+            // LSR never sets THRE and an unbounded loop hangs the whole boot.
+            // A missing UART must never freeze the kernel — give up and write
+            // anyway (harmless if there is no port).
+            for _ in 0..1_000_000 {
                 let mut status: u8 = 0;
                 core::arch::asm!("in al, dx", out("al") status, in("dx") COM1 + 5, options(nomem, preserves_flags));
                 if status & 0x20 != 0 {
