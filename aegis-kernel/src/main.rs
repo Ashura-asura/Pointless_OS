@@ -1150,6 +1150,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             // itself; keep it accurate here.
             unsafe {
                 aegis_kernel::cpu::set_usb_xhci_found(true);
+                aegis_kernel::cpu::set_usb_ehci_found(pci.find_usb_ehci().is_some());
             }
             unsafe {
                 XHCI = Some(usb);

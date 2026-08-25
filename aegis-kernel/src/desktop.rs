@@ -1421,13 +1421,14 @@ impl Desktop {
         let pe = unsafe { crate::cpu::hid_poll_events() };
         let ce = unsafe { crate::cpu::hid_cc_fail() };
         let inj = unsafe { crate::cpu::hid_injected() };
+        let ehc = unsafe { crate::cpu::usb_ehci_found() };
         let mut w = W {
             buf: [0u8; SW],
             len: 0,
         };
         let _ = write!(
             w,
-            "PS2={} USB={} KB={} MS={} IO={} T={} X2={} SV={} TC={} L={} HID={} HE={} PE={} CE={} IN={}",
+            "PS2={} USB={} KB={} MS={} IO={} T={} X2={} SV={} TC={} L={} HID={} HE={} PE={} CE={} IN={} EHC={}",
             if ps2 { "Y" } else { "N" },
             if usb { "Y" } else { "N" },
             if kf { "F" } else { "-" },
@@ -1442,7 +1443,8 @@ impl Desktop {
             if he { 1 } else { 0 },
             pe,
             ce,
-            inj
+            inj,
+            if ehc { 1 } else { 0 }
         );
         let attr: u16 = 0x4F00; // white on blue, high contrast
         for (i, &b) in w.buf[..w.len].iter().enumerate() {

@@ -795,6 +795,24 @@ pub unsafe fn usb_xhci_found() -> bool {
     USB_XHCI_FOUND
 }
 
+static mut USB_EHCI_FOUND: bool = false;
+
+/// Record whether an EHCI (USB-2.0) host controller was discovered.
+///
+/// # Safety
+/// Boot-time call.
+pub unsafe fn set_usb_ehci_found(v: bool) {
+    USB_EHCI_FOUND = v;
+}
+
+/// True if an EHCI host controller was discovered.
+///
+/// # Safety
+/// Read after boot init.
+pub unsafe fn usb_ehci_found() -> bool {
+    USB_EHCI_FOUND
+}
+
 // ---- USB-HID pipeline diagnostics (surfaced on the on-screen status line) ----
 // These let us see *where* the input pipeline breaks on real hardware that has
 // no serial output: did enumeration find boot HID devices? were any HID
