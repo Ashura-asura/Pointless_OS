@@ -32,6 +32,9 @@ static mut FB_BPP: u32 = 0;
 static mut BUF: [u16; COLS * ROWS] = [0; COLS * ROWS];
 static mut CUR_ROW: usize = 0;
 static mut CUR_COL: usize = 0;
+/// Highest row index already drawn to the framebuffer (-1 = none yet), so
+/// each blit only clears+draws the newly-appended rows.
+static mut DRAWN_UPTO: isize = -1;
 
 /// Point the console at the GOP framebuffer. Installed once at kernel entry
 /// so the whole boot log renders on the physical screen; later calls are
@@ -52,6 +55,7 @@ pub fn install(base: u64, width: u32, height: u32, stride_px: u32, bpp: u32) {
         FB_BPP = bpp;
         CUR_ROW = 0;
         CUR_COL = 0;
+        DRAWN_UPTO = -1;
         BUF = [0; COLS * ROWS];
     }
 }
@@ -133,13 +137,15 @@ fn scroll() {
         for c in BUF[(ROWS - 1) * COLS..].iter_mut() {
             *c = 0;
         }
+        // All rows shifted: the next blit must redraw everything.
+        DRAWN_UPTO = -1;
     }
 }
 
 fn blit() {
     let base = unsafe { FB_BASE };
     let width = unsafe { FB_WIDTH };
-    let height = unsafe { FB_HEIGHT };
+    let _height = unsafe { FB_HEIGHT };
     let stride = unsafe { FB_STRIDE };
     let bpp = unsafe { FB_BPP };
     // The loader's identity map covers only the first 4 GiB. A framebuffer
@@ -155,37 +161,47 @@ fn blit() {
     if bpp_bytes == 0 {
         return;
     }
-    // Only touch the rows that actually have content (0..=CUR_ROW), NOT all
-    // ROWS. On real hardware the framebuffer can be slow MMIO: clearing and
-    // redrawing 40 rows per sprintln line froze the TP201S (it appeared to
-    // hang after the first line). Redrawing just the active rows makes each
-    // blit cheap. Also skip the clear entirely: just draw the white glyphs
-    // on top of whatever the framebuffer already has — the background is
-    // black after the first blit, and the clear was the expensive part.
+    // Incremental redraw: clear + draw ONLY the rows that have changed since
+    // the last blit (start..=CUR_ROW where start = last-drawn+1). On real
+    // hardware the framebuffer is slow MMIO — redrawing every active row on
+    // every sprintln froze the TP201S. New lines draw ~1 row of pixels.
+    // Scrolling forces a full redraw (rare: once per 40 lines).
     let cols = (width / 8) as usize;
-    let nrows = (unsafe { CUR_ROW } + 1).min(ROWS);
+    let upto = (unsafe { CUR_ROW }).min(ROWS - 1);
+    let start = unsafe { DRAWN_UPTO + 1 };
+    let start = start.max(0) as usize;
     let fb = base as *mut u8;
-    for r in 0..nrows {
-        for c in 0..cols.min(COLS) {
-            let ch = unsafe { BUF[r * COLS + c] } as usize;
-            let glyph = crate::font::FONT8X16_BASIC[ch & 0xFF];
-            for (gy, bits) in glyph.iter().enumerate() {
-                for gx in 0..8 {
-                    let on = (bits >> (7 - gx)) & 1 == 1;
-                    let px = c * 8 + gx;
-                    let py = r * 16 + gy;
-                    let off = (py * stride as usize + px) * bpp_bytes;
-                    if off + bpp_bytes <= (nrows * 16) * stride as usize * bpp_bytes {
+    unsafe {
+        // Clear the new rows to black (they may hold garbage).
+        for r in start..=upto {
+            for px in 0..cols.min(COLS) * 8 {
+                let py = r * 16;
+                let off = (py * stride as usize + px) * bpp_bytes;
+                for k in 0..bpp_bytes.min(4) {
+                    *fb.add(off + k) = 0;
+                }
+            }
+        }
+        // Draw the new rows' glyphs.
+        for r in start..=upto {
+            for c in 0..cols.min(COLS) {
+                let ch = BUF[r * COLS + c] as usize;
+                let glyph = crate::font::FONT8X16_BASIC[ch & 0xFF];
+                for (gy, bits) in glyph.iter().enumerate() {
+                    for gx in 0..8 {
+                        let on = (bits >> (7 - gx)) & 1 == 1;
+                        let px = c * 8 + gx;
+                        let py = r * 16 + gy;
+                        let off = (py * stride as usize + px) * bpp_bytes;
                         let rgb = if on { 0xFFu8 } else { 0x00u8 };
                         for k in 0..bpp_bytes.min(4) {
-                            unsafe {
-                                *fb.add(off + k) = rgb;
-                            }
+                            *fb.add(off + k) = rgb;
                         }
                     }
                 }
             }
         }
+        DRAWN_UPTO = upto as isize;
     }
 }
 
