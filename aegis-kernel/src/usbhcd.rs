@@ -46,14 +46,15 @@ const ERSTSZ: u32 = 0x10; // interrupter 0, ERST size
 const ERSTBA: u32 = 0x18; // ERST base (low at +0x18, high at +0x1C)
 const ERDP: u32 = 0x24; // event ring dequeue pointer
 
-// ---------- TRB types ----------
-const TRB_ENABLE_SLOT: u32 = 3;
-const TRB_ADDRESS_DEVICE: u32 = 8;
-const TRB_LINK: u32 = 1;
-const TRB_SETUP_STAGE: u32 = 5;
-const TRB_DATA_STAGE: u32 = 6;
-const TRB_STATUS_STAGE: u32 = 7;
-const TRB_EVENT_CMD_COMPLETE: u32 = 32;
+// ---------- TRB types (xHCI 1.2 §6.4.6 TRB Type field encodings) ----------
+const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_ADDRESS_DEVICE: u32 = 11;
+const TRB_LINK: u32 = 6;
+const TRB_SETUP_STAGE: u32 = 2;
+const TRB_DATA_STAGE: u32 = 3;
+const TRB_STATUS_STAGE: u32 = 4;
+const TRB_EVENT_CMD_COMPLETE: u32 = 33; // Command Completion Event
+const TRB_TRANSFER_EVENT: u32 = 32; // Transfer Event
 
 // Completion codes (event TRB bits 23:16).
 const CC_SUCCESS: u32 = 1;
@@ -215,13 +216,16 @@ fn ring_put(ring: u64, trb: [u32; 4], enq: &mut u32, ccs: &mut bool) {
     }
     if idx as u32 == RING_TRBS - 2 {
         // Next free slot would be 15 (the Link slot): write the Link TRB,
-        // toggle the cycle, wrap to slot 0.
+        // toggle the cycle, wrap to slot 0. The Link TRB's cycle bit must be
+        // the *current* lap's consumer-cycle (the hardware follows it and only
+        // then toggles to the next lap), so capture it before toggling.
+        let link_cycle = *ccs;
         *ccs = !*ccs;
         let link = [
             (ring & 0xFFFF_FFC0) as u32,
             (ring >> 32) as u32,
             0,
-            (TRB_LINK << 10) | (1 << 1) | if *ccs { 1 } else { 0 }, // TC + new cycle
+            (TRB_LINK << 10) | (1 << 1) | if link_cycle { 1 } else { 0 }, // TC + current cycle
         ];
         unsafe {
             core::ptr::copy_nonoverlapping(link.as_ptr(), base.add(15 * 4), 4);
@@ -393,8 +397,8 @@ impl XhciController {
         reg_write(rts, ERSTSZ, 1);
         reg_write(rts, ERSTBA, self.buf.erst as u32);
         reg_write(rts, ERSTBA + 4, (self.buf.erst >> 32) as u32);
-        // ERDP points at the first event TRB; bit 0 (EHB) set on write.
-        reg_write(rts, ERDP, (self.buf.ev_ring | 1) as u32);
+        // ERDP points at the first event TRB; writing bit 3 clears EHB.
+        reg_write(rts, ERDP, (self.buf.ev_ring | 0x8) as u32);
         reg_write(rts, ERDP + 4, 0);
 
         // DCBAA.
@@ -451,15 +455,19 @@ impl XhciController {
             }
             let trb_type = (dw3 >> 10) & 0x3F;
             let cc = (dw2 >> 16) & 0xFF;
-            let slot = (dw2 >> 24) & 0xFF;
+            // For the Enable Slot command the newly-assigned Slot ID is returned
+            // in the Completion Parameter (DW2[15:0]); for other commands the
+            // parameter is 0 and only the success flag matters to callers.
+            let slot = dw2 & 0xFFFF;
             self.ev_idx = (self.ev_idx + 1) % 16;
             if self.ev_idx == 0 {
                 self.ev_ccs = !self.ev_ccs;
             }
-            // Advance ERDP to the next unprocessed event TRB.
+            // Advance ERDP to the next event TRB to be processed (EVidx points
+            // at it after the increment), clearing the EHB (bit 3).
             let rts = unsafe { self.base.add(self.rts_off as usize) };
-            let next = self.buf.ev_ring + (self.ev_idx as u64) * 16 + 16;
-            reg_write(rts, ERDP, next as u32);
+            let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
+            reg_write(rts, ERDP, (next as u32) | 0x8);
             reg_write(rts, ERDP + 4, (next >> 32) as u32);
             if trb_type == TRB_EVENT_CMD_COMPLETE && cc == CC_SUCCESS {
                 return Some(slot);
@@ -532,8 +540,9 @@ impl XhciController {
         data_len: u16,
         dir_in: bool,
     ) -> bool {
-        // Setup stage TRB (type 5): TRB[0..1] = setup packet, DW2 bits 31:17 =
-        // transfer length, bit 16 = TRT (1=IN data stage, 2=OUT data stage).
+        // Setup stage TRB (type 2): TRB[0..1] = setup packet, DW2 bits 23:0 =
+        // transfer length (fixed 8 for the setup packet), bits 17:16 = TRT
+        // (0=no data, 1=IN data stage, 2=OUT data stage).
         let mut s = [0u32; 4];
         s[0] = u32::from_le_bytes([setup[0], setup[1], setup[2], setup[3]]);
         s[1] = u32::from_le_bytes([setup[4], setup[5], setup[6], setup[7]]);
@@ -544,7 +553,7 @@ impl XhciController {
         } else {
             2
         };
-        s[2] = (data_len as u32) << 17 | (trt << 16);
+        s[2] = 8 | (trt << 16);
         s[3] = (TRB_SETUP_STAGE << 10) | (1 << 5); // IOC
         ring_put(
             self.buf.xfer_ring,
@@ -558,7 +567,9 @@ impl XhciController {
             let mut d = [0u32; 4];
             d[0] = data as u32;
             d[1] = (data >> 32) as u32;
-            d[2] = (data_len as u32) << 17 | if dir_in { 0 } else { 1 << 16 }; // DIR=0 IN, 1 OUT
+            // Data stage TRB (type 3): DW2 bits 23:0 = transfer length, bit 16 =
+            // DIR (0=OUT, 1=IN). A control IN reads data device->host, so DIR=1.
+            d[2] = (data_len as u32) | if dir_in { 1 << 16 } else { 0 };
             d[3] = (TRB_DATA_STAGE << 10) | (1 << 5); // IOC
             ring_put(
                 self.buf.xfer_ring,
@@ -568,12 +579,12 @@ impl XhciController {
             );
         }
 
-        // Status stage (type 7). DIR bit (bit 16) is the OPPOSITE of the data
-        // stage: for a control IN (device->host) the status stage is OUT
-        // (DIR=1); for a control OUT it is IN (DIR=0).
-        let dir = if dir_in { 1 } else { 0 };
+        // Status stage (type 4). DIR bit (bit 16) is the OPPOSITE of the data
+        // stage: for a control IN (data DIR=1) the status stage is OUT (DIR=0);
+        // for a control OUT (data DIR=0) it is IN (DIR=1).
+        let dir = if dir_in { 0 } else { 1 << 16 };
         let mut st = [0u32; 4];
-        st[3] = (TRB_STATUS_STAGE << 10) | (1 << 5) | (dir << 16); // IOC
+        st[3] = (TRB_STATUS_STAGE << 10) | (1 << 5) | dir; // IOC
         ring_put(
             self.buf.xfer_ring,
             st,
@@ -582,7 +593,7 @@ impl XhciController {
         );
         // Ring the doorbell for this slot (doorbell offset + slot).
         reg_write(self.base, self.db_off + slot * 4, 1);
-        // Poll the event ring for the transfer event (type 33). Completion
+        // Poll the event ring for the Transfer Event (type 32). Completion
         // code is DW2 bits 23:16.
         for _ in 0..100_000 {
             let idx = self.ev_idx as usize;
@@ -599,10 +610,10 @@ impl XhciController {
                 self.ev_ccs = !self.ev_ccs;
             }
             let rts = unsafe { self.base.add(self.rts_off as usize) };
-            let next = self.buf.ev_ring + (self.ev_idx as u64) * 16 + 16;
-            reg_write(rts, ERDP, next as u32);
+            let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
+            reg_write(rts, ERDP, (next as u32) | 0x8);
             reg_write(rts, ERDP + 4, (next >> 32) as u32);
-            if trb_type == 33 {
+            if trb_type == TRB_TRANSFER_EVENT {
                 return cc == CC_SUCCESS; // transfer event, completion code
             }
         }
@@ -851,7 +862,7 @@ impl XhciController {
         let trb = [
             dev.report_buf as u32,
             (dev.report_buf >> 32) as u32,
-            (dev.report_len as u32) << 17,
+            dev.report_len as u32,         // DW2 bits 23:0 = transfer length
             (TRB_NORMAL << 10) | (1 << 5), // IOC
         ];
         ring_put(dev.int_ring, trb, &mut dev.int_enq, &mut dev.int_ccs);
@@ -1037,11 +1048,6 @@ impl XhciController {
     /// real PS/2 IRQ would have, then re-arms every device's next transfer.
     /// Meant to be called once per `task_input` iteration.
     ///
-    /// Dispatch-by-identity (rather than "the next event must be mine") is
-    /// required because one event ring serves every endpoint on the
-    /// controller: with two HID devices outstanding, device B's completion
-    /// can land before device A's, and a poll that assumed order would
-    /// misattribute B's report to A and desync permanently.
     #[allow(clippy::needless_range_loop)]
     pub fn poll_hid(&mut self) {
         let mut completions: [Option<bool>; MAX_HID] = [None; MAX_HID];
@@ -1082,8 +1088,7 @@ impl XhciController {
     }
 
     /// Non-blocking single read of the next event TRB, if any. For a
-    /// Transfer Event (type 33 — this codebase's TRB-type convention,
-    /// matching `control_transfer`'s existing manual poll) returns
+    /// Transfer Event (type 32) returns
     /// `(Slot ID, Endpoint DCI, completion-code-success)`; other event
     /// types are consumed (ERDP still advances — required, events must
     /// drain in order) and reported back as slot id 0, which is never a
@@ -1098,17 +1103,18 @@ impl XhciController {
         let dw2 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 2)) };
         let trb_type = (dw3 >> 10) & 0x3F;
         let cc = (dw2 >> 16) & 0xFF;
-        let slot_id = (dw3 >> 24) & 0xFF;
-        let ep_dci = (dw3 >> 16) & 0x1F;
+        // Transfer Event DW2[31:24] = Slot ID; DW3[31:24] = Endpoint ID (DCI).
+        let slot_id = (dw2 >> 24) & 0xFF;
+        let ep_dci = (dw3 >> 24) & 0x1F;
         self.ev_idx = (self.ev_idx + 1) % 16;
         if self.ev_idx == 0 {
             self.ev_ccs = !self.ev_ccs;
         }
         let rts = unsafe { self.base.add(self.rts_off as usize) };
-        let next = self.buf.ev_ring + (self.ev_idx as u64) * 16 + 16;
-        reg_write(rts, ERDP, next as u32);
+        let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
+        reg_write(rts, ERDP, (next as u32) | 0x8);
         reg_write(rts, ERDP + 4, (next >> 32) as u32);
-        if trb_type == 33 {
+        if trb_type == TRB_TRANSFER_EVENT {
             Some((slot_id, ep_dci, cc == CC_SUCCESS))
         } else {
             Some((0, 0, false))
@@ -1331,12 +1337,15 @@ mod tests {
 
     #[test]
     fn trb_types() {
-        assert_eq!(TRB_ENABLE_SLOT, 3);
-        assert_eq!(TRB_ADDRESS_DEVICE, 8);
-        assert_eq!(TRB_SETUP_STAGE, 5);
-        assert_eq!(TRB_DATA_STAGE, 6);
-        assert_eq!(TRB_STATUS_STAGE, 7);
-        assert_eq!(TRB_EVENT_CMD_COMPLETE, 32);
+        // Values must match the xHCI 1.2 TRB Type field encodings.
+        assert_eq!(TRB_ENABLE_SLOT, 9);
+        assert_eq!(TRB_ADDRESS_DEVICE, 11);
+        assert_eq!(TRB_LINK, 6);
+        assert_eq!(TRB_SETUP_STAGE, 2);
+        assert_eq!(TRB_DATA_STAGE, 3);
+        assert_eq!(TRB_STATUS_STAGE, 4);
+        assert_eq!(TRB_EVENT_CMD_COMPLETE, 33);
+        assert_eq!(TRB_TRANSFER_EVENT, 32);
     }
 
     #[test]
@@ -1428,24 +1437,24 @@ mod tests {
         // The command landed at slot 14 with cycle bit set.
         let slot14 = unsafe { (ring as *const u32).add(14 * 4) };
         assert_eq!(unsafe { *slot14.add(3) } & 1, 1);
-        // Link TRB at slot 15: type LINK(1)<<10 | TC(bit1) | new cycle.
+        // Link TRB at slot 15: type LINK<<10 | TC(bit1) | current-lap cycle.
         let slot15 = unsafe { (ring as *const u32).add(15 * 4) };
         let dw3 = unsafe { *slot15.add(3) };
         assert_eq!((dw3 >> 10) & 0x3F, TRB_LINK);
         assert_eq!(dw3 & 2, 2); // TC set
-        assert_eq!(dw3 & 1, 0); // cycle toggled off
+        assert_eq!(dw3 & 1, 1); // cycle = current lap (so HW follows the link)
         assert_eq!(enq, 0);
-        assert!(!ccs); // toggled
+        assert!(!ccs); // producer cycle toggled for the next lap
     }
 
     #[test]
     fn setup_trb_encodes_trt() {
-        // GET_DESCRIPTOR (IN): TRT=1. For an 18-byte transfer, length<<17.
-        let data_len = 18u16;
+        // GET_DESCRIPTOR (IN): TRT=1. Setup stage DW2 bits 23:0 = fixed
+        // transfer length 8; bits 17:16 = TRT.
         let trt = 1u32; // IN data stage
-        let dw2 = (data_len as u32) << 17 | (trt << 16);
+        let dw2 = 8 | (trt << 16);
         assert_eq!(dw2 & 0x10000, 0x10000); // TRT bit
-        assert_eq!((dw2 >> 17) & 0x7FFF, 18); // length
+        assert_eq!(dw2 & 0xFFFF, 8); // transfer length fixed at 8
     }
 
     #[test]
