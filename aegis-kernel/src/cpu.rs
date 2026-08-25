@@ -824,6 +824,14 @@ static mut HID_POLL_EVENTS: u64 = 0; // transfer events drained in poll_hid
 static mut HID_CC_FAIL: u64 = 0; // of those, completion code != success
 static mut HID_INJECTED: u64 = 0; // reports handed to the PS/2 ring
 
+// ---- xHCI enumeration diagnostics (why did `enumerate_hid_devices` find 0?) ----
+static mut XHCI_PORTS: usize = 0; // HCSPARAMS1 max ports
+static mut XHCI_CONN: usize = 0; // root ports reporting Connect Status
+static mut XHCI_DEV: bool = false; // a device descriptor was successfully read
+static mut XHCI_DEV_CLS: u8 = 0; // device/interface class of first device read
+static mut XHCI_HUB: bool = false; // a hub (class 9) was seen on a root port
+static mut XHCI_PP: usize = 0; // ports we explicitly powered on (PP set)
+
 /// # Safety
 /// Boot-time call from the USB-HID driver.
 pub unsafe fn set_hid_enum_count(n: usize) {
@@ -873,6 +881,67 @@ pub unsafe fn hid_cc_fail() -> u64 {
 /// Read from the desktop diagnostic renderer.
 pub unsafe fn hid_injected() -> u64 {
     HID_INJECTED
+}
+
+/// # Safety
+/// Set from the USB-HID xHCI driver during enumeration.
+pub unsafe fn set_xhci_ports(n: usize) {
+    XHCI_PORTS = n;
+}
+/// # Safety
+/// Set from the USB-HID xHCI driver during enumeration.
+pub unsafe fn set_xhci_conn(n: usize) {
+    XHCI_CONN = n;
+}
+/// # Safety
+/// Set from the USB-HID xHCI driver during enumeration.
+pub unsafe fn set_xhci_dev(v: bool) {
+    XHCI_DEV = v;
+}
+/// # Safety
+/// Set from the USB-HID xHCI driver during enumeration.
+pub unsafe fn set_xhci_dev_cls(c: u8) {
+    XHCI_DEV_CLS = c;
+}
+/// # Safety
+/// Set from the USB-HID xHCI driver during enumeration.
+pub unsafe fn set_xhci_hub(v: bool) {
+    XHCI_HUB = v;
+}
+/// # Safety
+/// Set from the USB-HID xHCI driver during enumeration.
+pub unsafe fn set_xhci_pp(n: usize) {
+    XHCI_PP = n;
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_ports() -> usize {
+    XHCI_PORTS
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_conn() -> usize {
+    XHCI_CONN
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_dev() -> bool {
+    XHCI_DEV
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_dev_cls() -> u8 {
+    XHCI_DEV_CLS
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_hub() -> bool {
+    XHCI_HUB
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_pp() -> usize {
+    XHCI_PP
 }
 
 /// Snapshot the LAPIC's health for the on-screen boot diagnostic: whether we

@@ -77,6 +77,7 @@ const DESC_ENDPOINT: u8 = 5;
 // Interface class/subclass/protocol for boot-protocol HID keyboard/mouse
 // (USB HID 1.11 §4.2, Device Class Definition for HID).
 const CLASS_HID: u8 = 3;
+const CLASS_HUB: u8 = 9;
 const SUBCLASS_BOOT: u8 = 1;
 const PROTOCOL_KEYBOARD: u8 = 1;
 const PROTOCOL_MOUSE: u8 = 2;
@@ -620,9 +621,45 @@ impl XhciController {
         false
     }
 
+    /// Power on every root port (xHCI PP bit, bit 9) and record diagnostic
+    /// counters. Bay Trail / many SoC xHCI ports start unpowered, so without
+    /// this `PORTSC.CCS` stays 0 and enumeration finds nothing.
+    fn power_ports(&mut self) {
+        unsafe {
+            crate::cpu::set_xhci_ports(self.max_ports as usize);
+        }
+        let mut pp = 0usize;
+        for p in 0..self.max_ports {
+            let psc = self.caplen + PORTSC_BASE + (p as u32) * PORTSC_STRIDE;
+            let v = reg_read(self.base, psc);
+            if v & (1 << 9) == 0 {
+                reg_write(self.base, psc, v | (1 << 9));
+            }
+            pp += 1;
+        }
+        unsafe {
+            crate::cpu::set_xhci_pp(pp);
+        }
+        // Let ports ramp up and any attached devices connect.
+        for _ in 0..500_000 {
+            core::hint::spin_loop();
+        }
+        let mut conn = 0usize;
+        for p in 0..self.max_ports {
+            let psc = self.caplen + PORTSC_BASE + (p as u32) * PORTSC_STRIDE;
+            if reg_read(self.base, psc) & 1 != 0 {
+                conn += 1;
+            }
+        }
+        unsafe {
+            crate::cpu::set_xhci_conn(conn);
+        }
+    }
+
     /// Enumerate the first connected device: wait for a port, enable a slot,
     /// address the device.
     pub fn enumerate_first_device(&mut self) -> bool {
+        self.power_ports();
         // Find a connected port (PORTSC CCS = bit 0).
         let mut port = None;
         for p in 0..self.max_ports {
@@ -672,6 +709,14 @@ impl XhciController {
                 slot
             );
             return false;
+        }
+        let cls = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(4)) };
+        unsafe {
+            crate::cpu::set_xhci_dev(true);
+            crate::cpu::set_xhci_dev_cls(cls);
+            if cls == CLASS_HUB {
+                crate::cpu::set_xhci_hub(true);
+            }
         }
         let max_pkt0 = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(7)) };
         if !self.address_device(slot, max_pkt0) {
@@ -880,6 +925,7 @@ impl XhciController {
     /// interrupt transfer. Returns the number of devices brought up.
     pub fn enumerate_hid_devices(&mut self) -> usize {
         let mut found = 0usize;
+        self.power_ports();
         for p in 0..self.max_ports {
             if found >= MAX_HID {
                 break;
@@ -909,6 +955,14 @@ impl XhciController {
             if !self.control_transfer(slot, setup8, self.buf.desc, 8, true) {
                 continue;
             }
+            let cls = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(4)) };
+            unsafe {
+                crate::cpu::set_xhci_dev(true);
+                crate::cpu::set_xhci_dev_cls(cls);
+                if cls == CLASS_HUB {
+                    crate::cpu::set_xhci_hub(true);
+                }
+            }
             let max_pkt0 = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(7)) };
             if !self.address_device(slot, max_pkt0) {
                 continue;
@@ -917,8 +971,17 @@ impl XhciController {
             if len == 0 {
                 continue;
             }
+            if len > 5 {
+                let devcls =
+                    unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(5)) };
+                unsafe {
+                    crate::cpu::set_xhci_dev_cls(devcls);
+                }
+            }
             if Self::config_has_hid(self, len) {
-                unsafe { crate::cpu::set_hid_any_seen(true); }
+                unsafe {
+                    crate::cpu::set_hid_any_seen(true);
+                }
             }
             let Some((config_value, iface_num, kind, ep_addr, max_pkt, binterval)) =
                 Self::find_hid_boot_interface(self, len)
@@ -989,7 +1052,9 @@ impl XhciController {
                 }
             }
         }
-        unsafe { crate::cpu::set_hid_enum_count(found); }
+        unsafe {
+            crate::cpu::set_hid_enum_count(found);
+        }
         found
     }
 
@@ -1060,8 +1125,16 @@ impl XhciController {
             if blen < 2 || i + blen > d.len() {
                 break;
             }
-            if d[i + 1] == DESC_INTERFACE && blen >= 6 && d[i + 5] == CLASS_HID {
-                return true;
+            if d[i + 1] == DESC_INTERFACE && blen >= 6 {
+                let c = d[i + 5];
+                if c == CLASS_HID {
+                    return true;
+                }
+                if c == CLASS_HUB {
+                    unsafe {
+                        crate::cpu::set_xhci_hub(true);
+                    }
+                }
             }
             i += blen;
         }
@@ -1158,7 +1231,9 @@ impl XhciController {
     /// Decode one completed HID boot report and inject it into the
     /// existing PS/2 input pipeline.
     fn handle_hid_report(&self, dev: &mut HidDevice) {
-        unsafe { crate::cpu::inc_hid_injected(); }
+        unsafe {
+            crate::cpu::inc_hid_injected();
+        }
         let mut report = [0u8; 8];
         let n = dev.report_len.min(8);
         unsafe {

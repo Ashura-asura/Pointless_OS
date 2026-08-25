@@ -1467,6 +1467,32 @@ impl Desktop {
                 self.screen[SW + i] = attr | b as u16;
             }
         }
+        // Third line: xHCI root-port enumeration detail — why did we find 0 HID?
+        let xp = unsafe { crate::cpu::xhci_ports() };
+        let xc = unsafe { crate::cpu::xhci_conn() };
+        let xd = unsafe { crate::cpu::xhci_dev() };
+        let xcls = unsafe { crate::cpu::xhci_dev_cls() };
+        let xhub = unsafe { crate::cpu::xhci_hub() };
+        let xpp = unsafe { crate::cpu::xhci_pp() };
+        let mut w3 = W {
+            buf: [0u8; SW],
+            len: 0,
+        };
+        let _ = write!(
+            w3,
+            "XP={} XC={} XD={} XCLS={} XHUB={} XPP={}",
+            xp,
+            xc,
+            if xd { 1 } else { 0 },
+            xcls,
+            if xhub { 1 } else { 0 },
+            xpp
+        );
+        for (i, &b) in w3.buf[..w3.len].iter().enumerate() {
+            if i < SW {
+                self.screen[2 * SW + i] = attr | b as u16;
+            }
+        }
     }
 
     /// Blit the current composited screen onto the real VGA display.
