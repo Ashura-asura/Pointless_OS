@@ -48,6 +48,11 @@ pub extern "sysv64" fn _start(handoff_addr: u64) -> ! {
 }
 
 extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
+    // Disable interrupts immediately: the loader skipped ExitBootServices
+    // (TP201S firmware hangs on it), so the firmware's timer interrupt
+    // handlers are still active. Without `cli` they fire during early boot
+    // (before the kernel's own IDT is installed) and crash the kernel.
+    unsafe { core::arch::asm!("cli", options(nomem, preserves_flags)); }
     aegis_kernel::serial::SerialWriter::init();
     // Blank the VGA text buffer only: entering text mode (which disables
     // the firmware's Bochs-VBE/GOP display mode) is deferred until after
