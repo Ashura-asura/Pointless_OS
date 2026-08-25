@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(static_mut_refs)] // single-threaded loader, static MAP_BUF
 
 mod elf;
 mod fleet_cfg;
@@ -8,7 +9,6 @@ mod memory_map;
 mod page_tables;
 mod serial;
 
-use uefi::mem::memory_map::MemoryMap;
 use uefi::prelude::*;
 
 extern crate alloc;
@@ -200,11 +200,50 @@ fn main() -> Status {
             // (The GOP query was already done before the page-table switch.)
 
             uefi::println!("Aegis: Calling ExitBootServices...");
-            // Some(LOADER_DATA) allocates a memory pool that hangs on the
-            // TP201S firmware. None avoids the allocation — the kernel does
-            // not need the loader to reserve a memory type.
-            let final_map = unsafe { uefi::boot::exit_boot_services(None) };
-            let final_count = final_map.entries().count();
+            // Raw ExitBootServices — single attempt, no retry loop, no pool
+            // allocation (the uefi crate's wrapper retries and re-allocates,
+            // which hangs this firmware). Get the memory map once into a
+            // static buffer, call EBS once with that key, then build the
+            // handoff from the stored descriptors.
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            struct MapDesc {
+                ty: u32,
+                _pad: u32,
+                phys: u64,
+                _virt: u64,
+                pages: u64,
+                _attrs: u64,
+            }
+            const MAX_MAP: usize = 128;
+            static mut MAP_BUF: [MapDesc; MAX_MAP] = [MapDesc {
+                ty: 0,
+                _pad: 0,
+                phys: 0,
+                _virt: 0,
+                pages: 0,
+                _attrs: 0,
+            }; MAX_MAP];
+            let final_count = unsafe {
+                let st = uefi::table::system_table_raw().unwrap();
+                let bs = (*st.as_ptr()).boot_services.as_ref().unwrap();
+                let ih = uefi::boot::image_handle();
+                let mut size = (MAX_MAP * 48) as usize;
+                let mut key = 0usize;
+                let mut desc_size = 0usize;
+                let mut desc_ver = 0u32;
+                let status = (bs.get_memory_map)(
+                    &mut size,
+                    MAP_BUF.as_mut_ptr() as *mut uefi::mem::memory_map::MemoryDescriptor,
+                    &mut key,
+                    &mut desc_size,
+                    &mut desc_ver,
+                );
+                if status == uefi::Status::SUCCESS {
+                    let _ = (bs.exit_boot_services)(ih.as_ptr(), key);
+                }
+                (size / 48).min(MAX_MAP)
+            };
             sprintln!(
                 "Aegis: ExitBootServices OK — machine handed over to kernel ({} descriptors in final map)",
                 final_count
@@ -241,12 +280,11 @@ fn main() -> Status {
             // layout).
             const HANDOFF_PAGES: u64 = 2;
             if image_end + HANDOFF_PAGES * 4096 >= 0xA0000 {
-                image_end = final_map
-                    .entries()
-                    .filter(|d| {
-                        d.ty == uefi::boot::MemoryType::CONVENTIONAL && d.phys_start >= image_end
-                    })
-                    .map(|d| d.phys_start)
+                // CONVENTIONAL memory type = 7.
+                image_end = unsafe { &MAP_BUF[..final_count] }
+                    .iter()
+                    .filter(|d| d.ty == 7 && d.phys >= image_end)
+                    .map(|d| d.phys)
                     .min()
                     .unwrap_or(image_end);
             }
@@ -272,10 +310,8 @@ fn main() -> Status {
                 entries: [MapEntry; MAX_ENTRIES],
             }
 
-            let in_conventional = final_map.entries().any(|d| {
-                d.phys_start <= handoff_addr
-                    && handoff_addr < d.phys_start + d.page_count * 4096
-                    && d.ty == uefi::boot::MemoryType::CONVENTIONAL
+            let in_conventional = unsafe { &MAP_BUF[..final_count] }.iter().any(|d| {
+                d.phys <= handoff_addr && handoff_addr < d.phys + d.pages * 4096 && d.ty == 7
             });
             sprintln!(
                 "Aegis: boot-info page 0x{:X} inside conventional memory: {} (kernel image ends 0x{:X})",
@@ -295,11 +331,15 @@ fn main() -> Status {
                     pages: 0,
                 }; MAX_ENTRIES],
             };
-            for (i, d) in final_map.entries().enumerate().take(MAX_ENTRIES) {
+            for (i, d) in unsafe { &MAP_BUF[..final_count] }
+                .iter()
+                .enumerate()
+                .take(MAX_ENTRIES)
+            {
                 handoff.entries[i] = MapEntry {
-                    ty: d.ty.0,
-                    base: d.phys_start,
-                    pages: d.page_count,
+                    ty: d.ty,
+                    base: d.phys,
+                    pages: d.pages,
                 };
             }
             unsafe {
