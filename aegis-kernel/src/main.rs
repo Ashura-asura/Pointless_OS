@@ -55,31 +55,15 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // the GOP framebuffer the firmware set up.
     aegis_kernel::vga::vga_init();
 
-    // Install the on-screen GOP scrolling console IMMEDIATELY so every
-    // kernel `sprintln!` from here on renders to the physical display. The
-    // loader's UEFI console services die at ExitBootServices; COM1 is
-    // unwired on the TP201S and VGA text mode does not render under GOP —
-    // this is the only visible channel until the desktop backend installs.
-    if let Some(h) = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) } {
-        aegis_kernel::gop_console::install(
-            h.framebuffer_base,
-            h.width,
-            h.height,
-            h.stride_px,
-            h.bpp,
-        );
-        // `GopHandoff` is packed; copy fields out before formatting.
-        let (fb, w, hgt, bpp) = (h.framebuffer_base, h.width, h.height, h.bpp);
-        sprintln!(
-            "Aegis: GOP console installed at boot entry (base={:#x} {}x{} bpp={})",
-            fb,
-            w,
-            hgt,
-            bpp
-        );
-    } else {
-        sprintln!("Aegis: no GOP handoff for the on-screen console");
-    }
+    // GOP console install was HERE — moved DOWN to after the IDT is loaded
+    // (see below). The first `gop_console::mirror()` call does a real MMIO
+    // blit to the GOP framebuffer; on the TP201S this is the earliest point
+    // in boot that touches unverified device memory, and with no IDT up yet
+    // any fault there (bad PTE, unmapped page, whatever) triple-faults
+    // silently instead of printing vector/error-code/CR2 over serial. Until
+    // GOP installs, `gop_console::mirror()` is a no-op (checked via
+    // `installed()`), so every `sprintln!` between here and the install call
+    // below is serial+VGA-text only — safe.
 
     sprintln!("=== Aegis Phase 2: Bare-Metal Kernel ===");
     sprintln!("Aegis: kernel started (loader handed off at entry)");
@@ -216,6 +200,35 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // is a logged exception, not a silent triple-fault.
     unsafe {
         aegis_kernel::cpu::disable_smep_smap();
+    }
+
+    // Install the on-screen GOP scrolling console now that GDT+IDT are live,
+    // so every kernel `sprintln!` from here on renders to the physical
+    // display AND any fault the blit hits is caught and reported over
+    // serial (vector/error-code/RIP/CR2) instead of triple-faulting
+    // silently. The loader's UEFI console services die at ExitBootServices;
+    // COM1 is unwired on the TP201S and VGA text mode does not render under
+    // GOP — this is the only visible channel until the desktop backend
+    // installs.
+    if let Some(h) = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) } {
+        aegis_kernel::gop_console::install(
+            h.framebuffer_base,
+            h.width,
+            h.height,
+            h.stride_px,
+            h.bpp,
+        );
+        // `GopHandoff` is packed; copy fields out before formatting.
+        let (fb, w, hgt, bpp) = (h.framebuffer_base, h.width, h.height, h.bpp);
+        sprintln!(
+            "Aegis: GOP console installed (base={:#x} {}x{} bpp={})",
+            fb,
+            w,
+            hgt,
+            bpp
+        );
+    } else {
+        sprintln!("Aegis: no GOP handoff for the on-screen console");
     }
 
     unsafe {
