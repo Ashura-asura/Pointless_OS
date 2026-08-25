@@ -227,25 +227,26 @@ fn main() -> Status {
             let final_count = unsafe {
                 let st = uefi::table::system_table_raw().unwrap();
                 let bs = (*st.as_ptr()).boot_services.as_ref().unwrap();
-                let ih = uefi::boot::image_handle();
                 let mut size = (MAX_MAP * 48) as usize;
                 let mut key = 0usize;
                 let mut desc_size = 0usize;
                 let mut desc_ver = 0u32;
-                let status = (bs.get_memory_map)(
+                let _ = (bs.get_memory_map)(
                     &mut size,
                     MAP_BUF.as_mut_ptr() as *mut uefi::mem::memory_map::MemoryDescriptor,
                     &mut key,
                     &mut desc_size,
                     &mut desc_ver,
                 );
-                if status == uefi::Status::SUCCESS {
-                    let _ = (bs.exit_boot_services)(ih.as_ptr(), key);
-                }
+                // ExitBootServices SKIPPED — the TP201S firmware hangs on the
+                // call (both the uefi crate's wrapper and the raw firmware
+                // function pointer). The kernel runs under the firmware's
+                // boot services without EBS. The framebuffer and handoff are
+                // already set up, so the kernel can print and boot.
                 (size / 48).min(MAX_MAP)
             };
             sprintln!(
-                "Aegis: ExitBootServices OK — machine handed over to kernel ({} descriptors in final map)",
+                "Aegis: ExitBootServices SKIPPED (TP201S workaround) — {} descriptors, handing off",
                 final_count
             );
 
