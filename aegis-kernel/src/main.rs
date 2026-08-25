@@ -84,9 +84,11 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     sprintln!("=== Aegis Phase 2: Bare-Metal Kernel ===");
     sprintln!("Aegis: kernel started (loader handed off at entry)");
 
-    unsafe {
-        aegis_kernel::cpu::disable_smep_smap();
-    }
+    // disable_smep_smap was HERE — moved DOWN to after the IDT is loaded
+    // (line ~211) so the CR4 write is caught by the exception handler if
+    // it faults on real silicon (QEMU tolerates the write, but real CPUs
+    // with an unsupported SMAP bit would triple-fault without an IDT up).
+
     sprintln!(
         "Aegis: kernel stack 0x{:016X} ({} KiB, dedicated BSS region)",
         aegis_kernel::cpu::stack_top(),
@@ -209,6 +211,12 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         aegis_kernel::cpu::init_idt();
     }
     sprintln!("Aegis: IDT loaded (exception vectors 0-31 + timer at 0x30 + keyboard at 0x21)");
+
+    // CR4 SMEP/SMAP disable now runs with the IDT installed, so a fault here
+    // is a logged exception, not a silent triple-fault.
+    unsafe {
+        aegis_kernel::cpu::disable_smep_smap();
+    }
 
     unsafe {
         aegis_kernel::cpu::mask_pic();
