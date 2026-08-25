@@ -159,21 +159,12 @@ fn blit() {
     // ROWS. On real hardware the framebuffer can be slow MMIO: clearing and
     // redrawing 40 rows per sprintln line froze the TP201S (it appeared to
     // hang after the first line). Redrawing just the active rows makes each
-    // blit cheap.
+    // blit cheap. Also skip the clear entirely: just draw the white glyphs
+    // on top of whatever the framebuffer already has — the background is
+    // black after the first blit, and the clear was the expensive part.
     let cols = (width / 8) as usize;
     let nrows = (unsafe { CUR_ROW } + 1).min(ROWS);
     let fb = base as *mut u8;
-    unsafe {
-        for r in 0..nrows {
-            for px in 0..cols.min(COLS) * 8 {
-                let py = r * 16;
-                let off = (py * stride as usize + px) * bpp_bytes;
-                for k in 0..bpp_bytes.min(4) {
-                    *fb.add(off + k) = 0;
-                }
-            }
-        }
-    }
     for r in 0..nrows {
         for c in 0..cols.min(COLS) {
             let ch = unsafe { BUF[r * COLS + c] } as usize;
