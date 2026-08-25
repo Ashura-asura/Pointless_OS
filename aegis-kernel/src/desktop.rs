@@ -1428,7 +1428,7 @@ impl Desktop {
         };
         let _ = write!(
             w,
-            "PS2={} USB={} KB={} MS={} IO={} T={} X2={} SV={} TC={} L={} HID={} HE={} PE={} CE={} IN={} EHC={}",
+            "PS2={} USB={} KB={} MS={} IO={} T={} X2={} SV={} TC={} L={}",
             if ps2 { "Y" } else { "N" },
             if usb { "Y" } else { "N" },
             if kf { "F" } else { "-" },
@@ -1438,7 +1438,17 @@ impl Desktop {
             if x2 { 1 } else { 0 },
             if sv { 1 } else { 0 },
             tc,
-            lid,
+            lid
+        );
+        // Second line: USB-HID pipeline diagnostics (kept on its own row so it
+        // is never clipped by the 80-column width).
+        let mut w2 = W {
+            buf: [0u8; SW],
+            len: 0,
+        };
+        let _ = write!(
+            w2,
+            "HID={} HE={} PE={} CE={} IN={} EHC={}",
             hid,
             if he { 1 } else { 0 },
             pe,
@@ -1450,6 +1460,11 @@ impl Desktop {
         for (i, &b) in w.buf[..w.len].iter().enumerate() {
             if i < SW {
                 self.screen[i] = attr | b as u16;
+            }
+        }
+        for (i, &b) in w2.buf[..w2.len].iter().enumerate() {
+            if i < SW {
+                self.screen[SW + i] = attr | b as u16;
             }
         }
     }
