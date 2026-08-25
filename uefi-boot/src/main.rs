@@ -200,9 +200,10 @@ fn main() -> Status {
             // (The GOP query was already done before the page-table switch.)
 
             uefi::println!("Aegis: Calling ExitBootServices...");
-            let final_map = unsafe {
-                uefi::boot::exit_boot_services(Some(uefi::boot::MemoryType::LOADER_DATA))
-            };
+            // Some(LOADER_DATA) allocates a memory pool that hangs on the
+            // TP201S firmware. None avoids the allocation — the kernel does
+            // not need the loader to reserve a memory type.
+            let final_map = unsafe { uefi::boot::exit_boot_services(None) };
             let final_count = final_map.entries().count();
             sprintln!(
                 "Aegis: ExitBootServices OK — machine handed over to kernel ({} descriptors in final map)",
