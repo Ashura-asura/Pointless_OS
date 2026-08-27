@@ -272,3 +272,32 @@ jobs:
         run: |
           rm -f Cargo.lock
           cargo test --release fuzz_corpus::corpus_driven_fuzz_is_total_and_grows
+
+  summary:
+    name: Emit test-summary.json
+    # Prevents the documentation's test totals from drifting: CI computes the
+    # authoritative per-suite counts and publishes them as an artifact. Self-
+    # contained (re-runs the three suites) so it cannot break the Test/Kernel
+    # gate jobs above.
+    runs-on: ubuntu-latest
+    needs: [test, kernel]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: clippy, rustfmt
+
+      - name: Install kernel/bootloader targets
+        run: rustup target add x86_64-unknown-none x86_64-unknown-uefi
+
+      - name: Emit test-summary.json
+        run: bash scripts/emit-test-summary.sh
+
+      - name: Upload test-summary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-summary
+          path: test-summary.json

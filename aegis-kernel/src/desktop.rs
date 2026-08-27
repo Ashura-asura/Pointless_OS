@@ -1493,6 +1493,119 @@ impl Desktop {
                 self.screen[2 * SW + i] = attr | b as u16;
             }
         }
+        // Fourth line: enumeration phase + event/transfer counters. P = furthest
+        // phase reached (1=ports powered .. 11=device armed). NS=enable_slot
+        // ok, NA=addr(BSR) ok, NCMD=cmd-completion events, NT=control xfers
+        // attempted, NTO=control xfers that timed out.
+        let ph = unsafe { crate::cpu::xhci_phase() };
+        let ns = unsafe { crate::cpu::xhci_nslot() };
+        let na = unsafe { crate::cpu::xhci_naddr() };
+        let ncmd = unsafe { crate::cpu::xhci_ncmd() };
+        let ntr = unsafe { crate::cpu::xhci_ntr() };
+        let nto = unsafe { crate::cpu::xhci_nto() };
+        let last_cc = unsafe { crate::cpu::xhci_last_cc() };
+        let ccf = unsafe { crate::cpu::xhci_cc_fail() };
+        let ccs = unsafe { crate::cpu::xhci_cc_success() };
+        let natt = unsafe { crate::cpu::xhci_natt() };
+        let nevt = unsafe { crate::cpu::xhci_nevt() };
+        let csts = unsafe { crate::cpu::xhci_csts() };
+        let crcr_lo = unsafe { crate::cpu::xhci_crcr_lo() };
+        let crcr_hi = unsafe { crate::cpu::xhci_crcr_hi() };
+        let crcr_wlo = unsafe { crate::cpu::xhci_crcr_wlo() };
+        let crcr_whi = unsafe { crate::cpu::xhci_crcr_whi() };
+        let cmd_ring = unsafe { crate::cpu::xhci_cmd_ring() };
+        let legacy = unsafe { crate::cpu::xhci_legacy() };
+        let legacy_st = unsafe { crate::cpu::xhci_legacy_st() };
+        let caplen = unsafe { crate::cpu::xhci_caplen() };
+        let crcr_pre_lo = unsafe { crate::cpu::xhci_crcr_pre_lo() };
+        let crcr_pre_hi = unsafe { crate::cpu::xhci_crcr_pre_hi() };
+        let hch0 = unsafe { crate::cpu::xhci_hch0() };
+        let hrst = unsafe { crate::cpu::xhci_hrst() };
+        let sts_pre = unsafe { crate::cpu::xhci_usbsts_pre() };
+        let sts_post = unsafe { crate::cpu::xhci_usbsts_post() };
+        let mut w4 = W {
+            buf: [0u8; SW],
+            len: 0,
+        };
+        let _ = write!(
+            w4,
+            "P={} NAT={} NCMD={} NEV={} NT={} CC={:02X} CF={} ST={:02X}",
+            ph, natt, ncmd, nevt, ntr, last_cc, ccf, csts & 0xFF
+        );
+        for (i, &b) in w4.buf[..w4.len].iter().enumerate() {
+            if i < SW {
+                self.screen[3 * SW + i] = attr | b as u16;
+            }
+        }
+        // Line 5: our intended cmd_ring vs CRCR readback (after-write/halted,
+        // then after-Run). If CRW != cmd_ring the write was ignored.
+        let mut w5 = W {
+            buf: [0u8; SW],
+            len: 0,
+        };
+        let _ = write!(
+            w5,
+            "CRW={:08X}{:08X} CR={:08X}{:08X} CMD={:08X}{:08X} NA={}",
+            crcr_whi, crcr_wlo, crcr_hi, crcr_lo,
+            (cmd_ring >> 32) as u32, cmd_ring as u32, na
+        );
+        for (i, &b) in w5.buf[..w5.len].iter().enumerate() {
+            if i < SW {
+                self.screen[4 * SW + i % SW] = attr | b as u16;
+            }
+        }
+        // Line 6: USB Legacy Support ownership. LEG = cap register value;
+        // bits 16 = BIOS-owned, 24 = OS-owned. ST: 0=no xECP, 1=no legcap,
+        // 2=already OS, 3=handed off, 4=forced. If BIOS still owns (bit16=1)
+        // the controller drops OS register writes (CRCR stays 0 -> CC=05).
+        let mut w6 = W {
+            buf: [0u8; SW],
+            len: 0,
+        };
+        let _ = write!(
+            w6,
+            "LEG={:08X} ST={} B={} O={}",
+            legacy, legacy_st,
+            (legacy >> 16) & 1, (legacy >> 24) & 1
+        );
+        for (i, &b) in w6.buf[..w6.len].iter().enumerate() {
+            if i < SW {
+                self.screen[5 * SW + i % SW] = attr | b as u16;
+            }
+        }
+        // Line 7: reset/CRCR-write diagnostic. CAP=caplen (operational base
+        // offset). PRE=CRCR readback BEFORE our write (should be ~0). HCH/HRST
+        // = whether Halted/HCRST were ever observed (0 => USBSTS reads are
+        // unreliable / controller wasn't seen Halted => CRCR write dropped).
+        // STPRE/STPOST = raw USBSTS before the write and after Run.
+        let mut w7 = W {
+            buf: [0u8; SW],
+            len: 0,
+        };
+        let _ = write!(
+            w7,
+            "CAP={:X} HCH={} HRST={} PRE={:08X}{:08X} STP={:08X} STQ={:08X}",
+            caplen, hch0, hrst, crcr_pre_hi, crcr_pre_lo, sts_pre, sts_post
+        );
+        for (i, &b) in w7.buf[..w7.len].iter().enumerate() {
+            if i < SW {
+                self.screen[6 * SW + i % SW] = attr | b as u16;
+            }
+        }
+        // Line 8: xHCI MMIO BAR physical address, so we can confirm which
+        // page-table region it lives in (4th GB vs high window) and therefore
+        // which mapping must be uncacheable.
+        let bar = unsafe { crate::cpu::xhci_bar() };
+        let mut w8 = W {
+            buf: [0u8; SW],
+            len: 0,
+        };
+        let _ = write!(w8, "BAR={:016X}", bar);
+        for (i, &b) in w8.buf[..w8.len].iter().enumerate() {
+            if i < SW {
+                self.screen[7 * SW + i % SW] = attr | b as u16;
+            }
+        }
     }
 
     /// Blit the current composited screen onto the real VGA display.

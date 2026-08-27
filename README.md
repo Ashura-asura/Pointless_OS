@@ -40,13 +40,16 @@ engineering experimentation.
 
 ## Status
 
-An active research prototype. **All 12 phases of the design-doc roadmap are
-implemented and closed**, with the core architectural claim — a role-granted,
+An active research prototype. **The 12 phases of the design-doc roadmap are
+implemented as research milestones** (design + a first real implementation per
+phase — see the evidence taxonomy in `Docs/HONEST_STATUS.md` for what "done"
+means for each feature), with the core architectural claim — a role-granted,
 zero-capability AI agent that provably cannot self-escalate, running one real
-task — verified live under QEMU. The **full live test suite is 912 tests**:
-**754 in `aegis-kernel`** (contract tests over the real kernel, **757 with
-`--features vmx-demo`**), **136 in the `aegis` model crates**, and **22 in
-`uefi-boot`** (loader + ELF parsing), fmt/clippy-clean. An external audit of
+task — verified live under QEMU. The **live test suite is 1,015 tests**:
+**856 in `aegis-kernel`** (contract tests over the real kernel, **859 with
+`--features vmx-demo`**), **137 in the `aegis` model crates**, and **22 in
+`uefi-boot`** (loader + ELF parsing); fmt/clippy-clean. The authoritative
+totals are emitted by CI to `test-summary.json`. An external audit of
 the kernel (2026-08-19) found a critical `ipc_cap_grant` bounds bug and
 several boundary holes; all are fixed with adversarial tests, and the honest
 gap inventory (what is designed-but-not-refactored and what is hardware- or
@@ -99,16 +102,21 @@ serial logs + framebuffer captures):
 - **Fleet / distributed**: a two-node link over real e1000e/socket-netdev
   frames — capability envelopes, consensus re-election, split-brain resolution,
   and remote invocation of a transferred capability.
-- **Hypervisor groundwork (hardware-gated)**: a resumable VMX run loop
-  (vmlaunch/vmresume, corrected SDM exit-reason map, EPT wired into the
-  VMCS, I/O emulation into in-guest device models), a real **Linux guest
-  image** (bzImage + static BusyBox initramfs, three standalone boot paths
-  verified), a 4-level EPT builder, and a growing guest device set —
-  virtio-blk, 8259 PIC / 16550 UART / 8254 PIT / PCI config, then **UHCI USB
-  (low-speed HID keyboard, full 7-TD enumeration live) and a Sound Blaster 16
-  DSP (reset handshake 0xAA, version 4.5, sample-rate playback live)**. The
-  Aegis-hosted guest run still needs a VMX-capable CPU — the bring-up
-  primitive compiles + contract-tests but has not run on one here.
+- **Hypervisor groundwork**: a resumable VMX run loop (vmlaunch/vmresume,
+  corrected SDM exit-reason map, EPT wired into the VMCS, I/O emulation into
+  in-guest device models), a real **Linux guest image** (bzImage + static
+  BusyBox initramfs, three standalone boot paths verified), a 4-level EPT
+  builder, and a growing guest device set — virtio-blk, 8259 PIC / 16550
+  UART / 8254 PIT / PCI config, then **UHCI USB (low-speed HID keyboard, full
+  7-TD enumeration live) and a Sound Blaster 16 DSP (reset handshake 0xAA,
+  version 4.5, sample-rate playback live)**. **Execution evidence:** Aegis has
+  demonstrated live nested VT-x activation and genuine EPT VM-exit handling
+  (VMXON → VMCS → VMLAUNCH → guest → EPT violation → real VM exit, under
+  QEMU/KVM nested virt). **What is NOT yet proven:** sustained guest
+  instruction execution through the run loop — the guest does not yet execute a
+  stable stream of instructions, take repeated exits/resumes, or reach an
+  emulated device. So: *hypervisor execution has begun, but guest execution is
+  broken.* Aegis is neither a functioning hypervisor nor unimplemented.
 - **Host-side ACPI + SMP groundwork**: the kernel reads the *real* RSDP/RSDT/
   MADT tables QEMU/OVMF expose (three-tier search; >4 GiB entries rejected by
   the identity map) and enumerates the CPUs/APICs (`SMP: 2 processor(s)
@@ -135,8 +143,9 @@ Limits section, split into *closed / reduced / inherent*):
 - Networking is polled (no interrupts/MSI-X); TLS uses a fixed deterministic
   scalar (no CSPRNG in the guest); no certificate-chain verification.
 - Windows/Linux compat is translation-layer only; the hypervisor path (VMX
-  run loop, EPT, guest device models, real Linux guest image) compiles +
-  contract-tests but has not run on a VMX-capable CPU.
+  run loop, EPT, guest device models, real Linux guest image) has demonstrated
+  live nested VT-x activation and EPT VM-exit handling, but has not yet
+  demonstrated sustained guest instruction execution.
 - The kernel is single-threaded; contract tests prove the model, not
   production behavior.
 
@@ -149,10 +158,10 @@ Limits section, split into *closed / reduced / inherent*):
 ## Repository layout
 - `aegis-kernel/` — the real kernel: boot, drivers, netstack, TLS, store,
   scheduler, supervision, desktop/compositor/editor, compat layers, ACPI/SMP,
-  and the hypervisor device models (`cargo test` = 754 tests; **757 with
-  `--features vmx-demo`**)
+   and the hypervisor device models (`cargo test` = 856 tests; **859 with
+   `--features vmx-demo`**)
 - `aegis/` — model crates mirroring the kernel (capability-core, store,
-  net, fleet, grants, conformance, orchestration, etc.; 136 tests) + the SDK
+   net, fleet, grants, conformance, orchestration, etc.; 137 tests) + the SDK
   guide and runnable example in `Docs/spec/sdk.md` and `aegis/crates/sdk-example/`
 - `uefi-boot/` — UEFI loader + image build + QEMU demo scripts (22 tests)
 - `guest/` — the real Linux guest image (bzImage + BusyBox initramfs,
@@ -206,8 +215,9 @@ the demo scripts' headers.
 1. Real-hardware certification (the single largest remaining gap).
 2. Real DMAR IOMMU programming and interrupt-driven (MSI-X) NIC paths.
 3. Aegis-hosted VM path: the hypervisor groundwork (VMX run loop, EPT, guest
-   device models incl. UHCI/SB16, real Linux guest image, guest-ACPI seam) is
-   built and contract-tested — it closes on a VMX-capable CPU.
+   device models incl. UHCI/SB16, real Linux guest image, guest-ACPI seam) has
+   demonstrated live nested VT-x activation and EPT VM-exit handling, but guest
+   execution is not yet sustained — that is the next VMX milestone.
 4. More desktop apps on the live desktop: multi-instance spawning (taskbar
    "launch" currently raises the one boot-time instance of each app) and a
    manifest-driven app model (the desktop roadmap itself is complete).

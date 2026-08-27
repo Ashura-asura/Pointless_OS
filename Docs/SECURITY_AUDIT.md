@@ -5,13 +5,16 @@ kernel-hardening rows updated 2026-08-19 (audit follow-up: ObjectID + pointer ga
 This document is the honest certification matrix for Phase 12. No claim below outruns
 its test evidence; nothing here certifies production behavior.*
 
-*Partial-reconciliation note: the fuzzing, kernel-boundary-hardening, and totals rows were
-updated in this pass with real re-run numbers (kernel 787/790, workspace 136, bootloader
-22). Several "NOT certified" rows below reflect real live-boot evidence gained in Phases
-J/K/L/G/T/P/Q/R/S/AA and re-checked in `HONEST_STATUS.md` (real VMware boots, real fleet
-networking, VT-d-style DMA gate, GOP-first display, live apps); the untouched rows below
-that lack such evidence remain genuinely not certified. Don't treat any row as re-verified
-just because this file was edited — the authoritative live status is `HONEST_STATUS.md`.*
+*Reconciliation note: the fuzzing, kernel-boundary-hardening, and totals rows were
+updated with real re-run numbers and are now reconciled with `HONEST_STATUS.md` and the
+CI-emitted `test-summary.json` (currently **1,015 total — 856 kernel + 137 workspace + 22
+bootloader**; kernel also green at 859 with `--features vmx-demo`). Several "NOT certified"
+rows below reflect real live-boot evidence gained in Phases J/K/L/G/T/P/Q/R/S/AA and
+re-checked in `HONEST_STATUS.md` (real VMware boots, real fleet networking, VT-d-style DMA
+gate, GOP-first display, live apps); the rows below that lack such evidence remain genuinely
+not certified. Don't treat any row as re-verified just because this file was edited — the
+authoritative live status is `HONEST_STATUS.md`, and the authoritative test counts are
+emitted by CI to `test-summary.json`.*
 
 ## What the audits cover (machine-checked)
 

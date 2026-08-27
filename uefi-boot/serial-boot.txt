@@ -1,0 +1,176 @@
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;042;160t[2J[001;001H[2J[001;001H[8;056;240t[2J[001;001HBdsDxe: loading Boot0002 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
+BdsDxe: starting Boot0002 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
+=== Aegis Phase 1: Real Hardware Boot (loader 381b7db) ===
+=== Aegis Phase 1: Real Hardware Boot (loader 381b7db) ===
+Aegis: UEFI boot successful
+Aegis: UEFI boot successful
+Aegis: UEFI memory map (113 entries):
+  Type                 Physical     Pages        Attr      
+  Conventional         0x0000000000 135          0xF
+  BootSvcData          0x0000087000 1            0xF
+  Conventional         0x0000088000 24           0xF
+  Conventional         0x0000100000 1792         0xF
+  ACPINV               0x0000800000 8            0xF
+  Conventional         0x0000808000 3            0xF
+  ACPINV               0x000080B000 1            0xF
+  Conventional         0x000080C000 6            0xF
+  RtSvcData            0x0000812000 1            0x800000000000000F
+  Conventional         0x0000813000 1            0xF
+  ACPINV               0x0000814000 236          0xF
+  BootSvcData          0x0000900000 3712         0xF
+  Conventional         0x0001780000 108525       0xF
+  BootSvcData          0x001BF6D000 32           0xF
+  Conventional         0x001BF8D000 6620         0xF
+  LoaderCode           0x001D969000 163          0xF
+  Conventional         0x001DA0C000 148          0xF
+  BootSvcData          0x001DAA0000 2042         0xF
+  LoaderData           0x001E29A000 2            0xF
+  BootSvcData          0x001E29C000 6            0xF
+  Conventional         0x001E2A2000 1            0xF
+  BootSvcData          0x001E2A3000 13           0xF
+  BootSvcCode          0x001E2B0000 1367         0xF
+  BootSvcData          0x001E807000 102          0xF
+  BootSvcCode          0x001E86D000 14           0xF
+  BootSvcData          0x001E87B000 15           0xF
+  BootSvcCode          0x001E88A000 16           0xF
+  BootSvcData          0x001E89A000 10           0xF
+  BootSvcCode          0x001E8A4000 17           0xF
+  BootSvcData          0x001E8B5000 3            0xF
+  BootSvcCode          0x001E8B8000 6            0xF
+  BootSvcData          0x001E8BE000 1            0xF
+  BootSvcCode          0x001E8BF000 12           0xF
+  BootSvcData          0x001E8CB000 1            0xF
+  BootSvcCode          0x001E8CC000 79           0xF
+  BootSvcData          0x001E91B000 47           0xF
+  BootSvcCode          0x001E94A000 17           0xF
+  BootSvcData          0x001E95B000 18           0xF
+  BootSvcCode          0x001E96D000 25           0xF
+  BootSvcData          0x001E986000 7            0xF
+  BootSvcCode          0x001E98D000 55           0xF
+  BootSvcData          0x001E9C4000 8            0xF
+  BootSvcCode          0x001E9CC000 10           0xF
+  BootSvcData          0x001E9D6000 2            0xF
+  BootSvcCode          0x001E9D8000 73           0xF
+  BootSvcData          0x001EA21000 5            0xF
+  BootSvcCode          0x001EA26000 42           0xF
+  BootSvcData          0x001EA50000 2            0xF
+  BootSvcCode          0x001EA52000 43           0xF
+  BootSvcData          0x001EA7D000 2            0xF
+  BootSvcCode          0x001EA7F000 7            0xF
+  BootSvcData          0x001EA86000 8            0xF
+  BootSvcCode          0x001EA8E000 34           0xF
+  BootSvcData          0x001EAB0000 4            0xF
+  BootSvcCode          0x001EAB4000 38           0xF
+  BootSvcData          0x001EADA000 4            0xF
+  BootSvcCode          0x001EADE000 53           0xF
+  BootSvcData          0x001EB13000 4            0xF
+  BootSvcCode          0x001EB17000 3            0xF
+  BootSvcData          0x001EB1A000 4            0xF
+  BootSvcCode          0x001EB1E000 7            0xF
+  BootSvcData          0x001EB25000 8            0xF
+  BootSvcCode          0x001EB2D000 18           0xF
+  RtSvcData            0x001EB3F000 193          0x800000000000000F
+  BootSvcData          0x001EC00000 512          0xF
+  BootSvcCode          0x001EE00000 44           0xF
+  BootSvcData          0x001EE2C000 2            0xF
+  BootSvcCode          0x001EE2E000 4            0xF
+  BootSvcData          0x001EE32000 6            0xF
+  BootSvcCode          0x001EE38000 29           0xF
+  BootSvcData          0x001EE55000 1            0xF
+  BootSvcCode          0x001EE56000 7            0xF
+  BootSvcData          0x001EE5D000 8            0xF
+  BootSvcCode          0x001EE65000 12           0xF
+  BootSvcData          0x001EE71000 3            0xF
+  BootSvcCode          0x001EE74000 14           0xF
+  BootSvcData          0x001EE82000 6            0xF
+  BootSvcCode          0x001EE88000 6            0xF
+  BootSvcData          0x001EE8E000 3            0xF
+  BootSvcCode          0x001EE91000 28           0xF
+  BootSvcData          0x001EEAD000 3            0xF
+  BootSvcCode          0x001EEB0000 4            0xF
+  BootSvcData          0x001EEB4000 5            0xF
+  BootSvcCode          0x001EEB9000 17           0xF
+  BootSvcData          0x001EECA000 1            0xF
+  BootSvcCode          0x001EECB000 4            0xF
+  BootSvcData          0x001EECF000 7            0xF
+  BootSvcCode          0x001EED6000 28           0xF
+  BootSvcData          0x001EEF2000 2            0xF
+  BootSvcCode          0x001EEF4000 5            0xF
+  BootSvcData          0x001EEF9000 1044         0xF
+  BootSvcCode          0x001F30D000 40           0xF
+  BootSvcData          0x001F335000 1464         0xF
+  RtSvcData            0x001F8ED000 256          0x800000000000000F
+  RtSvcCode            0x001F9ED000 256          0x800000000000000F
+  Other                0x001FAED000 128          0xF
+  ACPIReclaim          0x001FB6D000 18           0xF
+  ACPINV               0x001FB7F000 128          0xF
+  BootSvcData          0x001FBFF000 513          0xF
+  Conventional         0x001FE00000 108          0xF
+  BootSvcData          0x001FE6C000 32           0xF
+  BootSvcCode          0x001FE8C000 54           0xF
+  BootSvcData          0x001FEC2000 2            0xF
+  Conventional         0x001FEC4000 1            0xF
+  BootSvcData          0x001FEC5000 1            0xF
+  BootSvcCode          0x001FEC6000 1            0xF
+  BootSvcData          0x001FEC7000 18           0xF
+  BootSvcCode          0x001FED9000 27           0xF
+  RtSvcData            0x001FEF4000 132          0x800000000000000F
+  ACPINV               0x001FF78000 136          0xF
+  Other                0x00E0000000 65536        0x1
+  Other                0x00FEFFC000 4            0x0
+  MMIO                 0x00FFC00000 1024         0x8000000000000001
+Aegis: GOP: querying display...
+Aegis: GOP: querying display...
+GOP: locate
+GOP: open
+GOP: mode
+GOP: fb
+Aegis: GOP: framebuffer 1280x800 stride 1280 fmt BGRX @ 0x80000000 (4096000 bytes)
+Aegis: GOP: framebuffer 1280x800 stride 1280 fmt BGRX @ 0x80000000 (4096000 bytes)
+Aegis: Setting up page tables...
+Aegis: Setting up page tables...
+Aegis: Page tables configured, CR3 = 0x000000001DA09000
+Aegis: Page tables configured, CR3 = 0x000000001DA09000
+Aegis: Parsing kernel ELF (553472 bytes)...
+Aegis: Parsing kernel ELF (553472 bytes)...
+Aegis: Kernel entry point: 0x000000000002A1F1
+Aegis: Kernel entry point: 0x000000000002A1F1
+Aegis: Kernel segments: 4
+Aegis: Kernel segments: 4
+  Segment 0: vaddr=0x0000000000000000 filesz=0xCB94 memsz=0xCB94 flags=0x4
+  Segment 0: vaddr=0x0000000000000000 filesz=0xCB94 memsz=0xCB94 flags=0x4
+  Segment 1: vaddr=0x000000000000DBA0 filesz=0x394A4 memsz=0x394A4 flags=0x5
+  Segment 1: vaddr=0x000000000000DBA0 filesz=0x394A4 memsz=0x394A4 flags=0x5
+  Segment 2: vaddr=0x0000000000048048 filesz=0x22E8 memsz=0x2FB8 flags=0x6
+  Segment 2: vaddr=0x0000000000048048 filesz=0x22E8 memsz=0x2FB8 flags=0x6
+  Segment 3: vaddr=0x000000000004B330 filesz=0x35178 memsz=0x73D9A flags=0x6
+  Segment 3: vaddr=0x000000000004B330 filesz=0x35178 memsz=0x73D9A flags=0x6
+Aegis: Applying 390 relocations...
+Aegis: Applying 390 relocations...
+Aegis: no FLEET.CFG — kernel uses compile-time defaults
+Aegis: no FLEET.CFG — kernel uses compile-time defaults
+Aegis: Calling ExitBootServices...
+Aegis: ExitBootServices SKIPPED (TP201S workaround) — 128 descriptors, handing off
+Aegis: boot-info page 0xC0000 inside conventional memory: false (kernel image ends 0xC0000)
+Aegis: GOP handoff block written at handoff+5199 (40 bytes, present=1)
+Aegis: boot-info written at 0xC0000 (128 descriptors, image end 0xC0000)
+Aegis: Kernel loaded. Jumping to 0x000000000002A1F1...
+Aegis: Kernel loaded. Jumping to 0x000000000002A1F1...
+!!!! X64 Exception Type - 0E(#PF - Page-Fault)  CPU Apic ID - 00000000 !!!!
+ExceptionData - 0000000000000010  I:1 R:0 U:0 W:0 P:0 PK:0 SS:0 SGX:0
+RIP  - FFFFFFFFFFFFFFFF, CS  - 0000000000000038, RFLAGS - 0000000000010046
+RAX  - 0000000000000000, RCX - 0000000000000000, RDX - 0000000000000000
+RBX  - 0000000000000000, RSP - 00000000000B2668, RBP - 0000000000000080
+RSI  - 00000000000C0000, RDI - 00000000000B2677
+R8   - 000000001D9FA488, R9  - 000000001FE8890A, R10 - 00000000FFFFFFFF
+R11  - 00000000000B2FF0, R12 - 000000001FE88F48, R13 - 000000001D96DC80
+R14  - 00000000000B2677, R15 - 000000001D9FA486
+DS   - 0000000000000030, ES  - 0000000000000030, FS  - 0000000000000030
+GS   - 0000000000000030, SS  - 0000000000000030
+CR0  - 0000000080010033, CR2 - FFFFFFFFFFFFFFFF, CR3 - 000000001DA09000
+CR4  - 0000000000000668, CR8 - 0000000000000000
+DR0  - 0000000000000000, DR1 - 0000000000000000, DR2 - 0000000000000000
+DR3  - 0000000000000000, DR6 - 00000000FFFF0FF0, DR7 - 0000000000000400
+GDTR - 000000001F9DB000 0000000000000057, LDTR - 0000000000000000
+IDTR - 000000001BF8BF58 0000000000000FFF,   TR - 0000000000000048
+FXSAVE_STATE - 000000001F9DA460

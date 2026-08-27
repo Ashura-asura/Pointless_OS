@@ -33,6 +33,13 @@ const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const HUGE_PAGE: u64 = 1 << 7;
 const NX: u64 = 1 << 63;
+// PCD (bit 4) + PWT (bit 3) -> uncacheable (UC). REQUIRED for MMIO device
+// windows: without it the page is mapped write-back, so register writes get
+// cached and lost (and reads return stale cache). This was the root cause of
+// the xHCI CRCR write being silently dropped on real hardware.
+const PCD: u64 = 1 << 4;
+const PWT: u64 = 1 << 3;
+const UNCACHEABLE: u64 = PCD | PWT;
 
 /// IA32_EFER MSR. NXE (bit 11) must be set or the hardware ignores the NX
 /// page-table bit.
@@ -347,13 +354,14 @@ pub unsafe fn init_kernel_tables() {
     pdpt.entries[3] = core::ptr::addr_of!(SCRATCH_PD) as u64 | PRESENT | WRITABLE;
     for i in 0..512u64 {
         pd.entries[i as usize] =
-            (0xC000_0000 + i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX;
+            (0xC000_0000 + i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX | UNCACHEABLE;
     }
     let lapic_pd_index = ((LAPIC_PHYS >> 21) & 0x1FF) as usize;
     pd.entries[lapic_pd_index] = core::ptr::addr_of!(SCRATCH_PT) as u64 | PRESENT | WRITABLE;
     let lapic_window = LAPIC_PHYS & !0x1F_FFFF;
     for i in 0..512u64 {
-        pt.entries[i as usize] = (lapic_window + i * 0x1000) | PRESENT | WRITABLE | NX;
+        pt.entries[i as usize] =
+            (lapic_window + i * 0x1000) | PRESENT | WRITABLE | NX | UNCACHEABLE;
     }
 
     // Link PDPT into PML4. NO USER flag — ring-3 cannot access any memory
@@ -370,11 +378,12 @@ pub unsafe fn init_kernel_tables() {
     dev_pdpt.entries[dev_pdpt_idx] = core::ptr::addr_of!(DEV_HI_PD) as u64 | PRESENT | WRITABLE;
     for i in 0..512u64 {
         dev_pd.entries[i as usize] =
-            (DEVICE_BAR_WINDOW + i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX;
+            (DEVICE_BAR_WINDOW + i * 0x20_0000) | PRESENT | WRITABLE | HUGE_PAGE | NX | UNCACHEABLE;
     }
     dev_pd.entries[0] = core::ptr::addr_of!(DEV_HI_PT) as u64 | PRESENT | WRITABLE;
     for i in 0..512u64 {
-        dev_pt.entries[i as usize] = (DEVICE_BAR_WINDOW + i * 0x1000) | PRESENT | WRITABLE | NX;
+        dev_pt.entries[i as usize] =
+            (DEVICE_BAR_WINDOW + i * 0x1000) | PRESENT | WRITABLE | NX | UNCACHEABLE;
     }
     pml4.entries[1] = core::ptr::addr_of!(DEV_HI_PDPT) as u64 | PRESENT | WRITABLE;
 
@@ -388,6 +397,47 @@ pub unsafe fn init_kernel_tables() {
         dev_pd.entries[0],
         dev_pt.entries[0]
     );
+}
+
+/// Make the 2 MB huge page covering physical address `phys` uncacheable (UC).
+///
+/// The GB1/GB2 identity map (PD level) builds its pages write-back by default.
+/// A PCIe MMIO BAR that lands in GB2 (e.g. the xHCI controller at 0x81400000
+/// on the TP201S) is therefore mapped cacheable, so register writes get cached
+/// and silently lost while reads return stale cache — this was the root cause
+/// of the xHCI `CRCR` write being dropped on real hardware. Flipping only the
+/// BAR's specific 2 MB page to `PCD|PWT` (UC) fixes it without disturbing the
+/// rest of GB1/GB2 (which may hold system RAM).
+///
+/// The 4th GB and the 64-bit device window are already built `UNCACHEABLE`, so
+/// only `PD1`/`PD2` are scanned. Per-user PML4s reference the *same* `PD1`/`PD2`
+/// (their PDPT is a copy of the kernel's, which points at these PDs), so the
+/// flip takes effect for every address space.
+///
+/// # Safety
+///
+/// Call from ring 0 after `init_kernel_tables`, with a device MMIO physical
+/// address. The static page tables are mutated in place; the kernel runs with
+/// these identity-mapped tables, so `PD1`/`PD2` are reachable at their own
+/// addresses.
+pub unsafe fn mark_mmio_uncacheable(phys: u64) {
+    let target = phys & !0x1F_FFFF; // 2 MB-aligned base of the covering page
+    // Flush any dirty WB cache lines for this page so a stale cached write
+    // can't linger, then flip the page to UC and invalidate the TLB entry.
+    for off in (0u64..0x20_0000).step_by(64) {
+        asm!("clflush [{0}]", in(reg) (target + off), options(nostack));
+    }
+    for pd in [core::ptr::addr_of_mut!(PD1), core::ptr::addr_of_mut!(PD2)] {
+        let pd = &mut *pd;
+        for i in 0..512usize {
+            let e = pd.entries[i];
+            if (e & HUGE_PAGE) != 0 && (e & !0x1F_FFFF) == target {
+                pd.entries[i] = e | UNCACHEABLE;
+                asm!("invlpg [{0}]", in(reg) target, options(nostack));
+                return;
+            }
+        }
+    }
 }
 
 /// Create a per-user-task PML4 with memory isolation.

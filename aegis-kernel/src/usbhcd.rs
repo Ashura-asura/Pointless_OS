@@ -24,10 +24,11 @@ const RTSOFF: u32 = 0x18;
 // ---------- operational registers (BAR + CAPLENGTH + off) ----------
 const USBCMD: u32 = 0x00;
 const USBSTS: u32 = 0x04;
-const CRCR: u32 = 0x18;
-const DCBAAP: u32 = 0x30;
-const CONFIG: u32 = 0x38;
-const PORTSC_BASE: u32 = 0x400;
+const CRCR: u32 = 0x10;
+const DCBAAP: u32 = 0x18;
+const CONFIG: u32 = 0x20;
+
+const PORTSC_BASE: u32 = 0x30;
 const PORTSC_STRIDE: u32 = 0x10;
 
 // USBCMD bits.
@@ -41,10 +42,10 @@ const USBCMD_HSEE: u32 = 1 << 3;
 const USBSTS_HCH: u32 = 1; // host controller halted
 const USBSTS_CNR: u32 = 1 << 11; // controller not ready
 
-// ---------- runtime registers (BAR + RTSOFF + off) ----------
-const ERSTSZ: u32 = 0x10; // interrupter 0, ERST size
-const ERSTBA: u32 = 0x18; // ERST base (low at +0x18, high at +0x1C)
-const ERDP: u32 = 0x24; // event ring dequeue pointer
+// ---------- runtime registers (BAR + RTSOFF + off, interrupter 0) ----------
+const ERSTSZ: u32 = 0x28; // ERST size (16-bit count of segments)
+const ERSTBA: u32 = 0x30; // ERST base (low at +0x30, high at +0x34)
+const ERDP: u32 = 0x38; // event ring dequeue pointer (low at +0x38, high at +0x3C)
 
 // ---------- TRB types (xHCI 1.2 §6.4.6 TRB Type field encodings) ----------
 const TRB_ENABLE_SLOT: u32 = 9;
@@ -150,7 +151,7 @@ pub fn descriptor_class(d: &[u8]) -> u8 {
 struct Bufs {
     /// Command ring: 16 TRBs x 16 bytes = 256 B (4 KiB page).
     cmd_ring: u64,
-    /// Event ring: 16 event TRBs x 16 bytes = 256 B.
+    /// Event ring: 256 event TRBs x 16 bytes = 4 KiB (one frame page).
     ev_ring: u64,
     /// ERST: 1 segment table entry (16 bytes).
     erst: u64,
@@ -181,6 +182,11 @@ pub struct XhciController {
     ev_ccs: bool,  // event-ring cycle bit
     cmd_ccs: bool,
     xfer_ccs: bool,
+    /// Whether the event ring has been programmed (ERST/ERDP). Configured
+    /// lazily by `setup_event_ring()` right before the first command, so the
+    /// ring is never live during port power/reset (which wedges this SoC's
+    /// MMIO bus).
+    ring_ready: bool,
     slot: u32, // enabled slot id
     pub device_descriptor: [u8; 18],
     buf: Bufs,
@@ -199,9 +205,97 @@ fn reg_read(base: *mut u8, off: u32) -> u32 {
 fn reg_write(base: *mut u8, off: u32, v: u32) {
     unsafe { core::ptr::write_volatile(base.add(off as usize) as *mut u32, v) }
 }
+/// 64-bit MMIO store. Some xHCI controllers (notably Intel Bay/Cherry Trail)
+/// only latch the 64-bit CRCR (Command Ring Control) register on a single
+/// 64-bit bus transaction and silently drop two back-to-back 32-bit writes,
+/// leaving CRCR=0 and the controller never fetching a command.
+fn reg_write64(base: *mut u8, off: u32, v: u64) {
+    unsafe {
+        core::ptr::write_volatile(base.add(off as usize) as *mut u64, v);
+        core::arch::x86_64::_mm_mfence();
+    }
+}
+
+// xHCI Extended Capabilities (xHCI 1.2 §7). HCCPARAMS1 bits[31:16] give the
+// xECP: a DWORD offset from `base` to the first entry. Each entry's first
+// DWORD is bits[7:0] Capability ID, bits[15:8] Next Capability Pointer (a
+// further DWORD offset from *this* entry, 0 = end of list).
+const XECP_ID_USB_LEGACY_SUPPORT: u32 = 1;
+const USBLEGSUP_BIOS_OWNED: u32 = 1 << 16;
+const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
+
+/// USB Legacy Support (BIOS-to-OS) ownership handoff. See the call site in
+/// `probe()` for why this matters: on real hardware, skipping it leaves the
+/// platform firmware's SMI handler contending with this driver for the
+/// same command ring / doorbell / event ring registers, so commands can be
+/// posted correctly and still never complete. A no-op (with a log line) if
+/// the controller has no Legacy Support capability at all — some xHCI
+/// implementations (and QEMU) don't expose one, meaning there's nothing to
+/// hand off and the controller is already OS-owned.
+fn xhci_legacy_handoff(base: *mut u8, hccparams1: u32) {
+    let mut off = ((hccparams1 >> 16) & 0xFFFF) * 4;
+    if off == 0 {
+        crate::sprintln!("Aegis: xHCI: no extended capabilities list (nothing to hand off)");
+        unsafe { crate::cpu::set_xhci_legacy(0, 0) };
+        return;
+    }
+    loop {
+        let cap = reg_read(base, off);
+        let id = cap & 0xFF;
+        let next = (cap >> 8) & 0xFF;
+        if id == XECP_ID_USB_LEGACY_SUPPORT {
+            if cap & USBLEGSUP_BIOS_OWNED == 0 {
+                crate::sprintln!("Aegis: xHCI: legacy support cap found, already OS-owned");
+                unsafe { crate::cpu::set_xhci_legacy(cap, 2) };
+                return;
+            }
+            crate::sprintln!("Aegis: xHCI: claiming ownership from BIOS/SMM...");
+            reg_write(base, off, cap | USBLEGSUP_OS_OWNED);
+            // Spec-recommended poll: up to ~1s in practice, but this is a
+            // pre-init busy loop (no timer yet) so it's an iteration count
+            // rather than a wall-clock bound, matching this driver's other
+            // register-poll loops (see `init`, `poll_event`).
+            let mut handed_off = false;
+            for _ in 0..1_000_000 {
+                if reg_read(base, off) & USBLEGSUP_BIOS_OWNED == 0 {
+                    handed_off = true;
+                    break;
+                }
+            }
+            let cap_final = reg_read(base, off);
+            if handed_off {
+                crate::sprintln!("Aegis: xHCI: BIOS released ownership");
+                unsafe { crate::cpu::set_xhci_legacy(cap_final, 3) };
+            } else {
+                // Some firmware never clears this bit despite (or because
+                // of) an implementation bug. Proceeding anyway matches
+                // common real-world OS driver practice: forcibly clear the
+                // BIOS-owned bit ourselves so at least software agrees on
+                // who owns the controller, and hope the SMI handler
+                // actually stopped (most do, even when they fail to
+                // acknowledge it in this register).
+                crate::sprintln!(
+                    "Aegis: xHCI: BIOS did not release ownership (timeout) - forcing it"
+                );
+                let cap_now = reg_read(base, off);
+                reg_write(base, off, cap_now & !USBLEGSUP_BIOS_OWNED);
+                unsafe { crate::cpu::set_xhci_legacy(reg_read(base, off), 4) };
+            }
+            return;
+        }
+        if next == 0 {
+            crate::sprintln!("Aegis: xHCI: no legacy support cap in extended capabilities list");
+            unsafe { crate::cpu::set_xhci_legacy(0, 1) };
+            return;
+        }
+        off += next * 4;
+    }
+}
 
 /// Number of TRBs in the command and transfer rings (slot 15 is the link).
 const RING_TRBS: u32 = 16;
+/// Number of TRBs in the event ring (fills one 4 KiB frame page).
+const EV_TRBS: u32 = 256;
 
 /// Write one TRB into a 16-slot ring at `*enq`, advancing `*enq`. Slot 15 is
 /// a permanent Link TRB that wraps the ring to slot 0 with the cycle toggled
@@ -237,6 +331,30 @@ fn ring_put(ring: u64, trb: [u32; 4], enq: &mut u32, ccs: &mut bool) {
     }
 }
 
+/// Write-back + invalidate the CPU cache lines covering `[addr, addr+len)`.
+///
+/// DMA masters (the xHCI controller, when an IOMMU/SoC memory fabric does
+/// not snoop the CPU write-back cache) can read stale ring/context data from
+/// DRAM if software's writes are still sitting in L1/L2. `clflush` pushes the
+/// line to memory and drops the cached copy, so the next device read sees what
+/// we just wrote. Without this, every command TRB is garbage to the controller
+/// and every command is rejected — while the event ring (CPU *reads* it, which
+/// misses cache and fetches fresh DRAM) still works. Mirrors `ahci::flush_data`.
+fn flush_region(addr: u64, len: u64) {
+    let ptr = addr as *const u8;
+    let mut off = 0u64;
+    while off < len {
+        unsafe {
+            core::arch::asm!(
+                "clflush [{}]",
+                in(reg) ptr.add(off as usize),
+                options(nostack, preserves_flags)
+            );
+        }
+        off += 64;
+    }
+}
+
 impl XhciController {
     pub fn probe(pci: &crate::pci::PciDeviceList) -> Option<Self> {
         let dev = pci.find_usb_xhci()?;
@@ -252,7 +370,13 @@ impl XhciController {
             return None;
         };
         let base = bar_addr as *mut u8;
+        // The BAR lives in GB2 (0x81400000 on the TP201S), mapped cacheable by
+        // the identity page tables. Mark its 2 MB page uncacheable NOW, before
+        // any register access, or every MMIO write (CRCR, DCBAAP, USBCMD) gets
+        // cached and lost. See `page_tables::mark_mmio_uncacheable`.
+        unsafe { crate::page_tables::mark_mmio_uncacheable(bar_addr as u64); }
         let caplen = reg_read(base, CAPLENGTH) & 0xFF;
+        unsafe { crate::cpu::set_xhci_bar(bar_addr as u64); }
         let db_off = reg_read(base, DB_OFFSET) & 0xFFFF_FFF0;
         let rts_off = reg_read(base, RTSOFF) & 0xFFFF_FFF0;
         let hcs1 = reg_read(base, HCSPARAMS1);
@@ -260,7 +384,22 @@ impl XhciController {
         let max_ports = ((hcs1 >> 24) & 0xFF) as u8;
         // 64-bit addressing capability (HCCPARAMS1 bit 0) is assumed; we use
         // only low 32 bits of phys (frame allocator returns < 4 GiB here).
-        reg_read(base, HCCPARAMS1);
+        let hccparams1 = reg_read(base, HCCPARAMS1);
+
+        // USB Legacy Support (BIOS-to-OS) handoff. This is the step that's
+        // invisible under QEMU (it doesn't model SMM ownership at all, so
+        // the controller is simply OS-owned from boot) but load-bearing on
+        // real hardware: firmware keeps the xHCI controller under SMI
+        // control for legacy USB keyboard emulation until the OS explicitly
+        // claims it. Skipping this means the BIOS's SMI handler is still
+        // touching the same command ring / doorbell / event ring registers
+        // this driver programs below — every command this driver posts can
+        // be silently lost to that fight, which looks exactly like "ports
+        // enumerate fine, but not a single command ever completes" (the
+        // static xHCI capability registers, including port count, are
+        // always OS-readable regardless of ownership; the command/transfer
+        // path is what's actually gated).
+        xhci_legacy_handoff(base, hccparams1);
 
         // Allocate + zero DMA buffers, provision the IOMMU domain.
         let buf = unsafe {
@@ -328,6 +467,7 @@ impl XhciController {
             ev_ccs: true,
             cmd_ccs: true,
             xfer_ccs: true,
+            ring_ready: false,
             slot: 0,
             device_descriptor: [0; 18],
             buf,
@@ -336,6 +476,15 @@ impl XhciController {
             hid: [None, None, None, None],
         };
         s.init()?;
+        unsafe {
+            crate::cpu::set_xhci_phase(2);
+            // DIAGNOSTIC: paint the key DMA addresses at the top-left so we
+            // can sanity-check them when the live event ring hangs.
+            crate::cpu::fb_hex(8, 70, s.buf.cmd_ring, 8, 3, 0xFF, 0x00, 0x00);
+            crate::cpu::fb_hex(8, 86, s.buf.ev_ring, 8, 3, 0xFF, 0x80, 0x00);
+            crate::cpu::fb_hex(8, 102, s.buf.erst, 8, 3, 0xFF, 0xFF, 0x00);
+            crate::cpu::fb_hex(8, 118, s.rts_off as u64, 4, 3, 0x00, 0xFF, 0x00);
+        }
         Some(s)
     }
 
@@ -365,42 +514,94 @@ impl XhciController {
         self.max_ports
     }
 
-    /// Reset the controller, set up DCBAA + command + event rings, and run.
+    /// Reset the controller, set up DCBAA + command rings, and run. The event
+    /// ring is deliberately NOT configured here (see `setup_event_ring`).
     fn init(&mut self) -> Option<()> {
-        // Reset.
-        reg_write(self.base, self.caplen + USBCMD, USBCMD_HCRST);
-        for _ in 0..100_000 {
-            if reg_read(self.base, self.caplen + USBCMD) & USBCMD_HCRST == 0 {
+        // CRCR (the command-ring pointer) is ONLY writable while the controller
+        // is Halted. On this SoC the firmware/SMM often leaves the xHCI
+        // controller already Running (it inits the boot keyboard itself), so a
+        // bare HCRST may not actually halt it and our CRCR write gets dropped
+        // -> the controller sits with CRCR=0 and never fetches a command. So:
+        // first explicitly clear Run and wait for Halted, THEN reset, THEN wait
+        // for Halted again before touching CRCR.
+        let caplen = self.caplen;
+        let mut hrst = false;
+        reg_write(self.base, caplen + USBCMD, 0);
+        for _ in 0..2_000_000 {
+            if reg_read(self.base, caplen + USBSTS) & USBSTS_HCH != 0 {
                 break;
             }
         }
-        // Wait for not-halted.
-        for _ in 0..100_000 {
-            if reg_read(self.base, self.caplen + USBSTS) & (USBSTS_HCH | USBSTS_CNR) == 0 {
+        reg_write(self.base, caplen + USBCMD, USBCMD_HCRST);
+        for _ in 0..2_000_000 {
+            if reg_read(self.base, caplen + USBCMD) & USBCMD_HCRST != 0 {
+                hrst = true;
                 break;
             }
+        }
+        // Wait for Controller Not Ready to clear, then for Halted. CRCR is ONLY
+        // writable while Halted, so the value we record here (`hch0`) is the one
+        // that matters: it tells us whether the controller was actually observed
+        // Halted at the moment we write CRCR. Reads may be unreliable on this SoC
+        // (USBSTS frequently reads 0), so we also burn a generous fixed delay to
+        // guarantee the reset has fully completed before we program CRCR.
+        for _ in 0..2_000_000 {
+            if reg_read(self.base, caplen + USBSTS) & USBSTS_CNR == 0 {
+                break;
+            }
+        }
+        let mut hch0 = false;
+        for _ in 0..10_000_000 {
+            if reg_read(self.base, caplen + USBSTS) & USBSTS_HCH != 0 {
+                hch0 = true;
+                break;
+            }
+        }
+        for _ in 0..50_000_000 {
+            core::hint::spin_loop();
         }
 
         // Command ring CRCR: ring base | RCS (bit 0). The CRR bit (3) is
         // read-only and set by hardware; software only arms the ring here.
+        // CRCR is a *64-bit* register; write the HIGH DWORD first, then the
+        // LOW DWORD (with RCS) last, the order the spec's example uses to
+        // commit the pointer. Retry the write and read it back: if the
+        // controller wasn't actually Halted the write is dropped (readback
+        // stays 0) and the diagnostic will show CRW=0.
+        let sts_pre = reg_read(self.base, caplen + USBSTS);
+        let pre_lo = reg_read(self.base, caplen + CRCR);
+        let pre_hi = reg_read(self.base, caplen + CRCR + 4);
         let cmd_base = (self.buf.cmd_ring as u32) | 1;
-        reg_write(self.base, self.caplen + CRCR, cmd_base);
-
-        // Event ring: ERST (1 segment of 16 entries) + ERDP.
-        let erst_base = self.buf.erst as *mut u32;
-        unsafe {
-            *erst_base.add(0) = self.buf.ev_ring as u32;
-            *erst_base.add(1) = (self.buf.ev_ring >> 32) as u32;
-            *erst_base.add(2) = 16; // 16 event TRBs
-            *erst_base.add(3) = 0;
+        let cmd_hi = (self.buf.cmd_ring >> 32) as u32;
+        let mut crcr_w_lo = 0u32;
+        let mut crcr_w_hi = 0u32;
+        // Try a true 64-bit store first (some controllers only latch CRCR on a
+        // 64-bit transaction), then fall back to the two-32-bit sequence,
+        // retrying and reading back each time. Break as soon as the low DWORD
+        // matches what we wrote (the controller accepted the pointer).
+        for _ in 0..16 {
+            reg_write64(
+                self.base,
+                caplen + CRCR,
+                ((cmd_hi as u64) << 32) | (cmd_base as u64),
+            );
+            crcr_w_lo = reg_read(self.base, caplen + CRCR);
+            crcr_w_hi = reg_read(self.base, caplen + CRCR + 4);
+            if crcr_w_lo == cmd_base {
+                break;
+            }
+            reg_write(self.base, caplen + CRCR + 4, cmd_hi);
+            reg_write(self.base, caplen + CRCR, cmd_base);
+            crcr_w_lo = reg_read(self.base, caplen + CRCR);
+            crcr_w_hi = reg_read(self.base, caplen + CRCR + 4);
+            if crcr_w_lo == cmd_base {
+                break;
+            }
         }
-        let rts = unsafe { self.base.add(self.rts_off as usize) };
-        reg_write(rts, ERSTSZ, 1);
-        reg_write(rts, ERSTBA, self.buf.erst as u32);
-        reg_write(rts, ERSTBA + 4, (self.buf.erst >> 32) as u32);
-        // ERDP points at the first event TRB; writing bit 3 clears EHB.
-        reg_write(rts, ERDP, (self.buf.ev_ring | 0x8) as u32);
-        reg_write(rts, ERDP + 4, 0);
+        unsafe {
+            crate::cpu::set_xhci_crcr_w(crcr_w_lo, crcr_w_hi);
+            crate::cpu::set_xhci_cmd_ring(self.buf.cmd_ring);
+        }
 
         // DCBAA.
         reg_write(self.base, self.caplen + DCBAAP, self.buf.dcbaa as u32);
@@ -412,13 +613,30 @@ impl XhciController {
 
         // CONFIG: enable all slots.
         reg_write(self.base, self.caplen + CONFIG, self.max_slots as u32);
+        flush_region(self.buf.cmd_ring, 4096);
+        flush_region(self.buf.dcbaa, 4096);
 
-        // Run.
-        reg_write(self.base, self.caplen + USBCMD, USBCMD_RUN | USBCMD_INTE);
-        for _ in 0..100_000 {
+        // Run. INTE is deliberately NOT set: this driver polls the event ring
+        // (never uses interrupts), and asserting an xHCI interrupt with no IDT
+        // handler would fault the kernel the moment the controller produces
+        // its first event.
+        reg_write(self.base, self.caplen + USBCMD, USBCMD_RUN);
+        for _ in 0..2_000_000 {
             if reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH == 0 {
                 break;
             }
+        }
+        // Diagnostics: capture whether the controller actually started, and
+        // read back CRCR to confirm our 64-bit command-ring pointer landed.
+        let usbsts = reg_read(self.base, self.caplen + USBSTS);
+        let crcr_lo = reg_read(self.base, self.caplen + CRCR);
+        let crcr_hi = reg_read(self.base, self.caplen + CRCR + 4);
+        unsafe {
+            crate::cpu::set_xhci_csts(usbsts);
+            crate::cpu::set_xhci_crcr(crcr_lo, crcr_hi);
+            crate::cpu::set_xhci_reset_diag(
+                caplen, pre_lo, pre_hi, hch0, hrst, sts_pre, usbsts,
+            );
         }
         Some(())
     }
@@ -428,10 +646,44 @@ impl XhciController {
         reg_write(self.base, self.db_off, 0);
     }
 
+    /// Program the event ring (ERST + ERDP) at the correct interrupter-0
+    /// offsets. Called lazily just before the first command, so the event
+    /// ring is never live while root ports are being powered/reset — a live
+    /// event ring during those phases wedges this SoC's MMIO bus.
+    fn setup_event_ring(&mut self) {
+        if self.ring_ready {
+            return;
+        }
+        let erst_base = self.buf.erst as *mut u32;
+        unsafe {
+            *erst_base.add(0) = self.buf.ev_ring as u32;
+            *erst_base.add(1) = (self.buf.ev_ring >> 32) as u32;
+            *erst_base.add(2) = EV_TRBS; // 256 event TRBs (full 4 KiB page)
+            *erst_base.add(3) = 0;
+        }
+        let rts = unsafe { self.base.add(self.rts_off as usize) };
+        // Some controllers refuse to post events to the ring unless the
+        // interrupter is enabled; set IMAN.IE (bit 1) but leave USBCMD.INTE
+        // clear so no interrupt is actually asserted (we poll the ring).
+        reg_write(rts, 0x20, 0x2); // IMAN: IE=1
+        reg_write(rts, ERSTSZ, 1);
+        flush_region(self.buf.erst, 4096);
+        flush_region(self.buf.ev_ring, 4096);
+        reg_write(rts, ERSTBA, self.buf.erst as u32);
+        reg_write(rts, ERSTBA + 4, (self.buf.erst >> 32) as u32);
+        // ERDP points at the first event TRB; bit 3 clears EHB, bit 0 = DCS.
+        reg_write(rts, ERDP, (self.buf.ev_ring as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 });
+        reg_write(rts, ERDP + 4, 0);
+        self.ring_ready = true;
+    }
+
     /// Post one command TRB to the command ring and ring the doorbell.
     /// Returns the slot id from the command-completion event, or None.
     fn cmd(&mut self, trb: [u32; 4]) -> Option<u32> {
+        unsafe { crate::cpu::inc_xhci_natt() };
+        self.setup_event_ring();
         ring_put(self.buf.cmd_ring, trb, &mut self.cmd_enq, &mut self.cmd_ccs);
+        flush_region(self.buf.cmd_ring, 4096);
         self.ring_cmd_doorbell();
         // Poll the event ring for a command-completion event.
         self.poll_event()
@@ -447,6 +699,15 @@ impl XhciController {
         for _ in 0..100_000 {
             let idx = self.ev_idx as usize;
             let ev = self.buf.ev_ring as *const u32;
+            // The event ring is written by the *controller* via DMA; on x86
+            // WB memory the CPU cache is NOT coherent with device writes. The
+            // `clflush` in `setup_event_ring` only invalidated the line once,
+            // so after the first read the cache holds stale zeros and we'd
+            // never observe a completion (NCMD stuck at 0). Invalidate the
+            // event slot's cache line before each read so we see the
+            // controller's DMA write. `clflush` on a clean (CPU-never-written)
+            // line is a pure invalidate — safe for device-owned memory.
+            flush_region(self.buf.ev_ring + (idx as u64) * 16, 16);
             let dw2 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 2)) };
             let dw3 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 3)) };
             let ccs_bit = dw3 & 1;
@@ -454,13 +715,19 @@ impl XhciController {
                 // No event yet.
                 continue;
             }
+            // A real, controller-posted event (cycle matched). Track the total
+            // so we can tell "controller posts no events at all" apart from
+            // "posts events but not command completions".
+            unsafe { crate::cpu::inc_xhci_nevt() };
             let trb_type = (dw3 >> 10) & 0x3F;
-            let cc = (dw2 >> 16) & 0xFF;
-            // For the Enable Slot command the newly-assigned Slot ID is returned
-            // in the Completion Parameter (DW2[15:0]); for other commands the
-            // parameter is 0 and only the success flag matters to callers.
-            let slot = dw2 & 0xFFFF;
-            self.ev_idx = (self.ev_idx + 1) % 16;
+            let cc = (dw2 >> 24) & 0xFF;
+            // Command Completion Event: Slot ID is DW3 bits 31:24, not
+            // anywhere in DW2 (DW2's low bits are the Completion Parameter,
+            // reserved/0 for Enable Slot — reading "slot" out of DW2 always
+            // silently returned 0 here before, independent of the real slot
+            // the controller assigned).
+            let slot = (dw3 >> 24) & 0xFF;
+            self.ev_idx = (self.ev_idx + 1) % EV_TRBS;
             if self.ev_idx == 0 {
                 self.ev_ccs = !self.ev_ccs;
             }
@@ -468,10 +735,16 @@ impl XhciController {
             // at it after the increment), clearing the EHB (bit 3).
             let rts = unsafe { self.base.add(self.rts_off as usize) };
             let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
-            reg_write(rts, ERDP, (next as u32) | 0x8);
+            reg_write(rts, ERDP, (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 });
             reg_write(rts, ERDP + 4, (next >> 32) as u32);
-            if trb_type == TRB_EVENT_CMD_COMPLETE && cc == CC_SUCCESS {
-                return Some(slot);
+            if trb_type == TRB_EVENT_CMD_COMPLETE {
+                unsafe {
+                    crate::cpu::inc_xhci_ncmd();
+                    crate::cpu::set_xhci_last_cc(cc as u8);
+                }
+                if cc == CC_SUCCESS {
+                    return Some(slot);
+                }
             }
             // Non-command events: keep polling.
         }
@@ -484,50 +757,67 @@ impl XhciController {
         self.cmd(trb)
     }
 
-    /// Address the device in `slot` (command type 8) using the input context.
+    /// Address the device in `slot` (command type 11) using the input context.
     /// `max_pkt0` is the device's EP0 max packet size (bytes) from the first
     /// descriptor read; it goes into the EP0 context MaxPacketSize field.
-    fn address_device(&mut self, slot: u32, max_pkt0: u8) -> bool {
-        // Input context: input-control (8 bytes: context flags), then slot
-        // context, then EP0 context.
+    /// `addr` is the USB device address to assign (0 = keep the default
+    /// address, used with `bsr` before the first descriptor read). `bsr` sets
+    /// the Block SetAddress Request bit so the controller keeps the device at
+    /// address 0 (EP0 becomes usable) without sending SET_ADDRESS.
+    fn address_device(&mut self, slot: u32, max_pkt0: u8, addr: u8, bsr: bool, speed: u8) -> bool {
         let ic = self.buf.input_ctx as *mut u32;
         unsafe {
-            // Input control: A0=1 (slot ctx), A1=1 (EP0 ctx).
-            *ic.add(0) = 0x3;
-            *ic.add(1) = 0;
-            // Slot context (offset +8): Context Entries field = bits 26:24,
-            // set to 1 (only EP0). Route/parent/other fields = 0.
+            core::ptr::write_bytes(self.buf.input_ctx as *mut u8, 0, 96);
+            // Input control: DWord0 = drop flags (0), DWord1 = add flags
+            // (bit 0 = slot context, bit 1 = EP0 context).
+            *ic.add(0) = 0;
+            *ic.add(1) = 0x3;
+            // Slot context DWord0: Route String [19:0]=0, Speed [23:20]=speed,
+            // Context Entries [31:27]=1 (EP0 only). DWord3 [7:0] = USB Device
+            // Address.
             let slot_ctx = ic.add(2);
-            *slot_ctx.add(0) = 1 << 24;
+            *slot_ctx.add(0) = (1u32 << 27) | ((speed as u32 & 0xF) << 20);
             *slot_ctx.add(1) = 0;
             *slot_ctx.add(2) = 0;
-            *slot_ctx.add(3) = 0;
-            // EP0 context (offset +8 + 32): EP Type (bits 15:13) = 4 (control),
-            // Max Packet Size (bits 9:6) = log2(max_pkt0)-3 (8->0, 64->3).
-            let mps = if max_pkt0 >= 8 {
-                ((max_pkt0 as u32).trailing_zeros().saturating_sub(3)).min(0xF)
-            } else {
-                0
-            };
+            *slot_ctx.add(3) = (addr as u32) & 0xFF;
+            // EP0 context (input index 10): DWord0 EP Type [15:13]=0 (control),
+            // Interval [23:16]=0. DWord1 Max Packet Size [31:16]=max_pkt0.
+            // DWord2/3 TR Dequeue Pointer = xfer_ring, DCS=1.
             let ep0 = ic.add(2 + 8);
-            *ep0.add(0) = (4 << 13) | (mps << 6);
-            *ep0.add(1) = 0;
-            *ep0.add(2) = 0;
-            *ep0.add(3) = 0;
+            *ep0.add(0) = 0u32; // EP State/Interval: 0 for the control EP
+            *ep0.add(1) = (4u32 << 3) | ((max_pkt0 as u32) << 16); // EP Type 4 = Control [5:3], MaxPacket [31:16]
+            *ep0.add(2) = (self.buf.xfer_ring as u32) | 1;
+            *ep0.add(3) = (self.buf.xfer_ring >> 32) as u32;
             // DCBAA[slot] -> device context.
             let dcbaa = self.buf.dcbaa as *mut u32;
             *dcbaa.add(slot as usize * 2) = self.buf.dev_ctx as u32;
             *dcbaa.add(slot as usize * 2 + 1) = (self.buf.dev_ctx >> 32) as u32;
         }
-        // Address Device command: DW0 bits 31:24 = slot id, DW1/DW2 = input
-        // context base (64-byte aligned).
+        self.reset_xfer_ring();
+        flush_region(self.buf.input_ctx, 4096);
+        flush_region(self.buf.dev_ctx, 4096);
+        flush_region(self.buf.dcbaa, 4096);
+        let mut dw3 = TRB_ADDRESS_DEVICE << 10;
+        if bsr {
+            dw3 |= 1 << 9; // Block SetAddress Request
+        }
         let trb = [
-            slot << 24,
             (self.buf.input_ctx & !0x3F) as u32,
             (self.buf.input_ctx >> 32) as u32,
-            TRB_ADDRESS_DEVICE << 10,
+            0,
+            (slot << 24) | dw3,
         ];
         self.cmd(trb).is_some()
+    }
+
+    /// Zero the EP0 transfer ring and reset the producer/consumer cycle so the
+    /// next control transfer starts clean (after (re)addressing the device).
+    fn reset_xfer_ring(&mut self) {
+        unsafe {
+            core::ptr::write_bytes(self.buf.xfer_ring as *mut u8, 0, RING_TRBS as usize * 16);
+        }
+        self.xfer_enq = 0;
+        self.xfer_ccs = true;
     }
 
     /// Submit a control transfer on `slot`'s EP0 transfer ring (we reuse the
@@ -545,6 +835,7 @@ impl XhciController {
         // transfer length (fixed 8 for the setup packet), bits 17:16 = TRT
         // (0=no data, 1=IN data stage, 2=OUT data stage).
         let mut s = [0u32; 4];
+        unsafe { crate::cpu::inc_xhci_ntr() };
         s[0] = u32::from_le_bytes([setup[0], setup[1], setup[2], setup[3]]);
         s[1] = u32::from_le_bytes([setup[4], setup[5], setup[6], setup[7]]);
         let trt = if data_len == 0 {
@@ -555,7 +846,7 @@ impl XhciController {
             2
         };
         s[2] = 8 | (trt << 16);
-        s[3] = (TRB_SETUP_STAGE << 10) | (1 << 5); // IOC
+        s[3] = (TRB_SETUP_STAGE << 10); // IOC only on the status TRB (below)
         ring_put(
             self.buf.xfer_ring,
             s,
@@ -571,7 +862,7 @@ impl XhciController {
             // Data stage TRB (type 3): DW2 bits 23:0 = transfer length, bit 16 =
             // DIR (0=OUT, 1=IN). A control IN reads data device->host, so DIR=1.
             d[2] = (data_len as u32) | if dir_in { 1 << 16 } else { 0 };
-            d[3] = (TRB_DATA_STAGE << 10) | (1 << 5); // IOC
+            d[3] = (TRB_DATA_STAGE << 10); // IOC only on the status TRB (below)
             ring_put(
                 self.buf.xfer_ring,
                 d,
@@ -593,32 +884,77 @@ impl XhciController {
             &mut self.xfer_ccs,
         );
         // Ring the doorbell for this slot (doorbell offset + slot).
+        flush_region(self.buf.xfer_ring, 4096);
+        if data != 0 && data_len > 0 {
+            // OUT (host->device): writes back the CPU's data so the
+            // controller sees it. IN (device->host): invalidates the CPU
+            // cache line so the later read sees the controller's DMA write
+            // (WB memory is not coherent with device writes). `clflush` on a
+            // clean line is a pure invalidate, safe for device-owned data.
+            flush_region(data, data_len as u64);
+        }
         reg_write(self.base, self.db_off + slot * 4, 1);
         // Poll the event ring for the Transfer Event (type 32). Completion
         // code is DW2 bits 23:16.
         for _ in 0..100_000 {
             let idx = self.ev_idx as usize;
             let ev = self.buf.ev_ring as *const u32;
+            // See `poll_event`: invalidate the event slot before reading so
+            // the controller's DMA write is observed (WB cache isn't coherent
+            // with device writes).
+            flush_region(self.buf.ev_ring + (idx as u64) * 16, 16);
             let dw2 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 2)) };
             let dw3 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 3)) };
             if (dw3 & 1) != if self.ev_ccs { 1 } else { 0 } {
                 continue;
             }
             let trb_type = (dw3 >> 10) & 0x3F;
-            let cc = (dw2 >> 16) & 0xFF;
-            self.ev_idx = (self.ev_idx + 1) % 16;
+            let cc = (dw2 >> 24) & 0xFF;
+            self.ev_idx = (self.ev_idx + 1) % EV_TRBS;
             if self.ev_idx == 0 {
                 self.ev_ccs = !self.ev_ccs;
             }
             let rts = unsafe { self.base.add(self.rts_off as usize) };
             let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
-            reg_write(rts, ERDP, (next as u32) | 0x8);
+            reg_write(rts, ERDP, (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 });
             reg_write(rts, ERDP + 4, (next >> 32) as u32);
             if trb_type == TRB_TRANSFER_EVENT {
+                if dir_in && data != 0 {
+                    flush_region(data, data_len as u64);
+                }
                 return cc == CC_SUCCESS; // transfer event, completion code
             }
         }
+        if dir_in && data != 0 {
+            flush_region(data, data_len as u64);
+        }
+        unsafe { crate::cpu::inc_xhci_nto() };
         false
+    }
+
+    /// Non-blocking drain: consume every event currently on the event ring
+    /// (advancing ERDP) without waiting for any specific one. On this SoC the
+    /// controller wedges the MMIO bus while events sit unacknowledged on a
+    /// full ring (PORTSC reads stall), so we must drain after powering ports
+    /// and before/after a port reset — events that would otherwise pile up
+    /// and block the bus.
+    fn drain_events(&mut self) {
+        for _ in 0..64 {
+            let idx = self.ev_idx as usize;
+            let ev = self.buf.ev_ring as *const u32;
+            let dw3 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 3)) };
+            if (dw3 & 1) != if self.ev_ccs { 1 } else { 0 } {
+                break; // no more events pending
+            }
+            self.ev_idx = (self.ev_idx + 1) % EV_TRBS;
+            if self.ev_idx == 0 {
+                self.ev_ccs = !self.ev_ccs;
+            }
+            let rts = unsafe { self.base.add(self.rts_off as usize) };
+            let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
+            reg_write(rts, ERDP, (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 });
+            reg_write(rts, ERDP + 4, (next >> 32) as u32);
+        }
     }
 
     /// Power on every root port (xHCI PP bit, bit 9) and record diagnostic
@@ -644,6 +980,9 @@ impl XhciController {
         for _ in 0..500_000 {
             core::hint::spin_loop();
         }
+        // Drain the connect-status-change events the controller posted while
+        // the ports were powering up, so it doesn't wedge the MMIO bus.
+        self.drain_events();
         let mut conn = 0usize;
         for p in 0..self.max_ports {
             let psc = self.caplen + PORTSC_BASE + (p as u32) * PORTSC_STRIDE;
@@ -653,6 +992,7 @@ impl XhciController {
         }
         unsafe {
             crate::cpu::set_xhci_conn(conn);
+            crate::cpu::set_xhci_phase(3);
         }
     }
 
@@ -676,20 +1016,31 @@ impl XhciController {
             crate::sprintln!("Aegis: xHCI: no connected port");
             return false;
         }
-        // Reset the port (bit 4, write 1), wait for PR to clear (reset done)
-        // then PED (bit 1) — the device is enabled.
+        // Reset the port (bit 4), wait for PR to clear then PED (bit 1) to
+        // set. On this SoC, PORTSC reads HANG while a reset is in flight (the
+        // MMIO read never completes), so we wait a fixed period with NO
+        // PORTSC access first, then poll sparsely; and all of it is bounded —
+        // we proceed to enable_slot regardless so a stalled port can never
+        // wedge the boot.
         let psc = self.caplen + PORTSC_BASE + (port.unwrap() as u32) * PORTSC_STRIDE;
+        unsafe { crate::cpu::set_xhci_phase(12) };
+        self.drain_events();
         reg_write(self.base, psc, reg_read(self.base, psc) | (1 << 4));
         for _ in 0..200_000 {
             if reg_read(self.base, psc) & (1 << 4) == 0 {
                 break;
             }
+            core::hint::spin_loop();
         }
         for _ in 0..200_000 {
             if reg_read(self.base, psc) & 2 != 0 {
                 break;
             }
+            core::hint::spin_loop();
         }
+        let speed = ((reg_read(self.base, psc) >> 10) & 0xF) as u8;
+        unsafe { crate::cpu::set_xhci_phase(14) };
+        self.drain_events();
         let slot = match self.enable_slot() {
             Some(s) => s,
             None => {
@@ -698,6 +1049,21 @@ impl XhciController {
             }
         };
         self.slot = slot;
+        unsafe {
+            crate::cpu::set_xhci_phase(4);
+            crate::cpu::inc_xhci_nslot();
+        }
+
+        // Move the device into the addressed-at-0 state (BSR) so EP0 is live
+        // before we read its descriptor.
+        if !self.address_device(slot, 0, 0, true, speed) {
+            crate::sprintln!("Aegis: xHCI: address-device(BSR) failed for slot {}", slot);
+            return false;
+        }
+        unsafe {
+            crate::cpu::set_xhci_phase(5);
+            crate::cpu::inc_xhci_naddr();
+        }
 
         // Read the first 8 bytes of the device descriptor at address 0 to
         // learn bMaxPacketSize0 (byte 7), then address the device with the
@@ -710,6 +1076,7 @@ impl XhciController {
             );
             return false;
         }
+        unsafe { crate::cpu::set_xhci_phase(6) };
         let cls = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(4)) };
         unsafe {
             crate::cpu::set_xhci_dev(true);
@@ -719,10 +1086,11 @@ impl XhciController {
             }
         }
         let max_pkt0 = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(7)) };
-        if !self.address_device(slot, max_pkt0) {
+        if !self.address_device(slot, max_pkt0, slot as u8, false, speed) {
             crate::sprintln!("Aegis: xHCI: address-device failed for slot {}", slot);
             return false;
         }
+        unsafe { crate::cpu::set_xhci_phase(7) };
         true
     }
 
@@ -858,41 +1226,40 @@ impl XhciController {
         max_pkt: u16,
         interval_field: u32,
         int_ring: u64,
+        speed: u8,
     ) -> bool {
         let ic = self.buf.input_ctx as *mut u32;
         unsafe {
             core::ptr::write_bytes(self.buf.input_ctx as *mut u8, 0, 96);
-            // Input control: A0 = 0 (slot context not itself changing
-            // besides Context Entries, folded in below), A(dci) = 1 (add
-            // this endpoint). Add-context flags live in DW1.
+            // Input control: DWord0 = drop flags (0), DWord1 = add flags
+            // (bit 0 = slot context, bit dci = this endpoint).
             *ic.add(0) = 0;
-            *ic.add(1) = 1 << dci;
-            // Slot context (offset +8): Context Entries (bits 26:24) must
-            // cover the highest DCI in use.
+            *ic.add(1) = 1 | (1 << dci);
+            // Slot context DWord0: Speed [23:20] preserved, Context Entries
+            // [31:27] = dci (covers EP0..this endpoint's context index).
             let slot_ctx = ic.add(2);
-            *slot_ctx.add(0) = dci << 24;
+            *slot_ctx.add(0) = (dci << 27) | ((speed as u32 & 0xF) << 20);
             *slot_ctx.add(1) = 0;
             *slot_ctx.add(2) = 0;
             *slot_ctx.add(3) = 0;
-            // Endpoint context at offset +8 + dci*32 within the input
-            // context (slot context occupies index 1, EP0 index 2, ...).
+            // Endpoint context (input index 2 + dci*8): DWord0 EP Type
+            // [15:13]=6 (Interrupt IN), Interval [23:16]=interval_field.
+            // DWord1 Error Count [2:1]=3, Max Packet Size [31:16]=max_pkt.
+            // DWord2/3 TR Dequeue Pointer = int_ring, DCS=1.
             let ep = ic.add(2 + (dci as usize) * 8);
-            // DW0: bits 7:0 Interval, bits 18:16 Max Primary Streams (0),
-            // bit 23 LSA (0), bits 31:24 Max ESIT Payload Hi (0).
-            *ep.add(0) = interval_field & 0xFF;
-            // DW1: bits 2:1 Error Count (3, standard), bits 5:3 EP Type
-            // (7 = Interrupt IN), bits 31:16 Max Packet Size.
-            *ep.add(1) = (3 << 1) | (7 << 3) | ((max_pkt as u32) << 16);
-            // DW2/DW3: TR Dequeue Pointer (bit 0 of DW2 = DCS, ring starts
-            // with cycle 1) | Average TRB Length in the low 16 bits of DW3.
+            // DW0: Interval [23:16]. DW1: Error Count [2:1]=3, EP Type
+            // [5:3]=7 (Interrupt IN), Max Packet Size [31:16]=max_pkt.
+            // DW2/3: TR Dequeue Pointer = int_ring, DCS=1.
+            *ep.add(0) = ((interval_field & 0xFF) << 16);
+            *ep.add(1) = (3u32 << 1) | (7u32 << 3) | ((max_pkt as u32) << 16);
             *ep.add(2) = (int_ring as u32) | 1;
-            *ep.add(3) = (int_ring >> 32) as u32 | 8;
+            *ep.add(3) = (int_ring >> 32) as u32;
         }
         let trb = [
-            slot << 24,
             (self.buf.input_ctx & !0x3F) as u32,
             (self.buf.input_ctx >> 32) as u32,
-            TRB_CONFIGURE_ENDPOINT << 10,
+            0,
+            (slot << 24) | (TRB_CONFIGURE_ENDPOINT << 10),
         ];
         self.cmd(trb).is_some()
     }
@@ -935,26 +1302,59 @@ impl XhciController {
             if ps & 1 == 0 {
                 continue; // nothing connected on this port
             }
-            // Reset the port and wait for it to enable, same sequence as
-            // `enumerate_first_device`.
-            reg_write(self.base, psc, reg_read(self.base, psc) | (1 << 4));
-            for _ in 0..200_000 {
-                if reg_read(self.base, psc) & (1 << 4) == 0 {
-                    break;
+            // Reset the port and wait for it to enable ONLY when it is not
+            // already enabled. `enumerate_first_device` (called before this
+            // on the same controller) already powered, reset, and enabled
+            // the first connected port and addressed its device, so issuing
+            // a SECOND port reset here is exactly the documented MMIO-wedge
+            // trigger on this SoC (PORTSC reads hang while a reset is in
+            // flight) — on the TP201S that redundant reset is what stalls
+            // the HID config-descriptor read that follows, freezing the boot
+            // at xHCI phase 7 before the desktop shell is ever installed.
+            // If the port is already enabled (PED = bit 1), skip the reset
+            // entirely and go straight to (re)addressing + configuring the
+            // device; ports that were never enabled still get the full reset
+            // sequence (e.g. a second HID port the first pass never touched).
+            self.drain_events();
+            if reg_read(self.base, psc) & 2 == 0 {
+                reg_write(self.base, psc, reg_read(self.base, psc) | (1 << 4));
+                for _ in 0..200_000 {
+                    if reg_read(self.base, psc) & (1 << 4) == 0 {
+                        break;
+                    }
+                    core::hint::spin_loop();
                 }
-            }
-            for _ in 0..200_000 {
-                if reg_read(self.base, psc) & 2 != 0 {
-                    break;
+                for _ in 0..200_000 {
+                    if reg_read(self.base, psc) & 2 != 0 {
+                        break;
+                    }
+                    core::hint::spin_loop();
                 }
+                self.drain_events();
             }
+            let speed = ((reg_read(self.base, psc) >> 10) & 0xF) as u8;
+            unsafe { crate::cpu::set_xhci_phase(13) };
             let Some(slot) = self.enable_slot() else {
                 continue;
             };
+            unsafe {
+                crate::cpu::set_xhci_phase(4);
+                crate::cpu::inc_xhci_nslot();
+            }
+            // Address at the default address (BSR) so EP0 is live before we
+            // read the descriptor.
+            if !self.address_device(slot, 0, 0, true, speed) {
+                continue;
+            }
+            unsafe {
+                crate::cpu::set_xhci_phase(5);
+                crate::cpu::inc_xhci_naddr();
+            }
             let setup8 = [0x80, GET_DESCRIPTOR, 0x00, 0x01, 0x00, 0x00, 8, 0];
             if !self.control_transfer(slot, setup8, self.buf.desc, 8, true) {
                 continue;
             }
+            unsafe { crate::cpu::set_xhci_phase(6) };
             let cls = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(4)) };
             unsafe {
                 crate::cpu::set_xhci_dev(true);
@@ -964,13 +1364,15 @@ impl XhciController {
                 }
             }
             let max_pkt0 = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(7)) };
-            if !self.address_device(slot, max_pkt0) {
+            if !self.address_device(slot, max_pkt0, slot as u8, false, speed) {
                 continue;
             }
+            unsafe { crate::cpu::set_xhci_phase(7) };
             let len = self.read_config_descriptor(slot);
             if len == 0 {
                 continue;
             }
+            unsafe { crate::cpu::set_xhci_phase(8) };
             if len > 5 {
                 let devcls =
                     unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(5)) };
@@ -988,6 +1390,7 @@ impl XhciController {
             else {
                 continue;
             };
+            unsafe { crate::cpu::set_xhci_phase(9) };
             if !self.set_configuration(slot, config_value) {
                 continue;
             }
@@ -1010,9 +1413,10 @@ impl XhciController {
             let epnum = ep_addr & 0x0F;
             let dci = epnum as u32 * 2 + 1; // IN endpoint DCI = 2*epnum + 1
             let interval_field = Self::interval_field_for_interrupt(binterval);
-            if !self.configure_hid_endpoint(slot, dci, max_pkt, interval_field, int_ring) {
+            if !self.configure_hid_endpoint(slot, dci, max_pkt, interval_field, int_ring, speed) {
                 continue;
             }
+            unsafe { crate::cpu::set_xhci_phase(10) };
 
             let report_len = match kind {
                 HidKind::Keyboard => 8,
@@ -1033,6 +1437,7 @@ impl XhciController {
                 kb_prev: [0; 8],
             };
             self.submit_hid_transfer(&mut dev);
+            unsafe { crate::cpu::set_xhci_phase(11) };
             crate::sprintln!(
                 "Aegis: xHCI: HID {} on slot {} (ep 0x{:02X}, dci {}, maxpkt {})",
                 match kind {
@@ -1203,23 +1608,29 @@ impl XhciController {
     fn next_transfer_event(&mut self) -> Option<(u32, u32, bool)> {
         let idx = self.ev_idx as usize;
         let ev = self.buf.ev_ring as *const u32;
+        // Invalidate the event slot before reading (WB cache isn't coherent
+        // with the controller's DMA writes — see `poll_event`).
+        flush_region(self.buf.ev_ring + (idx as u64) * 16, 16);
         let dw3 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 3)) };
         if (dw3 & 1) != if self.ev_ccs { 1 } else { 0 } {
             return None; // ring empty
         }
         let dw2 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 2)) };
         let trb_type = (dw3 >> 10) & 0x3F;
-        let cc = (dw2 >> 16) & 0xFF;
-        // Transfer Event DW2[31:24] = Slot ID; DW3[31:24] = Endpoint ID (DCI).
-        let slot_id = (dw2 >> 24) & 0xFF;
-        let ep_dci = (dw3 >> 24) & 0x1F;
-        self.ev_idx = (self.ev_idx + 1) % 16;
+        let cc = (dw2 >> 24) & 0xFF;
+        // Transfer Event (xHCI 1.2 §6.4.2.1): DW3 bits 31:24 = Slot ID,
+        // bits 20:16 = Endpoint ID (DCI). Both were being read out of DW2
+        // (which doesn't carry either field — DW2 is Completion Code +
+        // Transfer Length) at the wrong shift before.
+        let slot_id = (dw3 >> 24) & 0xFF;
+        let ep_dci = (dw3 >> 16) & 0x1F;
+        self.ev_idx = (self.ev_idx + 1) % EV_TRBS;
         if self.ev_idx == 0 {
             self.ev_ccs = !self.ev_ccs;
         }
         let rts = unsafe { self.base.add(self.rts_off as usize) };
         let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
-        reg_write(rts, ERDP, (next as u32) | 0x8);
+        reg_write(rts, ERDP, (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 });
         reg_write(rts, ERDP + 4, (next >> 32) as u32);
         if trb_type == TRB_TRANSFER_EVENT {
             Some((slot_id, ep_dci, cc == CC_SUCCESS))
@@ -1422,6 +1833,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_handoff_noop_when_no_extended_caps() {
+        // xECP field (HCCPARAMS1 bits 31:16) is 0: nothing to walk, nothing
+        // to touch.
+        let mut regs = [0u32; 8];
+        let base = regs.as_mut_ptr() as *mut u8;
+        xhci_legacy_handoff(base, 0); // hccparams1 with xECP = 0
+        assert_eq!(regs, [0u32; 8]);
+    }
+
+    #[test]
+    fn legacy_handoff_skips_list_with_no_legacy_support_cap() {
+        // One extended capability, ID 2 (Supported Protocol, not Legacy
+        // Support), Next Capability Pointer = 0 (end of list).
+        let mut regs = [0u32; 8];
+        regs[1] = 2; // capability ID 2, next = 0, at DWORD offset 1
+        let base = regs.as_mut_ptr() as *mut u8;
+        // xECP = DWORD offset 1 -> HCCPARAMS1 bits[31:16] = 1.
+        xhci_legacy_handoff(base, 1 << 16);
+        assert_eq!(regs[1], 2); // untouched
+    }
+
+    #[test]
+    fn legacy_handoff_claims_and_force_clears_on_timeout() {
+        // One extended capability at DWORD offset 1: ID 1 (Legacy Support),
+        // Next = 0, BIOS-owned bit already set (the real-hardware starting
+        // state this driver needs to handle). Nothing in this test ever
+        // clears the BIOS-owned bit on its own (there's no SMI handler in
+        // a unit test), so this exercises the timeout/force-clear path.
+        let mut regs = [0u32; 8];
+        regs[1] = XECP_ID_USB_LEGACY_SUPPORT | USBLEGSUP_BIOS_OWNED;
+        let base = regs.as_mut_ptr() as *mut u8;
+        xhci_legacy_handoff(base, 1 << 16);
+        // OS-owned set (claimed), BIOS-owned force-cleared after the poll
+        // gave up — software-level ownership is unambiguous either way.
+        assert_ne!(regs[1] & USBLEGSUP_OS_OWNED, 0);
+        assert_eq!(regs[1] & USBLEGSUP_BIOS_OWNED, 0);
+    }
+
+    #[test]
+    fn legacy_handoff_returns_immediately_if_already_os_owned() {
+        // BIOS-owned bit already clear: nothing to claim, no 1M-iteration
+        // poll should even start (this test would be slow if it did).
+        let mut regs = [0u32; 8];
+        regs[1] = XECP_ID_USB_LEGACY_SUPPORT; // BIOS-owned bit clear
+        let base = regs.as_mut_ptr() as *mut u8;
+        xhci_legacy_handoff(base, 1 << 16);
+        assert_eq!(regs[1], XECP_ID_USB_LEGACY_SUPPORT); // untouched
+    }
+
+    #[test]
+    fn legacy_handoff_walks_next_pointer_to_find_legacy_support() {
+        // Two extended capabilities: offset 1 is ID 2 (Next -> offset 3),
+        // offset 3 is ID 1 (Legacy Support, BIOS-owned, Next = 0).
+        let mut regs = [0u32; 8];
+        regs[1] = 2 | (2 << 8); // ID 2, Next Capability Pointer = 2 DWORDs -> offset 1+2=3
+        regs[3] = XECP_ID_USB_LEGACY_SUPPORT | USBLEGSUP_BIOS_OWNED;
+        let base = regs.as_mut_ptr() as *mut u8;
+        xhci_legacy_handoff(base, 1 << 16);
+        assert_ne!(regs[3] & USBLEGSUP_OS_OWNED, 0);
+        assert_eq!(regs[1], 2 | (2 << 8)); // first entry untouched
+    }
+
+    #[test]
     fn xhci_register_offsets() {
         assert_eq!(CAPLENGTH, 0x00);
         assert_eq!(HCSPARAMS1, 0x04);
@@ -1430,10 +1904,10 @@ mod tests {
         assert_eq!(RTSOFF, 0x18);
         assert_eq!(USBCMD, 0x00);
         assert_eq!(USBSTS, 0x04);
-        assert_eq!(CRCR, 0x18);
-        assert_eq!(DCBAAP, 0x30);
-        assert_eq!(CONFIG, 0x38);
-        assert_eq!(PORTSC_BASE, 0x400);
+        assert_eq!(CRCR, 0x10);
+        assert_eq!(DCBAAP, 0x18);
+        assert_eq!(CONFIG, 0x20);
+        assert_eq!(PORTSC_BASE, 0x30);
         assert_eq!(PORTSC_STRIDE, 0x10);
     }
 

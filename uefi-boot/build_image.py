@@ -60,7 +60,7 @@ def build_fat16(efi_data, fleet_cfg_data=None):
     bpb[36] = 0x80
     bpb[38] = 0x29
     struct.pack_into("<I", bpb, 40, 0x12345678)
-    bpb[44:55] = b"AEGIS BOOT "
+    bpb[43:54] = b"AEGIS BOOT "
     bpb[55:63] = b"FAT16   "
     bpb[510:512] = b"\x55\xAA"
     fs[0:BYTES_PER_SECTOR] = bpb
@@ -100,17 +100,41 @@ def build_fat16(efi_data, fleet_cfg_data=None):
         struct.pack_into("<I", e, 28, size)
         return e
 
+    def dot_entries(self_cluster, parent_cluster):
+        dot = bytearray(32)
+        dot[0] = 0x2E
+        for i in range(1, 11):
+            dot[i] = 0x20
+        dot[11] = 0x10
+        struct.pack_into("<H", dot, 26, self_cluster)
+        dotdot = bytearray(32)
+        dotdot[0:2] = b".."
+        for i in range(2, 11):
+            dotdot[i] = 0x20
+        dotdot[11] = 0x10
+        struct.pack_into("<H", dotdot, 26, parent_cluster)
+        return dot + dotdot
+
+    def label_entry(text):
+        e = bytearray(32)
+        e[0:11] = text.ljust(11).encode("ascii")[:11]
+        e[11] = 0x08  # volume label
+        return e
+
     root_off = (RESERVED_SECTORS + FAT_SECTORS) * BYTES_PER_SECTOR
     fs[root_off:root_off + 32] = dir_entry("EFI", "", 0x10, 2)
+    fs[root_off + 32:root_off + 64] = label_entry("AEGIS BOOT")
     if fleet_cfg_data:
-        fs[root_off + 32:root_off + 64] = dir_entry(
+        fs[root_off + 64:root_off + 96] = dir_entry(
             "FLEET", "CFG", 0x20, cfg_first_cluster, len(fleet_cfg_data))
 
     efi_off = (DATA_START + (2 - 2) * SECTORS_PER_CLUSTER) * BYTES_PER_SECTOR
-    fs[efi_off:efi_off + 32] = dir_entry("BOOT", "", 0x10, 3)
+    fs[efi_off:efi_off + 32] = dot_entries(2, 0)  # "." + ".." for /EFI
+    fs[efi_off + 64:efi_off + 96] = dir_entry("BOOT", "", 0x10, 3)
 
     boot_off = (DATA_START + (3 - 2) * SECTORS_PER_CLUSTER) * BYTES_PER_SECTOR
-    fs[boot_off:boot_off + 32] = dir_entry(
+    fs[boot_off:boot_off + 32] = dot_entries(3, 2)  # "." + ".." for /EFI/BOOT
+    fs[boot_off + 64:boot_off + 96] = dir_entry(
         "BOOTX64", "EFI", 0x20, file_first_cluster, len(efi_data))
 
     # --- file data ---
@@ -234,7 +258,7 @@ def verify(disk, efi_data, fleet_cfg_data=None):
         errors.append(f"partition type GUID mismatch: got {decoded_guid} expected C12A7328-F81F-11D2-BA4B-00A0C93EC93B")
     part_start_lba = struct.unpack_from("<Q", disk, 1024 + 32)[0]
     part_end_lba = struct.unpack_from("<Q", disk, 1024 + 40)[0]
-    if part_start_lba < 34 or part_end_lba > 32733:
+    if part_start_lba < 34 or part_end_lba > TOTAL_SECTORS - 35:
         errors.append("partition out of usable range")
 
     fs_off = PART_START_LBA * BYTES_PER_SECTOR
@@ -262,14 +286,16 @@ def verify(disk, efi_data, fleet_cfg_data=None):
         errors.append("root dir missing EFI entry")
     efi_cluster = u16(disk, root_off + 26)
     efi_dir_off = data_off + (efi_cluster - 2) * CLUSTER_SIZE
-    if disk[efi_dir_off:efi_dir_off + 11] != b"BOOT       ":
+    # /EFI dir layout: ".", "..", then "BOOT" at offset 64
+    if disk[efi_dir_off + 64:efi_dir_off + 75] != b"BOOT       ":
         errors.append("EFI dir missing BOOT entry")
-    boot_cluster = u16(disk, efi_dir_off + 26)
+    boot_cluster = u16(disk, efi_dir_off + 64 + 26)
     boot_dir_off = data_off + (boot_cluster - 2) * CLUSTER_SIZE
-    if disk[boot_dir_off:boot_dir_off + 11] != b"BOOTX64 EFI":
+    # /EFI/BOOT dir layout: ".", "..", then "BOOTX64.EFI" at offset 64
+    if disk[boot_dir_off + 64:boot_dir_off + 75] != b"BOOTX64 EFI":
         errors.append("BOOT dir missing BOOTX64.EFI entry")
-    size = u32(disk, boot_dir_off + 28)
-    cluster = u16(disk, boot_dir_off + 26)
+    size = u32(disk, boot_dir_off + 64 + 28)
+    cluster = u16(disk, boot_dir_off + 64 + 26)
 
     out = bytearray()
     while cluster >= 2 and cluster < 0xFFF8:
@@ -284,8 +310,8 @@ def verify(disk, efi_data, fleet_cfg_data=None):
         errors.append("reconstructed file bytes differ from the EFI binary")
 
     # root -> FLEET.CFG
-    cfg_cluster = u16(disk, root_off + 32 + 26)
-    cfg_size = u32(disk, root_off + 32 + 28)
+    cfg_cluster = u16(disk, root_off + 64 + 26)
+    cfg_size = u32(disk, root_off + 64 + 28)
     cfg_out = bytearray()
     cluster = cfg_cluster
     while cluster >= 2 and cluster < 0xFFF8:
@@ -294,7 +320,7 @@ def verify(disk, efi_data, fleet_cfg_data=None):
         cfg_out.extend(chunk)
         cluster = u16(disk, fat_off + cluster * 2)
     cfg_out = cfg_out[:cfg_size]
-    if cfg_size == 0:
+    if cfg_size == 0 and fleet_cfg_data:
         errors.append("FLEET.CFG missing (size 0)")
     elif cfg_out != fleet_cfg_data:
         errors.append("reconstructed FLEET.CFG differs from source")
@@ -309,6 +335,7 @@ def verify(disk, efi_data, fleet_cfg_data=None):
 
 
 def create_disk_image(efi_path, output_path, fleet_cfg_path=None):
+    global TOTAL_SECTORS, PART_SECTORS
     with open(efi_path, "rb") as f:
         efi_data = f.read()
     if len(efi_data) == 0:
@@ -318,6 +345,25 @@ def create_disk_image(efi_path, output_path, fleet_cfg_path=None):
     if fleet_cfg_path and os.path.exists(fleet_cfg_path):
         with open(fleet_cfg_path, "rb") as f:
             fleet_cfg_data = f.read()
+    # Size the image to its content instead of a fixed 16 MB: the FAT16
+    # geometry above (FAT_SECTORS=128 -> 32768 cluster entries, SPC=4 ->
+    # max ~64 MB payload) covers any EFI up to that, but the old hard-coded
+    # TOTAL_SECTORS=32768 silently overflowed for the ~36 MB kernel build —
+    # Python grows the `fs`/`disk` bytearrays past the declared GPT bounds,
+    # leaving a corrupt backup GPT (verify() caught it: "backup GPT header
+    # CRC mismatch"). Keep the 16 MB minimum so small images are unchanged.
+    efi_clusters = (len(efi_data) + CLUSTER_SIZE - 1) // CLUSTER_SIZE
+    cfg_clusters = (len(fleet_cfg_data) + CLUSTER_SIZE - 1) // CLUSTER_SIZE
+    file_last_cluster = 4 + efi_clusters - 1
+    cfg_last_cluster = file_last_cluster + 1 + max(cfg_clusters, 1) - 1
+    last_cluster = cfg_last_cluster
+    needed_part_sectors = DATA_START + (last_cluster - 1) * SECTORS_PER_CLUSTER
+    needed_part_sectors = (
+        (needed_part_sectors + SECTORS_PER_CLUSTER - 1) // SECTORS_PER_CLUSTER
+    ) * SECTORS_PER_CLUSTER
+    total = PART_START_LBA + needed_part_sectors + 34
+    TOTAL_SECTORS = max(total, 32 * 1024)
+    PART_SECTORS = TOTAL_SECTORS - PART_START_LBA - 34
     fs = build_fat16(efi_data, fleet_cfg_data)
     disk = build_gpt(fs)
     with open(output_path, "wb") as f:

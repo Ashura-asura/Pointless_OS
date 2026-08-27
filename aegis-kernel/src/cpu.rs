@@ -266,6 +266,64 @@ pub unsafe fn diag_fill(x: usize, y: usize, w: usize, h: usize, r: u8, g: u8, b:
     }
 }
 
+/// Minimal 3x5 hex glyphs (one u8 per row, low 3 bits = pixels), so a fault
+/// on the TP201S (whose display shows only direct framebuffer writes) can
+/// print vector/CR2/RIP without any console/font.
+const HEX_FONT: [[u8; 5]; 16] = [
+    [0b111, 0b101, 0b101, 0b101, 0b111], // 0
+    [0b010, 0b110, 0b010, 0b010, 0b111], // 1
+    [0b111, 0b001, 0b111, 0b100, 0b111], // 2
+    [0b111, 0b001, 0b111, 0b001, 0b111], // 3
+    [0b101, 0b101, 0b111, 0b001, 0b001], // 4
+    [0b111, 0b100, 0b111, 0b001, 0b111], // 5
+    [0b111, 0b100, 0b111, 0b101, 0b111], // 6
+    [0b111, 0b001, 0b001, 0b010, 0b010], // 7
+    [0b111, 0b101, 0b111, 0b101, 0b111], // 8
+    [0b111, 0b101, 0b111, 0b001, 0b111], // 9
+    [0b111, 0b101, 0b111, 0b101, 0b101], // A
+    [0b110, 0b101, 0b110, 0b101, 0b110], // B
+    [0b111, 0b100, 0b100, 0b100, 0b111], // C
+    [0b110, 0b101, 0b101, 0b101, 0b110], // D
+    [0b111, 0b100, 0b111, 0b100, 0b111], // E
+    [0b111, 0b100, 0b111, 0b100, 0b100], // F
+];
+
+/// Draw the low `n` hex digits of `val` to the framebuffer starting at
+/// column `x` (pixels), row `y`, scaled by `scale` pixels per font bit.
+/// Uses the framebuffer base/stride recorded by `init_diag_fb`.
+///
+/// # Safety
+/// Requires `init_diag_fb` to have run (guarded internally).
+pub unsafe fn fb_hex(x: usize, y: usize, val: u64, n: usize, scale: usize, r: u8, g: u8, b: u8) {
+    if DIAG_FB == 0 {
+        return;
+    }
+    let fb = DIAG_FB as *mut u8;
+    let stride = DIAG_STRIDE as usize;
+    for i in 0..n {
+        let digit = ((val >> ((n - 1 - i) * 4)) & 0xF) as usize;
+        let glyph = HEX_FONT[digit];
+        let ox = x + i * (3 * scale + scale);
+        for row in 0..5 {
+            let bits = glyph[row];
+            for col in 0..3 {
+                if bits & (1 << (2 - col)) != 0 {
+                    for sy in 0..scale {
+                        for sx in 0..scale {
+                            let px = ox + col * scale + sx;
+                            let py = y + row * scale + sy;
+                            let off = (py * stride + px) * 4;
+                            core::ptr::write_volatile(fb.add(off), b);
+                            core::ptr::write_volatile(fb.add(off + 1), g);
+                            core::ptr::write_volatile(fb.add(off + 2), r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Program the I/O APIC (parsed from the MADT; fallback 0xFEC00000) to deliver
 /// the PS/2 keyboard (IRQ1) and mouse (IRQ12) to the BSP via the kernel's
 /// fixed vectors. This is the "CPU selection" for those interrupts: the
@@ -647,6 +705,19 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
         }
     }
 
+    // Paint the fault to the framebuffer FIRST — before any serial I/O that
+    // could itself stall. The TP201S displays only direct framebuffer writes,
+    // so this is the one readable fault dump. A full-width red banner plus
+    // three rows of hex at the top-left: VECTOR, CR2, RIP.
+    unsafe {
+        if DIAG_W > 0 {
+            diag_fill(0, 0, DIAG_W as usize, 64, 0xFF, 0x00, 0x00);
+        }
+        fb_hex(8, 8, vector, 2, 3, 0xFF, 0xFF, 0xFF); // vector (white on red)
+        fb_hex(8, 24, cr2, 16, 3, 0xFF, 0xFF, 0x00); // CR2 (yellow)
+        fb_hex(8, 40, rip, 16, 3, 0xFF, 0x80, 0x00); // RIP (orange)
+    }
+
     crate::sprintln!(
         "KERNEL EXCEPTION vector=0x{:02X} err=0x{:X} RIP=0x{:016X} RSP=0x{:016X} CR2=0x{:016X} CR3=0x{:016X}",
         vector,
@@ -831,6 +902,33 @@ static mut XHCI_DEV: bool = false; // a device descriptor was successfully read
 static mut XHCI_DEV_CLS: u8 = 0; // device/interface class of first device read
 static mut XHCI_HUB: bool = false; // a hub (class 9) was seen on a root port
 static mut XHCI_PP: usize = 0; // ports we explicitly powered on (PP set)
+static mut XHCI_PHASE: u8 = 0; // furthest enumeration phase reached (1..11)
+static mut XHCI_NSLOT: u16 = 0; // enable_slot command successes
+static mut XHCI_NADDR: u16 = 0; // address_device(BSR) command successes
+static mut XHCI_NCMD: u16 = 0; // command-completion events received
+static mut XHCI_NTR: u16 = 0; // control transfers attempted
+static mut XHCI_NTO: u16 = 0; // control transfers that timed out (no event)
+static mut XHCI_LAST_CC: u8 = 0; // completion code of the last command-completion event
+static mut XHCI_CC_FAIL: u16 = 0; // command completions with a non-success code
+static mut XHCI_CC_SUCCESS: u16 = 0; // command completions with CC=2 (Success)
+static mut XHCI_NATT: u16 = 0; // command TRBs posted (attempts)
+static mut XHCI_NEVT: u16 = 0; // total event TRBs observed on the event ring
+static mut XHCI_CSTS: u32 = 0; // USBSTS snapshot after Run was requested
+static mut XHCI_CRCR_LO: u32 = 0; // CRCR low DWORD readback after init
+static mut XHCI_CRCR_HI: u32 = 0; // CRCR high DWORD readback after init
+static mut XHCI_CRCR_WLO: u32 = 0; // CRCR low DWORD readback right after write (halted)
+static mut XHCI_CRCR_WHI: u32 = 0; // CRCR high DWORD readback right after write (halted)
+static mut XHCI_CMD_RING: u64 = 0; // command-ring physical address we wrote
+static mut XHCI_LEGACY: u32 = 0; // USB Legacy Support cap register value (post-handoff)
+static mut XHCI_LEGACY_ST: u8 = 0; // 0=no xECP 1=no legcap 2=already-OS 3=handed 4=forced
+static mut XHCI_CAPLEN: u32 = 0; // CAPLENGTH (operational register base offset)
+static mut XHCI_CRCR_PRE_LO: u32 = 0; // CRCR low read back immediately BEFORE our write
+static mut XHCI_CRCR_PRE_HI: u32 = 0; // CRCR high read back immediately BEFORE our write
+static mut XHCI_HCH0: u8 = 0; // 1 if Halted was observed after clearing Run
+static mut XHCI_HRST: u8 = 0; // 1 if HCRST bit was observed set after writing it
+static mut XHCI_USBSTS_PRE: u32 = 0; // raw USBSTS read immediately before the CRCR write
+static mut XHCI_USBSTS_POST: u32 = 0; // raw USBSTS read after Run was requested
+static mut XHCI_BAR: u64 = 0; // physical address of the xHCI MMIO BAR (for diag)
 
 /// # Safety
 /// Boot-time call from the USB-HID driver.
@@ -942,6 +1040,318 @@ pub unsafe fn xhci_hub() -> bool {
 /// Read from the desktop diagnostic renderer.
 pub unsafe fn xhci_pp() -> usize {
     XHCI_PP
+}
+/// # Safety
+/// Set from the USB-HID xHCI driver during enumeration.
+pub unsafe fn set_xhci_phase(p: u8) {
+    if p > XHCI_PHASE {
+        XHCI_PHASE = p;
+    }
+    diag_phase_block(p);
+    // Also paint a big solid block in the centre whose colour encodes the
+    // phase (same palette as the bottom strip), so it is easy to read even
+    // when the desktop never renders.
+    let (r, g, b) = PHASE_COLOR(p);
+    diag_fill((DIAG_W as usize).saturating_sub(160) / 2, (DIAG_H as usize).saturating_sub(160) / 2, 160, 160, r, g, b);
+}
+
+/// Phase -> colour, shared by `diag_phase_block` (bottom strip) and the
+/// centred phase indicator.
+const fn PHASE_COLOR(phase: u8) -> (u8, u8, u8) {
+    const PALETTE: [(u8, u8, u8); 16] = [
+        (0xFF, 0x00, 0x00), // 1  red
+        (0xFF, 0xFF, 0xFF), // 2  white
+        (0x00, 0x00, 0xFF), // 3  blue
+        (0xFF, 0xFF, 0x00), // 4  yellow
+        (0x00, 0xFF, 0x00), // 5  green
+        (0xFF, 0x00, 0xFF), // 6  magenta
+        (0x00, 0xFF, 0xFF), // 7  cyan
+        (0xFF, 0x80, 0x00), // 8  orange
+        (0x80, 0x00, 0x80), // 9  purple
+        (0xFF, 0x80, 0x80), // 10 salmon
+        (0x80, 0xFF, 0x00), // 11 lime
+        (0x00, 0x80, 0x80), // 12 teal
+        (0xFF, 0xFF, 0x80), // 13 light yellow
+        (0x80, 0x80, 0x80), // 14 grey
+        (0x80, 0xFF, 0xFF), // 15 light cyan
+        (0xFF, 0xC0, 0x00), // 16 dark orange
+    ];
+    let idx = if (phase as usize) > 15 { 15 } else { phase as usize };
+    PALETTE[idx]
+}
+
+/// Paint `val`'s hex digits huge (scale 12, ~36 px tall) centred near the
+/// top of the framebuffer. Used to make the xHCI phase / command-completion
+/// counters readable on the TP201S without the desktop shell.
+///
+/// # Safety
+/// Requires `init_diag_fb` to have run (guarded internally).
+pub unsafe fn diag_center_hex(val: u64, scale: usize, r: u8, g: u8, b: u8) {
+    if DIAG_FB == 0 {
+        return;
+    }
+    let n = if val > 0xFF { 8 } else if val > 0xF { 2 } else { 1 };
+    let wpx = n * (3 * scale + scale);
+    let x = (DIAG_W as usize).saturating_sub(wpx) / 2;
+    let y = (DIAG_H as usize).saturating_sub(30) / 2;
+    fb_hex(x, y, val, n, scale, r, g, b);
+}
+/// # Safety
+/// Called from the USB-HID xHCI driver on a successful enable_slot.
+pub unsafe fn inc_xhci_nslot() {
+    XHCI_NSLOT += 1;
+}
+/// # Safety
+/// Called from the USB-HID xHCI driver on a successful BSR address.
+pub unsafe fn inc_xhci_naddr() {
+    XHCI_NADDR += 1;
+}
+/// # Safety
+/// Called from the USB-HID xHCI driver when a command-completion event arrives.
+pub unsafe fn inc_xhci_ncmd() {
+    XHCI_NCMD += 1;
+    // Paint the running command-completion count below the centre phase
+    // number, so we can see events arrive even without the shell.
+    diag_center_hex(XHCI_NCMD as u64, 8, 0xFF, 0xFF, 0x00);
+}
+/// # Safety
+/// Called from the USB-HID xHCI driver when a command TRB is posted.
+pub unsafe fn inc_xhci_natt() {
+    XHCI_NATT += 1;
+}
+/// # Safety
+/// Called from the USB-HID xHCI driver whenever an event TRB is observed on
+/// the event ring (any type) — distinguishes "controller posts no events at
+/// all" from "posts events but not command completions".
+pub unsafe fn inc_xhci_nevt() {
+    XHCI_NEVT += 1;
+}
+/// # Safety
+/// Snapshot USBSTS after Run was requested (to confirm the controller is
+/// actually running: HCH bit 0 clear, CNR bit 1 clear).
+pub unsafe fn set_xhci_csts(v: u32) {
+    XHCI_CSTS = v;
+}
+/// # Safety
+/// Snapshot the CRCR readback after init (to confirm our 64-bit command-ring
+/// pointer actually landed).
+pub unsafe fn set_xhci_crcr(lo: u32, hi: u32) {
+    XHCI_CRCR_LO = lo;
+    XHCI_CRCR_HI = hi;
+}
+/// # Safety
+/// Snapshot the CRCR readback taken immediately after the write, while the
+/// controller is still Halted (before Run) — proves whether the write itself
+/// landed vs. the controller ignoring it.
+pub unsafe fn set_xhci_crcr_w(lo: u32, hi: u32) {
+    XHCI_CRCR_WLO = lo;
+    XHCI_CRCR_WHI = hi;
+}
+/// # Safety
+/// Record the command-ring physical address we intended to program.
+pub unsafe fn set_xhci_cmd_ring(v: u64) {
+    XHCI_CMD_RING = v;
+}
+/// # Safety
+/// Record the USB Legacy Support capability register value and handoff outcome
+/// (0=no xECP list, 1=no legacy cap, 2=already OS-owned, 3=handed off ok,
+/// 4=forced). Lets the on-screen diagnostic show whether the OS actually owns
+/// the controller — if BIOS still owns it, CRCR/operational writes are dropped.
+pub unsafe fn set_xhci_legacy(v: u32, st: u8) {
+    XHCI_LEGACY = v;
+    XHCI_LEGACY_ST = st;
+}
+/// # Safety
+/// Record the reset/wrote-CRCR diagnostic: CAPLENGTH, the CRCR readback taken
+/// immediately before our write, whether Halted was ever observed, whether the
+/// HCRST bit was ever observed set, and the raw USBSTS before the write and
+/// after Run. This tells us definitively whether the controller was actually in
+/// the Halted state when we wrote CRCR (a CRCR write is only accepted while
+/// Halted; if it isn't, the write is silently dropped and CRCR stays 0).
+pub unsafe fn set_xhci_reset_diag(
+    caplen: u32,
+    pre_lo: u32,
+    pre_hi: u32,
+    hch0: bool,
+    hrst: bool,
+    sts_pre: u32,
+    sts_post: u32,
+) {
+    XHCI_CAPLEN = caplen;
+    XHCI_CRCR_PRE_LO = pre_lo;
+    XHCI_CRCR_PRE_HI = pre_hi;
+    XHCI_HCH0 = if hch0 { 1 } else { 0 };
+    XHCI_HRST = if hrst { 1 } else { 0 };
+    XHCI_USBSTS_PRE = sts_pre;
+    XHCI_USBSTS_POST = sts_post;
+}
+/// # Safety
+/// Record the xHCI MMIO BAR physical address so the on-screen diagnostic can
+/// show which address space the controller lives in (and therefore which
+/// page-table mapping must be uncacheable).
+pub unsafe fn set_xhci_bar(v: u64) {
+    XHCI_BAR = v;
+}
+/// # Safety
+/// Record the completion code of a command-completion event, plus whether it
+/// was Success (CC=2) or not. Lets the on-screen diagnostics answer "why did
+/// the command fail" instead of just "did it fail".
+pub unsafe fn set_xhci_last_cc(cc: u8) {
+    XHCI_LAST_CC = cc;
+    // xHCI Completion Code 1 = Success (matches `CC_SUCCESS` in usbhcd.rs).
+    // A prior copy used `cc == 2`, which miscounted every real success as a
+    // failure in the CS/CF counters (cosmetic to the counters only; `cmd()`
+    // itself checks the correct `CC_SUCCESS` constant for its return value).
+    if cc == 1 {
+        XHCI_CC_SUCCESS += 1;
+    } else {
+        XHCI_CC_FAIL += 1;
+    }
+}
+/// # Safety
+/// Called from the USB-HID xHCI driver when a control transfer is attempted.
+pub unsafe fn inc_xhci_ntr() {
+    XHCI_NTR += 1;
+}
+/// # Safety
+/// Called from the USB-HID xHCI driver when a control transfer times out.
+pub unsafe fn inc_xhci_nto() {
+    XHCI_NTO += 1;
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_phase() -> u8 {
+    XHCI_PHASE
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_nslot() -> u16 {
+    XHCI_NSLOT
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_naddr() -> u16 {
+    XHCI_NADDR
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_ncmd() -> u16 {
+    XHCI_NCMD
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_ntr() -> u16 {
+    XHCI_NTR
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_nto() -> u16 {
+    XHCI_NTO
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_last_cc() -> u8 {
+    XHCI_LAST_CC
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_cc_fail() -> u16 {
+    XHCI_CC_FAIL
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_cc_success() -> u16 {
+    XHCI_CC_SUCCESS
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_natt() -> u16 {
+    XHCI_NATT
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_nevt() -> u16 {
+    XHCI_NEVT
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_csts() -> u32 {
+    XHCI_CSTS
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_crcr_lo() -> u32 {
+    XHCI_CRCR_LO
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_crcr_hi() -> u32 {
+    XHCI_CRCR_HI
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_crcr_wlo() -> u32 {
+    XHCI_CRCR_WLO
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_crcr_whi() -> u32 {
+    XHCI_CRCR_WHI
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_cmd_ring() -> u64 {
+    XHCI_CMD_RING
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_legacy() -> u32 {
+    XHCI_LEGACY
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_legacy_st() -> u8 {
+    XHCI_LEGACY_ST
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_caplen() -> u32 {
+    XHCI_CAPLEN
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_crcr_pre_lo() -> u32 {
+    XHCI_CRCR_PRE_LO
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_crcr_pre_hi() -> u32 {
+    XHCI_CRCR_PRE_HI
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_hch0() -> u8 {
+    XHCI_HCH0
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_hrst() -> u8 {
+    XHCI_HRST
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_usbsts_pre() -> u32 {
+    XHCI_USBSTS_PRE
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_usbsts_post() -> u32 {
+    XHCI_USBSTS_POST
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_bar() -> u64 {
+    XHCI_BAR
 }
 
 /// Snapshot the LAPIC's health for the on-screen boot diagnostic: whether we
@@ -1069,6 +1479,34 @@ pub unsafe fn diag_paint(slot: u8) {
     for dy in 0..8u32 {
         for dx in 0..8u32 {
             let off = ((dy as usize) * stride + (x + dx as usize)) * 4;
+            core::ptr::write_volatile(fb.add(off), b);
+            core::ptr::write_volatile(fb.add(off + 1), g);
+            core::ptr::write_volatile(fb.add(off + 2), r);
+        }
+    }
+}
+
+/// Paint a 6x6 phase marker for the xHCI enumeration, in a horizontal strip
+/// across the bottom-left of the framebuffer, so a TP201S boot that never
+/// reaches the desktop shell still shows exactly how far enumeration got.
+/// `phase` selects a distinct color from a 16-color palette and a unique
+/// column, so "how many colored blocks appear" maps 1:1 to the last phase
+/// reached.
+///
+/// # Safety
+/// Requires `init_diag_fb` to have run (guarded internally by DIAG_FB == 0).
+pub unsafe fn diag_phase_block(phase: u8) {
+    if DIAG_FB == 0 {
+        return;
+    }
+    let (r, g, b) = PHASE_COLOR(phase);
+    let fb = DIAG_FB as *mut u8;
+    let stride = DIAG_STRIDE as usize;
+    let x = (phase as usize % 16) * 14 + 4;
+    let y = DIAG_H.saturating_sub(32) as usize;
+    for dy in 0..10u32 {
+        for dx in 0..10u32 {
+            let off = ((y + dy as usize) * stride + (x + dx as usize)) * 4;
             core::ptr::write_volatile(fb.add(off), b);
             core::ptr::write_volatile(fb.add(off + 1), g);
             core::ptr::write_volatile(fb.add(off + 2), r);
