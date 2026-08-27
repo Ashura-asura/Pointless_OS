@@ -1592,18 +1592,39 @@ impl Desktop {
                 self.screen[6 * SW + i % SW] = attr | b as u16;
             }
         }
-        // Line 8: xHCI MMIO BAR physical address, so we can confirm which
-        // page-table region it lives in (4th GB vs high window) and therefore
-        // which mapping must be uncacheable.
+        // Line 8: xHCI MMIO BAR, whether `mark_mmio_uncacheable` actually flipped
+        // its page to uncacheable (UC), and the raw USBSTS captured right after
+        // the CRCR write (WSTS) — HCH bit0 / CNR bit11 tell us the controller
+        // state at the moment the write was (not) accepted.
         let bar = unsafe { crate::cpu::xhci_bar() };
+        let uc = unsafe { crate::cpu::xhci_mmio_uc() };
+        let wsts = unsafe { crate::cpu::xhci_crcr_wsts() };
+        let cstate = unsafe { crate::cpu::xhci_crcr_state() };
         let mut w8 = W {
             buf: [0u8; SW],
             len: 0,
         };
-        let _ = write!(w8, "BAR={:016X}", bar);
+        let _ = write!(w8, "BAR={:016X} UC={} WSTS={:08X} ST={}", bar, uc, wsts, cstate);
         for (i, &b) in w8.buf[..w8.len].iter().enumerate() {
             if i < SW {
                 self.screen[7 * SW + i % SW] = attr | b as u16;
+            }
+        }
+        // Line 9: doorbell-offset sanity + command-TRB/doorbell readback. If
+        // DBOFF is 0 the doorbell write lands on CAPLENGTH (no fetch). If TRB3
+        // != intended DW3, ring_put/flush failed. If DBRD != 0 the doorbell
+        // reached HW.
+        let dboff = unsafe { crate::cpu::xhci_dboff() };
+        let trb3 = unsafe { crate::cpu::xhci_cmd_trb3() };
+        let dbrd = unsafe { crate::cpu::xhci_db_rd() };
+        let mut w9 = W {
+            buf: [0u8; SW],
+            len: 0,
+        };
+        let _ = write!(w9, "DB={:08X} TRB3={:08X} DBRD={:08X}", dboff, trb3, dbrd);
+        for (i, &b) in w9.buf[..w9.len].iter().enumerate() {
+            if i < SW {
+                self.screen[8 * SW + i % SW] = attr | b as u16;
             }
         }
     }

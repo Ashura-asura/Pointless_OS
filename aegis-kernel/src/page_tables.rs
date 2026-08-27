@@ -421,23 +421,34 @@ pub unsafe fn init_kernel_tables() {
 /// these identity-mapped tables, so `PD1`/`PD2` are reachable at their own
 /// addresses.
 pub unsafe fn mark_mmio_uncacheable(phys: u64) {
-    let target = phys & !0x1F_FFFF; // 2 MB-aligned base of the covering page
-    // Flush any dirty WB cache lines for this page so a stale cached write
+    // 2 MB-aligned base of the covering page. The xHCI BAR lives below 4 GiB
+    // (e.g. 0xB1400000 on the TP201S), so comparing only the low 32 bits is
+    // sufficient — and avoids a 64-bit page-frame-mask constant. Stripping the
+    // low 12 bits (and ignoring the high word) also drops the NX bit (bit 63),
+    // which is what made the earlier `!0x1F_FFFF` comparison never match.
+    let target = phys & !0x1F_FFFF;
+    // Flush any dirty WB cache lines (whole cache) so a stale cached write
     // can't linger, then flip the page to UC and invalidate the TLB entry.
-    for off in (0u64..0x20_0000).step_by(64) {
-        asm!("clflush [{0}]", in(reg) (target + off), options(nostack));
-    }
+    asm!("wbinvd", options(nostack));
+    let mut flipped = false;
     for pd in [core::ptr::addr_of_mut!(PD1), core::ptr::addr_of_mut!(PD2)] {
         let pd = &mut *pd;
         for i in 0..512usize {
             let e = pd.entries[i];
-            if (e & HUGE_PAGE) != 0 && (e & !0x1F_FFFF) == target {
+            if (e & HUGE_PAGE) != 0
+                && ((e as u32) & 0xFFFF_F000) == ((target as u32) & 0xFFFF_F000)
+            {
                 pd.entries[i] = e | UNCACHEABLE;
                 asm!("invlpg [{0}]", in(reg) target, options(nostack));
-                return;
+                flipped = true;
+                break;
             }
         }
+        if flipped {
+            break;
+        }
     }
+    crate::cpu::set_xhci_mmio_uc(if flipped { 1 } else { 0 });
 }
 
 /// Create a per-user-task PML4 with memory isolation.

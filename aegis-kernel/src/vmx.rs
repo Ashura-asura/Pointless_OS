@@ -1097,6 +1097,15 @@ const GUEST_BZIMAGE: &[u8] = include_bytes!("../../guest/out/bzImage");
 #[cfg(feature = "vmx-demo")]
 const GUEST_INITRAMFS: &[u8] = include_bytes!("../../guest/out/initramfs.cpio.gz");
 
+/// True only when a real (multi-MiB) guest image is embedded. When the guest is
+/// stubbed out (e.g. during kernel debugging, to shrink the `vmx-demo` payload
+/// below the ESP size limit), the boot demos are skipped so the kernel reaches
+/// its own shell instead of trying to boot an invalid 4-byte "guest".
+#[cfg(feature = "vmx-demo")]
+pub fn guest_image_valid() -> bool {
+    GUEST_BZIMAGE.len() > (1 << 20)
+}
+
 /// Guest RAM for the real-kernel demo: must cover the kernel's `init_size`
 /// window (34 MiB) plus the initrd at 16 MiB; Linux relocates itself into
 /// the top of this region at decompress time.

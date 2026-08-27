@@ -2519,7 +2519,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                                                     // own exit budget, so the machine keeps booting afterward.
     #[cfg(feature = "vmx-demo")]
     {
-        if aegis_kernel::vmx::vmx_supported() {
+        if aegis_kernel::vmx::vmx_supported() && aegis_kernel::vmx::guest_image_valid() {
             sprintln!("Aegis: [vmx] VT-x present — running bring-up demo");
             unsafe {
                 match aegis_kernel::vmx::bringup_demo() {

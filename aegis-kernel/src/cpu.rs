@@ -929,6 +929,12 @@ static mut XHCI_HRST: u8 = 0; // 1 if HCRST bit was observed set after writing i
 static mut XHCI_USBSTS_PRE: u32 = 0; // raw USBSTS read immediately before the CRCR write
 static mut XHCI_USBSTS_POST: u32 = 0; // raw USBSTS read after Run was requested
 static mut XHCI_BAR: u64 = 0; // physical address of the xHCI MMIO BAR (for diag)
+static mut XHCI_MMIO_UC: u8 = 0; // 1 if mark_mmio_uncacheable flipped the BAR's 2MB page to UC
+static mut XHCI_CRCR_WSTS: u32 = 0; // raw USBSTS captured right after the CRCR write loop (before Run)
+static mut XHCI_CRCR_STATE: u8 = 2; // 0 = CRCR latched while Halted, 1 = while Running, 2 = never latched
+static mut XHCI_DBOFF: u32 = 0; // computed doorbell-array offset (base + this); 0 => doorbell writes land on CAPLENGTH
+static mut XHCI_CMD_TRB3: u32 = 0; // command TRB DW3 read back after flush (sanity: did ring_put land?)
+static mut XHCI_DB_RD: u32 = 0; // doorbell register read back after the ring write (did it reach HW?)
 
 /// # Safety
 /// Boot-time call from the USB-HID driver.
@@ -1193,6 +1199,27 @@ pub unsafe fn set_xhci_bar(v: u64) {
     XHCI_BAR = v;
 }
 /// # Safety
+/// Record whether `mark_mmio_uncacheable` actually found and flipped the BAR's
+/// page to uncacheable (1) or scanned PD1/PD2 and found no match (0). This is
+/// the decisive check for the "CRCR write dropped on real hardware" bug: if it
+/// is 0, the MMIO page was cacheable and the flip missed its address.
+pub unsafe fn set_xhci_mmio_uc(v: u8) {
+    XHCI_MMIO_UC = v;
+}
+/// # Safety
+/// Record the raw USBSTS captured immediately after the CRCR write loop (still
+/// Halted, before Run). Lets the on-screen diagnostic show whether HCH/CNR were
+/// actually set at the moment of the (failed) write.
+pub unsafe fn set_xhci_crcr_wsts(v: u32) {
+    XHCI_CRCR_WSTS = v;
+}
+/// # Safety
+/// Which state the controller was in when CRCR finally latched:
+/// 0 = Halted, 1 = Running, 2 = never latched.
+pub unsafe fn set_xhci_crcr_state(v: u8) {
+    XHCI_CRCR_STATE = v;
+}
+/// # Safety
 /// Record the completion code of a command-completion event, plus whether it
 /// was Success (CC=2) or not. Lets the on-screen diagnostics answer "why did
 /// the command fail" instead of just "did it fail".
@@ -1352,6 +1379,40 @@ pub unsafe fn xhci_usbsts_post() -> u32 {
 /// Read from the desktop diagnostic renderer.
 pub unsafe fn xhci_bar() -> u64 {
     XHCI_BAR
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_mmio_uc() -> u8 {
+    XHCI_MMIO_UC
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_crcr_wsts() -> u32 {
+    XHCI_CRCR_WSTS
+}
+/// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_crcr_state() -> u8 {
+    XHCI_CRCR_STATE
+}
+/// Door bell-array offset.
+pub unsafe fn set_xhci_dboff(v: u32) {
+    XHCI_DBOFF = v;
+}
+pub unsafe fn xhci_dboff() -> u32 {
+    XHCI_DBOFF
+}
+/// Command TRB DW3 readback + doorbell readback (diagnostics).
+pub unsafe fn set_xhci_cmd_trb3(v: u32) {
+    XHCI_CMD_TRB3 = v;
+}
+pub unsafe fn xhci_cmd_trb3() -> u32 {
+    XHCI_CMD_TRB3
+}
+pub unsafe fn set_xhci_db_rd(v: u32) {
+    XHCI_DB_RD = v;
+}
+pub unsafe fn xhci_db_rd() -> u32 {
+    XHCI_DB_RD
 }
 
 /// Snapshot the LAPIC's health for the on-screen boot diagnostic: whether we
