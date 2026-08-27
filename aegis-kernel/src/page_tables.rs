@@ -435,8 +435,7 @@ pub unsafe fn mark_mmio_uncacheable(phys: u64) {
         let pd = &mut *pd;
         for i in 0..512usize {
             let e = pd.entries[i];
-            if (e & HUGE_PAGE) != 0
-                && ((e as u32) & 0xFFFF_F000) == ((target as u32) & 0xFFFF_F000)
+            if (e & HUGE_PAGE) != 0 && ((e as u32) & 0xFFFF_F000) == ((target as u32) & 0xFFFF_F000)
             {
                 pd.entries[i] = e | UNCACHEABLE;
                 asm!("invlpg [{0}]", in(reg) target, options(nostack));

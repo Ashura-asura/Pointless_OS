@@ -81,6 +81,7 @@
 //! already-existing window rather than spawning a new instance — see the
 //! note on `TASKBAR_LABELS` for what would be needed to go further.
 
+#![allow(unused_unsafe)]
 use crate::browser::FileBrowser;
 use crate::calc::Calc;
 use crate::compositor::{self, Cell, MAX_WINDOWS};
@@ -1498,14 +1499,14 @@ impl Desktop {
         // ok, NA=addr(BSR) ok, NCMD=cmd-completion events, NT=control xfers
         // attempted, NTO=control xfers that timed out.
         let ph = unsafe { crate::cpu::xhci_phase() };
-        let ns = unsafe { crate::cpu::xhci_nslot() };
+        let _ns = unsafe { crate::cpu::xhci_nslot() };
         let na = unsafe { crate::cpu::xhci_naddr() };
         let ncmd = unsafe { crate::cpu::xhci_ncmd() };
         let ntr = unsafe { crate::cpu::xhci_ntr() };
-        let nto = unsafe { crate::cpu::xhci_nto() };
+        let _nto = unsafe { crate::cpu::xhci_nto() };
         let last_cc = unsafe { crate::cpu::xhci_last_cc() };
         let ccf = unsafe { crate::cpu::xhci_cc_fail() };
-        let ccs = unsafe { crate::cpu::xhci_cc_success() };
+        let _ccs = unsafe { crate::cpu::xhci_cc_success() };
         let natt = unsafe { crate::cpu::xhci_natt() };
         let nevt = unsafe { crate::cpu::xhci_nevt() };
         let csts = unsafe { crate::cpu::xhci_csts() };
@@ -1530,7 +1531,14 @@ impl Desktop {
         let _ = write!(
             w4,
             "P={} NAT={} NCMD={} NEV={} NT={} CC={:02X} CF={} ST={:02X}",
-            ph, natt, ncmd, nevt, ntr, last_cc, ccf, csts & 0xFF
+            ph,
+            natt,
+            ncmd,
+            nevt,
+            ntr,
+            last_cc,
+            ccf,
+            csts & 0xFF
         );
         for (i, &b) in w4.buf[..w4.len].iter().enumerate() {
             if i < SW {
@@ -1546,8 +1554,13 @@ impl Desktop {
         let _ = write!(
             w5,
             "CRW={:08X}{:08X} CR={:08X}{:08X} CMD={:08X}{:08X} NA={}",
-            crcr_whi, crcr_wlo, crcr_hi, crcr_lo,
-            (cmd_ring >> 32) as u32, cmd_ring as u32, na
+            crcr_whi,
+            crcr_wlo,
+            crcr_hi,
+            crcr_lo,
+            (cmd_ring >> 32) as u32,
+            cmd_ring as u32,
+            na
         );
         for (i, &b) in w5.buf[..w5.len].iter().enumerate() {
             if i < SW {
@@ -1565,8 +1578,10 @@ impl Desktop {
         let _ = write!(
             w6,
             "LEG={:08X} ST={} B={} O={}",
-            legacy, legacy_st,
-            (legacy >> 16) & 1, (legacy >> 24) & 1
+            legacy,
+            legacy_st,
+            (legacy >> 16) & 1,
+            (legacy >> 24) & 1
         );
         for (i, &b) in w6.buf[..w6.len].iter().enumerate() {
             if i < SW {
@@ -1604,7 +1619,11 @@ impl Desktop {
             buf: [0u8; SW],
             len: 0,
         };
-        let _ = write!(w8, "BAR={:016X} UC={} WSTS={:08X} ST={}", bar, uc, wsts, cstate);
+        let _ = write!(
+            w8,
+            "BAR={:016X} UC={} WSTS={:08X} ST={}",
+            bar, uc, wsts, cstate
+        );
         for (i, &b) in w8.buf[..w8.len].iter().enumerate() {
             if i < SW {
                 self.screen[7 * SW + i % SW] = attr | b as u16;

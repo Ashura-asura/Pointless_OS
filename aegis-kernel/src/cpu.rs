@@ -5,6 +5,8 @@
 //! (division/initial-count chosen arbitrarily, no calibration against a
 //! wall-clock source), so tick rate is machine-dependent.
 
+#![allow(unused_unsafe)]
+#![allow(clippy::missing_safety_doc)]
 use core::arch::{asm, naked_asm};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -294,6 +296,7 @@ const HEX_FONT: [[u8; 5]; 16] = [
 ///
 /// # Safety
 /// Requires `init_diag_fb` to have run (guarded internally).
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn fb_hex(x: usize, y: usize, val: u64, n: usize, scale: usize, r: u8, g: u8, b: u8) {
     if DIAG_FB == 0 {
         return;
@@ -304,8 +307,7 @@ pub unsafe fn fb_hex(x: usize, y: usize, val: u64, n: usize, scale: usize, r: u8
         let digit = ((val >> ((n - 1 - i) * 4)) & 0xF) as usize;
         let glyph = HEX_FONT[digit];
         let ox = x + i * (3 * scale + scale);
-        for row in 0..5 {
-            let bits = glyph[row];
+        for (row, &bits) in glyph.iter().enumerate() {
             for col in 0..3 {
                 if bits & (1 << (2 - col)) != 0 {
                     for sy in 0..scale {
@@ -1058,11 +1060,20 @@ pub unsafe fn set_xhci_phase(p: u8) {
     // phase (same palette as the bottom strip), so it is easy to read even
     // when the desktop never renders.
     let (r, g, b) = PHASE_COLOR(p);
-    diag_fill((DIAG_W as usize).saturating_sub(160) / 2, (DIAG_H as usize).saturating_sub(160) / 2, 160, 160, r, g, b);
+    diag_fill(
+        (DIAG_W as usize).saturating_sub(160) / 2,
+        (DIAG_H as usize).saturating_sub(160) / 2,
+        160,
+        160,
+        r,
+        g,
+        b,
+    );
 }
 
 /// Phase -> colour, shared by `diag_phase_block` (bottom strip) and the
 /// centred phase indicator.
+#[allow(non_snake_case)]
 const fn PHASE_COLOR(phase: u8) -> (u8, u8, u8) {
     const PALETTE: [(u8, u8, u8); 16] = [
         (0xFF, 0x00, 0x00), // 1  red
@@ -1082,7 +1093,11 @@ const fn PHASE_COLOR(phase: u8) -> (u8, u8, u8) {
         (0x80, 0xFF, 0xFF), // 15 light cyan
         (0xFF, 0xC0, 0x00), // 16 dark orange
     ];
-    let idx = if (phase as usize) > 15 { 15 } else { phase as usize };
+    let idx = if (phase as usize) > 15 {
+        15
+    } else {
+        phase as usize
+    };
     PALETTE[idx]
 }
 
@@ -1096,7 +1111,13 @@ pub unsafe fn diag_center_hex(val: u64, scale: usize, r: u8, g: u8, b: u8) {
     if DIAG_FB == 0 {
         return;
     }
-    let n = if val > 0xFF { 8 } else if val > 0xF { 2 } else { 1 };
+    let n = if val > 0xFF {
+        8
+    } else if val > 0xF {
+        2
+    } else {
+        1
+    };
     let wpx = n * (3 * scale + scale);
     let x = (DIAG_W as usize).saturating_sub(wpx) / 2;
     let y = (DIAG_H as usize).saturating_sub(30) / 2;
@@ -1391,28 +1412,34 @@ pub unsafe fn xhci_crcr_wsts() -> u32 {
     XHCI_CRCR_WSTS
 }
 /// Read from the desktop diagnostic renderer.
-pub unsafe fn xhci_crcr_state() -> u8 {
-    XHCI_CRCR_STATE
+pub fn xhci_crcr_state() -> u8 {
+    unsafe { XHCI_CRCR_STATE }
 }
 /// Door bell-array offset.
-pub unsafe fn set_xhci_dboff(v: u32) {
-    XHCI_DBOFF = v;
+pub fn set_xhci_dboff(v: u32) {
+    unsafe {
+        XHCI_DBOFF = v;
+    }
 }
-pub unsafe fn xhci_dboff() -> u32 {
-    XHCI_DBOFF
+pub fn xhci_dboff() -> u32 {
+    unsafe { XHCI_DBOFF }
 }
 /// Command TRB DW3 readback + doorbell readback (diagnostics).
-pub unsafe fn set_xhci_cmd_trb3(v: u32) {
-    XHCI_CMD_TRB3 = v;
+pub fn set_xhci_cmd_trb3(v: u32) {
+    unsafe {
+        XHCI_CMD_TRB3 = v;
+    }
 }
-pub unsafe fn xhci_cmd_trb3() -> u32 {
-    XHCI_CMD_TRB3
+pub fn xhci_cmd_trb3() -> u32 {
+    unsafe { XHCI_CMD_TRB3 }
 }
-pub unsafe fn set_xhci_db_rd(v: u32) {
-    XHCI_DB_RD = v;
+pub fn set_xhci_db_rd(v: u32) {
+    unsafe {
+        XHCI_DB_RD = v;
+    }
 }
-pub unsafe fn xhci_db_rd() -> u32 {
-    XHCI_DB_RD
+pub fn xhci_db_rd() -> u32 {
+    unsafe { XHCI_DB_RD }
 }
 
 /// Snapshot the LAPIC's health for the on-screen boot diagnostic: whether we

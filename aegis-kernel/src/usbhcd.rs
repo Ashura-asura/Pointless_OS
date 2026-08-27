@@ -14,6 +14,8 @@
 //! verified under QEMU with a `-device usb-*` attached; final validation is
 //! the real TP201S. EHCI is probed but not yet driven.
 
+#![allow(unused_unsafe)]
+
 // ---------- capability registers (BAR + off) ----------
 const CAPLENGTH: u32 = 0x00;
 const HCSPARAMS1: u32 = 0x04;
@@ -37,6 +39,7 @@ const PORTSC_STRIDE: u32 = 0x10;
 // USBCMD bits.
 const USBCMD_RUN: u32 = 1;
 const USBCMD_HCRST: u32 = 1 << 1;
+#[allow(dead_code)]
 const USBCMD_INTE: u32 = 1 << 2;
 #[cfg_attr(not(test), allow(dead_code))]
 const USBCMD_HSEE: u32 = 1 << 3;
@@ -377,11 +380,17 @@ impl XhciController {
         // the identity page tables. Mark its 2 MB page uncacheable NOW, before
         // any register access, or every MMIO write (CRCR, DCBAAP, USBCMD) gets
         // cached and lost. See `page_tables::mark_mmio_uncacheable`.
-        unsafe { crate::page_tables::mark_mmio_uncacheable(bar_addr as u64); }
+        unsafe {
+            crate::page_tables::mark_mmio_uncacheable(bar_addr);
+        }
         let caplen = reg_read(base, CAPLENGTH) & 0xFF;
-        unsafe { crate::cpu::set_xhci_bar(bar_addr as u64); }
+        unsafe {
+            crate::cpu::set_xhci_bar(bar_addr);
+        }
         let db_off = reg_read(base, DB_OFFSET) & 0xFFFF_FFF0;
-        unsafe { crate::cpu::set_xhci_dboff(db_off); }
+        unsafe {
+            crate::cpu::set_xhci_dboff(db_off);
+        }
         let rts_off = reg_read(base, RTSOFF) & 0xFFFF_FFF0;
         let hcs1 = reg_read(base, HCSPARAMS1);
         let max_slots = (hcs1 & 0xFF) as u8;
@@ -720,9 +729,7 @@ impl XhciController {
         unsafe {
             crate::cpu::set_xhci_csts(usbsts);
             crate::cpu::set_xhci_crcr(crcr_lo, crcr_hi);
-            crate::cpu::set_xhci_reset_diag(
-                caplen, pre_lo, pre_hi, hch0, hrst, sts_pre, usbsts,
-            );
+            crate::cpu::set_xhci_reset_diag(caplen, pre_lo, pre_hi, hch0, hrst, sts_pre, usbsts);
         }
         Some(())
     }
@@ -758,7 +765,11 @@ impl XhciController {
         reg_write(rts, ERSTBA, self.buf.erst as u32);
         reg_write(rts, ERSTBA + 4, (self.buf.erst >> 32) as u32);
         // ERDP points at the first event TRB; bit 3 clears EHB, bit 0 = DCS.
-        reg_write(rts, ERDP, (self.buf.ev_ring as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 });
+        reg_write(
+            rts,
+            ERDP,
+            (self.buf.ev_ring as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 },
+        );
         reg_write(rts, ERDP + 4, 0);
         // Program the Command Ring pointer now. The controller only accepts the
         // CRCR write in the Halted state (xHCI spec), AND this SoC additionally
@@ -774,7 +785,11 @@ impl XhciController {
         }
         let cmd_base = (self.buf.cmd_ring as u32) | 1; // RCS = 1
         let cmd_hi = (self.buf.cmd_ring >> 32) as u32;
-        reg_write64(self.base, self.caplen + CRCR, ((cmd_hi as u64) << 32) | (cmd_base as u64));
+        reg_write64(
+            self.base,
+            self.caplen + CRCR,
+            ((cmd_hi as u64) << 32) | (cmd_base as u64),
+        );
         reg_write(self.base, self.caplen + CRCR + 4, cmd_hi);
         reg_write(self.base, self.caplen + CRCR, cmd_base);
         unsafe {
@@ -801,12 +816,14 @@ impl XhciController {
         // DIAGNOSTIC: read back the command TRB DW3 the controller is about to
         // fetch, so we can tell "TRB never reached memory" apart from "controller
         // refuses to fetch it".
-        let trb3_rd = unsafe {
-            core::ptr::read_volatile((self.buf.cmd_ring as *const u32).add(3))
-        };
-        unsafe { crate::cpu::set_xhci_cmd_trb3(trb3_rd); }
+        let trb3_rd = unsafe { core::ptr::read_volatile((self.buf.cmd_ring as *const u32).add(3)) };
+        unsafe {
+            crate::cpu::set_xhci_cmd_trb3(trb3_rd);
+        }
         self.ring_cmd_doorbell();
-        unsafe { crate::cpu::set_xhci_db_rd(reg_read(self.base, self.db_off)); }
+        unsafe {
+            crate::cpu::set_xhci_db_rd(reg_read(self.base, self.db_off));
+        }
         // Poll the event ring for a command-completion event.
         self.poll_event()
     }
@@ -857,7 +874,11 @@ impl XhciController {
             // at it after the increment), clearing the EHB (bit 3).
             let rts = unsafe { self.base.add(self.rts_off as usize) };
             let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
-            reg_write(rts, ERDP, (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 });
+            reg_write(
+                rts,
+                ERDP,
+                (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 },
+            );
             reg_write(rts, ERDP + 4, (next >> 32) as u32);
             if trb_type == TRB_EVENT_CMD_COMPLETE {
                 unsafe {
@@ -968,7 +989,7 @@ impl XhciController {
             2
         };
         s[2] = 8 | (trt << 16);
-        s[3] = (TRB_SETUP_STAGE << 10); // IOC only on the status TRB (below)
+        s[3] = TRB_SETUP_STAGE << 10; // IOC only on the status TRB (below)
         ring_put(
             self.buf.xfer_ring,
             s,
@@ -984,7 +1005,7 @@ impl XhciController {
             // Data stage TRB (type 3): DW2 bits 23:0 = transfer length, bit 16 =
             // DIR (0=OUT, 1=IN). A control IN reads data device->host, so DIR=1.
             d[2] = (data_len as u32) | if dir_in { 1 << 16 } else { 0 };
-            d[3] = (TRB_DATA_STAGE << 10); // IOC only on the status TRB (below)
+            d[3] = TRB_DATA_STAGE << 10; // IOC only on the status TRB (below)
             ring_put(
                 self.buf.xfer_ring,
                 d,
@@ -1038,7 +1059,11 @@ impl XhciController {
             }
             let rts = unsafe { self.base.add(self.rts_off as usize) };
             let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
-            reg_write(rts, ERDP, (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 });
+            reg_write(
+                rts,
+                ERDP,
+                (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 },
+            );
             reg_write(rts, ERDP + 4, (next >> 32) as u32);
             if trb_type == TRB_TRANSFER_EVENT {
                 if dir_in && data != 0 {
@@ -1074,7 +1099,11 @@ impl XhciController {
             }
             let rts = unsafe { self.base.add(self.rts_off as usize) };
             let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
-            reg_write(rts, ERDP, (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 });
+            reg_write(
+                rts,
+                ERDP,
+                (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 },
+            );
             reg_write(rts, ERDP + 4, (next >> 32) as u32);
         }
     }
@@ -1372,8 +1401,8 @@ impl XhciController {
             // DW0: Interval [23:16]. DW1: Error Count [2:1]=3, EP Type
             // [5:3]=7 (Interrupt IN), Max Packet Size [31:16]=max_pkt.
             // DW2/3: TR Dequeue Pointer = int_ring, DCS=1.
-            *ep.add(0) = ((interval_field & 0xFF) << 16);
-            *ep.add(1) = (3u32 << 1) | (7u32 << 3) | ((max_pkt as u32) << 16);
+            *ep.add(0) = (interval_field & 0xFF) << 16;
+            *ep.add(1) = 3u32 << 1 | 7u32 << 3 | (max_pkt as u32) << 16;
             *ep.add(2) = (int_ring as u32) | 1;
             *ep.add(3) = (int_ring >> 32) as u32;
         }
@@ -1752,7 +1781,11 @@ impl XhciController {
         }
         let rts = unsafe { self.base.add(self.rts_off as usize) };
         let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
-        reg_write(rts, ERDP, (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 });
+        reg_write(
+            rts,
+            ERDP,
+            (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 },
+        );
         reg_write(rts, ERDP + 4, (next >> 32) as u32);
         if trb_type == TRB_TRANSFER_EVENT {
             Some((slot_id, ep_dci, cc == CC_SUCCESS))
