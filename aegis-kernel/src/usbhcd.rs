@@ -250,43 +250,48 @@ fn xhci_legacy_handoff(base: *mut u8, hccparams1: u32) {
         let id = cap & 0xFF;
         let next = (cap >> 8) & 0xFF;
         if id == XECP_ID_USB_LEGACY_SUPPORT {
+            let legsup = off + 4;
+            let cap = reg_read(base, legsup);
             if cap & USBLEGSUP_BIOS_OWNED == 0 {
                 crate::sprintln!("Aegis: xHCI: legacy support cap found, already OS-owned");
                 unsafe { crate::cpu::set_xhci_legacy(cap, 2) };
                 return;
             }
             crate::sprintln!("Aegis: xHCI: claiming ownership from BIOS/SMM...");
-            reg_write(base, off, cap | USBLEGSUP_OS_OWNED);
+            reg_write(base, legsup, cap | USBLEGSUP_OS_OWNED);
             // Spec-recommended poll: up to ~1s in practice, but this is a
             // pre-init busy loop (no timer yet) so it's an iteration count
             // rather than a wall-clock bound, matching this driver's other
             // register-poll loops (see `init`, `poll_event`).
             let mut handed_off = false;
             for _ in 0..1_000_000 {
-                if reg_read(base, off) & USBLEGSUP_BIOS_OWNED == 0 {
+                if reg_read(base, legsup) & USBLEGSUP_BIOS_OWNED == 0 {
                     handed_off = true;
                     break;
                 }
             }
-            let cap_final = reg_read(base, off);
+            let cap_final = reg_read(base, legsup);
             if handed_off {
                 crate::sprintln!("Aegis: xHCI: BIOS released ownership");
-                unsafe { crate::cpu::set_xhci_legacy(cap_final, 3) };
             } else {
-                // Some firmware never clears this bit despite (or because
-                // of) an implementation bug. Proceeding anyway matches
-                // common real-world OS driver practice: forcibly clear the
-                // BIOS-owned bit ourselves so at least software agrees on
-                // who owns the controller, and hope the SMI handler
-                // actually stopped (most do, even when they fail to
-                // acknowledge it in this register).
                 crate::sprintln!(
-                    "Aegis: xHCI: BIOS did not release ownership (timeout) - forcing it"
+                    "Aegis: xHCI: BIOS did not release ownership (timeout) - proceeding anyway"
                 );
-                let cap_now = reg_read(base, off);
-                reg_write(base, off, cap_now & !USBLEGSUP_BIOS_OWNED);
-                unsafe { crate::cpu::set_xhci_legacy(reg_read(base, off), 4) };
             }
+            // Clear ALL SMI enable bits in USBLEGSUP so the SMM handler
+            // is never triggered by USB events after this point.  Bits 9,
+            // 13 and 26-31 control various SMI sources; clearing them
+            // prevents the SMI handler from firing on doorbell writes,
+            // event ring posts, or port-status changes — all of which
+            // wedge this SoC's MMIO bus when SMI tries to re-enter the
+            // BIOS keyboard emulation path.
+            let smi_mask: u32 = (1 << 9) | (1 << 13) | (0x3F << 26);
+            let cleared = cap_final & !smi_mask;
+            if cleared != cap_final {
+                reg_write(base, legsup, cleared);
+                crate::sprintln!("Aegis: xHCI: SMI enable bits cleared");
+            }
+            unsafe { crate::cpu::set_xhci_legacy(reg_read(base, legsup), 3) };
             return;
         }
         if next == 0 {
@@ -583,11 +588,14 @@ impl XhciController {
         // +0x28) should be non-zero if the firmware configured slots.
         let op0 = reg_read(self.base, caplen + 0x00);
         let op2 = reg_read(self.base, caplen + 0x08);
-        let op5 = reg_read(self.base, caplen + CRCR);
-        let op8 = reg_read(self.base, caplen + DCBAAP);
-        let op10 = reg_read(self.base, caplen + CONFIG);
+        let op14 = reg_read(self.base, caplen + 0x14);
+        let op18 = reg_read(self.base, caplen + 0x18);
+        let op20 = reg_read(self.base, caplen + 0x20);
+        let op28 = reg_read(self.base, caplen + 0x28);
+        let op30 = reg_read(self.base, caplen + 0x30);
+        let op38 = reg_read(self.base, caplen + 0x38);
         unsafe {
-            crate::cpu::set_xhci_op_raw(op0, op2, op5, op8, op10);
+            crate::cpu::set_xhci_op_raw(op0, op2, op14, op18, op20, op28, op30, op38);
         }
         let cmd_base = (self.buf.cmd_ring as u32) | 1;
         let cmd_hi = (self.buf.cmd_ring >> 32) as u32;
@@ -632,10 +640,36 @@ impl XhciController {
         }
         flush_region(self.buf.cmd_ring, 4096);
 
+        // Re-assert Halt IMMEDIATELY before the CRCR write. On this SoC the
+        // firmware/SMM may keep the controller Running (it drives the boot
+        // keyboard); CRCR is ONLY writable while Halted, so if the controller
+        // has drifted to Running the write is silently ignored.
+        let sts_pre2 = reg_read(self.base, caplen + USBSTS);
+        if sts_pre2 & USBSTS_HCH == 0 {
+            reg_write(self.base, caplen + USBCMD, 0);
+            for _ in 0..2_000_000 {
+                if reg_read(self.base, caplen + USBSTS) & USBSTS_HCH != 0 {
+                    break;
+                }
+            }
+        }
+        // Capture USBSTS at the exact moment we write CRCR.
+        let wsts = reg_read(self.base, caplen + USBSTS);
+        unsafe {
+            crate::cpu::set_xhci_crcr_wsts(wsts);
+        }
+
         // Program the Command Ring pointer (while Halted).
         reg_write64(self.base, caplen + CRCR, ((cmd_hi as u64) << 32) | (cmd_base as u64));
         reg_write(self.base, caplen + CRCR + 4, cmd_hi);
         reg_write(self.base, caplen + CRCR, cmd_base);
+        // DIAGNOSTIC: read CRCR back IMMEDIATELY (no delay) to see if the write
+        // lands at all — a readback of cmd_base means the write stuck; 0 means
+        // either the offset is wrong or the write is rejected.
+        let crcr_imm = reg_read(self.base, caplen + CRCR);
+        unsafe {
+            crate::cpu::set_xhci_crcr_imm(crcr_imm);
+        }
         for _ in 0..1_000_000 {
             core::hint::spin_loop();
         }
@@ -715,17 +749,13 @@ impl XhciController {
     /// Ensure the event ring is armed and the controller is Running. Called
     /// lazily just before the first command as a backstop in case `init()`
     /// could not arm the ring (e.g. the controller was wedged).
+    /// After the first command the ring is live and the controller is running
+    /// (we just completed a command or control transfer), so skip the USBSTS
+    /// read — on this SoC the MMIO bus wedges after a control transfer, and
+    /// reading USBSTS (the very first MMIO) would hang the CPU.
     fn setup_event_ring(&mut self) {
         if !self.ring_ready {
             self.arm_event_ring();
-        }
-        if reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH != 0 {
-            reg_write(self.base, self.caplen + USBCMD, USBCMD_RUN);
-            for _ in 0..2_000_000 {
-                if reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH == 0 {
-                    break;
-                }
-            }
         }
     }
 
@@ -766,9 +796,6 @@ impl XhciController {
             crate::cpu::set_xhci_cmd_trb3(trb3_rd);
         }
         self.ring_cmd_doorbell();
-        unsafe {
-            crate::cpu::set_xhci_db_rd(reg_read(self.base, self.db_off));
-        }
         // Poll the event ring for a command-completion event.
         self.poll_event()
     }
@@ -1041,6 +1068,12 @@ impl XhciController {
         for _ in 0..64 {
             let idx = self.ev_idx as usize;
             let ev = self.buf.ev_ring as *const u32;
+            // Invalidate the CPU cache line before reading the event TRB:
+            // the controller writes the ring via DMA but the CPU cache may
+            // hold stale zeros, causing us to miss pending events.  All
+            // other event-ring readers (poll_event, control_transfer) do
+            // this; drain_events must too or events pile up unacknowledged.
+            flush_region(self.buf.ev_ring + (idx as u64) * 16, 16);
             let dw3 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 3)) };
             if (dw3 & 1) != if self.ev_ccs { 1 } else { 0 } {
                 break; // no more events pending
@@ -1058,6 +1091,44 @@ impl XhciController {
             );
             reg_write(rts, ERDP + 4, (next >> 32) as u32);
         }
+    }
+
+    /// Quiesce the event ring: disable the interrupter, drain any pending
+    /// events (with proper cache invalidation), and advance ERDP so the
+    /// controller has no unacknowledged events. Sets `ring_ready = false` so
+    /// the next `setup_event_ring()` call will re-arm the ring from scratch.
+    /// This is a narrow experiment on the TP201S: the MMIO bus wedges after
+    /// a control transfer if the event ring is live with pending events, so
+    /// we quiesce before the next operation.
+    fn quiesce_event_ring(&mut self) {
+        let rts = unsafe { self.base.add(self.rts_off as usize) };
+        // Disable the interrupter (IMAN.IE = 0) so no interrupt or SMI
+        // fires from USB events while we are quiescing.
+        reg_write(rts, 0x20, 0x0);
+        // Drain all pending events, acknowledging each to the controller.
+        // This loop runs at most 2× the ring length so it always terminates
+        // even if ev_ccs is wrong (it will drain every event that matches
+        // the current cycle bit, then the next cycle bit won't match).
+        for _ in 0..(EV_TRBS as usize * 2) {
+            let idx = self.ev_idx as usize;
+            let ev = self.buf.ev_ring as *const u32;
+            flush_region(self.buf.ev_ring + (idx as u64) * 16, 16);
+            let dw3 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 3)) };
+            if (dw3 & 1) != if self.ev_ccs { 1 } else { 0 } {
+                break;
+            }
+            self.ev_idx = (self.ev_idx + 1) % EV_TRBS;
+            if self.ev_idx == 0 {
+                self.ev_ccs = !self.ev_ccs;
+            }
+            let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
+            reg_write(rts, ERDP, (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 });
+            reg_write(rts, ERDP + 4, (next >> 32) as u32);
+        }
+        // Mark the ring as not-ready so the next cmd() re-arms it fresh
+        // (setup_event_ring → arm_event_ring will re-program ERST + ERDP
+        // and re-enable the interrupter).
+        self.ring_ready = false;
     }
 
     /// Power on every root port (xHCI PP bit, bit 9) and record diagnostic
@@ -1188,11 +1259,19 @@ impl XhciController {
                 crate::cpu::set_xhci_hub(true);
             }
         }
-        let max_pkt0 = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(7)) };
-        if !self.address_device(slot, max_pkt0, slot as u8, false, speed) {
-            crate::sprintln!("Aegis: xHCI: address-device failed for slot {}", slot);
-            return false;
-        }
+            let max_pkt0 = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(7)) };
+            // EXPERIMENT: quiesce the event ring (disable interrupter, drain
+            // and acknowledge all pending events, disarm so the next command
+            // re-arms it fresh) before the next operation after the control
+            // transfer.  This isolates whether the Cherry-Trail MMIO wedge is
+            // caused by the live event ring at the transition.
+            unsafe { crate::cpu::set_xhci_phase(11) }; // lime: quiescing event ring
+            self.quiesce_event_ring();
+            unsafe { crate::cpu::set_xhci_phase(12) }; // teal: quiesced, before BSR re-address
+            if !self.address_device(slot, max_pkt0, 0, true, speed) {
+                return false;
+            }
+            unsafe { crate::cpu::set_xhci_phase(9) }; // purple: BSR re-address returned
         unsafe { crate::cpu::set_xhci_phase(7) };
         true
     }
@@ -1476,7 +1555,12 @@ impl XhciController {
             if !self.control_transfer(slot, setup8, self.buf.desc, 8, true) {
                 continue;
             }
-            unsafe { crate::cpu::set_xhci_phase(6) };
+unsafe { crate::cpu::set_xhci_phase(6) };
+        // DIAG fingerprint: immediately paint the center block RED so we can
+        // tell whether the quiesce build is actually running. If you see a
+        // RED center block, the new build is active. If still cyan, the
+        // device is booting a stale binary.
+        unsafe { crate::cpu::set_xhci_phase(1) };
             let cls = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(4)) };
             unsafe {
                 crate::cpu::set_xhci_dev(true);
@@ -1486,9 +1570,13 @@ impl XhciController {
                 }
             }
             let max_pkt0 = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(7)) };
-            if !self.address_device(slot, max_pkt0, slot as u8, false, speed) {
-                continue;
-            }
+            // Skip the real SET_ADDRESS (wire transaction wedges this SoC's
+            // MMIO bus).  Keep the device at address 0 — EP0 is already live
+            // from the BSR address above and all control transfers work.
+            // Quiesce the event ring before the next operation to avoid the
+            // Cherry-Trail MMIO wedge after a control transfer.
+            unsafe { crate::cpu::set_xhci_phase(11) }; // lime: quiescing (path 2)
+            self.quiesce_event_ring();
             unsafe { crate::cpu::set_xhci_phase(7) };
             let len = self.read_config_descriptor(slot);
             if len == 0 {
@@ -1510,7 +1598,10 @@ impl XhciController {
             let Some((config_value, iface_num, kind, ep_addr, max_pkt, binterval)) =
                 Self::find_hid_boot_interface(self, len)
             else {
-                continue;
+                // Do NOT continue to the next port: reading PORTSC on a second
+                // connected port after the event ring is live wedges the MMIO
+                // bus on this SoC.  Break out of the whole port loop instead.
+                break;
             };
             unsafe { crate::cpu::set_xhci_phase(9) };
             if !self.set_configuration(slot, config_value) {
@@ -1578,6 +1669,9 @@ impl XhciController {
                     break;
                 }
             }
+            // Only process one port: accessing a second connected port's
+            // PORTSC after the event ring is live wedges this SoC's MMIO bus.
+            break;
         }
         unsafe {
             crate::cpu::set_hid_enum_count(found);

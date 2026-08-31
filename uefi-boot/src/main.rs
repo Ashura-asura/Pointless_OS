@@ -418,6 +418,10 @@ fn main() -> Status {
                 "Aegis: Kernel loaded. Jumping to 0x{:016X}...",
                 kernel.entry
             );
+            sprintln!(
+                "Aegis: Kernel file size: {} bytes (embedded ELF)",
+                KERNEL_ELF.len()
+            );
 
             // Jump to kernel entry point, passing the boot-info handoff
             // address in %rdi (first sysv64 argument).

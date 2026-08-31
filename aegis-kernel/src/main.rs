@@ -89,17 +89,55 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         core::arch::asm!("cli", options(nomem, preserves_flags));
     }
 
+    // KERNEL FINGERPRINT (diagnostic): paint a full-width banner of the
+    // framebuffer a solid MAGENTA and print a unique string BEFORE anything
+    // else. This proves, unambiguously, that the newly built kernel has
+    // actually begun executing — the previous boot showed only the
+    // bootloader's "Kernel loaded. Jumping..." line and no kernel-side
+    // output, meaning the kernel entry was never reached (wrong kernel file
+    // on the boot path, or a crash before the first visible write).
+    if let Some(h) = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) } {
+        let fb = h.framebuffer_base as *mut u8;
+        let stride = h.stride_px as usize;
+        let bpp = (h.bpp / 8) as usize;
+        let fill = [0xFFu8, 0x00, 0xFF]; // magenta
+        for y in 0..200u32 {
+            for x in 0..h.width {
+                let off = (y as usize * stride + x as usize) * bpp;
+                unsafe {
+                    core::ptr::write_volatile(fb.add(off), fill[0]);
+                    core::ptr::write_volatile(fb.add(off + 1), fill[1]);
+                    core::ptr::write_volatile(fb.add(off + 2), fill[2]);
+                }
+            }
+        }
+    }
+    aegis_kernel::serial::SerialWriter::init();
+    sprintln!("Aegis: KERNEL FINGERPRINT 2026-08-31 internal-nvme — kernel entry reached");
+    // Stash the handoff address globally so frame::init_global (and anything
+    // else) can paint via gop_at directly — diag_fill may be a silent no-op.
+    unsafe { aegis_kernel::boot_info::set_boot_handoff(handoff_addr) };
+    // Register the diagnostic framebuffer EARLY (before frame::init_global)
+    // so the markers inside the allocator init can paint via `diag_fill`.
+    if let Some(h) = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) } {
+        unsafe {
+            aegis_kernel::cpu::init_diag_fb(h.framebuffer_base, h.stride_px, h.width, h.height);
+        }
+    }
+    // MARKERS below the magenta banner (slot 8+ is below y=200). Each paint()
+    // is a 24x24 block at the RIGHT edge, so it stays visible.
+    paint(handoff_addr, 0, 8, [0xFF, 0x00, 0x00]); // M1: after fingerprint
+
     // DIAGNOSTIC: colored blocks at each boot step so the TP201S shows
     // exactly where the kernel freezes. Each paint() is a small 40x40 block.
-    paint(handoff_addr, 0, 0, [0xFF, 0x00, 0x00]); // entry
     aegis_kernel::serial::SerialWriter::init();
-    paint(handoff_addr, 0, 1, [0x00, 0xFF, 0x00]); // after serial init
-                                                   // Blank the VGA text buffer only: entering text mode (which disables
-                                                   // the firmware's Bochs-VBE/GOP display mode) is deferred until after
-                                                   // the display backend is chosen below — a pixel backend must not kill
-                                                   // the GOP framebuffer the firmware set up.
+    paint(handoff_addr, 0, 9, [0x00, 0xFF, 0x00]); // M2: after serial init
+                                                    // Blank the VGA text buffer only: entering text mode (which disables
+                                                    // the firmware's Bochs-VBE/GOP display mode) is deferred until after
+                                                    // the display backend is chosen below — a pixel backend must not kill
+                                                    // the GOP framebuffer the firmware set up.
     aegis_kernel::vga::vga_init();
-    paint(handoff_addr, 0, 2, [0x00, 0x00, 0xFF]); // after vga_init
+    paint(handoff_addr, 0, 10, [0x00, 0x00, 0xFF]); // M3: after vga_init
 
     // GOP console install was HERE — moved DOWN to after the IDT is loaded
     // (see below). The first `gop_console::mirror()` call does a real MMIO
@@ -111,7 +149,9 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // `installed()`), so every `sprintln!` between here and the install call
     // below is serial+VGA-text only — safe.
 
+    paint(handoff_addr, 0, 11, [0xFF, 0x80, 0x00]); // M4: before Phase 2 sprintln
     sprintln!("=== Aegis Phase 2: Bare-Metal Kernel ===");
+    paint(handoff_addr, 0, 12, [0x80, 0x00, 0x80]); // M5: after Phase 2 sprintln
     sprintln!("Aegis: kernel started (loader handed off at entry)");
 
     // disable_smep_smap was HERE — moved DOWN to after the IDT is loaded
@@ -125,11 +165,15 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         aegis_kernel::cpu::stack_size() / 1024
     );
 
+    paint(handoff_addr, 0, 13, [0x80, 0xFF, 0x00]); // M6: before boot_info::locate_at
     let boot_info = unsafe { aegis_kernel::boot_info::locate_at(handoff_addr) };
+    paint(handoff_addr, 0, 14, [0x00, 0x80, 0x80]); // M7: after boot_info::locate_at
     // Extract the runtime fleet config (FLEET.CFG on the boot volume) and
     // point the interface at the configured IP before NetIf::init. Absent =>
     // compile-time defaults apply.
+    paint(handoff_addr, 0, 15, [0x00, 0xFF, 0x00]); // M8: before fleet_at
     let fleet_cfg = unsafe { aegis_kernel::boot_info::fleet_at(handoff_addr) };
+    paint(handoff_addr, 0, 16, [0xFF, 0x80, 0x80]); // M9: after fleet_at
     unsafe {
         aegis_kernel::boot_info::set_fleet_config(fleet_cfg);
     }
@@ -169,9 +213,11 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 conv
             );
 
+            paint(handoff_addr, 0, 17, [0xFF, 0xFF, 0xFF]); // M10: before frame::init_global
             unsafe {
                 aegis_kernel::frame::init_global(info);
             }
+            paint(handoff_addr, 0, 18, [0x00, 0x00, 0x00]); // M11: after frame::init_global
             // Dedicated idle stack: its saved scheduler frame must point at
             // private, never-clobbered memory. If idle shared KERNEL_STACK,
             // other tasks' timer/syscall entries would overwrite that region
@@ -1126,25 +1172,11 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                 usb.max_slots(),
                 usb.max_ports()
             );
-            if usb.enumerate_first_device() && usb.read_device_descriptor() {
-                let d = usb.device_descriptor;
-                sprintln!(
-                    "Aegis: xHCI: device descriptor: class={:02X} vid={:04X} pid={:04X} maxpkt0={} nconf={}",
-                    descriptor_class(&d),
-                    descriptor_vendor_id(&d),
-                    descriptor_product_id(&d),
-                    d[7],
-                    d[17],
-                );
-            } else {
-                sprintln!(
-                    "Aegis: xHCI: no device enumerated (nothing attached, or enumeration failed)"
-                );
-            }
-            // Bring up USB-HID input (keyboard + mouse) and keep the controller
-            // alive so `task_input` can poll it each iteration. The TP201S
-            // tablet has no PS/2 controller, so this is the only input path.
+            // DIAG: enumerate_hid_devices is now the ONLY enumeration path —
+            // enumerate_first_device is skipped so we have exactly one code
+            // path to debug the post-GET_DESCRIPTOR MMIO wedge.
             let n = usb.enumerate_hid_devices();
+            unsafe { aegis_kernel::cpu::set_xhci_phase(13) };
             sprintln!("Aegis: xHCI: HID devices enumerated: {}", n);
             // The new HID driver no longer sets the diagnostic USB= flag
             // itself; keep it accurate here.
@@ -1158,6 +1190,10 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         } else if EhciController::probe(&pci).is_none() {
             sprintln!("Aegis: xHCI: no USB host controller found");
         }
+        // DIAG: mark that USB/xHCI enumeration COMPLETED. If the screen shows
+        // phase 14 here, the freeze is in the NVMe/storage block below, not
+        // in xHCI.
+        unsafe { aegis_kernel::cpu::set_xhci_phase(14) };
     }
 
     // Live NVMe demo: probe BAR0, reset, admin + IO queues, identify, read

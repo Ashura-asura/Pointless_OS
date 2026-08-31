@@ -225,6 +225,23 @@ pub unsafe fn fleet_at(addr: u64) -> Option<FleetConfig> {
 /// unsafe access is safe here.
 static mut FLEET_CONFIG: Option<FleetConfig> = None;
 
+/// Stashed kernel handoff address, set at boot so any module can paint
+/// diagnostics via `gop_at` without threading the address through call
+/// chains (same single-threaded global-mut discipline as FLEET_CONFIG).
+static mut BOOT_HANDOFF: u64 = 0;
+
+/// # Safety
+/// Single-threaded boot path only.
+pub unsafe fn set_boot_handoff(addr: u64) {
+    BOOT_HANDOFF = addr;
+}
+
+/// # Safety
+/// Single-threaded boot path only.
+pub unsafe fn boot_handoff() -> u64 {
+    BOOT_HANDOFF
+}
+
 /// Record the fleet config (or `None`) for the boot demo to read later.
 ///
 /// # Safety

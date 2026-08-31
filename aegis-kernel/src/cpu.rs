@@ -920,6 +920,7 @@ static mut XHCI_CRCR_LO: u32 = 0; // CRCR low DWORD readback after init
 static mut XHCI_CRCR_HI: u32 = 0; // CRCR high DWORD readback after init
 static mut XHCI_CRCR_WLO: u32 = 0; // CRCR low DWORD readback right after write (halted)
 static mut XHCI_CRCR_WHI: u32 = 0; // CRCR high DWORD readback right after write (halted)
+static mut XHCI_CRCR_IMM: u32 = 0; // CRCR readback IMMEDIATELY after write (no delay)
 static mut XHCI_CMD_RING: u64 = 0; // command-ring physical address we wrote
 static mut XHCI_LEGACY: u32 = 0; // USB Legacy Support cap register value (post-handoff)
 static mut XHCI_LEGACY_ST: u8 = 0; // 0=no xECP 1=no legcap 2=already-OS 3=handed 4=forced
@@ -948,6 +949,9 @@ static mut XHCI_OP2: u32 = 0; // raw read of operational +0x08 (PAGESIZE — sho
 static mut XHCI_OP5: u32 = 0; // raw read of operational +0x14 (CRCR low, firmware value)
 static mut XHCI_OP8: u32 = 0; // raw read of operational +0x20 (DCBAAP low, firmware value)
 static mut XHCI_OP10: u32 = 0; // raw read of operational +0x28 (CONFIG, firmware value)
+static mut XHCI_OP18: u32 = 0; // raw read of operational +0x18 (spec CRCR high / alt CRCR low)
+static mut XHCI_OP30: u32 = 0; // raw read of operational +0x30 (alt DCBAAP low)
+static mut XHCI_OP38: u32 = 0; // raw read of operational +0x38 (alt CONFIG)
 
 /// # Safety
 /// Boot-time call from the USB-HID driver.
@@ -1080,6 +1084,9 @@ pub unsafe fn set_xhci_phase(p: u8) {
         g,
         b,
     );
+    // Paint the phase NUMBER as huge white digits below the block so the
+    // exact phase is readable even if the colour is ambiguous on the panel.
+    fb_hex(8, (DIAG_H as usize).saturating_sub(190), p as u64, 2, 4, 0xFF, 0xFF, 0xFF);
 }
 
 /// Phase -> colour, shared by `diag_phase_block` (bottom strip) and the
@@ -1359,6 +1366,17 @@ pub unsafe fn xhci_crcr_whi() -> u32 {
 }
 /// # Safety
 /// Read from the desktop diagnostic renderer.
+pub unsafe fn xhci_crcr_imm() -> u32 {
+    XHCI_CRCR_IMM
+}
+/// Record the CRCR readback captured immediately (no delay) after the write.
+/// # Safety
+/// Trivial static write, safe when single-threaded.
+pub unsafe fn set_xhci_crcr_imm(v: u32) {
+    XHCI_CRCR_IMM = v;
+}
+/// # Safety
+/// Read from the desktop diagnostic renderer.
 pub unsafe fn xhci_cmd_ring() -> u64 {
     XHCI_CMD_RING
 }
@@ -1498,16 +1516,20 @@ pub fn xhci_dcb_rd() -> u32 {
     unsafe { XHCI_DCB_RD }
 }
 /// Raw firmware values of the operational registers (before our writes). OP0
-/// = USBCMD, OP2 = PAGESIZE (should be 0x1 if offset is right), OP5 = CRCR
-/// low (firmware's CRCR — should be 0x200 from EVPTR), OP8 = DCBAAP low
-/// (firmware's DCBAAP), OP10 = CONFIG (firmware's CONFIG).
-pub fn set_xhci_op_raw(op0: u32, op2: u32, op5: u32, op8: u32, op10: u32) {
+/// = USBCMD, OP2 = PAGESIZE (should be 0x1 if offset is right). The rest
+/// test both the spec-correct offsets (0x14/0x20/0x28) and the original-code
+/// offsets (0x18/0x30/0x38) to locate where the firmware's CRCR (0x200 from
+/// EVPTR), DCBAAP, and CONFIG actually live.
+pub fn set_xhci_op_raw(op0: u32, op2: u32, op14: u32, op18: u32, op20: u32, op28: u32, op30: u32, op38: u32) {
     unsafe {
         XHCI_OP0 = op0;
         XHCI_OP2 = op2;
-        XHCI_OP5 = op5;
-        XHCI_OP8 = op8;
-        XHCI_OP10 = op10;
+        XHCI_OP5 = op14;
+        XHCI_OP8 = op20;
+        XHCI_OP10 = op28;
+        XHCI_OP18 = op18;
+        XHCI_OP30 = op30;
+        XHCI_OP38 = op38;
     }
 }
 pub fn xhci_op0() -> u32 { unsafe { XHCI_OP0 } }
@@ -1515,6 +1537,9 @@ pub fn xhci_op2() -> u32 { unsafe { XHCI_OP2 } }
 pub fn xhci_op5() -> u32 { unsafe { XHCI_OP5 } }
 pub fn xhci_op8() -> u32 { unsafe { XHCI_OP8 } }
 pub fn xhci_op10() -> u32 { unsafe { XHCI_OP10 } }
+pub fn xhci_op18() -> u32 { unsafe { XHCI_OP18 } }
+pub fn xhci_op30() -> u32 { unsafe { XHCI_OP30 } }
+pub fn xhci_op38() -> u32 { unsafe { XHCI_OP38 } }
 
 /// Snapshot the LAPIC's health for the on-screen boot diagnostic: whether we
 /// are in x2APIC (MSR) mode, whether the LAPIC is software-enabled (SVR bit 8),

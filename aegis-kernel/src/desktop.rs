@@ -1514,6 +1514,7 @@ impl Desktop {
         let crcr_hi = unsafe { crate::cpu::xhci_crcr_hi() };
         let crcr_wlo = unsafe { crate::cpu::xhci_crcr_wlo() };
         let crcr_whi = unsafe { crate::cpu::xhci_crcr_whi() };
+        let crcr_imm = unsafe { crate::cpu::xhci_crcr_imm() };
         let cmd_ring = unsafe { crate::cpu::xhci_cmd_ring() };
         let legacy = unsafe { crate::cpu::xhci_legacy() };
         let legacy_st = unsafe { crate::cpu::xhci_legacy_st() };
@@ -1531,6 +1532,9 @@ impl Desktop {
         let op5 = unsafe { crate::cpu::xhci_op5() };
         let op8 = unsafe { crate::cpu::xhci_op8() };
         let op10 = unsafe { crate::cpu::xhci_op10() };
+        let op18 = unsafe { crate::cpu::xhci_op18() };
+        let op30 = unsafe { crate::cpu::xhci_op30() };
+        let op38 = unsafe { crate::cpu::xhci_op38() };
         let mut w4 = W {
             buf: [0u8; SW],
             len: 0,
@@ -1560,13 +1564,12 @@ impl Desktop {
         };
         let _ = write!(
             w5,
-            "CRW={:08X}{:08X} CR={:08X}{:08X} CMD={:08X}{:08X} NA={}",
+            "CRW={:08X}{:08X} CR={:08X}{:08X} IMM={:08X} NA={}",
             crcr_whi,
             crcr_wlo,
             crcr_hi,
             crcr_lo,
-            (cmd_ring >> 32) as u32,
-            cmd_ring as u32,
+            crcr_imm,
             na
         );
         for (i, &b) in w5.buf[..w5.len].iter().enumerate() {
@@ -1606,8 +1609,8 @@ impl Desktop {
         };
         let _ = write!(
             w7,
-            "CAP={:X} HCH={} HRST={} PGS={:08X} FCR={:08X} FDCB={:08X} FCFG={:08X}",
-            caplen, hch0, hrst, op2, op5, op8, op10
+            "CAP={:X} HCH={} HRST={} PGS={:08X} FCR14={:08X} FCR18={:08X} FDCB={:08X} FCFG={:08X} OP30={:08X} OP38={:08X}",
+            caplen, hch0, hrst, op2, op5, op18, op8, op10, op30, op38
         );
         for (i, &b) in w7.buf[..w7.len].iter().enumerate() {
             if i < SW {

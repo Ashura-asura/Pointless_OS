@@ -85,11 +85,14 @@ impl<'a> FrameAllocator<'a> {
                 clear_bits(self.bitmap, start, end);
             }
         }
+        paint_diag(120, [0xFF, 0xFF, 0x00]); // F4: after entries loop
         let handoff_end = info
             .image_end
             .saturating_add(crate::boot_info::HANDOFF_PAGES * PAGE_SIZE);
         let kernel_end = handoff_end.max(BOOT_INFO_RESERVE_END);
+        paint_diag(160, [0xFF, 0x00, 0xFF]); // F5: before set_bits
         set_bits(self.bitmap, 0, kernel_end / PAGE_SIZE);
+        paint_diag(200, [0x00, 0xFF, 0xFF]); // F6: after set_bits
     }
 
     /// Total usable (conventional) frames: free bits plus allocated bits —
@@ -395,10 +398,40 @@ fn global_slice() -> (&'static mut [u64], &'static mut [u64]) {
 ///
 /// # Safety
 /// Single-threaded kernel; must run before any other allocation.
+/// Paint a 40x40 block at the right edge via the stashed GOP handoff (the
+/// same mechanism as `main::paint`, which is known to work on the TP201S).
+/// This bypasses `diag_fill`, which silently no-ops if the DIAG framebuffer
+/// hasn't been registered — so a visible block proves this line executed.
+fn paint_diag(x: usize, rgb: [u8; 3]) {
+    let handoff = unsafe { crate::boot_info::boot_handoff() };
+    if handoff == 0 {
+        return;
+    }
+    if let Some(h) = unsafe { crate::boot_info::gop_at(handoff) } {
+        let fb = h.framebuffer_base as *mut u8;
+        let stride = h.stride_px as usize;
+        let bpp = (h.bpp / 8) as usize;
+        let y = 300usize;
+        for dy in 0..40usize {
+            for dx in 0..40usize {
+                let off = ((y + dy) * stride + (x + dx)) * bpp;
+                unsafe {
+                    core::ptr::write_volatile(fb.add(off), rgb[0]);
+                    core::ptr::write_volatile(fb.add(off + 1), rgb[1]);
+                    core::ptr::write_volatile(fb.add(off + 2), rgb[2]);
+                }
+            }
+        }
+    }
+}
+
 pub unsafe fn init_global(info: &BootInfo) {
     let (bm, al) = global_slice();
+    paint_diag(0, [0xFF, 0x00, 0x00]); // F1: after global_slice
     let mut a = FrameAllocator::empty(bm, al);
+    paint_diag(40, [0x00, 0xFF, 0x00]); // F2: after empty
     a.init(info);
+    paint_diag(80, [0x00, 0x00, 0xFF]); // F3: after init
 }
 
 /// Allocate a frame from the global pool.
