@@ -26,12 +26,12 @@ const RTSOFF: u32 = 0x18;
 // ---------- operational registers (BAR + CAPLENGTH + off) ----------
 const USBCMD: u32 = 0x00;
 const USBSTS: u32 = 0x04;
-// Operational-register offsets are RELATIVE TO (BAR + CAPLENGTH); the code
-// adds `caplen` at every access. These are the spec values:
-//   CRCR=0x18, DCBAAP=0x30, CONFIG=0x38, PORTSC[0]=0x400.
-const CRCR: u32 = 0x18;
-const DCBAAP: u32 = 0x30;
-const CONFIG: u32 = 0x38;
+// Operational-register offsets are RELATIVE TO (BAR + CAPLENGTH).  These are
+// the xHCI 1.2 spec values (Table 5-4): CRCR low dword at 0x14 (high at 0x18),
+// DCBAAP low at 0x20 (high at 0x24), CONFIG at 0x28, PORTSC[0] at 0x400.
+const CRCR: u32 = 0x14;
+const DCBAAP: u32 = 0x20;
+const CONFIG: u32 = 0x28;
 
 const PORTSC_BASE: u32 = 0x400;
 const PORTSC_STRIDE: u32 = 0x10;
@@ -576,105 +576,28 @@ impl XhciController {
         let sts_pre = reg_read(self.base, caplen + USBSTS);
         let pre_lo = reg_read(self.base, caplen + CRCR);
         let pre_hi = reg_read(self.base, caplen + CRCR + 4);
+        // DIAGNOSTIC: capture the RAW firmware values of the operational
+        // registers BEFORE we touch them, to verify our offsets. OP2
+        // (PAGESIZE, +0x08) should read 0x1 if the offsets are right; OP5
+        // (CRCR low, +0x14) should be 0x200 (matching EVPTR); OP10 (CONFIG,
+        // +0x28) should be non-zero if the firmware configured slots.
+        let op0 = reg_read(self.base, caplen + 0x00);
+        let op2 = reg_read(self.base, caplen + 0x08);
+        let op5 = reg_read(self.base, caplen + CRCR);
+        let op8 = reg_read(self.base, caplen + DCBAAP);
+        let op10 = reg_read(self.base, caplen + CONFIG);
+        unsafe {
+            crate::cpu::set_xhci_op_raw(op0, op2, op5, op8, op10);
+        }
         let cmd_base = (self.buf.cmd_ring as u32) | 1;
         let cmd_hi = (self.buf.cmd_ring >> 32) as u32;
         let mut crcr_w_lo = 0u32;
         let mut crcr_w_hi = 0u32;
-        // Some xHCI controllers (notably Intel SoC parts) silently ignore the
-        // CRCR write while *freshly* Halted after reset — the command-ring
-        // pointer only sticks once the controller has been Started and Halted
-        // at least once. Prime the state machine: Run, wait until Running, then
-        // Halt, wait until Halted. We keep the event ring unarmed here (it is
-        // still set up lazily before the first command) so it is not live while
-        // the controller is briefly Running — a live event ring during Run can
-        // wedge this SoC's MMIO bus, and port power/reset happens later.
-        reg_write(self.base, caplen + USBCMD, USBCMD_RUN);
-        for _ in 0..4_000_000 {
-            if reg_read(self.base, caplen + USBSTS) & USBSTS_HCH == 0 {
-                break;
-            }
-        }
-        reg_write(self.base, caplen + USBCMD, 0);
-        for _ in 0..4_000_000 {
-            if reg_read(self.base, caplen + USBSTS) & USBSTS_HCH != 0 {
-                break;
-            }
-        }
-        // Observed: the CRCR write is silently dropped while Halted+ready and
-        // MMIO is uncacheable, even after a Run->Halt prime. Two opposing
-        // Intel-SoC quirks are known: (a) CRCR ignored while *freshly* Halted,
-        // and (b) CRCR only accepted while *Running* (opposite of the xHCI spec,
-        // which says CRCR is writable only while Halted). Settle it in one pass:
-        // even iterations write CRCR while the controller is Running, odd
-        // iterations while Halted. Each attempt re-asserts the desired Run/Halt
-        // state and waits for it, then retries the 64-bit store and the
-        // two-32-bit sequence, reading back each time; break as soon as the low
-        // DWORD matches (allowing the controller's CRR bit 3). Record which state
-        // latched it in `crcr_state`.
-        let mut crcr_state: u8 = 2;
-        for i in 0..64u32 {
-            if i % 2 == 0 {
-                // Write CRCR while Running.
-                reg_write(self.base, caplen + USBCMD, USBCMD_RUN);
-                for _ in 0..2_000_000 {
-                    if reg_read(self.base, caplen + USBSTS) & USBSTS_HCH == 0 {
-                        break;
-                    }
-                }
-            } else {
-                // Write CRCR while Halted.
-                reg_write(self.base, caplen + USBCMD, 0);
-                for _ in 0..2_000_000 {
-                    if reg_read(self.base, caplen + USBSTS) & USBSTS_HCH != 0 {
-                        break;
-                    }
-                }
-            }
-            reg_write64(
-                self.base,
-                caplen + CRCR,
-                ((cmd_hi as u64) << 32) | (cmd_base as u64),
-            );
-            for _ in 0..2000 {
-                core::hint::spin_loop();
-            }
-            crcr_w_lo = reg_read(self.base, caplen + CRCR);
-            crcr_w_hi = reg_read(self.base, caplen + CRCR + 4);
-            if crcr_w_lo == cmd_base || (crcr_w_lo & !0x8) == cmd_base {
-                crcr_state = if i % 2 == 0 { 1 } else { 0 };
-                break;
-            }
-            reg_write(self.base, caplen + CRCR + 4, cmd_hi);
-            reg_write(self.base, caplen + CRCR, cmd_base);
-            for _ in 0..2000 {
-                core::hint::spin_loop();
-            }
-            crcr_w_lo = reg_read(self.base, caplen + CRCR);
-            crcr_w_hi = reg_read(self.base, caplen + CRCR + 4);
-            if crcr_w_lo == cmd_base || (crcr_w_lo & !0x8) == cmd_base {
-                crcr_state = if i % 2 == 0 { 1 } else { 0 };
-                break;
-            }
-        }
-        unsafe {
-            crate::cpu::set_xhci_crcr_state(crcr_state);
-            crate::cpu::set_xhci_crcr_w(crcr_w_lo, crcr_w_hi);
-            crate::cpu::set_xhci_cmd_ring(self.buf.cmd_ring);
-            // USBSTS captured right after the CRCR write loop (controller still
-            // Halted, before Run) — shows HCH/CNR at the exact moment of the
-            // (failed) write.
-            crate::cpu::set_xhci_crcr_wsts(reg_read(self.base, self.caplen + USBSTS));
-        }
-
-        // If CRCR latched while Running, halt now so DCBAAP/CONFIG are written in
-        // the spec-correct Halted state. CRCR persists across Halt/Run, so the
-        // pointer we just programmed is not lost.
-        reg_write(self.base, self.caplen + USBCMD, 0);
-        for _ in 0..2_000_000 {
-            if reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH != 0 {
-                break;
-            }
-        }
+        // CRCR is programmed AFTER DCBAA/CONFIG below, while the controller has
+        // never been started since this reset (the spec-correct order). Earlier
+        // attempts wrote CRCR before DCBAA and/or after a Run->Halt prime; on
+        // this SoC the write was silently dropped in every one of those
+        // orderings, so now the controller must not be Run before CRCR is set.
 
         // DCBAA.
         reg_write(self.base, self.caplen + DCBAAP, self.buf.dcbaa as u32);
@@ -709,12 +632,30 @@ impl XhciController {
         }
         flush_region(self.buf.cmd_ring, 4096);
 
-        // Run the controller now. CRCR is still 0 here and the event ring is not
-        // yet armed, so no event is posted during root-port power/reset — that
-        // is the safe, non-wedging case on this SoC (a *live event ring* during
-        // port reset is what wedges the MMIO bus). `setup_event_ring` (called
-        // lazily on the first command, after port reset) arms the event ring and
-        // writes CRCR while Halted before starting the controller again.
+        // Program the Command Ring pointer (while Halted).
+        reg_write64(self.base, caplen + CRCR, ((cmd_hi as u64) << 32) | (cmd_base as u64));
+        reg_write(self.base, caplen + CRCR + 4, cmd_hi);
+        reg_write(self.base, caplen + CRCR, cmd_base);
+        for _ in 0..1_000_000 {
+            core::hint::spin_loop();
+        }
+        crcr_w_lo = reg_read(self.base, caplen + CRCR);
+        crcr_w_hi = reg_read(self.base, caplen + CRCR + 4);
+        // DIAGNOSTIC: read back the OTHER operational registers we programmed
+        // to prove the offsets are right (CRCR is write-only, so its readback
+        // is always 0; DCBAAP/CONFIG read back what we wrote if the offsets
+        // are correct). STP = readback of CONFIG, STQ = readback of DCBAAP low.
+        let cfg_rd = reg_read(self.base, caplen + CONFIG);
+        let dcb_rd = reg_read(self.base, caplen + DCBAAP);
+        unsafe {
+            crate::cpu::set_xhci_crcr_state(0);
+            crate::cpu::set_xhci_crcr_w(crcr_w_lo, crcr_w_hi);
+            crate::cpu::set_xhci_cmd_ring(self.buf.cmd_ring);
+            crate::cpu::set_xhci_crcr_wsts(reg_read(self.base, self.caplen + USBSTS));
+            crate::cpu::set_xhci_cfg_rd(cfg_rd, dcb_rd);
+        }
+
+        // Run the controller now.
         reg_write(self.base, self.caplen + USBCMD, USBCMD_RUN);
         for _ in 0..2_000_000 {
             if reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH == 0 {
@@ -740,13 +681,10 @@ impl XhciController {
     }
 
     /// Program the event ring (ERST + ERDP) at the correct interrupter-0
-    /// offsets. Called lazily just before the first command, so the event
-    /// ring is never live while root ports are being powered/reset — a live
-    /// event ring during those phases wedges this SoC's MMIO bus.
-    fn setup_event_ring(&mut self) {
-        if self.ring_ready {
-            return;
-        }
+    /// offsets. Split out so `init()` can arm the ring BEFORE programming CRCR
+    /// and starting the controller — this SoC requires the event ring to be
+    /// armed before it will accept the CRCR write or enter the Running state.
+    fn arm_event_ring(&mut self) {
         let erst_base = self.buf.erst as *mut u32;
         unsafe {
             *erst_base.add(0) = self.buf.ev_ring as u32;
@@ -771,39 +709,24 @@ impl XhciController {
             (self.buf.ev_ring as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 },
         );
         reg_write(rts, ERDP + 4, 0);
-        // Program the Command Ring pointer now. The controller only accepts the
-        // CRCR write in the Halted state (xHCI spec), AND this SoC additionally
-        // appears to require the event ring to already be armed — which is why the
-        // init()-time write (Halted, no event ring) and the naive Running write
-        // were both silently dropped (NCMD stayed 0). So: halt (leaving the event
-        // ring we just armed in place), write CRCR while Halted, then Run again.
-        reg_write(self.base, self.caplen + USBCMD, 0);
-        for _ in 0..2_000_000 {
-            if reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH != 0 {
-                break;
-            }
-        }
-        let cmd_base = (self.buf.cmd_ring as u32) | 1; // RCS = 1
-        let cmd_hi = (self.buf.cmd_ring >> 32) as u32;
-        reg_write64(
-            self.base,
-            self.caplen + CRCR,
-            ((cmd_hi as u64) << 32) | (cmd_base as u64),
-        );
-        reg_write(self.base, self.caplen + CRCR + 4, cmd_hi);
-        reg_write(self.base, self.caplen + CRCR, cmd_base);
-        unsafe {
-            crate::cpu::set_xhci_crcr_w(cmd_base, cmd_hi);
-            crate::cpu::set_xhci_crcr_state(0); // written while Halted + event ring armed
-            crate::cpu::set_xhci_crcr_wsts(reg_read(self.base, self.caplen + USBSTS));
-        }
-        reg_write(self.base, self.caplen + USBCMD, USBCMD_RUN);
-        for _ in 0..2_000_000 {
-            if reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH == 0 {
-                break;
-            }
-        }
         self.ring_ready = true;
+    }
+
+    /// Ensure the event ring is armed and the controller is Running. Called
+    /// lazily just before the first command as a backstop in case `init()`
+    /// could not arm the ring (e.g. the controller was wedged).
+    fn setup_event_ring(&mut self) {
+        if !self.ring_ready {
+            self.arm_event_ring();
+        }
+        if reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH != 0 {
+            reg_write(self.base, self.caplen + USBCMD, USBCMD_RUN);
+            for _ in 0..2_000_000 {
+                if reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH == 0 {
+                    break;
+                }
+            }
+        }
     }
 
     /// Post one command TRB to the command ring and ring the doorbell.
@@ -813,6 +736,28 @@ impl XhciController {
         self.setup_event_ring();
         ring_put(self.buf.cmd_ring, trb, &mut self.cmd_enq, &mut self.cmd_ccs);
         flush_region(self.buf.cmd_ring, 4096);
+        // Some Intel SoC xHCI controllers pre-fetch command TRBs beyond the
+        // one we posted, reading zero-filled slots (1-14) as garbage TRBs and
+        // producing error completions for each (NCMD ≫ NAT).  Seed a Link TRB
+        // right after this command so the pre-fetch hits the link, wraps to
+        // slot 0, and stops on the cycle mismatch — without ever hitting a
+        // zero-filled slot.  The next command will overwrite this Link TRB.
+        if self.cmd_enq != 0 {
+            let link = [
+                (self.buf.cmd_ring as u32) & 0xFFFF_FFC0,
+                (self.buf.cmd_ring >> 32) as u32,
+                0u32,
+                (TRB_LINK << 10) | (1 << 1) | if self.cmd_ccs { 1 } else { 0 },
+            ];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    link.as_ptr(),
+                    (self.buf.cmd_ring as *mut u32).add(self.cmd_enq as usize * 4),
+                    4,
+                );
+            }
+            flush_region(self.buf.cmd_ring, 4096);
+        }
         // DIAGNOSTIC: read back the command TRB DW3 the controller is about to
         // fetch, so we can tell "TRB never reached memory" apart from "controller
         // refuses to fetch it".
@@ -860,6 +805,13 @@ impl XhciController {
             unsafe { crate::cpu::inc_xhci_nevt() };
             let trb_type = (dw3 >> 10) & 0x3F;
             let cc = (dw2 >> 24) & 0xFF;
+            // DIAGNOSTIC: capture the very first event consumed so we can see
+            // what the controller actually reports (trb type / completion code
+            // / command TRB pointer).
+            let dw0 = unsafe { core::ptr::read_volatile(ev.add(idx * 4)) };
+            unsafe {
+                crate::cpu::set_xhci_evt_dw(dw0, dw2, dw3);
+            }
             // Command Completion Event: Slot ID is DW3 bits 31:24, not
             // anywhere in DW2 (DW2's low bits are the Completion Parameter,
             // reserved/0 for Enable Slot — reading "slot" out of DW2 always
@@ -1443,6 +1395,25 @@ impl XhciController {
     /// interrupt transfer. Returns the number of devices brought up.
     pub fn enumerate_hid_devices(&mut self) -> usize {
         let mut found = 0usize;
+        // The controller MUST be Running before root-port power/reset: a
+        // Halted controller cannot execute a port reset, so every subsequent
+        // enable/address command comes back CC=05 (USB Transaction Error).
+        // init() writes Run, but on this SoC it may not have latched yet (HCH
+        // still set); if so, start it now. No event ring is armed here yet, so
+        // nothing is posted during power/reset — the safe, non-wedging case.
+        let mut hch_enum = reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH;
+        if hch_enum != 0 {
+            reg_write(self.base, self.caplen + USBCMD, USBCMD_RUN);
+            for _ in 0..4_000_000 {
+                if reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH == 0 {
+                    break;
+                }
+            }
+            hch_enum = reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH;
+        }
+        unsafe {
+            crate::cpu::set_xhci_hch_enum((hch_enum == 0) as u8);
+        }
         self.power_ports();
         for p in 0..self.max_ports {
             if found >= MAX_HID {

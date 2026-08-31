@@ -1451,7 +1451,7 @@ impl Desktop {
             w2,
             "HID={} HE={} PE={} CE={} IN={} EHC={}",
             hid,
-            if he { 1 } else { 0 },
+            unsafe { crate::cpu::xhci_hch_enum() },
             pe,
             ce,
             inj,
@@ -1518,12 +1518,19 @@ impl Desktop {
         let legacy = unsafe { crate::cpu::xhci_legacy() };
         let legacy_st = unsafe { crate::cpu::xhci_legacy_st() };
         let caplen = unsafe { crate::cpu::xhci_caplen() };
-        let crcr_pre_lo = unsafe { crate::cpu::xhci_crcr_pre_lo() };
-        let crcr_pre_hi = unsafe { crate::cpu::xhci_crcr_pre_hi() };
+        let _crcr_pre_lo = unsafe { crate::cpu::xhci_crcr_pre_lo() };
+        let _crcr_pre_hi = unsafe { crate::cpu::xhci_crcr_pre_hi() };
         let hch0 = unsafe { crate::cpu::xhci_hch0() };
         let hrst = unsafe { crate::cpu::xhci_hrst() };
-        let sts_pre = unsafe { crate::cpu::xhci_usbsts_pre() };
-        let sts_post = unsafe { crate::cpu::xhci_usbsts_post() };
+        let _sts_pre = unsafe { crate::cpu::xhci_usbsts_pre() };
+        let _sts_post = unsafe { crate::cpu::xhci_usbsts_post() };
+        let cfg_rd = unsafe { crate::cpu::xhci_cfg_rd() };
+        let dcb_rd = unsafe { crate::cpu::xhci_dcb_rd() };
+        let op0 = unsafe { crate::cpu::xhci_op0() };
+        let op2 = unsafe { crate::cpu::xhci_op2() };
+        let op5 = unsafe { crate::cpu::xhci_op5() };
+        let op8 = unsafe { crate::cpu::xhci_op8() };
+        let op10 = unsafe { crate::cpu::xhci_op10() };
         let mut w4 = W {
             buf: [0u8; SW],
             len: 0,
@@ -1599,8 +1606,8 @@ impl Desktop {
         };
         let _ = write!(
             w7,
-            "CAP={:X} HCH={} HRST={} PRE={:08X}{:08X} STP={:08X} STQ={:08X}",
-            caplen, hch0, hrst, crcr_pre_hi, crcr_pre_lo, sts_pre, sts_post
+            "CAP={:X} HCH={} HRST={} PGS={:08X} FCR={:08X} FDCB={:08X} FCFG={:08X}",
+            caplen, hch0, hrst, op2, op5, op8, op10
         );
         for (i, &b) in w7.buf[..w7.len].iter().enumerate() {
             if i < SW {
@@ -1644,6 +1651,32 @@ impl Desktop {
         for (i, &b) in w9.buf[..w9.len].iter().enumerate() {
             if i < SW {
                 self.screen[8 * SW + i % SW] = attr | b as u16;
+            }
+        }
+        // Line 10: raw first event TRB the controller posted. DW0 = command TRB
+        // pointer (for a Command Completion this is the address of the TRB that
+        // generated the event — tells us if CRCR really points at our ring).
+        // DW2 bits 31:24 = completion code, DW3 bits 15:10 = TRB type (32=xfer,
+        // 33=cmd complete, 34=port status), DW3 bit 0 = cycle.
+        let evdw0 = unsafe { crate::cpu::xhci_evt_dw0() };
+        let evdw2 = unsafe { crate::cpu::xhci_evt_dw2() };
+        let evdw3 = unsafe { crate::cpu::xhci_evt_dw3() };
+        let mut w10 = W {
+            buf: [0u8; SW],
+            len: 0,
+        };
+        let _ = write!(
+            w10,
+            "EVPTR={:08X} EVCC={:02X} EVTYP={:02X} EVCY={} EVSLOT={:02X}",
+            evdw0,
+            (evdw2 >> 24) & 0xFF,
+            (evdw3 >> 10) & 0x3F,
+            evdw3 & 1,
+            (evdw3 >> 24) & 0xFF
+        );
+        for (i, &b) in w10.buf[..w10.len].iter().enumerate() {
+            if i < SW {
+                self.screen[9 * SW + i % SW] = attr | b as u16;
             }
         }
     }

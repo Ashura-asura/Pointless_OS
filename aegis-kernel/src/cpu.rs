@@ -937,6 +937,17 @@ static mut XHCI_CRCR_STATE: u8 = 2; // 0 = CRCR latched while Halted, 1 = while 
 static mut XHCI_DBOFF: u32 = 0; // computed doorbell-array offset (base + this); 0 => doorbell writes land on CAPLENGTH
 static mut XHCI_CMD_TRB3: u32 = 0; // command TRB DW3 read back after flush (sanity: did ring_put land?)
 static mut XHCI_DB_RD: u32 = 0; // doorbell register read back after the ring write (did it reach HW?)
+static mut XHCI_HCH_ENUM: u8 = 0; // 1 if controller was Running when enumerate_hid_devices started
+static mut XHCI_EVT_DW0: u32 = 0; // raw DW0 of the FIRST event poll_event consumed (cmd TRB ptr for completions)
+static mut XHCI_EVT_DW2: u32 = 0; // raw DW2 of the FIRST event poll_event consumed
+static mut XHCI_EVT_DW3: u32 = 0; // raw DW3 of the FIRST event poll_event consumed
+static mut XHCI_CFG_RD: u32 = 0; // readback of CONFIG (0x28) after write — proves offset is correct
+static mut XHCI_DCB_RD: u32 = 0; // readback of DCBAAP (0x20) after write
+static mut XHCI_OP0: u32 = 0; // raw read of operational +0x00 (USBCMD)
+static mut XHCI_OP2: u32 = 0; // raw read of operational +0x08 (PAGESIZE — should be 0x1 if offset right)
+static mut XHCI_OP5: u32 = 0; // raw read of operational +0x14 (CRCR low, firmware value)
+static mut XHCI_OP8: u32 = 0; // raw read of operational +0x20 (DCBAAP low, firmware value)
+static mut XHCI_OP10: u32 = 0; // raw read of operational +0x28 (CONFIG, firmware value)
 
 /// # Safety
 /// Boot-time call from the USB-HID driver.
@@ -1441,6 +1452,69 @@ pub fn set_xhci_db_rd(v: u32) {
 pub fn xhci_db_rd() -> u32 {
     unsafe { XHCI_DB_RD }
 }
+/// Record whether the controller was Running when `enumerate_hid_devices`
+/// started (0 = it had to be (re)started here, 1 = already Running). Lets the
+/// on-screen diagnostic show whether port power/reset ran under a Running
+/// controller (required; a Halted controller can't reset ports -> CC=05).
+pub fn set_xhci_hch_enum(running: u8) {
+    unsafe { XHCI_HCH_ENUM = running; }
+}
+pub fn xhci_hch_enum() -> u8 {
+    unsafe { XHCI_HCH_ENUM }
+}
+/// Raw DW0/DW2/DW3 of the first event `poll_event` consumed. For a Command
+/// Completion, DW0/DW1 is the pointer to the command TRB that generated the
+/// event (tells us if CRCR really points at our command ring); DW2 bits 31:24
+/// = completion code; DW3 bits 15:10 = TRB type, bit 0 = cycle.
+pub fn set_xhci_evt_dw(dw0: u32, dw2: u32, dw3: u32) {
+    unsafe {
+        XHCI_EVT_DW0 = dw0;
+        XHCI_EVT_DW2 = dw2;
+        XHCI_EVT_DW3 = dw3;
+    }
+}
+pub fn xhci_evt_dw0() -> u32 {
+    unsafe { XHCI_EVT_DW0 }
+}
+pub fn xhci_evt_dw2() -> u32 {
+    unsafe { XHCI_EVT_DW2 }
+}
+pub fn xhci_evt_dw3() -> u32 {
+    unsafe { XHCI_EVT_DW3 }
+}
+/// Readback of CONFIG (0x28) and DCBAAP (0x20) right after programming them —
+/// proves the operational-register offsets are correct (a readback equal to
+/// what we wrote means CRCR at 0x14 is also at the right place).
+pub fn set_xhci_cfg_rd(cfg: u32, dcb: u32) {
+    unsafe {
+        XHCI_CFG_RD = cfg;
+        XHCI_DCB_RD = dcb;
+    }
+}
+pub fn xhci_cfg_rd() -> u32 {
+    unsafe { XHCI_CFG_RD }
+}
+pub fn xhci_dcb_rd() -> u32 {
+    unsafe { XHCI_DCB_RD }
+}
+/// Raw firmware values of the operational registers (before our writes). OP0
+/// = USBCMD, OP2 = PAGESIZE (should be 0x1 if offset is right), OP5 = CRCR
+/// low (firmware's CRCR — should be 0x200 from EVPTR), OP8 = DCBAAP low
+/// (firmware's DCBAAP), OP10 = CONFIG (firmware's CONFIG).
+pub fn set_xhci_op_raw(op0: u32, op2: u32, op5: u32, op8: u32, op10: u32) {
+    unsafe {
+        XHCI_OP0 = op0;
+        XHCI_OP2 = op2;
+        XHCI_OP5 = op5;
+        XHCI_OP8 = op8;
+        XHCI_OP10 = op10;
+    }
+}
+pub fn xhci_op0() -> u32 { unsafe { XHCI_OP0 } }
+pub fn xhci_op2() -> u32 { unsafe { XHCI_OP2 } }
+pub fn xhci_op5() -> u32 { unsafe { XHCI_OP5 } }
+pub fn xhci_op8() -> u32 { unsafe { XHCI_OP8 } }
+pub fn xhci_op10() -> u32 { unsafe { XHCI_OP10 } }
 
 /// Snapshot the LAPIC's health for the on-screen boot diagnostic: whether we
 /// are in x2APIC (MSR) mode, whether the LAPIC is software-enabled (SVR bit 8),
