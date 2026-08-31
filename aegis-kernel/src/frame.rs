@@ -380,17 +380,18 @@ static mut BITMAP: [u64; FRAME_WORDS] = [u64::MAX; FRAME_WORDS];
 static mut ALLOCED: [u64; FRAME_WORDS] = [0u64; FRAME_WORDS];
 
 fn global_slice() -> (&'static mut [u64], &'static mut [u64]) {
+    paint_diag(240, [0xFF, 0xFF, 0xFF]); // G1: at very start of global_slice
     unsafe {
-        (
-            core::slice::from_raw_parts_mut(
-                core::ptr::addr_of_mut!(BITMAP) as *mut u64,
-                FRAME_WORDS,
-            ),
-            core::slice::from_raw_parts_mut(
-                core::ptr::addr_of_mut!(ALLOCED) as *mut u64,
-                FRAME_WORDS,
-            ),
-        )
+        let bm = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(BITMAP) as *mut u64,
+            FRAME_WORDS,
+        );
+        paint_diag(280, [0xFF, 0x80, 0x00]); // G2: after BITMAP slice
+        let al = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(ALLOCED) as *mut u64,
+            FRAME_WORDS,
+        );
+        (bm, al)
     }
 }
 
