@@ -147,6 +147,24 @@ fn main() -> Status {
                             core::ptr::write_bytes(bss_start, 0, bss_len);
                         }
                     }
+                } else {
+                    // Previously a silent no-op: this segment would just never
+                    // be copied, with no log line and no change to the segment
+                    // table already printed above, leaving `dst` as whatever
+                    // memory happened to be there. A kernel that boots and
+                    // then freezes deep inside some later region (exactly what
+                    // we're chasing on the TP201S) is indistinguishable, from
+                    // the log alone, from this segment having been dropped.
+                    // Make it loud instead of invisible.
+                    uefi::println!(
+                        "Aegis: FATAL: segment {} out of bounds (offset=0x{:X} filesz=0x{:X} elf_len=0x{:X}) — NOT LOADED",
+                        i, seg.offset, seg.filesz, KERNEL_ELF.len()
+                    );
+                    sprintln!(
+                        "Aegis: FATAL: segment {} out of bounds (offset=0x{:X} filesz=0x{:X} elf_len=0x{:X}) — NOT LOADED",
+                        i, seg.offset, seg.filesz, KERNEL_ELF.len()
+                    );
+                    panic!("kernel ELF segment {} out of bounds, refusing to boot a partially-loaded kernel", i);
                 }
             }
 
@@ -218,18 +236,17 @@ fn main() -> Status {
                 _attrs: u64,
             }
             const MAX_MAP: usize = 128;
-            static mut MAP_BUF: [MapDesc; MAX_MAP] = [MapDesc {
-                ty: 0,
-                _pad: 0,
-                phys: 0,
-                _virt: 0,
-                pages: 0,
-                _attrs: 0,
-            }; MAX_MAP];
-            let final_count = unsafe {
+            // Raw byte buffer — large enough for any UEFI descriptor size.
+            // The old code used `MapDesc[128]` (40 bytes each = 5120 bytes)
+            // but told the firmware `MAX_MAP * 48` (6144 bytes), causing a
+            // potential 1024-byte overflow into adjacent statics. Use a raw
+            // byte array sized for the worst case.
+            const MAX_DESC_SIZE: usize = 64;
+            static mut MAP_BUF: [u8; MAX_MAP * MAX_DESC_SIZE] = [0u8; MAX_MAP * MAX_DESC_SIZE];
+            let (final_count, actual_desc_size) = unsafe {
                 let st = uefi::table::system_table_raw().unwrap();
                 let bs = (*st.as_ptr()).boot_services.as_ref().unwrap();
-                let mut size = (MAX_MAP * 48) as usize;
+                let mut size = MAP_BUF.len();
                 let mut key = 0usize;
                 let mut desc_size = 0usize;
                 let mut desc_ver = 0u32;
@@ -245,7 +262,12 @@ fn main() -> Status {
                 // function pointer). The kernel runs under the firmware's
                 // boot services without EBS. The framebuffer and handoff are
                 // already set up, so the kernel can print and boot.
-                (size / 48).min(MAX_MAP)
+                //
+                // Use the firmware-returned `desc_size` (not hardcoded 48)
+                // so the count is correct regardless of the descriptor layout.
+                let ds = if desc_size > 0 { desc_size } else { 48 };
+                let count = (size / ds).min(MAX_MAP);
+                (count, ds)
             };
             sprintln!(
                 "Aegis: ExitBootServices SKIPPED (TP201S workaround) — {} descriptors, handing off",
@@ -284,8 +306,8 @@ fn main() -> Status {
             const HANDOFF_PAGES: u64 = 2;
             if image_end + HANDOFF_PAGES * 4096 >= 0xA0000 {
                 // CONVENTIONAL memory type = 7.
-                image_end = unsafe { &MAP_BUF[..final_count] }
-                    .iter()
+                image_end = (0..final_count)
+                    .map(|i| unsafe { desc_at(MAP_BUF.as_ptr(), actual_desc_size, i) })
                     .filter(|d| d.ty == 7 && d.phys >= image_end)
                     .map(|d| d.phys)
                     .min()
@@ -313,7 +335,22 @@ fn main() -> Status {
                 entries: [MapEntry; MAX_ENTRIES],
             }
 
-            let in_conventional = unsafe { &MAP_BUF[..final_count] }.iter().any(|d| {
+            // Helper to read a MapDesc from the raw byte buffer at a given
+            // descriptor index, striding by the firmware's actual desc_size.
+            unsafe fn desc_at(buf: *const u8, ds: usize, i: usize) -> MapDesc {
+                let p = buf.add(i * ds);
+                MapDesc {
+                    ty: core::ptr::read_unaligned(p.add(0) as *const u32),
+                    _pad: core::ptr::read_unaligned(p.add(4) as *const u32),
+                    phys: core::ptr::read_unaligned(p.add(8) as *const u64),
+                    _virt: core::ptr::read_unaligned(p.add(16) as *const u64),
+                    pages: core::ptr::read_unaligned(p.add(24) as *const u64),
+                    _attrs: core::ptr::read_unaligned(p.add(32) as *const u64),
+                }
+            }
+
+            let in_conventional = (0..final_count).any(|i| {
+                let d = unsafe { desc_at(MAP_BUF.as_ptr(), actual_desc_size, i) };
                 d.phys <= handoff_addr && handoff_addr < d.phys + d.pages * 4096 && d.ty == 7
             });
             sprintln!(
@@ -334,11 +371,8 @@ fn main() -> Status {
                     pages: 0,
                 }; MAX_ENTRIES],
             };
-            for (i, d) in unsafe { &MAP_BUF[..final_count] }
-                .iter()
-                .enumerate()
-                .take(MAX_ENTRIES)
-            {
+            for i in 0..final_count.min(MAX_ENTRIES) {
+                let d = unsafe { desc_at(MAP_BUF.as_ptr(), actual_desc_size, i) };
                 handoff.entries[i] = MapEntry {
                     ty: d.ty,
                     base: d.phys,

@@ -38,6 +38,9 @@ const IDX_ADVISOR: u64 = 16;
 
 #[no_mangle]
 pub extern "sysv64" fn _start(handoff_addr: u64) -> ! {
+    // K0: very first instruction in the kernel — prove the loader jumped
+    // to the correct address and the CPU is executing kernel code.
+    paint(handoff_addr, 0, 2, [0x00, 0xFF, 0xFF]); // K0: _start reached
     // Enter on a freshly-established kernel stack: jump (never return) so
     // boot_kernel's prologue and all its %rsp-relative slots live below the
     // stack top, instead of spilling into BSS statics placed just above it.
@@ -88,6 +91,8 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     unsafe {
         core::arch::asm!("cli", options(nomem, preserves_flags));
     }
+    // K1: boot_kernel entered (stack switched, interrupts off).
+    paint(handoff_addr, 0, 3, [0xFF, 0xFF, 0x00]); // K1: boot_kernel entry
 
     // KERNEL FINGERPRINT (diagnostic): paint a full-width banner of the
     // framebuffer a solid MAGENTA and print a unique string BEFORE anything
@@ -117,6 +122,8 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // Stash the handoff address globally so frame::init_global (and anything
     // else) can paint via gop_at directly — diag_fill may be a silent no-op.
     unsafe { aegis_kernel::boot_info::set_boot_handoff(handoff_addr) };
+    // K2: boot_handoff stashed, Rust globals accessible — early init done.
+    paint(handoff_addr, 0, 4, [0x00, 0xFF, 0x00]); // K2: handoff stashed
     // Register the diagnostic framebuffer EARLY (before frame::init_global)
     // so the markers inside the allocator init can paint via `diag_fill`.
     if let Some(h) = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) } {
@@ -217,7 +224,8 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             unsafe {
                 aegis_kernel::frame::init_global(info);
             }
-            paint(handoff_addr, 0, 18, [0x00, 0x00, 0x00]); // M11: after frame::init_global
+            paint(handoff_addr, 0, 18, [0xFF, 0xFF, 0x00]); // M11: after frame::init_global (was pure black — invisible; changed to yellow)
+            paint(handoff_addr, 0, 19, [0xFF, 0x80, 0x00]); // M12: before alloc_contiguous_global (idle stack)
             // Dedicated idle stack: its saved scheduler frame must point at
             // private, never-clobbered memory. If idle shared KERNEL_STACK,
             // other tasks' timer/syscall entries would overwrite that region
@@ -245,7 +253,9 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
                     sprintln!("Aegis: WARNING could not allocate idle stack");
                 }
             }
+            paint(handoff_addr, 0, 20, [0x00, 0xC0, 0x00]); // M13: after idle stack alloc
             let (total, free) = unsafe { aegis_kernel::frame::stats_global() };
+            paint(handoff_addr, 0, 21, [0x80, 0x00, 0xFF]); // M14: after stats_global
             sprintln!(
                 "Aegis: frame allocator: {} usable frames ({} MiB), {} free",
                 total,
@@ -254,19 +264,20 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             );
 
             let f0 = unsafe { aegis_kernel::frame::alloc_global() };
+            paint(handoff_addr, 0, 22, [0xFF, 0x00, 0x80]); // M15: after alloc_global f0
+            sprintln!("Aegis: probe f0={:#x}", f0.unwrap_or(0));
             let f1 = unsafe { aegis_kernel::frame::alloc_global() };
+            paint(handoff_addr, 0, 23, [0xFF, 0x80, 0xFF]); // M15b: after alloc_global f1
+            sprintln!("Aegis: probe f1={:#x}", f1.unwrap_or(0));
             let f2 = unsafe { aegis_kernel::frame::alloc_global() };
-            sprintln!(
-                "Aegis: allocator probe: frames @ 0x{:X}, 0x{:X}, 0x{:X}",
-                f0.unwrap_or(0),
-                f1.unwrap_or(0),
-                f2.unwrap_or(0)
-            );
+            paint(handoff_addr, 0, 24, [0x80, 0xFF, 0x00]); // M16: after alloc_global f2
+            sprintln!("Aegis: probe f2={:#x}", f2.unwrap_or(0));
             let freed = unsafe {
                 let a = aegis_kernel::frame::free_global(f0.unwrap_or(0));
                 let b = aegis_kernel::frame::free_global(f2.unwrap_or(0));
                 (a, b)
             };
+            paint(handoff_addr, 0, 24, [0xFF, 0xA5, 0x00]); // M17: after free_global
             let (_, free_after) = unsafe { aegis_kernel::frame::stats_global() };
             sprintln!(
                 "Aegis: allocator probe: freed f0={}, f2={}, {} free now",
@@ -333,15 +344,40 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     }
     paint(handoff_addr, 0, 9, [0x80, 0x80, 0x80]); // gray: GOP console installed
 
+    paint(handoff_addr, 0, 25, [0x00, 0x00, 0xFF]); // blue: before mask_pic
     unsafe {
         aegis_kernel::cpu::mask_pic();
     }
-    paint(handoff_addr, 0, 10, [0x00, 0xC0, 0x00]); // dark green: PIC masked
+    paint(handoff_addr, 0, 26, [0x00, 0xC0, 0x00]); // dk green: after mask_pic
     sprintln!("Aegis: legacy PIC masked");
 
+    paint(handoff_addr, 0, 27, [0xFF, 0xFF, 0x00]); // yellow: before init_kernel_tables
     unsafe {
         aegis_kernel::page_tables::init_kernel_tables();
+    }
+    paint(handoff_addr, 0, 28, [0xFF, 0xA5, 0x00]); // orange: after init_kernel_tables
+    unsafe {
         aegis_kernel::page_tables::switch_to(aegis_kernel::page_tables::kernel_pml4_phys());
+    }
+    paint(handoff_addr, 0, 29, [0xFF, 0x00, 0xFF]); // magenta: after CR3 switch
+    // The kernel page tables map GB2 (0x80000000-0xBFFFFFFF) as 2 MB WB pages.
+    // The GOP framebuffer at 0x90000000 on the TP201S lives there and MUST be
+    // uncacheable for writes to land on the display panel. Without this, the
+    // CPU caches framebuffer stores and the screen goes black after CR3 switch
+    // (the loader's UEFI WC mapping is replaced by our plain WB entries).
+    paint(handoff_addr, 0, 30, [0x00, 0xFF, 0xFF]); // cyan: before gop_at post-CR3
+    let post_cr3_fb = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) }.map(|h| h.framebuffer_base);
+    paint(handoff_addr, 0, 31, [0xFF, 0xFF, 0x00]); // yellow: gop_at returned
+    if let Some(fb) = post_cr3_fb {
+        paint(handoff_addr, 0, 32, [0xFF, 0x00, 0x00]); // red: about to mark_mmio_uncacheable
+        unsafe {
+            aegis_kernel::page_tables::mark_mmio_uncacheable(fb);
+        }
+        paint(handoff_addr, 0, 33, [0x00, 0xFF, 0x00]); // green: mark_mmio done
+        sprintln!(
+            "Aegis: GOP framebuffer at {:#x} marked uncacheable",
+            fb
+        );
     }
     paint(handoff_addr, 0, 11, [0xFF, 0x00, 0x80]); // pink: CR3 switched
     sprintln!("Aegis: CR3 switched to kernel page tables (identity with 4 KB LAPIC mapping)");

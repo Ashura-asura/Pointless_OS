@@ -82,9 +82,10 @@ static mut KERNEL_PDPT: PageTable = PageTable::new();
 static mut KERNEL_PD0: PageTable = PageTable::new();
 // 4 KB tables for the 2 MB regions that contain part of the executable
 // window (so code and data can be separated there). The window is a single
-// contiguous R+X PT_LOAD of the kernel image, so it can straddle at most two
+// Each 2 MB region containing part of the executable window gets its own
+// page table for 4 KB sub-pages. The kernel is ~25 MB, spanning up to 13
 // 2 MB regions.
-static mut KERNEL_PT_WIN: [PageTable; 2] = [PageTable::new(); 2];
+static mut KERNEL_PT_WIN: [PageTable; 16] = [PageTable::new(); 16];
 
 // Scratch area for the 0xC0000000-0xFFFFFFFF window (splits the huge page so
 // the local APIC page can be mapped with ordinary 4 KB pages: QEMU TCG cannot
@@ -218,14 +219,20 @@ pub fn text_window_from_elf(data: &[u8]) -> Result<(u64, u64), &'static str> {
 /// 0). `None` if the image's program headers cannot be parsed — a build
 /// problem, not a runtime one.
 pub fn kernel_text_window() -> Option<(u64, u64)> {
-    // Address 0 is the identity-mapped kernel image (ELF header + program
-    // header table). Copy the headers into a stack buffer with volatile
-    // reads (no raw-null slice), then run the pure parser on it.
-    let mut buf = [0u8; 1024];
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b = unsafe { core::ptr::read_volatile((i as u64) as *const u8) };
+    // Use linker symbols instead of parsing the ELF at runtime. The ELF header
+    // is at file offset 0 and NOT loaded into memory as part of any PT_LOAD
+    // segment (the first LOAD starts at file offset 0x1000), so reading from
+    // the kernel base gives us .text code, not an ELF header.
+    extern "C" {
+        static _text_start: u8;
+        static _text_end: u8;
     }
-    text_window_from_elf(&buf).ok()
+    let start = unsafe { core::ptr::addr_of!(_text_start) as u64 };
+    let end = unsafe { core::ptr::addr_of!(_text_end) as u64 };
+    if start == 0 || end <= start {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// Ensure IA32_EFER.NXE is set so the NX page-table bit is honored.

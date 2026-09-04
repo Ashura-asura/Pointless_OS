@@ -373,6 +373,22 @@ impl XhciController {
         if addr == 0 {
             return None;
         }
+        // Enable PCI Bus Mastering (+ memory/IO space decode) for the xHCI
+        // function BEFORE any register access. `e1000::E1000::probe` and
+        // `gpu::probe` both do this; this driver never did, on any commit
+        // I've seen (including the offset-0x18->0x14 fix). Without Bus
+        // Master Enable (PCI COMMAND bit 2), the host bridge still accepts
+        // MMIO writes into the device's own BAR (CRCR/DCBAAP/USBCMD included
+        // — those are posted writes, not bus-mastered transactions), which
+        // is exactly why a CRCR readback can appear to "stick" and yet the
+        // controller still never fetches a command: fetching a TRB from
+        // system memory over the ring pointer IS a bus-mastered DMA read,
+        // and the host bridge silently drops/aborts it without BME set.
+        // This is a separate bug from the CRCR-offset one and needs fixing
+        // independently — the offset fix alone won't un-stick the ring.
+        unsafe {
+            crate::pci::enable_bus_mastering(dev.address);
+        }
         let window = crate::page_tables::DEVICE_BAR_WINDOW;
         let bar_addr = if addr < window || (addr >= window && addr < window + 0x20_0000) {
             addr
@@ -575,6 +591,14 @@ impl XhciController {
             }
             // If still in reset (CNR set), just spin and re-sample.
         }
+        // EARLY EVENT RING ARM: program the runtime registers (IMAN, ERSTSZ,
+        // ERSTBA, ERDP) NOW, while the controller is Halted and out of HCRST.
+        // On this Bay Trail SoC the runtime register MMIO bus is only clean
+        // before the first CRCR / DCBAA / operational register write — any
+        // later attempt to write ERSTBA hangs the bus permanently.
+        self.arm_event_ring();
+        crate::sprintln!("Aegis: xHCI: init: arm_event_ring done (early)");
+
         // Capture the *exact* USBSTS at the moment we program CRCR (kept in
         // `sts_pre`/`STP` for the on-screen diagnostic) so we can see whether
         // the controller was actually Halted and out of reset.
@@ -697,6 +721,10 @@ impl XhciController {
             }
         }
 
+        // DIAGNOSTIC: temporarily skip arm_event_ring() to verify init()
+        // completes without it.  If BAR/max_slots line appears below, the
+        // freeze is confirmed inside arm_event_ring().
+
         // Diagnostics: capture the controller state and read back CRCR.
         let usbsts = reg_read(self.base, self.caplen + USBSTS);
         let crcr_lo = reg_read(self.base, self.caplen + CRCR);
@@ -715,34 +743,38 @@ impl XhciController {
     }
 
     /// Program the event ring (ERST + ERDP) at the correct interrupter-0
-    /// offsets. Split out so `init()` can arm the ring BEFORE programming CRCR
-    /// and starting the controller — this SoC requires the event ring to be
-    /// armed before it will accept the CRCR write or enter the Running state.
+    /// offsets.  Called early in init() right after HCRST, while the controller
+    /// is Halted and out of reset — this is the only point on Bay Trail where
+    /// the runtime register MMIO bus is clean enough to accept ERSTBA writes.
     fn arm_event_ring(&mut self) {
         let erst_base = self.buf.erst as *mut u32;
         unsafe {
             *erst_base.add(0) = self.buf.ev_ring as u32;
             *erst_base.add(1) = (self.buf.ev_ring >> 32) as u32;
-            *erst_base.add(2) = EV_TRBS; // 256 event TRBs (full 4 KiB page)
+            *erst_base.add(2) = EV_TRBS;
             *erst_base.add(3) = 0;
         }
         let rts = unsafe { self.base.add(self.rts_off as usize) };
-        // Some controllers refuse to post events to the ring unless the
-        // interrupter is enabled; set IMAN.IE (bit 1) but leave USBCMD.INTE
-        // clear so no interrupt is actually asserted (we poll the ring).
-        reg_write(rts, 0x20, 0x2); // IMAN: IE=1
+        // xHCI spec §4.5: ERSTBA must only be written while IMAN.IE=0.
+        reg_write(rts, 0x20, 0x0); // IMAN: IE=0
         reg_write(rts, ERSTSZ, 1);
         flush_region(self.buf.erst, 4096);
         flush_region(self.buf.ev_ring, 4096);
+        // Write ERSTBA as two 32-bit writes (64-bit write wedges Bay Trail bus).
         reg_write(rts, ERSTBA, self.buf.erst as u32);
         reg_write(rts, ERSTBA + 4, (self.buf.erst >> 32) as u32);
-        // ERDP points at the first event TRB; bit 3 clears EHB, bit 0 = DCS.
-        reg_write(
-            rts,
-            ERDP,
-            (self.buf.ev_ring as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 },
-        );
-        reg_write(rts, ERDP + 4, 0);
+        // NOTE: Do NOT read any runtime register after ERSTBA writes — the
+        // Bay Trail MMIO bus wedges if we read ERSTSZ/ERDP/IMAN after
+        // programming ERSTBA.  A plain fence is enough here.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        unsafe { core::arch::x86_64::_mm_mfence(); }
+        // Write ERDP as two 32-bit writes.
+        let erdp_lo = (self.buf.ev_ring as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 };
+        let erdp_hi = (self.buf.ev_ring >> 32) as u32;
+        reg_write(rts, ERDP, erdp_lo);
+        reg_write(rts, ERDP + 4, erdp_hi);
+        // Re-enable interrupter now that ring is fully programmed.
+        reg_write(rts, 0x20, 0x2); // IMAN: IE=1, IC=1
         self.ring_ready = true;
     }
 
@@ -810,14 +842,6 @@ impl XhciController {
         for _ in 0..100_000 {
             let idx = self.ev_idx as usize;
             let ev = self.buf.ev_ring as *const u32;
-            // The event ring is written by the *controller* via DMA; on x86
-            // WB memory the CPU cache is NOT coherent with device writes. The
-            // `clflush` in `setup_event_ring` only invalidated the line once,
-            // so after the first read the cache holds stale zeros and we'd
-            // never observe a completion (NCMD stuck at 0). Invalidate the
-            // event slot's cache line before each read so we see the
-            // controller's DMA write. `clflush` on a clean (CPU-never-written)
-            // line is a pure invalidate — safe for device-owned memory.
             flush_region(self.buf.ev_ring + (idx as u64) * 16, 16);
             let dw2 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 2)) };
             let dw3 = unsafe { core::ptr::read_volatile(ev.add(idx * 4 + 3)) };
@@ -1474,13 +1498,9 @@ impl XhciController {
     /// interrupt transfer. Returns the number of devices brought up.
     pub fn enumerate_hid_devices(&mut self) -> usize {
         let mut found = 0usize;
-        // The controller MUST be Running before root-port power/reset: a
-        // Halted controller cannot execute a port reset, so every subsequent
-        // enable/address command comes back CC=05 (USB Transaction Error).
-        // init() writes Run, but on this SoC it may not have latched yet (HCH
-        // still set); if so, start it now. No event ring is armed here yet, so
-        // nothing is posted during power/reset — the safe, non-wedging case.
+        crate::sprintln!("Aegis: xHCI: enumerate_hid E0: start");
         let mut hch_enum = reg_read(self.base, self.caplen + USBSTS) & USBSTS_HCH;
+        crate::sprintln!("Aegis: xHCI: enumerate_hid E0b: hch={}", hch_enum);
         if hch_enum != 0 {
             reg_write(self.base, self.caplen + USBCMD, USBCMD_RUN);
             for _ in 0..4_000_000 {
@@ -1493,15 +1513,35 @@ impl XhciController {
         unsafe {
             crate::cpu::set_xhci_hch_enum((hch_enum == 0) as u8);
         }
+        crate::sprintln!("Aegis: xHCI: enumerate_hid E1: power_ports");
         self.power_ports();
+
+        // DEBOUNCE: wait 50 ms for physical USB line voltages to stabilize
+        // after port power.  Without this, CCS reads 0 on freshly-powered
+        // ports and the port-reset sequence is skipped entirely.
+        crate::sprintln!("Aegis: xHCI: enumerate_hid E1b: debounce 50ms");
+        for _ in 0..5_000_000 {
+            core::hint::spin_loop();
+        }
+
+        crate::sprintln!("Aegis: xHCI: enumerate_hid E2: port_loop");
         for p in 0..self.max_ports {
             if found >= MAX_HID {
                 break;
             }
             let psc = self.caplen + PORTSC_BASE + (p as u32) * PORTSC_STRIDE;
             let ps = reg_read(self.base, psc);
+
+            // E3: CCS guard — only proceed if a device is actually connected.
+            crate::sprintln!(
+                "Aegis: xHCI: enumerate_hid E3: port{} ps={:#x} ccs={}",
+                p,
+                ps,
+                ps & 1
+            );
             if ps & 1 == 0 {
-                continue; // nothing connected on this port
+                crate::sprintln!("Aegis: xHCI: enumerate_hid E3: port{} no device", p);
+                continue;
             }
             // Reset the port and wait for it to enable ONLY when it is not
             // already enabled. `enumerate_first_device` (called before this
@@ -1518,6 +1558,8 @@ impl XhciController {
             // sequence (e.g. a second HID port the first pass never touched).
             self.drain_events();
             if reg_read(self.base, psc) & 2 == 0 {
+                // E4: port reset — only if not already enabled (PED = bit 1).
+                crate::sprintln!("Aegis: xHCI: enumerate_hid E4: port{} reset", p);
                 reg_write(self.base, psc, reg_read(self.base, psc) | (1 << 4));
                 for _ in 0..200_000 {
                     if reg_read(self.base, psc) & (1 << 4) == 0 {
@@ -1532,29 +1574,38 @@ impl XhciController {
                     core::hint::spin_loop();
                 }
                 self.drain_events();
+            } else {
+                crate::sprintln!("Aegis: xHCI: enumerate_hid E4b: port{} already enabled", p);
             }
             let speed = ((reg_read(self.base, psc) >> 10) & 0xF) as u8;
             unsafe { crate::cpu::set_xhci_phase(13) };
+            crate::sprintln!("Aegis: xHCI: enumerate_hid E5: enable_slot port{}", p);
             let Some(slot) = self.enable_slot() else {
+                crate::sprintln!("Aegis: xHCI: enumerate_hid E5: enable_slot FAILED port{}", p);
                 continue;
             };
+            crate::sprintln!("Aegis: xHCI: enumerate_hid E5b: slot={}", slot);
             unsafe {
                 crate::cpu::set_xhci_phase(4);
                 crate::cpu::inc_xhci_nslot();
             }
-            // Address at the default address (BSR) so EP0 is live before we
+            crate::sprintln!("Aegis: xHCI: enumerate_hid E6: address_device slot{}", slot);
             // read the descriptor.
             if !self.address_device(slot, 0, 0, true, speed) {
+                crate::sprintln!("Aegis: xHCI: enumerate_hid E6: address_device FAILED");
                 continue;
             }
+            crate::sprintln!("Aegis: xHCI: enumerate_hid E7: addr OK, GET_DESCRIPTOR(8)");
             unsafe {
                 crate::cpu::set_xhci_phase(5);
                 crate::cpu::inc_xhci_naddr();
             }
             let setup8 = [0x80, GET_DESCRIPTOR, 0x00, 0x01, 0x00, 0x00, 8, 0];
             if !self.control_transfer(slot, setup8, self.buf.desc, 8, true) {
+                crate::sprintln!("Aegis: xHCI: enumerate_hid E8: GET_DESCRIPTOR(8) FAILED");
                 continue;
             }
+            crate::sprintln!("Aegis: xHCI: enumerate_hid E9: GET_DESCRIPTOR(8) OK");
 unsafe { crate::cpu::set_xhci_phase(6) };
         // DIAG fingerprint: immediately paint the center block RED so we can
         // tell whether the quiesce build is actually running. If you see a

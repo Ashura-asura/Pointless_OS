@@ -427,6 +427,7 @@ fn paint_diag(x: usize, rgb: [u8; 3]) {
 }
 
 pub unsafe fn init_global(info: &BootInfo) {
+    paint_diag(320, [0xFF, 0xFF, 0xFF]); // F0: init_global entry, before global_slice() is even called
     let (bm, al) = global_slice();
     paint_diag(0, [0xFF, 0x00, 0x00]); // F1: after global_slice
     let mut a = FrameAllocator::empty(bm, al);

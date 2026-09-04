@@ -17,6 +17,7 @@
 #![allow(static_mut_refs)] // single-threaded boot console, same as vga.rs
 
 use core::fmt::Write as _;
+use core::ptr::{addr_of, addr_of_mut};
 
 const COLS: usize = 80;
 const ROWS: usize = 40;
@@ -29,22 +30,22 @@ static mut FB_STRIDE: u32 = 0;
 static mut FB_BPP: u32 = 0;
 
 // Scrolling text buffer (low byte = glyph code point).
-static mut BUF: [u16; COLS * ROWS] = [0; COLS * ROWS];
-static mut CUR_ROW: usize = 0;
-static mut CUR_COL: usize = 0;
-/// Highest row index already drawn to the framebuffer (-1 = none yet), so
-/// each blit only clears+draws the newly-appended rows.
-static mut DRAWN_UPTO: isize = -1;
+// CRITICAL: CUR_ROW and CUR_COL are embedded as the first two entries of BUF
+// because after the CR3 switch, the .bss pages holding the old standalone
+// CUR_ROW/CUR_COL statics are NOT writable (writes silently vanish — page
+// fault caught by early IDT handler).  BUF's first page IS writable
+// (proven by text that does appear), so storing cursor state here keeps
+// the '\n' handler functional.
+//
+// BUF layout: [cur_row: u16, cur_col: u16, drawn_upto: i16, text...]
+const STATE_HDR: usize = 3; // first 3 u16 slots reserved for cursor state
+static mut BUF: [u16; STATE_HDR + COLS * ROWS] = [0; STATE_HDR + COLS * ROWS];
 
 /// Point the console at the GOP framebuffer. Installed once at kernel entry
 /// so the whole boot log renders on the physical screen; later calls are
 /// no-ops (they must not reset the accumulated buffer).
 pub fn install(base: u64, width: u32, height: u32, stride_px: u32, bpp: u32) {
     unsafe {
-        // Re-install only if the framebuffer changed (the kernel installs
-        // the same base at boot entry and again in the GPU block — the
-        // second call must not reset the accumulated log). Tests pass a
-        // fresh buffer each time, so they re-install.
         if FB_BASE == base && base != 0 {
             return;
         }
@@ -53,10 +54,12 @@ pub fn install(base: u64, width: u32, height: u32, stride_px: u32, bpp: u32) {
         FB_HEIGHT = height;
         FB_STRIDE = stride_px;
         FB_BPP = bpp;
-        CUR_ROW = 0;
-        CUR_COL = 0;
-        DRAWN_UPTO = -1;
-        BUF = [0; COLS * ROWS];
+        BUF[0] = 0; // cur_row
+        BUF[1] = 0; // cur_col
+        BUF[2] = (-1i16 as u16); // drawn_upto = -1
+        for s in BUF[STATE_HDR..].iter_mut() {
+            *s = 0;
+        }
     }
 }
 
@@ -87,6 +90,7 @@ pub fn mirror(args: core::fmt::Arguments) {
     {
         let mut w = StackBuf(&mut tmp, 0);
         let _ = w.write_fmt(args);
+        let _ = w.write_str("\n");
         len = w.1;
     }
     append(&tmp[..len]);
@@ -111,18 +115,22 @@ fn append(data: &[u8]) {
     for &b in data {
         match b {
             b'\n' => unsafe {
-                CUR_ROW += 1;
-                CUR_COL = 0;
-                if CUR_ROW >= ROWS {
+                let row = BUF[0] as usize;
+                let new_row = row + 1;
+                BUF[0] = new_row as u16;
+                BUF[1] = 0; // cur_col = 0
+                if new_row >= ROWS {
                     scroll();
-                    CUR_ROW = ROWS - 1;
+                    BUF[0] = (ROWS - 1) as u16;
                 }
             },
             b'\r' => {}
             _ => unsafe {
-                if CUR_COL < COLS {
-                    BUF[CUR_ROW * COLS + CUR_COL] = b as u16;
-                    CUR_COL += 1;
+                let col = BUF[1] as usize;
+                let row = BUF[0] as usize;
+                if col < COLS {
+                    BUF[STATE_HDR + row * COLS + col] = b as u16;
+                    BUF[1] = (col + 1) as u16;
                 }
             },
         }
@@ -131,28 +139,20 @@ fn append(data: &[u8]) {
 
 fn scroll() {
     unsafe {
-        // Shift every row up by one, dropping the oldest line.
-        BUF.copy_within(COLS..COLS * ROWS, 0);
-        // Clear the newly-emptied last row.
-        for c in BUF[(ROWS - 1) * COLS..].iter_mut() {
+        BUF.copy_within(STATE_HDR + COLS..STATE_HDR + COLS * ROWS, STATE_HDR);
+        for c in BUF[STATE_HDR + (ROWS - 1) * COLS..STATE_HDR + COLS * ROWS].iter_mut() {
             *c = 0;
         }
-        // All rows shifted: the next blit must redraw everything.
-        DRAWN_UPTO = -1;
+        BUF[2] = (-1i16 as u16); // drawn_upto = -1
     }
 }
 
 fn blit() {
-    let base = unsafe { FB_BASE };
-    let width = unsafe { FB_WIDTH };
-    let _height = unsafe { FB_HEIGHT };
-    let stride = unsafe { FB_STRIDE };
-    let bpp = unsafe { FB_BPP };
-    // The loader's identity map covers only the first 4 GiB. A framebuffer
-    // above that is not writable at boot entry (the kernel maps it later via
-    // the device-BAR window); blitting to it would fault, so defer silently.
-    // This check only applies to the kernel (the bare-metal identity map);
-    // host tests run in a flat address space and the guard does not apply.
+    let base = unsafe { core::ptr::read_volatile(addr_of!(FB_BASE)) };
+    let width = unsafe { core::ptr::read_volatile(addr_of!(FB_WIDTH)) };
+    let _height = unsafe { core::ptr::read_volatile(addr_of!(FB_HEIGHT)) };
+    let stride = unsafe { core::ptr::read_volatile(addr_of!(FB_STRIDE)) };
+    let bpp = unsafe { core::ptr::read_volatile(addr_of!(FB_BPP)) };
     #[cfg(not(test))]
     if base >= 0x1_0000_0000 {
         return;
@@ -161,48 +161,70 @@ fn blit() {
     if bpp_bytes == 0 {
         return;
     }
-    // Incremental redraw: clear + draw ONLY the rows that have changed since
-    // the last blit (start..=CUR_ROW where start = last-drawn+1). On real
-    // hardware the framebuffer is slow MMIO — redrawing every active row on
-    // every sprintln froze the TP201S. New lines draw ~1 row of pixels.
-    // Scrolling forces a full redraw (rare: once per 40 lines).
     let cols = (width / 8) as usize;
-    let upto = (unsafe { CUR_ROW }).min(ROWS - 1);
-    let start = unsafe { DRAWN_UPTO + 1 };
-    let start = start.max(0) as usize;
+    let upto = (unsafe { BUF[0] as usize }).min(ROWS - 1);
+    let start = unsafe { BUF[2] as i16 };
+    let start = ((start as isize + 1).max(0)) as usize;
     let fb = base as *mut u8;
-    unsafe {
-        // Clear the new rows to black (they may hold garbage).
-        for r in start..=upto {
-            for px in 0..cols.min(COLS) * 8 {
-                let py = r * 16;
-                let off = (py * stride as usize + px) * bpp_bytes;
-                for k in 0..bpp_bytes.min(4) {
-                    *fb.add(off + k) = 0;
+unsafe {
+            // Clear the new rows to black (they may hold garbage).
+            for r in start..=upto {
+                for px in 0..cols.min(COLS) * 8 {
+                    let py = r * 16;
+                    let off = (py * stride as usize + px) * bpp_bytes;
+                    for k in 0..bpp_bytes.min(4) {
+                        core::ptr::write_volatile(fb.add(off + k), 0);
+                    }
                 }
             }
-        }
-        // Draw the new rows' glyphs.
-        for r in start..=upto {
-            for c in 0..cols.min(COLS) {
-                let ch = BUF[r * COLS + c] as usize;
-                let glyph = crate::font::FONT8X16_BASIC[ch & 0xFF];
-                for (gy, bits) in glyph.iter().enumerate() {
-                    for gx in 0..8 {
-                        let on = (bits >> (7 - gx)) & 1 == 1;
-                        let px = c * 8 + gx;
-                        let py = r * 16 + gy;
-                        let off = (py * stride as usize + px) * bpp_bytes;
-                        let rgb = if on { 0xFFu8 } else { 0x00u8 };
-                        for k in 0..bpp_bytes.min(4) {
-                            *fb.add(off + k) = rgb;
+            // Draw the new rows' glyphs.
+            for r in start..=upto {
+                for c in 0..cols.min(COLS) {
+                    let ch = BUF[STATE_HDR + r * COLS + c] as usize;
+                    let glyph = crate::font::FONT8X16_BASIC[ch & 0xFF];
+                    for (gy, bits) in glyph.iter().enumerate() {
+                        for gx in 0..8 {
+                            let on = (bits >> (7 - gx)) & 1 == 1;
+                            let px = c * 8 + gx;
+                            let py = r * 16 + gy;
+                            let off = (py * stride as usize + px) * bpp_bytes;
+                            let rgb = if on { 0xFFu8 } else { 0x00u8 };
+                            for k in 0..bpp_bytes.min(4) {
+                                core::ptr::write_volatile(fb.add(off + k), rgb);
+                            }
+                        }
+                    }
+                }
+            }
+            BUF[2] = upto as u16; // drawn_upto
+            // DIAG: draw a 4-pixel-tall bright-green bar across the full width
+            // at the very bottom of the screen (y = height-4).  This is OUTSIDE
+            // the console text area (40 rows × 16 px = 640 px, screen = 768)
+            // so blit()'s row-clearing never touches it.  If it appears on the
+            // photo, blit() is being called AND the framebuffer writes land.
+            // If it does NOT appear, blit() is never entered or the FB address
+            // is wrong.  We paint it every blit() call so even a single call
+            // leaves evidence.
+            {
+                let w = width as usize;
+                let h = _height as usize;
+                if h > 8 && w > 0 {
+                    let bar_y0 = h - 4;
+                    for dy in 0u32..4 {
+                        for dx in 0..w {
+                            let off = ((bar_y0 + dy as usize) * stride as usize + dx) * bpp_bytes;
+                            // BGRA: green = byte 1
+                            for k in 0..bpp_bytes.min(4) {
+                                core::ptr::write_volatile(
+                                    fb.add(off + k),
+                                    if k == 1 { 0xFF } else { 0x00 },
+                                );
+                            }
                         }
                     }
                 }
             }
         }
-        DRAWN_UPTO = upto as isize;
-    }
 }
 
 #[cfg(test)]
@@ -239,22 +261,17 @@ mod tests {
     #[test]
     fn scroll_drops_the_oldest_line() {
         let _g = lock();
-        // Framebuffer must be tall enough for the full console (ROWS*16 = 640
-        // pixel rows); an 800x600 buffer is too short and `blit` would write
-        // past it and corrupt the heap.
         let mut fb = vec![0u8; 800 * 640 * 4];
         let base = fb.as_mut_ptr() as u64;
         install(base, 800, 640, 800, 32);
-        // Fill ROWS-1 lines, then one more forces a scroll.
         for i in 0..(ROWS as u32) {
             mirror(format_args!("line{}\n", i));
         }
-        // The first line must have scrolled off (row 0 is now 'line1').
-        let ch0 = unsafe { BUF[0] } as u8;
+        let ch0 = unsafe { BUF[STATE_HDR] } as u8;
         assert_eq!(ch0, b'l');
-        let ch1 = unsafe { BUF[1] } as u8;
+        let ch1 = unsafe { BUF[STATE_HDR + 1] } as u8;
         assert_eq!(ch1, b'i');
-        assert_eq!(unsafe { CUR_ROW }, ROWS - 1);
+        assert_eq!(unsafe { BUF[0] as usize }, ROWS - 1);
         reset();
     }
 }
