@@ -2491,6 +2491,7 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
     let mut last_inject_rip: u64 = 0;
     let mut last_inject_vec: u8 = 0;
     let mut consecutive_same_rip: u32 = 0;
+    let mut first_exit_dumped = false;
     // Virtual-clock bookkeeping: the last host TSC sample and the
     // sub-millisecond accumulator (µs), so fractional per-exit deltas are
     // not lost to integer rounding.
@@ -2554,6 +2555,33 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
         }
 
         let reason = (vmread(field::VM_EXIT_REASON) & 0xFFFF) as u16;
+
+        // Fix 2: raw unmasked diagnostic on first exit only.
+        // Prints the full 32-bit exit reason (not masked to 16 bits),
+        // VM_INSTRUCTION_ERROR, and IDT-vectoring info. This catches
+        // VM-entry failures (reason 33/34) that get misclassified as
+        // "#GP" by the masked/classified path.
+        if !first_exit_dumped {
+            first_exit_dumped = true;
+            let raw_reason = vmread(field::VM_EXIT_REASON);
+            let instr_err = vmread(field::VM_INSTRUCTION_ERROR);
+            let idt_vectoring = vmread(0x2408); // IDT_VECTORING_INFO_FIELD
+            crate::sprintln!(
+                "Aegis: [vmx] RAW first-exit: reason={:#x} masked_reason={:#x} instr_err={:#x} idt_vectoring={:#x} rip={:#x}",
+                raw_reason,
+                reason,
+                instr_err,
+                idt_vectoring,
+                vmread(field::GUEST_RIP),
+            );
+            if raw_reason != 0 {
+                crate::sprintln!(
+                    "Aegis: [vmx] WARNING: raw exit reason != 0 — this may NOT be a #GP. reason={} (0=exception, 33=invalid-guest-state, 34=msr-loading)",
+                    raw_reason
+                );
+            }
+        }
+
         match classify_exit(reason) {
             ExitClass::Exception => {
                 let int_info = vmread(field::VM_EXIT_INTERRUPTION_INFO);
@@ -2625,13 +2653,18 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
                         last_inject_rip = rip;
                         last_inject_vec = vector;
                     }
-                    if consecutive_same_rip > 10 {
+                    // Fix 3: fail immediately on the first exception.
+                    // The first-exit raw diagnostic (Fix 2) and FIRST
+                    // EXCEPTION CONTEXT below capture everything needed.
+                    // Re-injecting into a bare iret-IDT guarantees an
+                    // infinite identical-RIP refault — no new info.
+                    if consecutive_same_rip > 1 {
                         let err_q = vmread(field::EXIT_QUALIFICATION);
                         crate::sprintln!(
                             "Aegis: [vmx] FATAL: exception injection loop — vec={} rip={:#x} err_qual={:#x} int_info={:#x} (consecutive={})",
                             vector, rip, err_q, int_info, consecutive_same_rip
                         );
-                        return Err("exception injection loop: same vector+RIP fired >10 times — guest is stuck");
+                        return Err("exception injection loop: same vector+RIP fired twice — guest is stuck");
                     }
 
                     if inject_count <= 5 || inject_count % 100 == 0 {
