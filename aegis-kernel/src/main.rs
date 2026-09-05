@@ -303,6 +303,32 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     }
     paint(handoff_addr, 0, 7, [0xFF, 0xFF, 0xFF]); // white: IDT installed (returned)
     sprintln!("Aegis: IDT loaded (exception vectors 0-31 + timer at 0x30 + keyboard at 0x21)");
+    // ── IDT integrity: dump checksum and all gates at boot ──
+    {
+        let idt_phys = unsafe { aegis_kernel::cpu::idt_frame_phys() };
+        let mut idtr: [u16; 5] = [0; 5];
+        unsafe { core::arch::asm!("sidt [{0}]", in(reg) idtr.as_mut_ptr(), options(nostack)) };
+        let base = (idtr[1] as u64)
+            | ((idtr[2] as u64) << 16)
+            | ((idtr[3] as u64) << 32)
+            | ((idtr[4] as u64) << 48);
+        let limit = idtr[0];
+        let cs = aegis_kernel::idt::idt_checksum(base, limit);
+        sprintln!(
+            "Aegis: IDT integrity: IDT_FRAME={:#x} IDTR base={:#x} limit={} checksum={:#018x}",
+            idt_phys, base, limit, cs
+        );
+        if base != idt_phys {
+            sprintln!(
+                "Aegis: IDT WARNING: IDTR base != IDT_FRAME! IDTR={:#x} FRAME={:#x}",
+                base, idt_phys
+            );
+        }
+        aegis_kernel::idt::dump_all_gates(base);
+        // Raw 16-byte descriptors for gates 0-31 (unambiguous byte-level comparison)
+        sprintln!("Aegis: [idt] BOOT RAW gates[0..32]:");
+        aegis_kernel::idt::dump_raw_gates(base, 0, 32);
+    }
 
     // CR4 SMEP/SMAP disable now runs with the IDT installed, so a fault here
     // is a logged exception, not a silent triple-fault.
@@ -2592,6 +2618,30 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     #[cfg(feature = "vmx-demo")]
     {
         if aegis_kernel::vmx::vmx_supported() && aegis_kernel::vmx::guest_image_valid() {
+            // ── Pre-VMX interrupt state dump ──
+            let rflags_val: u64;
+            unsafe { core::arch::asm!("pushfq; pop {0}", out(reg) rflags_val, options(nostack, preserves_flags)); }
+            let if_set = (rflags_val >> 9) & 1;
+            sprintln!(
+                "Aegis: [vmx] PRE-VMX RFLAGS={:#x} IF={} interrupts {}",
+                rflags_val, if_set, if if_set != 0 { "ENABLED" } else { "DISABLED" }
+            );
+            // Read PIC masks
+            let master_mask: u8;
+            let slave_mask: u8;
+            unsafe {
+                core::arch::asm!("in al, dx", out("al") master_mask, in("dx") 0x21u16, options(nostack, nomem));
+                core::arch::asm!("in al, dx", out("al") slave_mask, in("dx") 0xA1u16, options(nostack, nomem));
+            }
+            sprintln!(
+                "Aegis: [vmx] PRE-VMX PIC masks: master=0b{:08b} slave=0b{:08b}",
+                master_mask, slave_mask
+            );
+            // Ensure interrupts are disabled during VMX demos (diagnostic)
+            if if_set != 0 {
+                sprintln!("Aegis: [vmx] WARNING: interrupts were ON — issuing CLI for safety");
+                unsafe { core::arch::asm!("cli", options(nomem, preserves_flags)); }
+            }
             sprintln!("Aegis: [vmx] VT-x present — running bring-up demo");
             unsafe {
                 match aegis_kernel::vmx::bringup_demo() {

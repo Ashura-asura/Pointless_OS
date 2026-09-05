@@ -368,6 +368,37 @@ pub unsafe fn init_ioapic_legacy() {
     route_ioapic_gsi(gsi_for(1), crate::ps2::KEYBOARD_VECTOR, bsp);
     route_ioapic_gsi(gsi_for(12), crate::ps2_mouse::MOUSE_VECTOR, bsp);
 
+    // Mask ALL other I/O APIC redirection entries. UEFI may have configured
+    // them with arbitrary vectors (including 0x27=39). Only the entries we
+    // explicitly route (keyboard, mouse) should be unmasked.
+    let ver = ioapic_read(0x01);
+    let max_entries = ((ver >> 16) & 0xFF) + 1; // bits 23:16 = max redirection index
+    let keyboard_gsi = gsi_for(1) as u32;
+    let mouse_gsi = gsi_for(12) as u32;
+    crate::sprintln!(
+        "Aegis: [ioapic] version={:#x} max_entries={} keyboard_gsi={} mouse_gsi={}",
+        ver, max_entries, keyboard_gsi, mouse_gsi
+    );
+    for i in 0..max_entries {
+        let low = ioapic_read(0x10 + 2 * i);
+        let high = ioapic_read(0x11 + 2 * i);
+        let vec = low & 0xFF;
+        let masked = (low >> 16) & 1;
+        let dest = (high >> 24) & 0xFF;
+        crate::sprintln!(
+            "Aegis: [ioapic] entry[{}] vec={} mask={} dest={:#x} low={:#x} high={:#x}",
+            i, vec, masked, dest, low, high
+        );
+        // Mask entries we don't own (skip keyboard and mouse GSI)
+        if i != keyboard_gsi && i != mouse_gsi && masked == 0 {
+            crate::sprintln!(
+                "Aegis: [ioapic] MASKING entry[{}] vec={} (was unmasked, not ours)",
+                i, vec
+            );
+            ioapic_write(0x10 + 2 * i, low | (1 << 16)); // set mask bit
+        }
+    }
+
     // Boot latch: read back IRQ1's redirection entry and confirm the I/O APIC
     // accepted our routing (vector=KEYBOARD_VECTOR, unmasked, dest=BSP).
     let g = gsi_for(1) as u32;
@@ -442,6 +473,31 @@ pub fn get_tss_rsp0() -> u64 {
 /// memory that no other structure touches. Zero until `init_idt` runs.
 static mut IDT_FRAME: u64 = 0;
 
+/// Physical address of the IDT frame (set by `init_idt`). Exported so
+/// callers can compare the live IDTR against the expected base.
+pub fn idt_frame_phys() -> u64 {
+    unsafe { IDT_FRAME }
+}
+
+/// Check if a newly allocated physical address overlaps with the IDT frame.
+/// PANICS (infinite hlt loop) if the allocator is about to hand out the IDT
+/// frame for a second allocation — this is a catastrophic allocator bug.
+pub fn check_alloc_not_idt(phys: u64, label: &str) {
+    let idt = unsafe { IDT_FRAME };
+    if idt != 0 && phys == idt {
+        crate::sprintln!(
+            "Aegis: *** PANIC *** IDT FRAME DOUBLE ALLOCATION: {} at {:#x} == IDT_FRAME {:#x}!",
+            label, phys, idt
+        );
+        crate::sprintln!(
+            "Aegis: *** The frame allocator is about to overwrite the IDT. Halting."
+        );
+        loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        }
+    }
+}
+
 /// Load the kernel IDT: exception handlers for vectors 0-31, the LAPIC
 /// timer gate at `TIMER_VECTOR`, and the DPL-3 syscall gate at `SYS_VECTOR`.
 ///
@@ -478,7 +534,38 @@ pub unsafe fn init_idt() {
         crate::gdt::KERNEL_CODE_SELECTOR,
         3,
     );
+    // ── Fill ALL remaining vectors with a spurious handler ──
+    // This prevents #GP on any hardware interrupt that fires on an
+    // uninitialized IDT gate (e.g. UEFI-configured I/O APIC entries).
+    let spurious_addr = spurious_handler as *const () as u64;
+    let vectors_with_handlers: &[usize] = &[
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        TIMER_VECTOR as usize,
+        crate::ps2::KEYBOARD_VECTOR as usize,
+        crate::ps2_mouse::MOUSE_VECTOR as usize,
+        crate::syscall::SYS_VECTOR as usize,
+    ];
+    for v in 0..256usize {
+        if !vectors_with_handlers.contains(&v) {
+            idt.set_irq_handler(v, spurious_addr);
+        }
+    }
     idt.install();
+    // ── Post-LIDT verification: read back IDTR and dump gate[13] ──
+    {
+        let mut idtr: [u16; 5] = [0; 5];
+        core::arch::asm!("sidt [{0}]", in(reg) idtr.as_mut_ptr(), options(nostack));
+        let base = (idtr[1] as u64)
+            | ((idtr[2] as u64) << 16)
+            | ((idtr[3] as u64) << 32)
+            | ((idtr[4] as u64) << 48);
+        let limit = idtr[0];
+        crate::sprintln!(
+            "Aegis: [idt] POST-LIDT verify: IDTR base={:#x} limit={} IDT_FRAME={:#x} match={}",
+            base, limit, frame, base == frame
+        );
+        crate::idt::dump_raw_gate(base, 13);
+    }
 }
 
 static mut LAPIC_BASE: u64 = 0;
@@ -595,7 +682,40 @@ pub unsafe fn init_lapic_timer() -> u64 {
     }
     LAPIC_BASE = lapic_base();
     let svr = lapic_read(0xF0);
-    lapic_write(0xF0, svr | 0x100); // software enable
+    crate::sprintln!(
+        "Aegis: [lapic] SVR raw = {:#010x} (vector={:#x} enable={})",
+        svr,
+        svr & 0xFF,
+        (svr >> 8) & 1
+    );
+    // Force the spurious vector to 0xFF (standard Linux spurious vector).
+    // UEFI may have left it as 0x27 (39), which causes #GP on uninitialized
+    // IDT gates when the LAPIC delivers a spurious interrupt.
+    lapic_write(0xF0, (svr & !0xFF) | 0xFF | 0x100); // vector=0xFF, software enable
+    // Mask ALL LVT entries we don't use. UEFI may have left them configured
+    // with arbitrary vectors. Only keep LVT Timer (0x320) and LINT0 (0x350)
+    // which is needed for ExtINT (PIC passthrough).
+    let lvt_thermal = lapic_read(0x330);
+    let lvt_pmc = lapic_read(0x340);
+    let lvt1 = lapic_read(0x360);
+    let lvt_err = lapic_read(0x370);
+    crate::sprintln!(
+        "Aegis: [lapic] LVT thermal={:#x} pmc={:#x} lint1={:#x} err={:#x}",
+        lvt_thermal, lvt_pmc, lvt1, lvt_err
+    );
+    crate::sprintln!(
+        "Aegis: [lapic] LVT thermal.vector={} lint1.vector={} pmc.vector={} err.vector={}",
+        lvt_thermal & 0xFF,
+        lvt1 & 0xFF,
+        lvt_pmc & 0xFF,
+        lvt_err & 0xFF
+    );
+    // Mask thermal, PMC, LINT1, error — set mask bit (bit 16) and disable
+    // by setting delivery mode to 0 and vector to 0.
+    lapic_write(0x330, lvt_thermal | 0x1_0000); // mask thermal
+    lapic_write(0x340, lvt_pmc | 0x1_0000);    // mask PMC
+    lapic_write(0x360, lvt1 | 0x1_0000);        // mask LINT1
+    lapic_write(0x370, lvt_err | 0x1_0000);     // mask error
     lapic_write(0x320, 0x2_0030); // LVT timer: periodic (bit 17), vector 0x30, unmasked
     lapic_write(0x3E0, 0x3); // divide configuration: 16
                              // Quantum length: initial count 0x40000 (~16 ms at the QEMU APIC bus).
@@ -704,6 +824,144 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
             };
             crate::ipc::notify_task_kill(cur, reason);
             return;
+        }
+    }
+
+    // ── #GP (vector 13) deep diagnostic: decode error code, read IDTR,
+    // dump the IDT gate that was being accessed, and compare IDTR base
+    // against IDT_FRAME to distinguish "IDT corrupted" from "IDTR wrong". ──
+    if vector == 0x0D {
+        let mut idtr: [u16; 5] = [0; 5];
+        unsafe { asm!("sidt [{0}]", in(reg) idtr.as_mut_ptr(), options(nostack)) };
+        let idtr_base = (idtr[1] as u64)
+            | ((idtr[2] as u64) << 16)
+            | ((idtr[3] as u64) << 32)
+            | ((idtr[4] as u64) << 48);
+        let idtr_limit = idtr[0];
+        let idt_phys = idt_frame_phys();
+        crate::sprintln!(
+            "Aegis: [GP] IDTR base={:#x} limit={} IDT_FRAME={:#x} match={}",
+            idtr_base, idtr_limit, idt_phys, idtr_base == idt_phys
+        );
+        // Print IOAPIC_BASE unconditionally
+        let ioapic = unsafe { IOAPIC_BASE };
+        crate::sprintln!(
+            "Aegis: [GP] IOAPIC_BASE={:#x} LAPIC_BASE={:#x}",
+            ioapic, unsafe { LAPIC_BASE }
+        );
+        // Decode the error code
+        crate::idt::dump_gp_error(err, idtr_base);
+        // Also dump the interrupted CS and RFLAGS
+        let cs_val = unsafe { *frame.add(frame_rip_index(true) + 1) };
+        let rflags_val = unsafe { *frame.add(frame_rip_index(true) + 2) };
+        crate::sprintln!(
+            "Aegis: [GP] interrupted: CS={:#x} RFLAGS={:#x}",
+            cs_val, rflags_val
+        );
+        // The error code tells us which vector caused the #GP.
+        // For error code 0x13B: EXT=1 IDT=1 index=0x27=39
+        let idx = (err >> 3) & 0x1FFF;
+        crate::sprintln!(
+            "Aegis: [GP] #GP is about IDT vector {} (0x{:X}), NOT vector 13",
+            idx, idx
+        );
+        // Dump the ACTUAL referenced gate as raw bytes + decoded
+        crate::sprintln!("Aegis: [GP] gate[{}] RAW dump:", idx);
+        crate::idt::dump_raw_gate(idtr_base, idx as usize);
+        // Also dump gate 13 for comparison (the GP handler itself)
+        crate::sprintln!("Aegis: [GP] gate[13] RAW dump (GP handler, for comparison):");
+        crate::idt::dump_raw_gate(idtr_base, 13);
+        // Read PIC masks to see which IRQs are unmasked
+        let master_pic_mask: u8;
+        let slave_pic_mask: u8;
+        unsafe {
+            core::arch::asm!("in al, dx", out("al") master_pic_mask, in("dx") 0x21u16, options(nostack, nomem));
+            core::arch::asm!("in al, dx", out("al") slave_pic_mask, in("dx") 0xA1u16, options(nostack, nomem));
+        }
+        crate::sprintln!(
+            "Aegis: [GP] PIC masks: master=0b{:08b} slave=0b{:08b} (0=unmasked)",
+            master_pic_mask, slave_pic_mask
+        );
+        // Decode which IRQs are unmasked
+        crate::sprintln!(
+            "Aegis: [GP] Unmasked IRQs: master[{}{}{}{}{}{}{}{}] slave[{}{}{}{}{}{}{}{}]",
+            if master_pic_mask & 1 == 0 { "0" } else { "-" },
+            if master_pic_mask & 2 == 0 { "1" } else { "-" },
+            if master_pic_mask & 4 == 0 { "2" } else { "-" },
+            if master_pic_mask & 8 == 0 { "3" } else { "-" },
+            if master_pic_mask & 0x10 == 0 { "4" } else { "-" },
+            if master_pic_mask & 0x20 == 0 { "5" } else { "-" },
+            if master_pic_mask & 0x40 == 0 { "6" } else { "-" },
+            if master_pic_mask & 0x80 == 0 { "7" } else { "-" },
+            if slave_pic_mask & 1 == 0 { "8" } else { "-" },
+            if slave_pic_mask & 2 == 0 { "9" } else { "-" },
+            if slave_pic_mask & 4 == 0 { "10" } else { "-" },
+            if slave_pic_mask & 8 == 0 { "11" } else { "-" },
+            if slave_pic_mask & 0x10 == 0 { "12" } else { "-" },
+            if slave_pic_mask & 0x20 == 0 { "13" } else { "-" },
+            if slave_pic_mask & 0x40 == 0 { "14" } else { "-" },
+            if slave_pic_mask & 0x80 == 0 { "15" } else { "-" },
+        );
+        // Dump gate 39 specifically (vector 0x27) — raw bytes + decoded
+        crate::sprintln!("Aegis: [GP] gate[39] (0x27) RAW dump — THE FAULTING VECTOR:");
+        crate::idt::dump_raw_gate(idtr_base, 39);
+        // Dump LAPIC state to identify interrupt source
+        let lapic_base = unsafe { LAPIC_BASE };
+        if lapic_base != 0 {
+            let (svr, lvt_timer, lvt_thermal, lvt_pmc, lvt0, lvt1, lvt_err) = unsafe {
+                (
+                    lapic_read(0xF0),
+                    lapic_read(0x320),
+                    lapic_read(0x330),
+                    lapic_read(0x340),
+                    lapic_read(0x350),
+                    lapic_read(0x360),
+                    lapic_read(0x370),
+                )
+            };
+            crate::sprintln!(
+                "Aegis: [GP] LAPIC SVR={:#010x} (vec={} en={})",
+                svr, svr & 0xFF, (svr >> 8) & 1
+            );
+            crate::sprintln!(
+                "Aegis: [GP] LAPIC LVT: timer={:#x} thermal={:#x} pmc={:#x} lint0={:#x} lint1={:#x} err={:#x}",
+                lvt_timer, lvt_thermal, lvt_pmc, lvt0, lvt1, lvt_err
+            );
+            crate::sprintln!(
+                "Aegis: [GP] LAPIC LVT vectors: timer={} thermal={} pmc={} lint0={} lint1={} err={}",
+                lvt_timer & 0xFF, lvt_thermal & 0xFF, lvt_pmc & 0xFF,
+                lvt0 & 0xFF, lvt1 & 0xFF, lvt_err & 0xFF
+            );
+        }
+        // Dump I/O APIC redirection entries to find who's delivering vector 39
+        unsafe {
+            if IOAPIC_BASE != 0 {
+                let ver = ioapic_read(0x01);
+                let max_entries = ((ver >> 16) & 0xFF) + 1;
+                crate::sprintln!(
+                    "Aegis: [GP] I/O APIC base={:#x} ver={:#x} entries={}",
+                    IOAPIC_BASE, ver, max_entries
+                );
+                for i in 0..max_entries {
+                    let low = ioapic_read(0x10 + 2 * i);
+                    let high = ioapic_read(0x11 + 2 * i);
+                    let vec = low & 0xFF;
+                    let masked = (low >> 16) & 1;
+                    if vec != 0 || masked == 0 {
+                        crate::sprintln!(
+                            "Aegis: [GP] IOAPIC[{}] vec={} mask={} dest={:#x} low={:#x} high={:#x}",
+                            i, vec, masked, (high >> 24) & 0xFF, low, high
+                        );
+                    }
+                }
+            } else {
+                crate::sprintln!("Aegis: [GP] I/O APIC not initialized (base=0)");
+            }
+        }
+        // Dump gates 0-4 for baseline context
+        crate::sprintln!("Aegis: [GP] IDT gates[0..5] RAW:");
+        for v in 0..5usize {
+            crate::idt::dump_raw_gate(idtr_base, v);
         }
     }
 
@@ -1724,4 +1982,49 @@ pub extern "sysv64" fn timer_stub() -> ! {
         trap = sym crate::cpu::timer_trap_rust,
         preempt = sym crate::tasks::timer_preempt,
     )
+}
+
+/// Spurious interrupt handler: installed on all IDT vectors that don't have
+/// an explicit handler. Acknowledges the LAPIC EOI and returns silently.
+/// This prevents #GP on unhandled hardware interrupts (e.g. vector 0x27
+/// from I/O APIC or LAPIC misconfiguration by UEFI).
+///
+/// Hardware interrupts do NOT push an error code — the stack on entry is:
+///   [RIP] [CS] [RFLAGS]  (ring 0, no privilege change)
+#[unsafe(naked)]
+#[no_mangle]
+pub extern "sysv64" fn spurious_handler() -> ! {
+    naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rdi",
+        "push rsi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {eoi}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rsi",
+        "pop rdi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        eoi = sym spurious_eoi,
+    )
+}
+
+/// Send EOI to LAPIC for spurious interrupts.
+fn spurious_eoi() {
+    unsafe {
+        let base = LAPIC_BASE;
+        if base != 0 {
+            core::ptr::write_volatile((base + 0xB0) as *mut u32, 0);
+        }
+    }
 }

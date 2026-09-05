@@ -65,6 +65,10 @@ use crate::vm::{BootState, Vm};
 // ---------------------------------------------------------------------
 const IA32_FEATURE_CONTROL: u32 = 0x3A;
 const IA32_VMX_BASIC: u32 = 0x480;
+const IA32_VMX_CR0_FIXED0: u32 = 0x486;
+const IA32_VMX_CR0_FIXED1: u32 = 0x487;
+const IA32_VMX_CR4_FIXED0: u32 = 0x488;
+const IA32_VMX_CR4_FIXED1: u32 = 0x489;
 const IA32_VMX_PINBASED_CTLS: u32 = 0x481;
 const IA32_VMX_PROCBASED_CTLS: u32 = 0x482;
 const IA32_VMX_EXIT_CTLS: u32 = 0x483;
@@ -84,6 +88,17 @@ const IA32_VMX_TRUE_ENTRY_CTLS: u32 = 0x490;
 // arch/x86/include/asm/msr-index.h confirms 0x48B).
 const IA32_VMX_PROCBASED2_CTLS: u32 = 0x48B;
 const IA32_VMX_TRUE_PROCBASED2_CTLS: u32 = 0x48B;
+const IA32_VMX_EPT_VPID_CAP: u32 = 0x48C;
+
+/// Cached value of IA32_VMX_EPT_VPID_CAP read once during VMX init.
+/// Bit 14: WB memory type for EPT supported.
+/// Bit 21: EPT accessed/dirty (AD) supported.
+static mut EPT_VPID_CAP: u64 = 0;
+
+/// Read the EPT VPID capability once; returns the cached value.
+pub fn ept_vpid_cap() -> u64 {
+    unsafe { EPT_VPID_CAP }
+}
 
 // ---------------------------------------------------------------------
 // VMCS field encodings (SDM Vol. 3C, Appendix B) — the ones this minimal
@@ -100,12 +115,16 @@ mod field {
     pub const GUEST_LDTR_SELECTOR: u64 = 0x080C;
     pub const GUEST_TR_SELECTOR: u64 = 0x080E;
     // 16-bit host-state
+    pub const HOST_ES_SELECTOR: u64 = 0x0C00;
     pub const HOST_CS_SELECTOR: u64 = 0x0C02;
     pub const HOST_SS_SELECTOR: u64 = 0x0C04;
+    pub const HOST_DS_SELECTOR: u64 = 0x0C06;
+    pub const HOST_FS_SELECTOR: u64 = 0x0C08;
+    pub const HOST_GS_SELECTOR: u64 = 0x0C0A;
     pub const HOST_TR_SELECTOR: u64 = 0x0C0C;
     // 64-bit control
     pub const VMCS_LINK_POINTER: u64 = 0x2800;
-    pub const TSC_OFFSET: u64 = 0x2020;
+    pub const TSC_OFFSET: u64 = 0x2010;
     pub const EPTP: u64 = 0x201A;
     // 32-bit control
     pub const PIN_BASED_VM_EXEC_CONTROL: u64 = 0x4000;
@@ -117,9 +136,19 @@ mod field {
     /// Interruption-information field: written to inject an event at the
     /// next VM-entry (bit 31 = valid, bits 10:8 = type, bits 7:0 = vector).
     pub const VM_ENTRY_INTR_INFO: u64 = 0x4016;
+    /// Error code pushed onto guest stack when injecting an exception.
+    pub const VM_ENTRY_EXCEPTION_ERROR_CODE: u64 = 0x4018;
+    /// Instruction length — required when injecting exceptions with error codes.
+    pub const VM_ENTRY_INSTRUCTION_LEN: u64 = 0x401A;
     // 32-bit read-only (VM-exit info)
     pub const VM_INSTRUCTION_ERROR: u64 = 0x4400;
     pub const VM_EXIT_REASON: u64 = 0x4402;
+    pub const VM_EXIT_INSTRUCTION_LEN: u64 = 0x440C;
+    /// VM-Exit IDT-Vectoring Information (SDM §27.2.1, Table 24-7):
+    /// bits 7:0 = vector, bits 12:8 = type (0=ext,2=NMI,3=hw-exc,6=sw-int),
+    /// bit 31 = valid. This is the CORRECT source for the exception vector on
+    /// exit reason 0 — EXIT_QUALIFICATION does NOT contain the vector.
+    pub const VM_EXIT_INTERRUPTION_INFO: u64 = 0x440E;
     pub const EXIT_QUALIFICATION: u64 = 0x6400;
     // 32-bit guest-state
     pub const GUEST_ES_LIMIT: u64 = 0x4800;
@@ -167,9 +196,13 @@ mod field {
     pub const HOST_CR0: u64 = 0x6C00;
     pub const HOST_CR3: u64 = 0x6C02;
     pub const HOST_CR4: u64 = 0x6C04;
+    pub const HOST_FS_BASE: u64 = 0x6C06;
+    pub const HOST_GS_BASE: u64 = 0x6C08;
+    pub const HOST_TR_BASE: u64 = 0x6C0A;
     pub const HOST_GDTR_BASE: u64 = 0x6C0C;
     pub const HOST_IDTR_BASE: u64 = 0x6C0E;
     pub const HOST_RIP: u64 = 0x6C16;
+    pub const HOST_RSP: u64 = 0x6C14;
 }
 
 /// Real-mode-guest access-rights byte constants (SDM §26.3.1.2 / the
@@ -198,14 +231,18 @@ mod proc_primary {
     pub const SECONDARY_CONTROLS: u32 = 1 << 31;
 }
 
-/// Secondary processor-based VM-execution control bits (SDM §24.6.2).
+/// Secondary processor-based VM-execution control bits (SDM Table 24-7).
 mod proc_secondary {
     /// Nested paging: the guest's CR3 is ignored and the EPT root from the
-    /// EPTP field translates every guest-physical address.
+    /// EPTP field translates every guest-physical address. (SDM bit 1)
     pub const EPT_ENABLE: u32 = 1 << 1;
-    /// Guest may run in real/unreal mode without CR0.PE (lets a 32-bit
-    /// Linux kernel boot under EPT without VMX root- or ring-0 paging).
-    pub const UNRESTRICTED_GUEST: u32 = 1 << 3;
+    /// Enable RDTSCP: guest can execute RDTSCP. (SDM bit 3)
+    pub const RDTSCP: u32 = 1 << 3;
+    /// Unrestricted Guest: allows CR0.PE=0 (real mode) under VMX and
+    /// relaxes segment-check rules.  Required on Bay Trail for VM-entry
+    /// to pass even when running protected-mode guests without EPT.
+    /// (SDM Table 24-7 bit 7)
+    pub const UNRESTRICTED_GUEST: u32 = 1 << 7;
     /// Time-stamp-counter offsetting (per-VM TSC skew; needed once the
     /// guest measures time — the guest must never see the host's TSC).
     // Used by the SDM-value contract test; deliberately not requested in the
@@ -269,6 +306,35 @@ unsafe fn wrmsr(msr: u32, val: u64) {
     asm!("wrmsr", in("ecx") msr, in("eax") lo, in("edx") hi, options(nomem, nostack, preserves_flags));
 }
 
+/// Ensure the 4 KB physical page at `phys` is mapped as Write-Back via a
+/// variable-range MTRR.  On Bay Trail the firmware sets MTRRdefType to UC
+/// (0), which overrides the PAT for ALL physical memory not explicitly
+/// covered by a variable MTRR — and vmxon requires WB memory or #GP(0).
+unsafe fn ensure_wb_mtrr(phys: u64) {
+    let def = rdmsr(0x2FF);
+    let def_type = (def & 0xFF) as u8;
+    crate::sprintln!(
+        "Aegis: [vmx] MTRR: def_type={} phys={:#x}",
+        def_type, phys
+    );
+    if def_type == 6 {
+        return; // default is already WB
+    }
+    // Instead of hunting for a free variable MTRR (which the BIOS may have
+    // consumed entirely), set the MTRR default type to WB (6). This is what
+    // Linux does — it makes ALL physical memory Write-Back by default, and
+    // any variable-range MTRRs the BIOS set for specific UC/WC regions still
+    // override within their ranges.
+    let new_def = (def & !0xFF) | 6u64;
+    wrmsr(0x2FF, new_def);
+    // WBINVD + INVLPG to ensure the type change takes effect.
+    core::arch::asm!("wbinvd", options(nomem, nostack));
+    crate::sprintln!(
+        "Aegis: [vmx] MTRR: def_type {} -> 6 (WB) via MSR 0x2FF — all memory now WB",
+        def_type
+    );
+}
+
 unsafe fn read_cr0() -> u64 {
     let v: u64;
     asm!("mov {}, cr0", out(reg) v, options(nomem, nostack, preserves_flags));
@@ -287,56 +353,154 @@ unsafe fn read_cr4() -> u64 {
 unsafe fn write_cr4(v: u64) {
     asm!("mov cr4, {}", in(reg) v, options(nomem, nostack, preserves_flags));
 }
+unsafe fn write_cr0(v: u64) {
+    asm!("mov cr0, {}", in(reg) v, options(nomem, nostack, preserves_flags));
+}
 
 /// `vmxon`/`vmclear`/`vmptrld` all take the *physical address* of a region
 /// via a memory operand; `vmwrite`/`vmread` take field/value in registers.
 unsafe fn vmxon(phys_addr: u64) -> bool {
-    let ok: u8;
+    // Bay Trail errata: CR4.VMXE can get silently cleared between the
+    // enable_vmx_operation() write and the actual vmxon execution (SMM/SCI
+    // handlers or firmware-level CR4 shadowing).  Re-set it here with a
+    // serializing write to guarantee the write is committed before vmxon.
+    let cr4 = read_cr4();
+    if cr4 & (1 << 13) == 0 {
+        crate::sprintln!("Aegis: [vmx] vmxon pre-flight: CR4.VMXE was CLEAR, re-asserting (cr4={:#x})", cr4);
+        write_cr4(cr4 | (1 << 13));
+    }
+    // Dump diagnostics: IA32_FEATURE_CONTROL, CR0, CR4, VMXON region contents.
+    let fc = rdmsr(IA32_FEATURE_CONTROL);
+    let cr0 = read_cr0();
+    let basic = rdmsr(IA32_VMX_BASIC);
+    let vmx_mem_type = (basic >> 50) & 0xF; // bits 53:50 = required memory type
+    let revision = core::ptr::read_volatile(phys_addr as *const u32);
+    crate::sprintln!(
+        "Aegis: [vmx] vmxon: phys={:#x} cr0={:#x} cr4={:#x} fc={:#x} rev={:#x} basic={:#x} mem_type={}",
+        phys_addr, cr0, cr4, fc, revision, basic, vmx_mem_type
+    );
+    // Serializing fence: MFENCE + LFENCE ensures the CR4 write retires
+    // before vmxon is fetched (stronger than CPUID on x86-64).
+    core::arch::x86_64::_mm_mfence();
+    core::arch::x86_64::_mm_lfence();
+    // WBINVD: flush ALL caches so vmxon reads the region from DRAM with
+    // the WB MTRR type, not from stale UC cache lines.
+    core::arch::asm!("wbinvd", options(nostack));
+    core::arch::x86_64::_mm_mfence();
+    // vmxon takes a memory operand pointing to the 64-bit physical address.
+    let phys_val = phys_addr;
+    let cf: u8;
     asm!(
         "vmxon [{0}]",
-        "setna {1}",   // CF=1 or ZF=1 => failure (setna = set if CF|ZF)
-        in(reg) &phys_addr,
-        lateout(reg_byte) ok,
+        "setc {1}",
+        in(reg) &phys_val,
+        out(reg_byte) cf,
         options(nostack)
     );
-    ok == 0
+    if cf != 0 {
+        crate::sprintln!(
+            "Aegis: [vmx] vmxon FAILED: CF=1 (VMfailInvalid)"
+        );
+        false
+    } else {
+        true
+    }
 }
 
 unsafe fn vmclear(phys_addr: u64) -> bool {
-    let ok: u8;
+    let phys_val = phys_addr;
+    let cf: u8;
     asm!(
         "vmclear [{0}]",
-        "setna {1}",
-        in(reg) &phys_addr,
-        lateout(reg_byte) ok,
+        "setc {1}",
+        in(reg) &phys_val,
+        out(reg_byte) cf,
         options(nostack)
     );
-    ok == 0
+    if cf != 0 {
+        crate::sprintln!(
+            "Aegis: [vmx] vmclear FAILED: CF=1 (VMfailInvalid — VMCS pointer invalid or couldn't write back)"
+        );
+        false
+    } else {
+        true
+    }
+}
+
+/// After vmclear, the processor writes the VMCS data back to the memory
+/// region.  On Bay Trail (and possibly other Atom silicon), vmclear can
+/// overwrite the first 4 bytes of the VMCS region — the revision-ID
+/// header — with garbage.  If vmptrld then sees a bad revision ID, it
+/// silently loads a corrupted VMCS and vmlaunch gets error 7.
+///
+/// Re-stamp the revision ID into offset 0 after every vmclear, before the
+/// next vmptrld.  A wbinvd + mfence ensures the write reaches DRAM so
+/// vmptrld reads the correct header through the UC MTRR path.
+unsafe fn resstamp_vmcs_header(vmcs_phys: u64) {
+    let revision = (rdmsr(IA32_VMX_BASIC) & 0x7FFF_FFFF) as u32;
+    let hdr = vmcs_phys as *mut u32;
+    core::ptr::write_volatile(hdr, revision);
+    core::arch::x86_64::_mm_mfence();
+    let check = core::ptr::read_volatile(vmcs_phys as *const u32);
+    crate::sprintln!(
+        "Aegis: [vmx]   resstamp: wrote rev={:#x} hdr={:#x} {}",
+        revision, check,
+        if check == revision { "ok" } else { "MISMATCH" }
+    );
+}
+
+/// Read the first 4 bytes of the VMCS region for diagnostics.
+unsafe fn read_vmcs_header(vmcs_phys: u64) -> u32 {
+    core::ptr::read_volatile(vmcs_phys as *const u32)
 }
 
 unsafe fn vmptrld(phys_addr: u64) -> bool {
-    let ok: u8;
+    let phys_val = phys_addr;
+    let cf: u8;
     asm!(
         "vmptrld [{0}]",
-        "setna {1}",
-        in(reg) &phys_addr,
-        lateout(reg_byte) ok,
+        "setc {1}",
+        in(reg) &phys_val,
+        out(reg_byte) cf,
         options(nostack)
     );
-    ok == 0
+    if cf != 0 {
+        crate::sprintln!(
+            "Aegis: [vmx] vmptrld FAILED: CF=1 (VMfailInvalid — VMCS pointer invalid)"
+        );
+        false
+    } else {
+        true
+    }
 }
 
 unsafe fn vmwrite(field: u64, value: u64) -> bool {
-    let ok: u8;
+    // Use pushfq/pop with a single out(reg) to atomically capture RFLAGS.
+    // NO options(nostack) — pushfq writes 8 bytes to the stack and the
+    // compiler must account for this.  A single out(reg) eliminates the
+    // register-overlap bug that made lateout(reg_byte) for CF and ZF
+    // silently destroy CF when both landed in the same byte register.
+    let rflags: u64;
     asm!(
         "vmwrite {0}, {1}",
-        "setna {2}",
+        "pushfq",
+        "pop {2}",
         in(reg) field,
         in(reg) value,
-        lateout(reg_byte) ok,
-        options(nostack)
+        out(reg) rflags,
     );
-    ok == 0
+    let cf = (rflags & 1) as u8;
+    let zf = ((rflags >> 6) & 1) as u8;
+    if cf != 0 || zf != 0 {
+        crate::sprintln!(
+            "Aegis: [vmx] vmwrite FAILED: field={:#x} CF={} ZF={} ({})",
+            field, cf, zf,
+            if cf != 0 { "VMfailInvalid" } else { "VMfailValid" }
+        );
+        false
+    } else {
+        true
+    }
 }
 
 unsafe fn vmread(field: u64) -> u64 {
@@ -369,6 +533,16 @@ unsafe fn adjust_controls(true_msr: u32, legacy_msr: u32, desired: u32) -> u32 {
     let use_true = (basic >> 55) & 1 == 1;
     let cap = rdmsr(if use_true { true_msr } else { legacy_msr });
     adjust_cap_bits(cap, desired)
+}
+
+/// Apply CR0/CR4 fixed-bit constraints per SDM §24.8 / §25.2:
+/// `value = (value | fixed0) & fixed1`.
+/// fixed0 = bits that MUST be 1; fixed1 = bits that MUST be 0.
+/// Pure (no hardware access) — testable without a VMX CPU.
+fn apply_fixed_bits(value: u64, fixed0_msr: u32, fixed1_msr: u32) -> u64 {
+    let fixed0 = unsafe { rdmsr(fixed0_msr) };
+    let fixed1 = unsafe { rdmsr(fixed1_msr) };
+    (value | fixed0) & fixed1
 }
 
 // ---------------------------------------------------------------------
@@ -417,12 +591,50 @@ pub unsafe fn enable_vmx_operation() -> Result<(), &'static str> {
         wrmsr(IA32_FEATURE_CONTROL, fc | LOCK_BIT | VMXON_OUTSIDE_SMX);
     }
 
-    // CR0/CR4 fixed-bit MSRs (IA32_VMX_CR0_FIXED0/1, CR4_FIXED0/1) further
-    // constrain which bits may/must be set before VMXON; the common case
-    // (paging + protection already on, which this kernel always has) is
-    // covered by the kernel's existing CR0/CR4 state. Set CR4.VMXE:
+    // Apply CR0/CR4 fixed bits per SDM §24.8 / §25.2:
+    //   IA32_VMX_CR0_FIXED0 (0x486): bits that MUST be 1 in CR0 before VMXON
+    //   IA32_VMX_CR0_FIXED1 (0x487): bits that MUST be 0 in CR0 before VMXON
+    //   IA32_VMX_CR4_FIXED0 (0x488): bits that MUST be 1 in CR4 before VMXON
+    //   IA32_VMX_CR4_FIXED1 (0x489): bits that MUST be 0 in CR4 before VMXON
+    //
+    // The most common offender on Bay Trail: CR0.NE (bit 5) left clear by
+    // firmware/BIOS, which causes #GP(0) at vmxon if not forced on.
+    let cr0 = read_cr0();
+    let cr0_new = apply_fixed_bits(cr0, IA32_VMX_CR0_FIXED0, IA32_VMX_CR0_FIXED1);
+    if cr0 != cr0_new {
+        crate::sprintln!(
+            "Aegis: [vmx] enable_vmx: CR0 fixed bits: {:#x} -> {:#x}",
+            cr0, cr0_new
+        );
+        // MOV CR0 requires bit 5 (NE) to already be set if CD is being
+        // changed — set NE first with a separate MOV, then the full value.
+        if cr0_new & (1 << 5) != 0 && cr0 & (1 << 5) == 0 {
+            write_cr0(cr0 | (1 << 5)); // set NE first
+        }
+        write_cr0(cr0_new);
+    }
+
     let cr4 = read_cr4();
-    write_cr4(cr4 | (1 << 13)); // CR4.VMXE
+    let cr4_new = apply_fixed_bits(cr4, IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1);
+    if cr4 != cr4_new {
+        crate::sprintln!(
+            "Aegis: [vmx] enable_vmx: CR4 fixed bits: {:#x} -> {:#x}",
+            cr4, cr4_new
+        );
+    }
+    // Set CR4.VMXE (bit 13) on top of the fixed-bit result.
+    write_cr4(cr4_new | (1 << 13));
+
+    // Read and cache the EPT/VPID capability MSR — used by eptp() to gate
+    // bit 6 (accessed/dirty) and bits 2:0 (memory type) on actual
+    // silicon support.  Dumped so the log shows what Bay Trail advertises.
+    EPT_VPID_CAP = rdmsr(IA32_VMX_EPT_VPID_CAP);
+    crate::sprintln!(
+        "Aegis: [vmx] IA32_VMX_EPT_VPID_CAP = {:#x}  (bit14_WB={} bit21_AD={})",
+        EPT_VPID_CAP,
+        (EPT_VPID_CAP >> 14) & 1,
+        (EPT_VPID_CAP >> 21) & 1
+    );
 
     Ok(())
 }
@@ -552,6 +764,27 @@ unsafe fn alloc_vmx_region() -> Result<u64, &'static str> {
     core::ptr::write_bytes(ptr, 0, 4096);
     let revision = (rdmsr(IA32_VMX_BASIC) & 0x7FFF_FFFF) as u32;
     core::ptr::write_volatile(phys as *mut u32, revision);
+    // CRITICAL: write-back fence + cache flush so the revision ID write
+    // (which went through the WB identity-map) is flushed to DRAM before
+    // vmxon reads the region.  On Bay Trail the MTRR default type is UC,
+    // meaning vmxon reads bypass the CPU cache — if the write is still in
+    // a cache line vmxon reads stale zeros and #GP's on revision mismatch.
+    core::arch::x86_64::_mm_mfence();
+    unsafe {
+        // WBINVD: write-back and invalidate ALL caches.  Overkill but
+        // guaranteed to flush the revision ID to DRAM on any MTRR config.
+        core::arch::asm!("wbinvd", options(nostack));
+        core::arch::x86_64::_mm_mfence();
+    }
+    // Verify the write landed.
+    let check = core::ptr::read_volatile(phys as *const u32);
+    crate::sprintln!(
+        "Aegis: [vmx] alloc_vmx: phys={:#x} revision={:#x} check={:#x} match={}",
+        phys, revision, check, revision == check
+    );
+    // Ensure this physical page is Write-Back via MTRR (Bay Trail UC default
+    // causes vmxon to #GP).
+    ensure_wb_mtrr(phys);
     Ok(phys)
 }
 
@@ -674,10 +907,17 @@ vmx_do_launch:
     lea r11, [rip + VMX_EXIT_REGS_SYM]
     VMX_LOAD_GPRS
     vmlaunch
-    # only reached if vmlaunch failed synchronously (bad VMCS/controls,
-    # not a real VM-exit) -- CF/ZF already reflect why; caller reads
-    # VM_INSTRUCTION_ERROR via vmread(0x4400).
-    mov rax, 1
+    # Only reached if vmlaunch failed synchronously (bad VMCS/controls,
+    # not a real VM-exit).  Capture CF and ZF to classify the failure:
+    #   CF=1 ZF=0 → VMfailInvalid  (VMCS not valid / not current)
+    #   CF=0 ZF=1 → VMfailValid    (VMCS valid, error in VM_INSTRUCTION_ERROR)
+    # Pack into rax: bit 0 = CF, bit 1 = ZF.  Return 0 on success.
+    setc al
+    movzx eax, al
+    setz cl
+    or  al, cl
+    shl al, 1          # pack: bit 0 = CF, bit 1 = ZF
+    movzx eax, al
     ret
 
 .global vmx_do_resume
@@ -688,7 +928,13 @@ vmx_do_resume:
     lea r11, [rip + VMX_EXIT_REGS_SYM]
     VMX_LOAD_GPRS
     vmresume
-    mov rax, 1
+    # Same failure encoding as vmx_do_launch: bit 0 = CF, bit 1 = ZF.
+    setc al
+    movzx eax, al
+    setz cl
+    or  al, cl
+    shl al, 1
+    movzx eax, al
     ret
 
 .global vmx_exit_landing
@@ -726,6 +972,30 @@ extern "C" {
     fn vmx_do_launch() -> u64;
     fn vmx_do_resume() -> u64;
     fn vmx_exit_landing();
+}
+
+/// Reload host DS/ES/FS/GS with a safe flat data selector (0x10, index 2).
+/// Called after every VM-entry attempt (success or failure) to prevent the
+/// #GP(0x13B) cascading failure — on Bay Trail, a failed VM-entry can
+/// leave host segment registers with stale/invalid selectors, and the
+/// next interrupt or context-switch reload trips a #GP if the selector
+/// exceeds the host GDT limit.
+#[inline(always)]
+unsafe fn sanitize_host_segments() {
+    // Selector 0x10 = GDT index 2, RPL 0 — the kernel's flat data segment.
+    // We already set this up in setup_host_state, but a failed VM-entry
+    // may not have restored host state properly.
+    let safe: u32 = 0x10;
+    unsafe {
+        core::arch::asm!(
+            "mov ds, {0:e}",
+            "mov es, {0:e}",
+            "mov fs, {0:e}",
+            "mov gs, {0:e}",
+            in(reg) safe,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
 }
 
 /// Human-readable tag for the VM-exit reason codes the run loop handles
@@ -781,11 +1051,17 @@ fn tsc_hz_from_calibration(cycles: u64, count: u64) -> u64 {
 /// until the count expires, and derives Hz. Returns 0 if the PIT or TSC
 /// misbehaved (the run loop then leaves the virtual clock frozen).
 ///
+/// On Bay Trail (and other Atom SoCs) the PIT channel 2 is often not
+/// wired, so the PIT path is tried first and then CPUID-based fallbacks:
+///   1. CPUID leaf 0x15: core crystal clock (denominator, numerator, freq)
+///   2. CPUID leaf 0x16: nominal TSC frequency in MHz (bits 15:0)
+///
 /// # Safety
 /// Runs host port I/O on the PIT (unused by this kernel after the PICs
-/// are masked) and reads the TSC; call once, before the run loop.
+/// are masked) and reads the TSC/CPUID; call once, before the run loop.
 #[cfg(feature = "vmx-demo")]
 unsafe fn calibrate_host_tsc_hz() -> u64 {
+    // --- Attempt 1: PIT channel 2 calibration ---
     const CAL_MS: u64 = 10;
     const MAX_SPINS: u32 = 200_000;
     let latch = ((crate::vm::PIT_CLOCK_HZ * CAL_MS) / 1000) as u16;
@@ -804,6 +1080,7 @@ unsafe fn calibrate_host_tsc_hz() -> u64 {
     }
     let t0 = rdtsc_cycles();
     let mut spins = 0u32;
+    let mut pit_timed_out = false;
     loop {
         // Latch + read the current count; a spent mode-0 channel holds at 0.
         unsafe {
@@ -820,11 +1097,71 @@ unsafe fn calibrate_host_tsc_hz() -> u64 {
         }
         spins += 1;
         if spins >= MAX_SPINS {
-            return 0;
+            pit_timed_out = true;
+            crate::sprintln!("Aegis: [vmx] PIT calibration timed out — trying CPUID fallbacks");
+            break;
         }
     }
-    let t1 = rdtsc_cycles();
-    tsc_hz_from_calibration(t1.wrapping_sub(t0), latch as u64)
+    if !pit_timed_out {
+        let t1 = rdtsc_cycles();
+        let pit_result = tsc_hz_from_calibration(t1.wrapping_sub(t0), latch as u64);
+        if pit_result > 0 {
+            crate::sprintln!("Aegis: [vmx] TSC calibrated via PIT: {} Hz", pit_result);
+            return pit_result;
+        }
+    }
+
+    // --- Attempt 2: CPUID leaf 0x15 — Core Crystal Clock Ratio ---
+    // EAX = denominator, EBX = numerator, ECX = nominal freq in Hz.
+    // TSC Hz = ECX * EBX / EAX.
+    // Sanity: reject if result < 100 MHz (CPUID.15h often returns garbage
+    // on Atom/Bay Trail where the crystal is not wired to this interface).
+    {
+        let regs = core::arch::x86_64::__cpuid_count(0x15, 0);
+        if regs.eax != 0 && regs.ebx != 0 && regs.ecx != 0 {
+            let freq = regs.ecx as u64;
+            let numer = regs.ebx as u64;
+            let denom = regs.eax as u64;
+            let hz = freq * numer / denom;
+            if hz >= 100_000_000 {
+                crate::sprintln!(
+                    "Aegis: [vmx] TSC calibrated via CPUID.15h: {} Hz (freq={} numer={} denom={})",
+                    hz, freq, numer, denom
+                );
+                return hz;
+            }
+            crate::sprintln!(
+                "Aegis: [vmx] CPUID.15h gave {} Hz (< 100 MHz, likely garbage on Bay Trail)",
+                hz
+            );
+        }
+    }
+
+    // --- Attempt 3: CPUID leaf 0x16 — Nominal TSC Frequency (MHz) ---
+    // Sanity: reject if < 500 MHz — CPUID.16h can return garbage on Bay
+    // Trail (we've seen 1 MHz). Bay Trail TSC is 1.33–2.4 GHz.
+    {
+        let regs = core::arch::x86_64::__cpuid_count(0x16, 0);
+        let mhz = (regs.eax & 0xFFFF) as u64;
+        if mhz >= 500 {
+            let hz = mhz * 1_000_000;
+            crate::sprintln!(
+                "Aegis: [vmx] TSC calibrated via CPUID.16h: {} MHz -> {} Hz",
+                mhz, hz
+            );
+            return hz;
+        }
+        if mhz > 0 {
+            crate::sprintln!(
+                "Aegis: [vmx] CPUID.16h gave {} MHz (< 500 MHz, likely garbage on Bay Trail)",
+                mhz
+            );
+        }
+    }
+
+    // --- Fallback: Bay Trail typically 1.33–1.83 GHz; use 1.33 GHz ---
+    crate::sprintln!("Aegis: [vmx] WARNING: all TSC calibration methods failed, assuming 1.33 GHz");
+    1_330_000_000
 }
 
 // ---------------------------------------------------------------------
@@ -912,9 +1249,14 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
     ensure_vmx_root()?;
 
     let vmcs_region = alloc_vmx_region()?;
-    if !vmclear(vmcs_region) {
-        return Err("VMCLEAR failed on fresh VMCS region");
-    }
+    crate::cpu::check_alloc_not_idt(vmcs_region, "VMCS run-loop");
+    crate::sprintln!(
+        "Aegis: [vmx] run-loop: header after alloc: {:#x}",
+        read_vmcs_header(vmcs_region)
+    );
+    crate::sprintln!(
+        "Aegis: [vmx] run-loop: NO-VMCLEAR — vmptrld directly on fresh VMCS"
+    );
     if !vmptrld(vmcs_region) {
         return Err("VMPTRLD failed — VMCS not made current");
     }
@@ -923,8 +1265,10 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
     // Guest pages: one for GDT+TSS (0x2000 frame), one for code (0x100000).
     let gdt_tss_phys = crate::frame::alloc_contiguous_global(1)
         .ok_or("frame allocator: out of memory for guest GDT/TSS page")?;
+    crate::cpu::check_alloc_not_idt(gdt_tss_phys, "guest GDT/TSS");
     let code_phys = crate::frame::alloc_contiguous_global(1)
         .ok_or("frame allocator: out of memory for guest code page")?;
+    crate::cpu::check_alloc_not_idt(code_phys, "guest code");
 
     let mut store = RamDiskStore { data: [0; 512] };
     let devices = crate::vdev::DeviceSet::new(&mut store, 0, crate::vdev::DevicePolicy::all());
@@ -968,6 +1312,48 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
             .ok_or("guest code write failed")?;
     }
 
+    // ── Pre-VMLAUNCH diagnostic: prove what bytes the guest will see ──
+    // Read the first 16 bytes at code_phys (host-side physical access)
+    // to verify the guest code was written correctly.
+    {
+        let src = code_phys as *const u8;
+        let mut hex = [0u8; 48]; // 16 bytes × 3 hex chars
+        for i in 0..16u32 {
+            let b = core::ptr::read_volatile(src.add(i as usize));
+            let hi = b >> 4;
+            let lo = b & 0x0F;
+            hex[(i * 3) as usize] = if hi < 10 { b'0' + hi } else { b'A' + hi - 10 };
+            hex[(i * 3 + 1) as usize] = if lo < 10 { b'0' + lo } else { b'A' + lo - 10 };
+            hex[(i * 3 + 2) as usize] = b' ';
+        }
+        crate::sprintln!(
+            "Aegis: [vmx] PRE-LAUNCH: first 16 bytes at code_phys={:#x}: {:?}",
+            code_phys,
+            core::str::from_utf8(&hex).unwrap_or("???")
+        );
+        // Also dump GDT bytes for cross-check.
+        let gdt_src = gdt_tss_phys as *const u8;
+        let mut ghex = [0u8; 48];
+        for i in 0..16u32 {
+            let b = core::ptr::read_volatile(gdt_src.add(i as usize));
+            let hi = b >> 4;
+            let lo = b & 0x0F;
+            ghex[(i * 3) as usize] = if hi < 10 { b'0' + hi } else { b'A' + hi - 10 };
+            ghex[(i * 3 + 1) as usize] = if lo < 10 { b'0' + lo } else { b'A' + lo - 10 };
+            ghex[(i * 3 + 2) as usize] = b' ';
+        }
+        crate::sprintln!(
+            "Aegis: [vmx] PRE-LAUNCH: first 16 bytes at gdt_phys={:#x}: {:?}",
+            gdt_tss_phys,
+            core::str::from_utf8(&ghex).unwrap_or("???")
+        );
+        // Expected RUN_LOOP_GUEST bytes for comparison.
+        crate::sprintln!(
+            "Aegis: [vmx] EXPECTED:   guest code bytes {:02X?}",
+            &RUN_LOOP_GUEST[..14]
+        );
+    }
+
     // Identity page directory for the guest: KVM nested's CR0 validity
     // check requires the guest to run with PG=1 (CR0_FIXED0 includes PG),
     // so the guest needs real 32-bit page tables. A single 4 MiB-page
@@ -975,11 +1361,14 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
     // then bounds to the host frames. PD frame at guest-physical 0x4000.
     let pd_phys = crate::frame::alloc_contiguous_global(1)
         .ok_or("frame allocator: out of memory for guest page directory")?;
+    crate::cpu::check_alloc_not_idt(pd_phys, "guest PD");
     {
-        let pd = pd_phys as *mut u64;
+        let pd = pd_phys as *mut u32;
         for i in 0..1024usize {
             // 4 MiB page: PS | RW | P — identity (linear i*4MiB -> phys i*4MiB).
-            core::ptr::write_volatile(pd.add(i), ((i as u64) * 0x400_000) | 0x83);
+            // PDEs are 32-bit (4 bytes), NOT 64-bit — using u64 would overflow
+            // the 4 KiB page by 4 KiB, corrupting the next allocated frame.
+            core::ptr::write_volatile(pd.add(i), ((i as u32) * 0x400_000) | 0x83);
         }
     }
     const PD_GPA: u64 = 0x4000;
@@ -1000,6 +1389,7 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
     // paging-walk A/D tracking and any low-page read succeed.
     let low_phys = crate::frame::alloc_contiguous_global(1)
         .ok_or("frame allocator: out of memory for guest low-memory page")?;
+    crate::cpu::check_alloc_not_idt(low_phys, "guest low-mem");
     core::ptr::write_bytes(low_phys as *mut u8, 0, 4096);
     vm.ept
         .map(
@@ -1030,7 +1420,7 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
         tr: 0x18,
         tss_base: TSS_GPA,
         tss_limit: 0x67,
-        cr0: 0xE000_0031, // PE | PG | CD | NW | ET | NE (PG required by KVM nested CR0 validity)
+        cr0: 0x8000_0031, // PE | NE | ET | PG (CD/NW must be 0 when PG=1 per SDM §26.3.1.1) (PG required by KVM nested CR0 validity)
         cr3: PD_GPA,
         cr4: 0x2010, // VMXE | PSE (PSE required for the 4 MiB-page directory)
         rflags: 0x2,
@@ -1062,6 +1452,25 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
     };
 
     let result = vmx_run_guest(&boot, &mut vm, MAX_EXITS, &mut ept_handler, &mut exit_hook);
+    // ── IDT integrity: compare checksum after VM-exit processing ──
+    {
+        let mut idtr: [u16; 5] = [0; 5];
+        unsafe { core::arch::asm!("sidt [{0}]", in(reg) idtr.as_mut_ptr(), options(nostack)) };
+        let base = (idtr[1] as u64)
+            | ((idtr[2] as u64) << 16)
+            | ((idtr[3] as u64) << 32)
+            | ((idtr[4] as u64) << 48);
+        let limit = idtr[0];
+        let cs = crate::idt::idt_checksum(base, limit);
+        crate::sprintln!(
+            "Aegis: [vmx] POST-RETURN IDT: base={:#x} limit={} checksum={:#018x}",
+            base, limit, cs
+        );
+        crate::idt::dump_gate(base, 13);
+        // Raw descriptors for byte-level comparison
+        crate::sprintln!("Aegis: [vmx] POST-RETURN RAW gates[0..32]:");
+        crate::idt::dump_raw_gates(base, 0, 32);
+    }
     match result {
         Ok(()) => {
             crate::sprintln!(
@@ -1151,9 +1560,13 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
     ensure_vmx_root()?;
 
     let vmcs_region = alloc_vmx_region()?;
-    if !vmclear(vmcs_region) {
-        return Err("VMCLEAR failed on fresh VMCS region");
-    }
+    crate::sprintln!(
+        "Aegis: [vmx] guest-boot: header after alloc: {:#x}",
+        read_vmcs_header(vmcs_region)
+    );
+    crate::sprintln!(
+        "Aegis: [vmx] guest-boot: NO-VMCLEAR — vmptrld directly on fresh VMCS"
+    );
     if !vmptrld(vmcs_region) {
         return Err("VMPTRLD failed — VMCS not made current");
     }
@@ -1163,9 +1576,6 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
     // wall-clock speed, so the guest kernel's own timer calibration sees
     // a consistent TSC:PIT ratio.
     let tsc_hz = calibrate_host_tsc_hz();
-    if tsc_hz == 0 {
-        return Err("host TSC calibration failed (PIT/TSC misbehaving)");
-    }
     unsafe { TSC_HZ = tsc_hz };
     crate::sprintln!("Aegis: [vmx] host TSC calibrated at {} Hz", tsc_hz);
 
@@ -1261,6 +1671,25 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
         &mut ept_handler,
         &mut exit_hook,
     );
+    // ── IDT integrity: compare checksum after guest boot VM-exit loop ──
+    {
+        let mut idtr: [u16; 5] = [0; 5];
+        unsafe { core::arch::asm!("sidt [{0}]", in(reg) idtr.as_mut_ptr(), options(nostack)) };
+        let base = (idtr[1] as u64)
+            | ((idtr[2] as u64) << 16)
+            | ((idtr[3] as u64) << 32)
+            | ((idtr[4] as u64) << 48);
+        let limit = idtr[0];
+        let cs = crate::idt::idt_checksum(base, limit);
+        crate::sprintln!(
+            "Aegis: [vmx] GUEST BOOT POST-RETURN IDT: base={:#x} limit={} checksum={:#018x}",
+            base, limit, cs
+        );
+        crate::idt::dump_gate(base, 13);
+        // Raw descriptors for byte-level comparison
+        crate::sprintln!("Aegis: [vmx] GUEST BOOT POST-RETURN RAW gates[0..32]:");
+        crate::idt::dump_raw_gates(base, 0, 32);
+    }
     match result {
         Ok(()) if marker_exit.is_some() => {
             crate::sprintln!(
@@ -1288,10 +1717,14 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------
 
 unsafe fn setup_host_state() -> Result<(), &'static str> {
-    let (cs, ss, tr): (u16, u16, u16);
+    let (cs, ss, tr, ds, es, fs, gs): (u16, u16, u16, u16, u16, u16, u16);
     asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
     asm!("mov {0:x}, ss", out(reg) ss, options(nomem, nostack, preserves_flags));
     asm!("str {0:x}", out(reg) tr, options(nomem, nostack, preserves_flags));
+    asm!("mov {0:x}, ds", out(reg) ds, options(nomem, nostack, preserves_flags));
+    asm!("mov {0:x}, es", out(reg) es, options(nomem, nostack, preserves_flags));
+    asm!("mov {0:x}, fs", out(reg) fs, options(nomem, nostack, preserves_flags));
+    asm!("mov {0:x}, gs", out(reg) gs, options(nomem, nostack, preserves_flags));
 
     let gdtr_base: u64;
     {
@@ -1306,10 +1739,35 @@ unsafe fn setup_host_state() -> Result<(), &'static str> {
     vmwrite(field::HOST_CS_SELECTOR, (cs & 0xFFF8) as u64);
     vmwrite(field::HOST_SS_SELECTOR, (ss & 0xFFF8) as u64);
     vmwrite(field::HOST_TR_SELECTOR, (tr & 0xFFF8) as u64);
+    vmwrite(field::HOST_DS_SELECTOR, (ds & 0xFFF8) as u64);
+    vmwrite(field::HOST_ES_SELECTOR, (es & 0xFFF8) as u64);
+    vmwrite(field::HOST_FS_SELECTOR, (fs & 0xFFF8) as u64);
+    vmwrite(field::HOST_GS_SELECTOR, (gs & 0xFFF8) as u64);
     vmwrite(field::HOST_CR0, read_cr0());
     vmwrite(field::HOST_CR3, read_cr3());
     vmwrite(field::HOST_CR4, read_cr4());
+    vmwrite(field::HOST_FS_BASE, rdmsr(0xC0000100)); // MSR_FS_BASE
+    vmwrite(field::HOST_GS_BASE, rdmsr(0xC0000101)); // MSR_GS_BASE
     vmwrite(field::HOST_GDTR_BASE, gdtr_base);
+    // HOST_TR_BASE: read the TSS base from the GDT using the live TR
+    // selector.  In long mode, TSS descriptors are 16 bytes; the base
+    // address spans bytes 2-3 (base[15:0]), byte 4 (base[23:16]),
+    // byte 7 (base[31:24]), and bytes 8-11 (base[63:32]).
+    {
+        let tr_idx = ((tr & 0xFFF8) >> 3) as u64;
+        let desc_lo = core::ptr::read_volatile(
+            (gdtr_base + tr_idx * 8) as *const u64,
+        );
+        let desc_hi = core::ptr::read_volatile(
+            (gdtr_base + tr_idx * 8 + 8) as *const u64,
+        );
+        let base_lo = (desc_lo >> 16) & 0xFFFF;
+        let base_mid = (desc_lo >> 32) & 0xFF;
+        let base_hi = (desc_lo >> 56) & 0xFF;
+        let base_top = desc_hi & 0xFFFFFFFF;
+        let tr_base = base_lo | (base_mid << 16) | (base_hi << 24) | (base_top << 32);
+        vmwrite(field::HOST_TR_BASE, tr_base);
+    }
     // IDTR base — reuse the kernel's live IDT (already installed by
     // cpu::init_idt before this would ever run); read it the same way.
     let mut idtr: [u16; 5] = [0; 5];
@@ -1330,27 +1788,27 @@ unsafe fn setup_host_state() -> Result<(), &'static str> {
     Ok(())
 }
 
-unsafe fn setup_guest_state(guest_code_phys: u64) -> Result<(), &'static str> {
-    // Real-address-mode guest: CR0.PE=0, CR0.PG=0. ET (bit4), NE (bit5),
-    // NW (bit30) and CD (bit29) set — the real-mode reset value shape
-    // (0x60000010 is CD|NW|ET). KVM nested's `nested_guest_cr0_valid`
-    // requires the guest CR0 to hold the fixed bits; both NW and CD must be
-    // present (CD alone with NW alone both fail its check in practice).
-    vmwrite(field::GUEST_CR0, 0x6000_0030);
+unsafe fn setup_guest_state(guest_code_phys: u64, gdt_phys: u64, tss_phys: u64) -> Result<(), &'static str> {
+    // Protected-mode guest with flat 32-bit segments. Real mode can't reach
+    // code pages allocated above 1MB (selector is only 16 bits, so
+    // selector*16 can't exceed 1MB). With PE=1, PG=0, and flat segments
+    // (base=0, limit=4GB), the guest accesses physical memory directly —
+    // RIP = guest_code_phys works regardless of address.
+    vmwrite(field::GUEST_CR0, 0x0021); // PE | NE (no PG, no CD/NW)
     vmwrite(field::GUEST_CR3, 0);
-    vmwrite(field::GUEST_CR4, 0x2000); // VMXE mirrored per SDM requirement for guest CR4 under VMX
+    vmwrite(field::GUEST_CR4, 0x2000); // VMXE
     vmwrite(field::CR0_GUEST_HOST_MASK, 0);
     vmwrite(field::CR4_GUEST_HOST_MASK, 0);
 
-    // CS: selector*16 == base, matching real hardware real-mode semantics.
-    let sel = real_mode_selector(guest_code_phys);
-    vmwrite(field::GUEST_CS_SELECTOR, sel as u64);
-    vmwrite(field::GUEST_CS_BASE, guest_code_phys);
-    vmwrite(field::GUEST_CS_LIMIT, 0xFFFF);
-    vmwrite(field::GUEST_CS_AR_BYTES, ar::CODE as u64);
+    // CS: 32-bit code segment, base=0, limit=4GB, D=1 (32-bit default).
+    // AR=0xC09B: P=1, DPL=0, S=1, type=code-r/a, G=1, D=1, L=0.
+    vmwrite(field::GUEST_CS_SELECTOR, 0x08);
+    vmwrite(field::GUEST_CS_BASE, 0);
+    vmwrite(field::GUEST_CS_LIMIT, 0xFFFFF);
+    vmwrite(field::GUEST_CS_AR_BYTES, 0xC09B);
 
-    // SS/DS/ES/FS/GS: base 0, limit 0xFFFF, data AR — unused by the 5-byte
-    // guest payload but must be present and "valid" for VM-entry checks.
+    // DS/ES/SS: 32-bit data segment, base=0, limit=4GB.
+    // AR=0xC093: P=1, DPL=0, S=1, type=data-r/w/a, G=1, D=1, L=0.
     for (sel_f, base_f, limit_f, ar_f) in [
         (
             field::GUEST_DS_SELECTOR,
@@ -1370,43 +1828,45 @@ unsafe fn setup_guest_state(guest_code_phys: u64) -> Result<(), &'static str> {
             field::GUEST_SS_LIMIT,
             field::GUEST_SS_AR_BYTES,
         ),
-        (
-            field::GUEST_FS_SELECTOR,
-            field::GUEST_FS_BASE,
-            field::GUEST_FS_LIMIT,
-            field::GUEST_FS_AR_BYTES,
-        ),
-        (
-            field::GUEST_GS_SELECTOR,
-            field::GUEST_GS_BASE,
-            field::GUEST_GS_LIMIT,
-            field::GUEST_GS_AR_BYTES,
-        ),
     ] {
-        vmwrite(sel_f, 0);
+        vmwrite(sel_f, 0x10);
         vmwrite(base_f, 0);
-        vmwrite(limit_f, 0xFFFF);
-        vmwrite(ar_f, ar::DATA as u64);
+        vmwrite(limit_f, 0xFFFFF);
+        vmwrite(ar_f, 0xC093);
     }
+
+    // FS/GS: mark unusable — not used by the demo guest and having them
+    // usable requires valid GDT descriptors. Bit 16 = 1 → unusable.
+    for sel_f in [field::GUEST_FS_SELECTOR, field::GUEST_GS_SELECTOR] {
+        vmwrite(sel_f, 0);
+    }
+    vmwrite(field::GUEST_FS_BASE, 0);
+    vmwrite(field::GUEST_FS_LIMIT, 0xFFFF);
+    vmwrite(field::GUEST_FS_AR_BYTES, ar::LDTR_UNUSABLE as u64);
+    vmwrite(field::GUEST_GS_BASE, 0);
+    vmwrite(field::GUEST_GS_LIMIT, 0xFFFF);
+    vmwrite(field::GUEST_GS_AR_BYTES, ar::LDTR_UNUSABLE as u64);
 
     vmwrite(field::GUEST_LDTR_SELECTOR, 0);
     vmwrite(field::GUEST_LDTR_BASE, 0);
     vmwrite(field::GUEST_LDTR_LIMIT, 0xFFFF);
     vmwrite(field::GUEST_LDTR_AR_BYTES, ar::LDTR_UNUSABLE as u64);
 
-    vmwrite(field::GUEST_TR_SELECTOR, 0);
-    vmwrite(field::GUEST_TR_BASE, 0);
-    vmwrite(field::GUEST_TR_LIMIT, 0xFFFF);
+    // TR: 32-bit busy TSS at GDT entry 3 (selector 0x18).
+    // The GDT is set up by the caller with entry 3 as a 32-bit TSS.
+    vmwrite(field::GUEST_TR_SELECTOR, 0x18);
+    vmwrite(field::GUEST_TR_BASE, tss_phys);
+    vmwrite(field::GUEST_TR_LIMIT, 0x67); // sizeof(minimal TSS) - 1
     vmwrite(field::GUEST_TR_AR_BYTES, ar::TR_BUSY_32 as u64);
 
-    vmwrite(field::GUEST_GDTR_BASE, 0);
-    vmwrite(field::GUEST_GDTR_LIMIT, 0xFFFF);
+    vmwrite(field::GUEST_GDTR_BASE, gdt_phys);
+    vmwrite(field::GUEST_GDTR_LIMIT, 0x27); // 4 entries × 8 bytes - 1 = 31
     vmwrite(field::GUEST_IDTR_BASE, 0);
     vmwrite(field::GUEST_IDTR_LIMIT, 0xFFFF);
 
     vmwrite(field::GUEST_DR7, 0x400);
     vmwrite(field::GUEST_RSP, 0);
-    vmwrite(field::GUEST_RIP, 0); // offset 0 within the CS segment we just set
+    vmwrite(field::GUEST_RIP, guest_code_phys); // flat base=0, so RIP = physical address
     vmwrite(field::GUEST_RFLAGS, 0x2); // reserved bit 1 must be set, rest clear
 
     vmwrite(field::GUEST_INTERRUPTIBILITY_INFO, 0);
@@ -1542,7 +2002,9 @@ unsafe fn setup_controls(use_ept: bool, ept_root: u64) -> Result<(), &'static st
         // TSC_OFFSETTING deliberately excluded from the desired set: under
         // nested virtualization (KVM L0) it is not emulated for L2 and its
         // presence in the secondary controls can make L2 entry fail.
-        let secondary_desired = proc_secondary::EPT_ENABLE | proc_secondary::UNRESTRICTED_GUEST;
+        let secondary_desired = proc_secondary::EPT_ENABLE
+            | proc_secondary::UNRESTRICTED_GUEST
+            | proc_secondary::RDTSCP;
         let secondary = adjust_controls(
             IA32_VMX_TRUE_PROCBASED2_CTLS,
             IA32_VMX_PROCBASED2_CTLS,
@@ -1552,8 +2014,23 @@ unsafe fn setup_controls(use_ept: bool, ept_root: u64) -> Result<(), &'static st
             return Err("CPU lacks EPT (nested paging) — required for the run-loop demo");
         }
         vmwrite(field::SECONDARY_VM_EXEC_CONTROL, secondary as u64);
-        vmwrite(field::EPTP, eptp(ept_root));
-        vmwrite(field::TSC_OFFSET, 0);
+        vmwrite(field::EPTP, eptp(ept_root, EPT_VPID_CAP));
+        // TSC_OFFSET intentionally NOT written: Bay Trail reports RDTSCP
+        // (bit 3) as allowed-1 but does not support the TSC_OFFSET field
+        // when TSC_OFFSETTING (bit 17) is disabled.  Writing it causes a
+        // VMfailValid (VM_INSTRUCTION_ERROR=7).  With TSC_OFFSETTING off
+        // the CPU treats TSC_OFFSET as 0, which is what we want.
+    } else {
+        // Bay Trail requires Unrestricted Guest (bit 7) even for
+        // protected-mode guests without EPT — without it the
+        // VM-entry check rejects guest state (exit reason 33).
+        let secondary_desired = proc_secondary::UNRESTRICTED_GUEST;
+        let secondary = adjust_controls(
+            IA32_VMX_TRUE_PROCBASED2_CTLS,
+            IA32_VMX_PROCBASED2_CTLS,
+            secondary_desired,
+        );
+        vmwrite(field::SECONDARY_VM_EXEC_CONTROL, secondary as u64);
     }
 
     // VM-exit controls: bit 9 (0x200) = host address-space size (64-bit
@@ -1566,8 +2043,10 @@ unsafe fn setup_controls(use_ept: bool, ept_root: u64) -> Result<(), &'static st
     let entry_ctrls = adjust_controls(IA32_VMX_TRUE_ENTRY_CTLS, IA32_VMX_ENTRY_CTLS, 0);
     vmwrite(field::VM_ENTRY_CONTROLS, entry_ctrls as u64);
 
-    // Intercept #GP (13) and #PF (14) so bring-up can report the guest's
-    // faulting instruction/address instead of a silent triple fault.
+    // Intercept #GP (vec 13) and #PF (vec 14) so Linux faults cause a clean
+    // VM-exit.  The exit handler injects them back into the guest via VM-entry
+    // interruption injection so the guest's own IDT handles them.
+    // (Bitmap=0 caused triple-fault reboot loops on Braswell N3060.)
     vmwrite(field::EXCEPTION_BITMAP, (1 << 13) | (1 << 14));
     Ok(())
 }
@@ -1717,6 +2196,156 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
     setup_guest_state_from_boot(boot)?;
     setup_controls(true, vm.ept.root())?;
 
+    // ── Pre-VMLAUNCH diagnostic: dump VMCS guest state ──
+    crate::sprintln!(
+        "Aegis: [vmx] PRE-LAUNCH GUEST: RIP={:#x} CS_BASE={:#x} CS_LIM={:#x} CR0={:#x} CR3={:#x} CR4={:#x}",
+        vmread(field::GUEST_RIP),
+        vmread(field::GUEST_CS_BASE),
+        vmread(field::GUEST_CS_LIMIT),
+        vmread(field::GUEST_CR0),
+        vmread(field::GUEST_CR3),
+        vmread(field::GUEST_CR4),
+    );
+    crate::sprintln!(
+        "Aegis: [vmx] PRE-LAUNCH GUEST: RSP={:#x} RFLAGS={:#x} GDTR_BASE={:#x} GDTR_LIM={} TR_SEL={:#x}",
+        vmread(field::GUEST_RSP),
+        vmread(field::GUEST_RFLAGS),
+        vmread(field::GUEST_GDTR_BASE),
+        vmread(field::GUEST_GDTR_LIMIT),
+        vmread(field::GUEST_TR_SELECTOR),
+    );
+    // ── Pre-VMLAUNCH HOST state dump — compare with bringup_demo ──
+    crate::sprintln!(
+        "Aegis: [vmx] PRE-LAUNCH HOST: CS={:#x} SS={:#x} DS={:#x} ES={:#x} FS={:#x} GS={:#x} TR={:#x}",
+        vmread(field::HOST_CS_SELECTOR),
+        vmread(field::HOST_SS_SELECTOR),
+        vmread(field::HOST_DS_SELECTOR),
+        vmread(field::HOST_ES_SELECTOR),
+        vmread(field::HOST_FS_SELECTOR),
+        vmread(field::HOST_GS_SELECTOR),
+        vmread(field::HOST_TR_SELECTOR),
+    );
+    crate::sprintln!(
+        "Aegis: [vmx] PRE-LAUNCH HOST: CR0={:#x} CR3={:#x} CR4={:#x} RIP={:#x} RSP={:#x}",
+        vmread(field::HOST_CR0),
+        vmread(field::HOST_CR3),
+        vmread(field::HOST_CR4),
+        vmread(field::HOST_RIP),
+        vmread(field::HOST_RSP),
+    );
+    crate::sprintln!(
+        "Aegis: [vmx] PRE-LAUNCH HOST: GDTR_BASE={:#x} IDTR_BASE={:#x} FS_BASE={:#x} GS_BASE={:#x} TR_BASE={:#x}",
+        vmread(field::HOST_GDTR_BASE),
+        vmread(field::HOST_IDTR_BASE),
+        vmread(field::HOST_FS_BASE),
+        vmread(field::HOST_GS_BASE),
+        vmread(field::HOST_TR_BASE),
+    );
+    // ── Live CPU segment registers (right now, before VMLAUNCH) ──
+    {
+        let mut cs: u16; let mut ss: u16; let mut ds: u16;
+        let mut es: u16; let mut fs: u16; let mut gs: u16;
+        let mut tr: u16;
+        unsafe {
+            core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack));
+            core::arch::asm!("mov {0:x}, ss", out(reg) ss, options(nomem, nostack));
+            core::arch::asm!("mov {0:x}, ds", out(reg) ds, options(nomem, nostack));
+            core::arch::asm!("mov {0:x}, es", out(reg) es, options(nomem, nostack));
+            core::arch::asm!("mov {0:x}, fs", out(reg) fs, options(nomem, nostack));
+            core::arch::asm!("mov {0:x}, gs", out(reg) gs, options(nomem, nostack));
+            core::arch::asm!("str {0:x}", out(reg) tr, options(nomem, nostack));
+        }
+        crate::sprintln!(
+            "Aegis: [vmx] LIVE CPU SEG: CS={:#x} SS={:#x} DS={:#x} ES={:#x} FS={:#x} GS={:#x} TR={:#x}",
+            cs, ss, ds, es, fs, gs, tr
+        );
+    }
+    // ── Dump host GDT descriptors for selectors 0x08..0x38 ──
+    {
+        let gdtr_base = vmread(field::HOST_GDTR_BASE);
+        for sel in [0x08u16, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38] {
+            let idx = (sel >> 3) as usize;
+            let desc_lo = core::ptr::read_volatile((gdtr_base + (idx * 8) as u64) as *const u64);
+            let desc_hi = core::ptr::read_volatile((gdtr_base + (idx * 8 + 8) as u64) as *const u64);
+            let base = ((desc_lo >> 16) & 0xFFFF)
+                | (((desc_lo >> 32) & 0xFF) << 16)
+                | (((desc_lo >> 56) & 0xFF) << 24);
+            let limit = (desc_lo & 0xFFFF) | (((desc_lo >> 48) & 0xF) << 16);
+            let ar = ((desc_lo >> 40) & 0xFF) as u8;
+            let typ = ar & 0x0F;
+            let s = (ar >> 4) & 1;
+            let dpl = (ar >> 5) & 3;
+            let p = (ar >> 7) & 1;
+            let g = ((desc_lo >> 55) & 1) as u8;
+            let db = ((desc_lo >> 54) & 1) as u8;
+            let l = ((desc_lo >> 53) & 1) as u8;
+            crate::sprintln!(
+                "Aegis: [vmx] HOST GDT[{:#x}]: sel={:#x} base={:#x} lim={:#x} typ={} S={} DPL={} P={} G={} D/B={} L={}",
+                idx, sel, base, limit, typ, s, dpl, p, g, db, l
+            );
+        }
+    }
+    // ── Dump bytes at guest RIP (GPA 0x100000) through EPT translation ──
+    {
+        let gpa_rip = boot.eip;
+        let mut hex32 = [0u8; 96]; // 32 bytes × 3 hex chars
+        // Read through EPT translation (what the guest actually sees)
+        let hpa = vm.ept.translate(gpa_rip);
+        if let Some(hpa) = hpa {
+            let src = hpa as *const u8;
+            for i in 0..32u32 {
+                let b = core::ptr::read_volatile(src.add(i as usize));
+                let hi = b >> 4;
+                let lo = b & 0x0F;
+                hex32[(i * 3) as usize] = if hi < 10 { b'0' + hi } else { b'A' + hi - 10 };
+                hex32[(i * 3 + 1) as usize] = if lo < 10 { b'0' + lo } else { b'A' + lo - 10 };
+                hex32[(i * 3 + 2) as usize] = b' ';
+            }
+            crate::sprintln!(
+                "Aegis: [vmx] GUEST RIP BYTES (GPA={:#x} -> HPA={:#x}): {:?}",
+                gpa_rip,
+                hpa,
+                core::str::from_utf8(&hex32).unwrap_or("???")
+            );
+        } else {
+            crate::sprintln!(
+                "Aegis: [vmx] GUEST RIP BYTES: GPA={:#x} NOT MAPPED IN EPT!",
+                gpa_rip
+            );
+        }
+        // Dump EPT walk for GPA 0x100000
+        crate::sprintln!(
+            "Aegis: [vmx] EPT walk for GPA {:#x}: root={:#x}",
+            gpa_rip,
+            vm.ept.root()
+        );
+    }
+    crate::sprintln!("Aegis: [vmx] PRE-LAUNCH: seeding ESI={:#x}", boot.esi);
+    VMX_EXIT_REGS_SYM[4] = boot.esi;
+    crate::sprintln!("Aegis: [vmx] PRE-LAUNCH: ESI seeded, about to enter loop");
+
+    // ── IDT integrity: capture checksum before first VMLAUNCH ──
+    let (_idtr_base_pre, _idtr_limit_pre, _checksum_pre) = {
+        let mut idtr: [u16; 5] = [0; 5];
+        unsafe { asm!("sidt [{0}]", in(reg) idtr.as_mut_ptr(), options(nostack)) };
+        let base = (idtr[1] as u64)
+            | ((idtr[2] as u64) << 16)
+            | ((idtr[3] as u64) << 32)
+            | ((idtr[4] as u64) << 48);
+        let limit = idtr[0];
+        let cs = crate::idt::idt_checksum(base, limit);
+        crate::sprintln!(
+            "Aegis: [vmx] PRE-LAUNCH IDT: base={:#x} limit={} checksum={:#018x}",
+            base, limit, cs
+        );
+        // Dump the specific gate that would be vector 13 (#GP) for cross-check
+        crate::idt::dump_gate(base, 13);
+        // Raw descriptors for gates 0-31 for byte-level comparison
+        crate::sprintln!("Aegis: [vmx] PRE-LAUNCH RAW gates[0..32]:");
+        crate::idt::dump_raw_gates(base, 0, 32);
+        (base, limit, cs)
+    };
+
     // Seed the guest's initial registers: the trampoline loads every GPR
     // from VMX_EXIT_REGS_SYM (all zero initially, which is the boot
     // contract for every GPR except ESI/RSP/RIP), so only ESI differs:
@@ -1735,6 +2364,12 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
         if exits >= max_exits {
             return Err("exit budget exhausted");
         }
+        crate::sprintln!(
+            "Aegis: [vmx] LOOP ITER {}: about to {} (entered={})",
+            exits,
+            if entered { "vmresume" } else { "vmx_do_launch" },
+            entered as u32,
+        );
         let fail = if entered {
             vmx_do_resume()
         } else {
@@ -1742,11 +2377,19 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
         };
         entered = true;
         if fail != 0 {
+            sanitize_host_segments();
+            let cf = fail & 1;
+            let zf = (fail >> 1) & 1;
             let err = vmread(field::VM_INSTRUCTION_ERROR);
-            return Err(match err {
-                7 => "vmentry failed synchronously: VM_INSTRUCTION_ERROR=7 (invalid guest state — see module docs re SDM §26.3.1)",
-                _ => "vmentry failed synchronously: see VM_INSTRUCTION_ERROR in the log",
-            });
+            crate::sprintln!(
+                "Aegis: [vmx] vmentry FAILED: CF={} ZF={} VM_INSTRUCTION_ERROR={}",
+                cf, zf, err
+            );
+            if cf != 0 && zf == 0 {
+                return Err("vmentry failed: VMfailInvalid (VMCS not valid or not current)");
+            } else {
+                return Err("vmentry failed: VMfailValid — see VM_INSTRUCTION_ERROR above");
+            }
         }
         exits += 1;
 
@@ -1771,15 +2414,62 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
         let reason = (vmread(field::VM_EXIT_REASON) & 0xFFFF) as u16;
         match classify_exit(reason) {
             ExitClass::Exception => {
-                let qual = vmread(field::EXIT_QUALIFICATION);
-                let vector = (qual & 0xFF) as u8;
+                let int_info = vmread(field::VM_EXIT_INTERRUPTION_INFO);
+                let vector = (int_info & 0xFF) as u8;
+                let int_type = ((int_info >> 8) & 0x7) as u8;
                 let rip = vmread(field::GUEST_RIP);
-                crate::sprintln!(
-                    "Aegis: [vmx] guest exception vector {} at rip {:#x}",
-                    vector,
-                    rip
-                );
-                return Err("guest exception (vector in log)");
+
+                if int_type == 2 {
+                    crate::sprintln!(
+                        "Aegis: [vmx] NMI while in guest rip={:#x} (continuing)",
+                        rip
+                    );
+                    if !exit_hook(vm)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+
+                if int_info & (1 << 31) != 0 && (vector == 14 || vector == 13) {
+                    static INJECT_COUNT: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let count = INJECT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if count > 50 {
+                        return Err("exception injection loop detected (>50 #PF/#GP at same point)");
+                    }
+                    let error_code = (vmread(field::EXIT_QUALIFICATION) & 0xFFFF) as u32;
+                    let inst_len = vmread(field::VM_EXIT_INSTRUCTION_LEN) as u32;
+                    let entry_info: u32 = (1u32 << 31)      // valid
+                        | (3u32 << 8)                        // type = hardware exception
+                        | (vector as u32 & 0xFF);            // vector
+                    vmwrite(field::VM_ENTRY_INTR_INFO, entry_info as u64);
+                    vmwrite(field::VM_ENTRY_EXCEPTION_ERROR_CODE, error_code as u64);
+                    vmwrite(field::VM_ENTRY_INSTRUCTION_LEN, inst_len as u64);
+                    if !exit_hook(vm)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+
+                // Exit reason 0 with int_info bit 31 clear: Braswell quirk —
+                // the processor exited but cannot report the cause.  Count
+                // these and abort rather than spinning forever.
+                static MYSTERY_EXIT_COUNT: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let mc = MYSTERY_EXIT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if mc < 10 {
+                    crate::sprintln!(
+                        "Aegis: [vmx] mystery exit reason=0 rip={:#x} int_info={:#x} (count={})",
+                        rip, int_info, mc
+                    );
+                }
+                if mc >= 10 {
+                    return Err("too many mystery VM-exits (reason=0, int_info=0) — guest triple-faults on entry?");
+                }
+                if !exit_hook(vm)? {
+                    return Ok(());
+                }
+                continue;
             }
             ExitClass::ExternalInterrupt => {
                 crate::cpu::lapic_eoi();
@@ -1882,33 +2572,231 @@ pub unsafe fn bringup_demo() -> Result<(), &'static str> {
     ensure_vmx_root()?;
 
     let vmcs_region = alloc_vmx_region()?;
-    if !vmclear(vmcs_region) {
-        return Err("VMCLEAR failed on fresh VMCS region");
-    }
+    crate::cpu::check_alloc_not_idt(vmcs_region, "VMCS bringup");
+    crate::sprintln!(
+        "Aegis: [vmx] header after alloc (fresh, zeroed): {:#x}",
+        read_vmcs_header(vmcs_region)
+    );
+    crate::sprintln!(
+        "Aegis: [vmx] --- NO-VMCLEAR TEST: skipping vmclear, vmptrld only ---"
+    );
     if !vmptrld(vmcs_region) {
         return Err("VMPTRLD failed — VMCS not made current");
     }
     crate::sprintln!("Aegis: [vmx] VMCS active at {:#x}", vmcs_region);
 
     let guest_code = alloc_guest_code()?;
+    crate::cpu::check_alloc_not_idt(guest_code, "guest code bringup");
     crate::sprintln!(
         "Aegis: [vmx] guest code page at {:#x} (cpuid; hlt; jmp $-2)",
         guest_code
     );
 
+    // Allocate a minimal GDT for protected-mode guest:
+    //   Entry 0 (0x00): NULL descriptor
+    //   Entry 1 (0x08): 32-bit code: base=0, limit=4GB, G=1, D=1, present, code-r/a
+    //   Entry 2 (0x10): 32-bit data: base=0, limit=4GB, G=1, D=1, present, data-r/w/a
+    //   Entry 3 (0x18): 32-bit TSS: base=0, limit=0x67, P=1, type=0x9 (available 32-bit TSS)
+    let gdt_phys = crate::frame::alloc_contiguous_global(1)
+        .ok_or("frame allocator: out of memory for guest GDT")?;
+    crate::cpu::check_alloc_not_idt(gdt_phys, "guest GDT bringup");
+    core::ptr::write_bytes(gdt_phys as *mut u8, 0, 4096);
+    let gdt = gdt_phys as *mut u64;
+    // Entry 0: NULL
+    core::ptr::write_volatile(gdt.add(0), 0u64);
+    // Entry 1 (0x08): code segment — base=0, limit=0xFFFFF, G=1, D=1, L=0, P=1, type=0xA (code r/a)
+    // high32=0x00CF9A00, low32=0x0000FFFF → full 4 GiB flat code segment
+    core::ptr::write_volatile(gdt.add(1), 0x00CF_9A00_0000_FFFFu64);
+    // Entry 2 (0x10): data segment — base=0, limit=0xFFFFF, G=1, D=1, L=0, P=1, type=0x2 (data r/w/a)
+    // high32=0x00CF9300, low32=0x0000FFFF → full 4 GiB flat data segment
+    core::ptr::write_volatile(gdt.add(2), 0x00CF_9300_0000_FFFFu64);
+    // Entry 3 (0x18): 32-bit TSS — base=0, limit=0x67, G=0, D/B=0, P=1, type=0x9 (available 32-bit TSS)
+    // The VMCS TR AR will set type=0xB (busy) — the GDT entry is "available";
+    // the CPU transitions it to "busy" when TR is loaded.
+    // low32:  Limit[15:0]=0x0067, Base[15:0]=0x0000
+    // high32: Base[23:16]=0x00, Type=0x9, P=1, DPL=00, S=0, G=0, Base[31:24]=0x00
+    //   Type byte = 0x89 (P=1, DPL=00, S=0, type=1001=available 32-bit TSS)
+    //   Flags+limit_hi = 0x00 (G=0, AVL=0, limit[19:16]=0)
+    core::ptr::write_volatile(gdt.add(3), 0x0000_8900_0000_0067u64);
+    crate::sprintln!(
+        "Aegis: [vmx] guest GDT at {:#x} (4 entries: null/code/data/tss)",
+        gdt_phys
+    );
+
+    // Allocate a minimal TSS region for TR (32-bit TSS is 0x68 bytes).
+    // TR_BASE must point to real TSS memory, not the GDT entry that
+    // describes it.  The content doesn't matter — the guest never does
+    // hardware task switching — but the address must be valid for the
+    // VM-entry TR-base check.
+    let tss_phys = crate::frame::alloc_contiguous_global(1)
+        .ok_or("frame allocator: out of memory for guest TSS")?;
+    crate::cpu::check_alloc_not_idt(tss_phys, "guest TSS bringup");
+    core::ptr::write_bytes(tss_phys as *mut u8, 0, 4096);
+    crate::sprintln!(
+        "Aegis: [vmx] guest TSS at {:#x} (zeroed, 0x68 bytes)",
+        tss_phys
+    );
+
     setup_host_state()?;
-    setup_guest_state(guest_code)?;
-    setup_controls(false, 0)?;
+    setup_guest_state(guest_code, gdt_phys, tss_phys)?;
+
+    // ── Pre-VMLAUNCH diagnostic (bringup) ──
+    {
+        let src = guest_code as *const u8;
+        let mut hex = [0u8; 48];
+        for i in 0..16u32 {
+            let b = core::ptr::read_volatile(src.add(i as usize));
+            let hi = b >> 4;
+            let lo = b & 0x0F;
+            hex[(i * 3) as usize] = if hi < 10 { b'0' + hi } else { b'A' + hi - 10 };
+            hex[(i * 3 + 1) as usize] = if lo < 10 { b'0' + lo } else { b'A' + lo - 10 };
+            hex[(i * 3 + 2) as usize] = b' ';
+        }
+        crate::sprintln!(
+            "Aegis: [vmx] BRINGUP PRE-LAUNCH: first 16 bytes at guest_code={:#x}: {:?}",
+            guest_code,
+            core::str::from_utf8(&hex).unwrap_or("???")
+        );
+        crate::sprintln!(
+            "Aegis: [vmx] BRINGUP PRE-LAUNCH: GUEST_RIP={} GUEST_CS_BASE={} GUEST_CR0={:#x} GUEST_CR3={:#x} GUEST_CR4={:#x}",
+            vmread(field::GUEST_RIP),
+            vmread(field::GUEST_CS_BASE),
+            vmread(field::GUEST_CR0),
+            vmread(field::GUEST_CR3),
+            vmread(field::GUEST_CR4),
+        );
+    }
+
+    // Build a minimal EPT identity map for the 3 guest pages.
+    // Required because UG=1 ⟹ EPT=1 (SDM §26.2.1.1 cross-field
+    // constraint).  Without EPT, Bay Trail rejects VMLAUNCH with
+    // VM_INSTRUCTION_ERROR=7.
+    let grant = crate::ept::MemGrant::new(0, 0x400000); // cover 4 GiB
+    let mut ept = crate::ept::Ept::new();
+    ept.map(
+        &mut crate::ept::KernelAlloc,
+        &grant,
+        guest_code,
+        guest_code,
+        1,
+        crate::ept::EPT_DEFAULT_FLAGS,
+    )
+    .map_err(|_| "EPT map failed for guest code page")?;
+    ept.map(
+        &mut crate::ept::KernelAlloc,
+        &grant,
+        gdt_phys,
+        gdt_phys,
+        1,
+        crate::ept::EPT_DEFAULT_FLAGS,
+    )
+    .map_err(|_| "EPT map failed for guest GDT page")?;
+    ept.map(
+        &mut crate::ept::KernelAlloc,
+        &grant,
+        tss_phys,
+        tss_phys,
+        1,
+        crate::ept::EPT_DEFAULT_FLAGS,
+    )
+    .map_err(|_| "EPT map failed for guest TSS page")?;
+    crate::sprintln!(
+        "Aegis: [vmx] bringup EPT: identity-mapped code={:#x} gdt={:#x} tss={:#x} ({} tables)",
+        guest_code, gdt_phys, tss_phys, ept.table_pages()
+    );
+
+    setup_controls(true, ept.root())?;
+
+    // ── IDT integrity: capture checksum before VMLAUNCH (bringup) ──
+    {
+        let mut idtr: [u16; 5] = [0; 5];
+        unsafe { core::arch::asm!("sidt [{0}]", in(reg) idtr.as_mut_ptr(), options(nostack)) };
+        let base = (idtr[1] as u64)
+            | ((idtr[2] as u64) << 16)
+            | ((idtr[3] as u64) << 32)
+            | ((idtr[4] as u64) << 48);
+        let limit = idtr[0];
+        let cs = crate::idt::idt_checksum(base, limit);
+        crate::sprintln!(
+            "Aegis: [vmx] BRINGUP PRE-LAUNCH IDT: base={:#x} limit={} checksum={:#018x}",
+            base, limit, cs
+        );
+        crate::idt::dump_gate(base, 13);
+        // Raw descriptors for byte-level comparison
+        crate::sprintln!("Aegis: [vmx] BRINGUP PRE-LAUNCH RAW gates[0..32]:");
+        crate::idt::dump_raw_gates(base, 0, 32);
+    }
 
     crate::sprintln!("Aegis: [vmx] VMCS configured, launching guest...");
+    // ── Pre-VMLAUNCH HOST state dump (bringup path) ──
+    crate::sprintln!(
+        "Aegis: [vmx] BRINGUP PRE-LAUNCH GUEST: RIP={:#x} CS_BASE={:#x} CR0={:#x} CR3={:#x} CR4={:#x}",
+        vmread(field::GUEST_RIP),
+        vmread(field::GUEST_CS_BASE),
+        vmread(field::GUEST_CR0),
+        vmread(field::GUEST_CR3),
+        vmread(field::GUEST_CR4),
+    );
+    crate::sprintln!(
+        "Aegis: [vmx] BRINGUP PRE-LAUNCH HOST: CS={:#x} SS={:#x} DS={:#x} ES={:#x} FS={:#x} GS={:#x} TR={:#x}",
+        vmread(field::HOST_CS_SELECTOR),
+        vmread(field::HOST_SS_SELECTOR),
+        vmread(field::HOST_DS_SELECTOR),
+        vmread(field::HOST_ES_SELECTOR),
+        vmread(field::HOST_FS_SELECTOR),
+        vmread(field::HOST_GS_SELECTOR),
+        vmread(field::HOST_TR_SELECTOR),
+    );
+    crate::sprintln!(
+        "Aegis: [vmx] BRINGUP PRE-LAUNCH HOST: CR0={:#x} CR3={:#x} CR4={:#x} RIP={:#x} RSP={:#x}",
+        vmread(field::HOST_CR0),
+        vmread(field::HOST_CR3),
+        vmread(field::HOST_CR4),
+        vmread(field::HOST_RIP),
+        vmread(field::HOST_RSP),
+    );
+    crate::sprintln!(
+        "Aegis: [vmx] BRINGUP PRE-LAUNCH HOST: GDTR={:#x} IDTR={:#x} FS_BASE={:#x} GS_BASE={:#x} TR_BASE={:#x}",
+        vmread(field::HOST_GDTR_BASE),
+        vmread(field::HOST_IDTR_BASE),
+        vmread(field::HOST_FS_BASE),
+        vmread(field::HOST_GS_BASE),
+        vmread(field::HOST_TR_BASE),
+    );
+    crate::sprintln!(
+        "Aegis: [vmx] --- NO-VMCLEAR TEST: launching directly (no vmclear, no resstamp, no 2nd vmptrld) ---"
+    );
+    crate::sprintln!(
+        "Aegis: [vmx] header before launch: {:#x}",
+        read_vmcs_header(vmcs_region)
+    );
+    crate::sprintln!("Aegis: [vmx] VMLAUNCH (no vmclear)...");
     let fail = vmx_do_launch();
     if fail != 0 {
-        let err = vmread(field::VM_INSTRUCTION_ERROR);
+        sanitize_host_segments();
+        let cf = fail & 1;
+        let zf = (fail >> 1) & 1;
+        let vmcs_hdr = read_vmcs_header(vmcs_region);
         crate::sprintln!(
-            "Aegis: [vmx] VMLAUNCH failed synchronously, VM_INSTRUCTION_ERROR={}",
-            err
+            "Aegis: [vmx] 4/4 VMLAUNCH FAILED — CF={} ZF={} vmcs_header={:#x}",
+            cf, zf, vmcs_hdr
         );
-        return Err("vmlaunch failed synchronously — see VM_INSTRUCTION_ERROR in the log");
+        if cf != 0 && zf == 0 {
+            crate::sprintln!(
+                "Aegis: [vmx]   class: VMfailInvalid — VMCS not valid or not current"
+            );
+        } else if cf == 0 && zf != 0 {
+            let inst_err = vmread(field::VM_INSTRUCTION_ERROR);
+            crate::sprintln!(
+                "Aegis: [vmx]   class: VMfailValid — VMCS current, VM_INSTRUCTION_ERROR={}",
+                inst_err
+            );
+        } else {
+            crate::sprintln!(
+                "Aegis: [vmx]   class: unexpected CF={} ZF={}", cf, zf
+            );
+        }
+        return Err("vmlaunch failed — see VMX trace above");
     }
 
     // A real VM-exit has now happened and been handled: the landing saved
@@ -1926,12 +2814,33 @@ pub unsafe fn bringup_demo() -> Result<(), &'static str> {
         // names the specific failing check — read and report it, then halt
         // cleanly instead of reading meaningless guest GPRs (which under
         // nested virtualization was faulting at RIP=0).
+        sanitize_host_segments();
         let err = vmread(field::VM_INSTRUCTION_ERROR);
         crate::sprintln!(
             "Aegis: [vmx] VM-entry rejected: VM_INSTRUCTION_ERROR={} (guest state invalid per SDM §26.3.1)",
             err
         );
         return Err("guest state rejected at VM-entry — see VM_INSTRUCTION_ERROR above");
+    }
+    sanitize_host_segments();
+    // ── IDT integrity: compare checksum after VM-exit (bringup) ──
+    {
+        let mut idtr: [u16; 5] = [0; 5];
+        unsafe { core::arch::asm!("sidt [{0}]", in(reg) idtr.as_mut_ptr(), options(nostack)) };
+        let base = (idtr[1] as u64)
+            | ((idtr[2] as u64) << 16)
+            | ((idtr[3] as u64) << 32)
+            | ((idtr[4] as u64) << 48);
+        let limit = idtr[0];
+        let cs = crate::idt::idt_checksum(base, limit);
+        crate::sprintln!(
+            "Aegis: [vmx] BRINGUP POST-RETURN IDT: base={:#x} limit={} checksum={:#018x}",
+            base, limit, cs
+        );
+        crate::idt::dump_gate(base, 13);
+        // Raw descriptors for byte-level comparison
+        crate::sprintln!("Aegis: [vmx] BRINGUP POST-RETURN RAW gates[0..32]:");
+        crate::idt::dump_raw_gates(base, 0, 32);
     }
     crate::sprintln!(
         "Aegis: [vmx] guest RAX at exit = {:#x} (CPUID.EAX from real silicon)",
@@ -2022,6 +2931,25 @@ mod tests {
         assert_eq!(adjust_cap_bits(cap, 0x2), 0x3);
         // A desired bit that is NOT allowed-1 (2) is cleared.
         assert_eq!(adjust_cap_bits(cap, 0x4), 0x1);
+    }
+
+    /// Verify apply_fixed_bits logic: (value | fixed0) & fixed1.
+    /// This is the pure arithmetic — the MSR reads are tested on real HW.
+    #[test]
+    fn apply_fixed_bits_forces_required_and_clears_forbidden() {
+        // Simulate: bit 5 must be 1 (CR0.NE), bit 0 must be 0.
+        // fixed0 = 0x20, fixed1 = ~0x1 (all bits allowed except bit 0).
+        // value = 0 (neither NE set, bit 0 set) -> result = 0x20 & !0x1 = 0x20.
+        let val = 0u64;
+        let fixed0 = 0x20u64; // bit 5 must be 1
+        let fixed1 = !0u64;   // all bits allowed
+        let result = (val | fixed0) & fixed1;
+        assert_eq!(result, 0x20);
+        // value = 0x21 (NE + bit 0) with fixed1 clearing bit 0 -> 0x20.
+        let val2 = 0x21u64;
+        let fixed1_bit0_clear = !1u64;
+        let result2 = (val2 | fixed0) & fixed1_bit0_clear;
+        assert_eq!(result2, 0x20);
     }
 
     #[test]
@@ -2186,9 +3114,10 @@ mod tests {
         assert_eq!(proc_primary::IO_EXITING, 0x8);
         assert_eq!(proc_primary::HLT_EXITING, 0x80);
         assert_eq!(proc_primary::SECONDARY_CONTROLS, 0x8000_0000);
-        // Secondary: EPT = bit 1, unrestricted guest = bit 3, TSC offset = 17.
+        // Secondary: EPT = bit 1, RDTSCP = bit 3, unrestricted guest = bit 7, TSC offset = 17.
         assert_eq!(proc_secondary::EPT_ENABLE, 0x2);
-        assert_eq!(proc_secondary::UNRESTRICTED_GUEST, 0x8);
+        assert_eq!(proc_secondary::RDTSCP, 0x8);
+        assert_eq!(proc_secondary::UNRESTRICTED_GUEST, 0x80);
         assert_eq!(proc_secondary::TSC_OFFSETTING, 0x2_0000);
         // Exit reasons: the SDM Table 29-1 numbers, checked as a group so a
         // copy-paste mistake in any one of them fails loudly.

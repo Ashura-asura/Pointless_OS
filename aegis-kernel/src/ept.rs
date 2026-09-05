@@ -387,12 +387,20 @@ unsafe fn write_entry(table: *mut u64, i: u64, val: u64) {
 // ---------------------------------------------------------------------
 
 /// Build the EPTP value for a VMCS from the EPT root's host-physical
-/// address (SDM §24.6.11): memory type WB (6) in bits 2:0, EPT accessed/
-/// dirty (bit 6), page-walk length 4 minus one (3) in bits 5:3, root in
-/// bits 51:12. Previously used `3<<7` (bits 7-8, which are reserved),
-/// causing KVM nested to reject the EPTP via `nested_vmx_check_eptp`.
-pub fn eptp(root: u64) -> u64 {
-    (root & ADDR_MASK) | (6) | (1 << 6) | (3 << 3)
+/// address (SDM §24.6.11): memory type in bits 2:0, EPT accessed/dirty
+/// (bit 6), page-walk length 4 minus one (3) in bits 5:3, root in
+/// bits 51:12.
+///
+/// `cap` is the value of `IA32_VMX_EPT_VPID_CAP` (MSR 0x48C):
+///   - bit 14 → WB memory type (6) is valid in bits 2:0
+///   - bit 21 → accessed/dirty (bit 6) is valid
+///
+/// Bay Trail (Silvermont) sets cap[21]=0, so AD must stay clear —
+/// otherwise the EPTP is rejected with VMfailValid error 7.
+pub fn eptp(root: u64, cap: u64) -> u64 {
+    let mt_wb = if cap & (1 << 14) != 0 { 6u64 } else { 0 };
+    let ad = if cap & (1 << 21) != 0 { 1u64 << 6 } else { 0 };
+    (root & ADDR_MASK) | mt_wb | ad | (3 << 3)
 }
 
 /// A decoded EPT-violation VM-exit (exit reason 28) qualification
@@ -834,9 +842,11 @@ mod tests {
     #[test]
     fn eptp_encodes_wb_walk_length_4_and_root() {
         let root = 0x1234_5678_9000u64;
-        let ep = eptp(root);
+        // Cap with both WB (bit 14) and AD (bit 21) supported.
+        let cap_full = (1u64 << 14) | (1u64 << 21);
+        let ep = eptp(root, cap_full);
         assert_eq!(ep & 0x7, 6, "memory type WB");
-        assert_eq!((ep >> 6) & 1, 1, "EPT enabled");
+        assert_eq!((ep >> 6) & 1, 1, "EPT AD enabled");
         assert_eq!(
             (ep >> 3) & 0x7,
             3,
@@ -847,6 +857,29 @@ mod tests {
         assert_eq!(ep & 0x000F_FFFF_FFFF_F000, root);
         // The fields live in disjoint bit ranges: no aliasing.
         assert_eq!(ep, root | 6 | (1 << 6) | (3 << 3));
+    }
+
+    #[test]
+    fn eptp_gates_ad_and_mt_on_cap() {
+        let root = 0x000F_F000u64;
+        // Cap with neither WB nor AD (Bay Trail scenario).
+        let cap_none = 0u64;
+        let ep_none = eptp(root, cap_none);
+        assert_eq!(ep_none & 0x7, 0, "MT_WB clear when cap[14]=0");
+        assert_eq!((ep_none >> 6) & 1, 0, "AD clear when cap[21]=0");
+        assert_eq!((ep_none >> 3) & 0x7, 3, "walk length always 3");
+
+        // Cap with WB only.
+        let cap_wb = 1u64 << 14;
+        let ep_wb = eptp(root, cap_wb);
+        assert_eq!(ep_wb & 0x7, 6, "MT_WB set when cap[14]=1");
+        assert_eq!((ep_wb >> 6) & 1, 0, "AD clear when cap[21]=0");
+
+        // Cap with AD only.
+        let cap_ad = 1u64 << 21;
+        let ep_ad = eptp(root, cap_ad);
+        assert_eq!(ep_ad & 0x7, 0, "MT_WB clear when cap[14]=0");
+        assert_eq!((ep_ad >> 6) & 1, 1, "AD set when cap[21]=1");
     }
 
     #[test]

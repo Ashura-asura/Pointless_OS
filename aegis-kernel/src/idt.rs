@@ -256,6 +256,167 @@ pub fn install_exception_handlers(idt: &mut Idt) {
     idt.set_handler(18, handler_simd_exception as *const () as u64, selector, 0);
 }
 
+// ── Diagnostic utilities for IDT integrity checking ──
+
+/// Read a single IDT gate from a raw IDT base address using raw byte reads.
+/// The packed struct field access was unreliable — this reads bytes directly.
+/// Returns (selector, offset, type_attr) for the given vector.
+/// Safety: `base` must point to a valid IDT with at least `vector+1` entries.
+pub unsafe fn read_gate(base: u64, vector: usize) -> (u16, u64, u8) {
+    let addr = base + (vector * 16) as u64;
+    let b0 = core::ptr::read_volatile(addr as *const u8);
+    let b1 = core::ptr::read_volatile((addr + 1) as *const u8);
+    let b2 = core::ptr::read_volatile((addr + 2) as *const u8);
+    let b3 = core::ptr::read_volatile((addr + 3) as *const u8);
+    let b4 = core::ptr::read_volatile((addr + 4) as *const u8);
+    let b5 = core::ptr::read_volatile((addr + 5) as *const u8);
+    let b6 = core::ptr::read_volatile((addr + 6) as *const u8);
+    let b7 = core::ptr::read_volatile((addr + 7) as *const u8);
+    let b8 = core::ptr::read_volatile((addr + 8) as *const u8);
+    let b9 = core::ptr::read_volatile((addr + 9) as *const u8);
+    let b10 = core::ptr::read_volatile((addr + 10) as *const u8);
+    let b11 = core::ptr::read_volatile((addr + 11) as *const u8);
+
+    let offset_low = u16::from_le_bytes([b0, b1]);
+    let selector = u16::from_le_bytes([b2, b3]);
+    // b4 = IST, b5 = type_attr
+    let type_attr = b5;
+    let offset_mid = u16::from_le_bytes([b6, b7]);
+    let offset_high = u32::from_le_bytes([b8, b9, b10, b11]);
+
+    let offset = (offset_low as u64)
+        | ((offset_mid as u64) << 16)
+        | ((offset_high as u64) << 32);
+    (selector, offset, type_attr)
+}
+
+/// XOR-based checksum over an IDT region. Cheap and catches any byte change.
+/// `limit` is the IDTR.limit value (size - 1).
+pub fn idt_checksum(base: u64, limit: u16) -> u64 {
+    let len = (limit as usize) + 1;
+    let mut acc: u64 = 0;
+    for i in 0..len {
+        let b = unsafe { core::ptr::read_volatile((base + i as u64) as *const u8) };
+        acc ^= (b as u64) << ((i & 7) * 8);
+    }
+    acc
+}
+
+/// Dump all non-zero IDT gates (selector != 0 or offset != 0).
+/// Useful at boot to confirm the IDT contents, and after VM-exit to detect corruption.
+pub fn dump_all_gates(base: u64) {
+    for v in 0..256usize {
+        let (sel, off, attr) = unsafe { read_gate(base, v) };
+        if sel != 0 || off != 0 {
+            let present = (attr >> 7) & 1;
+            let dpl = (attr >> 5) & 3;
+            let gate_type = attr & 0x0F;
+            crate::sprintln!(
+                "Aegis: [idt] gate[{:3}] sel={:#06X} off={:#018X} type={} DPL={} P={}",
+                v, sel, off, gate_type, dpl, present
+            );
+        }
+    }
+}
+
+/// Dump a single IDT gate decoded from a raw base + vector.
+pub fn dump_gate(base: u64, vector: usize) {
+    let (sel, off, attr) = unsafe { read_gate(base, vector) };
+    let present = (attr >> 7) & 1;
+    let dpl = (attr >> 5) & 3;
+    let gate_type = attr & 0x0F;
+    crate::sprintln!(
+        "Aegis: [idt] gate[{:3}] sel={:#06X} off={:#018X} type={} DPL={} P={}",
+        vector, sel, off, gate_type, dpl, present
+    );
+}
+
+/// Dump raw 16-byte IDT descriptors for gates `start..end`.
+/// Prints the exact byte layout so corruption can be identified at byte level.
+/// Each line: `RAW gate[NN]: HH HH HH HH HH HH HH HH HH HH HH HH HH HH HH HH`
+pub fn dump_raw_gates(base: u64, start: usize, end: usize) {
+    for v in start..end {
+        let addr = base + (v * 16) as u64;
+        let mut raw = [0u8; 16];
+        for i in 0..16u64 {
+            raw[i as usize] = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
+        }
+        crate::sprintln!(
+            "Aegis: [idt] RAW gate[{:2}]: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+            v,
+            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]
+        );
+        // Also decode the entry for cross-reference
+        let sel = u16::from_le_bytes([raw[2], raw[3]]);
+        let off_lo = u16::from_le_bytes([raw[0], raw[1]]);
+        let off_mid = u16::from_le_bytes([raw[6], raw[7]]);
+        let off_hi = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+        let offset = (off_lo as u64) | ((off_mid as u64) << 16) | ((off_hi as u64) << 32);
+        let type_attr = raw[5];
+        let present = (type_attr >> 7) & 1;
+        let dpl = (type_attr >> 5) & 3;
+        let gate_type = type_attr & 0x0F;
+        crate::sprintln!(
+            "Aegis: [idt] DECODE gate[{:2}]: sel={:#06X} off={:#018X} type={} DPL={} P={}",
+            v, sel, offset, gate_type, dpl, present
+        );
+    }
+}
+
+/// Dump raw 16-byte IDT descriptor for a single gate and decode it.
+pub fn dump_raw_gate(base: u64, vector: usize) {
+    dump_raw_gates(base, vector, vector + 1);
+}
+
+/// Dump raw bytes of the entire IDT region (every 256 bytes for first 4K).
+/// Prints 16 bytes per line with address prefix.
+pub fn dump_idt_raw_region(base: u64) {
+    for chunk in (0..4096u64).step_by(16) {
+        let addr = base + chunk;
+        let mut raw = [0u8; 16];
+        for i in 0..16u64 {
+            raw[i as usize] = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
+        }
+        // Only dump lines that are non-zero (to keep output manageable)
+        let all_zero = raw.iter().all(|&b| b == 0);
+        if !all_zero {
+            crate::sprintln!(
+                "Aegis: [idt] RAW {:#x}: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                addr,
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]
+            );
+        }
+    }
+}
+
+/// Decode a #GP error code and dump the relevant IDT gate.
+/// `err` is the raw error code, `idtr_base` is the current IDTR base.
+pub fn dump_gp_error(err: u64, idtr_base: u64) {
+    let ext = err & 1;
+    let idt = (err >> 1) & 1;
+    let index = (err >> 3) & 0x1FFF;
+    crate::sprintln!(
+        "Aegis: [idt] #GP decode: EXT={} IDT={} index={:#x} (raw err={:#x})",
+        ext, idt, index, err
+    );
+    if idt == 1 {
+        crate::sprintln!(
+            "Aegis: [idt] #GP references IDT gate[{}], dumping gate:",
+            index
+        );
+        dump_gate(idtr_base, index as usize);
+    } else {
+        let ti = (err >> 2) & 1;
+        crate::sprintln!(
+            "Aegis: [idt] #GP references {}[{}]",
+            if ti == 1 { "LDT" } else { "GDT" },
+            index
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
