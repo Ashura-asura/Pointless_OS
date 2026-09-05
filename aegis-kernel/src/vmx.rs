@@ -1635,12 +1635,12 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
     let boot = vm.boot_state().ok_or("guest not loaded")?;
     setup_host_state()?;
 
-    // ── Dump first 16 bytes at the32-bit entry point ──
+    // ── Dump first 32 bytes at the 32-bit entry point ──
     {
         if let Some(hpa) = vm.ept.translate(crate::vm::CODE32_GPA) {
             let src = hpa as *const u8;
-            let mut hex = [0u8; 48];
-            for i in 0..16u32 {
+            let mut hex = [0u8; 96]; // 32 bytes × 3 hex chars
+            for i in 0..32u32 {
                 let b = core::ptr::read_volatile(src.add(i as usize));
                 let hi = b >> 4;
                 let lo = b & 0x0F;
@@ -1649,7 +1649,7 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
                 hex[(i * 3 + 2) as usize] = b' ';
             }
             crate::sprintln!(
-                "Aegis: [vmx] guest boot: first 16 bytes at {:#x} (hpa={:#x}): {:?}",
+                "Aegis: [vmx] guest boot: first 32 bytes at {:#x} (hpa={:#x}): {:?}",
                 crate::vm::CODE32_GPA,
                 hpa,
                 core::str::from_utf8(&hex).unwrap_or("?")
@@ -2480,6 +2480,9 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
     let mut exits = 0u64;
     let mut inject_count = 0u32;
     let mut mystery_count = 0u32;
+    let mut last_inject_rip: u64 = 0;
+    let mut last_inject_vec: u8 = 0;
+    let mut consecutive_same_rip: u32 = 0;
     // Virtual-clock bookkeeping: the last host TSC sample and the
     // sub-millisecond accumulator (µs), so fractional per-exit deltas are
     // not lost to integer rounding.
@@ -2563,16 +2566,36 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
 
                 if int_info & (1 << 31) != 0 && (vector == 14 || vector == 13) {
                     inject_count += 1;
+
+                    // Consecutive-same-RIP hard stop: if the same vector
+                    // fires at the same RIP more than 10 times in a row,
+                    // the guest is stuck and re-injecting is pointless.
+                    if rip == last_inject_rip && vector == last_inject_vec {
+                        consecutive_same_rip += 1;
+                    } else {
+                        consecutive_same_rip = 1;
+                        last_inject_rip = rip;
+                        last_inject_vec = vector;
+                    }
+                    if consecutive_same_rip > 10 {
+                        let err_q = vmread(field::EXIT_QUALIFICATION);
+                        crate::sprintln!(
+                            "Aegis: [vmx] FATAL: exception injection loop — vec={} rip={:#x} err_qual={:#x} int_info={:#x} (consecutive={})",
+                            vector, rip, err_q, int_info, consecutive_same_rip
+                        );
+                        return Err("exception injection loop: same vector+RIP fired >10 times — guest is stuck");
+                    }
+
                     if inject_count <= 5 || inject_count % 100 == 0 {
                         let err_q = vmread(field::EXIT_QUALIFICATION);
                         crate::sprintln!(
-                            "Aegis: [vmx] inject vec={} rip={:#x} err_qual={:#x} int_info={:#x} (count={})",
-                            vector, rip, err_q, int_info, inject_count
+                            "Aegis: [vmx] inject vec={} rip={:#x} err_qual={:#x} int_info={:#x} (total={}, consecutive={})",
+                            vector, rip, err_q, int_info, inject_count, consecutive_same_rip
                         );
                     }
                     if inject_count > 2000 {
                         return Err(
-                            "exception injection loop detected (>50 #PF/#GP at same point)",
+                            "total injection count exceeded (>2000 total #PF/#GP)",
                         );
                     }
                     let error_code =
