@@ -369,7 +369,7 @@ impl GuestBoot {
             tr: 0x18,
             tss_base: TSS_GPA,
             tss_limit: 0x67,
-            cr0: 0x6000_0031, // PE | CD | NW | ET | NE (KVM nested's guest-CR0 validity requires CD and NW)
+            cr0: 0x0000_0031, // PE | ET | NE — CD and NW must be 0 when PG=0 (SDM §26.3.1.1)
             cr3: 0,           // paging on (PG) needs a real page directory — supplied by the loader
             cr4: 0x2010,      // VMXE | PSE (4 MiB-page identity directory needs PSE)
             rflags: 0x2,
@@ -1012,7 +1012,7 @@ mod tests {
         assert_eq!((st.cs, st.ds, st.ss, st.tr), (0x08, 0x10, 0x10, 0x18));
         assert_eq!((st.gdt_base, st.gdt_limit), (GDT_GPA, 31));
         assert_eq!((st.tss_base, st.tss_limit), (TSS_GPA, 0x67));
-        assert_eq!(st.cr0, 0x6000_0031); // PE | CD | NW | ET | NE
+        assert_eq!(st.cr0, 0x0000_0031); // PE | ET | NE
         assert_eq!(st.cr3, 0); // loader supplies the page directory
         assert_eq!(st.cr4, 0x2010); // VMXE | PSE
         assert_eq!(st.rflags, 0x2);
