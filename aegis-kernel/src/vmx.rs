@@ -1785,26 +1785,29 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
         &mut ept_handler,
         &mut exit_hook,
     );
-    // ── IDT integrity: compare checksum after guest boot VM-exit loop ──
+    // ── Guest IDT diagnostic (read via VMCS + EPT, NOT host sidt) ──
+    // The host IDTR is reloaded by VMX hardware on every VM-exit, so
+    // `sidt` always shows the host's IDT — useless for diagnosing
+    // guest faults. Read the guest's actual IDTR from the VMCS.
     {
-        let mut idtr: [u16; 5] = [0; 5];
-        unsafe { core::arch::asm!("sidt [{0}]", in(reg) idtr.as_mut_ptr(), options(nostack)) };
-        let base = (idtr[1] as u64)
-            | ((idtr[2] as u64) << 16)
-            | ((idtr[3] as u64) << 32)
-            | ((idtr[4] as u64) << 48);
-        let limit = idtr[0];
-        let cs = crate::idt::idt_checksum(base, limit);
+        let idt_base = vmread(field::GUEST_IDTR_BASE);
+        let idt_limit = vmread(field::GUEST_IDTR_LIMIT) as u16;
         crate::sprintln!(
-            "Aegis: [vmx] GUEST BOOT POST-RETURN IDT: base={:#x} limit={} checksum={:#018x}",
-            base,
-            limit,
-            cs
+            "Aegis: [vmx] GUEST POST-VMEXIT IDTR: base={:#x} limit={:#x}",
+            idt_base,
+            idt_limit
         );
-        crate::idt::dump_gate(base, 13);
-        // Raw descriptors for byte-level comparison
-        crate::sprintln!("Aegis: [vmx] GUEST BOOT POST-RETURN RAW gates[0..32]:");
-        crate::idt::dump_raw_gates(base, 0, 32);
+        // Dump gate 13 from the guest's IDT via EPT translation.
+        if let Some(hpa) = vm.ept.translate(idt_base) {
+            crate::idt::dump_gate(hpa, 13);
+            crate::sprintln!("Aegis: [vmx] GUEST POST-VMEXIT RAW gates[0..32]:");
+            crate::idt::dump_raw_gates(hpa, 0, 32);
+        } else {
+            crate::sprintln!(
+                "Aegis: [vmx] GUEST POST-VMEXIT IDT: WARNING — cannot translate guest IDT base {:#x}",
+                idt_base
+            );
+        }
     }
     match result {
         Ok(()) if marker_exit.is_some() => {
@@ -2566,6 +2569,46 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
 
                 if int_info & (1 << 31) != 0 && (vector == 14 || vector == 13) {
                     inject_count += 1;
+
+                    // One-time: dump the guest's actual IDTR from VMCS
+                    // (not host sidt) + CS/CR0/CR4 at first exception.
+                    if inject_count == 1 {
+                        let g_idtr_base = vmread(field::GUEST_IDTR_BASE);
+                        let g_idtr_limit = vmread(field::GUEST_IDTR_LIMIT);
+                        let g_cs = vmread(field::GUEST_CS_SELECTOR);
+                        let g_cs_base = vmread(field::GUEST_CS_BASE);
+                        let g_cs_limit = vmread(field::GUEST_CS_LIMIT);
+                        let g_cs_ar = vmread(field::GUEST_CS_AR_BYTES);
+                        let g_cr0 = vmread(field::GUEST_CR0);
+                        let g_cr4 = vmread(field::GUEST_CR4);
+                        let g_rip = vmread(field::GUEST_RIP);
+                        crate::sprintln!(
+                            "Aegis: [vmx] FIRST EXCEPTION CONTEXT: rip={:#x} vec={} int_info={:#x}",
+                            g_rip, vector, int_info
+                        );
+                        crate::sprintln!(
+                            "Aegis: [vmx]   guest IDTR: base={:#x} limit={:#x}",
+                            g_idtr_base, g_idtr_limit
+                        );
+                        crate::sprintln!(
+                            "Aegis: [vmx]   guest CS: sel={:#x} base={:#x} limit={:#x} AR={:#x}",
+                            g_cs, g_cs_base, g_cs_limit, g_cs_ar
+                        );
+                        crate::sprintln!(
+                            "Aegis: [vmx]   guest CR0={:#x} CR4={:#x}",
+                            g_cr0, g_cr4
+                        );
+                        // Dump the first 2 gates from the guest's actual IDT
+                        // via EPT translate — confirms the iret gadget is there.
+                        if let Some(idt_hpa) = vm.ept.translate(g_idtr_base) {
+                            crate::sprintln!(
+                                "Aegis: [vmx]   guest IDT at GPA {:#x} = HPA {:#x}",
+                                g_idtr_base,
+                                idt_hpa
+                            );
+                            crate::idt::dump_raw_gates(idt_hpa, 0, 4);
+                        }
+                    }
 
                     // Consecutive-same-RIP hard stop: if the same vector
                     // fires at the same RIP more than 10 times in a row,
