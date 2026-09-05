@@ -45,10 +45,10 @@ implemented as research milestones** (design + a first real implementation per
 phase — see the evidence taxonomy in `Docs/HONEST_STATUS.md` for what "done"
 means for each feature), with the core architectural claim — a role-granted,
 zero-capability AI agent that provably cannot self-escalate, running one real
-task — verified live under QEMU. The **live test suite is 1,015 tests**:
-**856 in `aegis-kernel`** (contract tests over the real kernel, **859 with
-`--features vmx-demo`**), **137 in the `aegis` model crates**, and **22 in
-`uefi-boot`** (loader + ELF parsing); fmt/clippy-clean. The authoritative
+task — verified live under QEMU. The **live test suite is 949 tests**:
+**798 in `aegis-kernel`** (contract tests over the real kernel, **795 with
+`--features vmx-demo`**), **137 in the `aegis` model crates**, and **9 in
+`uefi-boot`** (loader + ELF parsing + fleet-CFG); fmt/clippy-clean. The authoritative
 totals are emitted by CI to `test-summary.json`. An external audit of
 the kernel (2026-08-19) found a critical `ipc_cap_grant` bounds bug and
 several boundary holes; all are fixed with adversarial tests, and the honest
@@ -112,11 +112,15 @@ serial logs + framebuffer captures):
   version 4.5, sample-rate playback live)**. **Execution evidence:** Aegis has
   demonstrated live nested VT-x activation and genuine EPT VM-exit handling
   (VMXON → VMCS → VMLAUNCH → guest → EPT violation → real VM exit, under
-  QEMU/KVM nested virt). **What is NOT yet proven:** sustained guest
-  instruction execution through the run loop — the guest does not yet execute a
-  stable stream of instructions, take repeated exits/resumes, or reach an
-  emulated device. So: *hypervisor execution has begun, but guest execution is
-  broken.* Aegis is neither a functioning hypervisor nor unimplemented.
+  QEMU/KVM nested virt). **Phase U-7 progress:** the VMCS field-encoding root
+  cause was found (`VM_EXIT_INTERRUPTION_INFO` was `0x440E` not `0x4404`),
+  the Linux guest CR0 CD/NW bits were fixed, exception injection back into the
+  guest is now working (#PF/#GP injected with error code and CR2 write), and a
+  minimal guest IDT with iret handlers was written into guest memory.
+  **What is NOT yet proven:** the Linux bzImage takes #GP(0) on its very first
+  instruction at RIP=0x100000 (error code 0) — the boot protocol or code
+  image setup needs further investigation. So: *guest exception delivery is
+  wired but the first instruction faults.*
 - **Host-side ACPI + SMP groundwork**: the kernel reads the *real* RSDP/RSDT/
   MADT tables QEMU/OVMF expose (three-tier search; >4 GiB entries rejected by
   the identity map) and enumerates the CPUs/APICs (`SMP: 2 processor(s)
@@ -144,8 +148,9 @@ Limits section, split into *closed / reduced / inherent*):
   scalar (no CSPRNG in the guest); no certificate-chain verification.
 - Windows/Linux compat is translation-layer only; the hypervisor path (VMX
   run loop, EPT, guest device models, real Linux guest image) has demonstrated
-  live nested VT-x activation and EPT VM-exit handling, but has not yet
-  demonstrated sustained guest instruction execution.
+  live nested VT-x activation and EPT VM-exit handling, with exception
+  injection into the guest working, but the guest's first instruction
+  faults (#GP at 0x100000) — guest execution is not yet sustained.
 - The kernel is single-threaded; contract tests prove the model, not
   production behavior.
 
@@ -181,8 +186,8 @@ loader respectively.
 
 - Run the full kernel suite:
   ```
-  cd aegis-kernel && cargo test --release            # 754 tests
-  cd aegis-kernel && cargo test --features vmx-demo  # 757 tests
+  cd aegis-kernel && cargo test --release            # 795 tests
+  cd aegis-kernel && cargo test --features vmx-demo  # 798 tests
   ```
 - Run the model crates:
   ```
@@ -216,8 +221,9 @@ the demo scripts' headers.
 2. Real DMAR IOMMU programming and interrupt-driven (MSI-X) NIC paths.
 3. Aegis-hosted VM path: the hypervisor groundwork (VMX run loop, EPT, guest
    device models incl. UHCI/SB16, real Linux guest image, guest-ACPI seam) has
-   demonstrated live nested VT-x activation and EPT VM-exit handling, but guest
-   execution is not yet sustained — that is the next VMX milestone.
+   demonstrated live nested VT-x activation and EPT VM-exit handling, with
+   exception injection working (Phase U-7), but the Linux guest takes #GP(0)
+   on its first instruction — that is the next VMX milestone.
 4. More desktop apps on the live desktop: multi-instance spawning (taskbar
    "launch" currently raises the one boot-time instance of each app) and a
    manifest-driven app model (the desktop roadmap itself is complete).

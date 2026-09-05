@@ -377,7 +377,10 @@ pub unsafe fn init_ioapic_legacy() {
     let mouse_gsi = gsi_for(12) as u32;
     crate::sprintln!(
         "Aegis: [ioapic] version={:#x} max_entries={} keyboard_gsi={} mouse_gsi={}",
-        ver, max_entries, keyboard_gsi, mouse_gsi
+        ver,
+        max_entries,
+        keyboard_gsi,
+        mouse_gsi
     );
     for i in 0..max_entries {
         let low = ioapic_read(0x10 + 2 * i);
@@ -387,13 +390,19 @@ pub unsafe fn init_ioapic_legacy() {
         let dest = (high >> 24) & 0xFF;
         crate::sprintln!(
             "Aegis: [ioapic] entry[{}] vec={} mask={} dest={:#x} low={:#x} high={:#x}",
-            i, vec, masked, dest, low, high
+            i,
+            vec,
+            masked,
+            dest,
+            low,
+            high
         );
         // Mask entries we don't own (skip keyboard and mouse GSI)
         if i != keyboard_gsi && i != mouse_gsi && masked == 0 {
             crate::sprintln!(
                 "Aegis: [ioapic] MASKING entry[{}] vec={} (was unmasked, not ours)",
-                i, vec
+                i,
+                vec
             );
             ioapic_write(0x10 + 2 * i, low | (1 << 16)); // set mask bit
         }
@@ -487,13 +496,15 @@ pub fn check_alloc_not_idt(phys: u64, label: &str) {
     if idt != 0 && phys == idt {
         crate::sprintln!(
             "Aegis: *** PANIC *** IDT FRAME DOUBLE ALLOCATION: {} at {:#x} == IDT_FRAME {:#x}!",
-            label, phys, idt
+            label,
+            phys,
+            idt
         );
-        crate::sprintln!(
-            "Aegis: *** The frame allocator is about to overwrite the IDT. Halting."
-        );
+        crate::sprintln!("Aegis: *** The frame allocator is about to overwrite the IDT. Halting.");
         loop {
-            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+            unsafe {
+                core::arch::asm!("hlt", options(nomem, nostack));
+            }
         }
     }
 }
@@ -539,7 +550,25 @@ pub unsafe fn init_idt() {
     // uninitialized IDT gate (e.g. UEFI-configured I/O APIC entries).
     let spurious_addr = spurious_handler as *const () as u64;
     let vectors_with_handlers: &[usize] = &[
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
         TIMER_VECTOR as usize,
         crate::ps2::KEYBOARD_VECTOR as usize,
         crate::ps2_mouse::MOUSE_VECTOR as usize,
@@ -562,7 +591,10 @@ pub unsafe fn init_idt() {
         let limit = idtr[0];
         crate::sprintln!(
             "Aegis: [idt] POST-LIDT verify: IDTR base={:#x} limit={} IDT_FRAME={:#x} match={}",
-            base, limit, frame, base == frame
+            base,
+            limit,
+            frame,
+            base == frame
         );
         crate::idt::dump_raw_gate(base, 13);
     }
@@ -692,16 +724,19 @@ pub unsafe fn init_lapic_timer() -> u64 {
     // UEFI may have left it as 0x27 (39), which causes #GP on uninitialized
     // IDT gates when the LAPIC delivers a spurious interrupt.
     lapic_write(0xF0, (svr & !0xFF) | 0xFF | 0x100); // vector=0xFF, software enable
-    // Mask ALL LVT entries we don't use. UEFI may have left them configured
-    // with arbitrary vectors. Only keep LVT Timer (0x320) and LINT0 (0x350)
-    // which is needed for ExtINT (PIC passthrough).
+                                                     // Mask ALL LVT entries we don't use. UEFI may have left them configured
+                                                     // with arbitrary vectors. Only keep LVT Timer (0x320) and LINT0 (0x350)
+                                                     // which is needed for ExtINT (PIC passthrough).
     let lvt_thermal = lapic_read(0x330);
     let lvt_pmc = lapic_read(0x340);
     let lvt1 = lapic_read(0x360);
     let lvt_err = lapic_read(0x370);
     crate::sprintln!(
         "Aegis: [lapic] LVT thermal={:#x} pmc={:#x} lint1={:#x} err={:#x}",
-        lvt_thermal, lvt_pmc, lvt1, lvt_err
+        lvt_thermal,
+        lvt_pmc,
+        lvt1,
+        lvt_err
     );
     crate::sprintln!(
         "Aegis: [lapic] LVT thermal.vector={} lint1.vector={} pmc.vector={} err.vector={}",
@@ -713,9 +748,9 @@ pub unsafe fn init_lapic_timer() -> u64 {
     // Mask thermal, PMC, LINT1, error — set mask bit (bit 16) and disable
     // by setting delivery mode to 0 and vector to 0.
     lapic_write(0x330, lvt_thermal | 0x1_0000); // mask thermal
-    lapic_write(0x340, lvt_pmc | 0x1_0000);    // mask PMC
-    lapic_write(0x360, lvt1 | 0x1_0000);        // mask LINT1
-    lapic_write(0x370, lvt_err | 0x1_0000);     // mask error
+    lapic_write(0x340, lvt_pmc | 0x1_0000); // mask PMC
+    lapic_write(0x360, lvt1 | 0x1_0000); // mask LINT1
+    lapic_write(0x370, lvt_err | 0x1_0000); // mask error
     lapic_write(0x320, 0x2_0030); // LVT timer: periodic (bit 17), vector 0x30, unmasked
     lapic_write(0x3E0, 0x3); // divide configuration: 16
                              // Quantum length: initial count 0x40000 (~16 ms at the QEMU APIC bus).
@@ -841,13 +876,17 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
         let idt_phys = idt_frame_phys();
         crate::sprintln!(
             "Aegis: [GP] IDTR base={:#x} limit={} IDT_FRAME={:#x} match={}",
-            idtr_base, idtr_limit, idt_phys, idtr_base == idt_phys
+            idtr_base,
+            idtr_limit,
+            idt_phys,
+            idtr_base == idt_phys
         );
         // Print IOAPIC_BASE unconditionally
         let ioapic = unsafe { IOAPIC_BASE };
         crate::sprintln!(
             "Aegis: [GP] IOAPIC_BASE={:#x} LAPIC_BASE={:#x}",
-            ioapic, unsafe { LAPIC_BASE }
+            ioapic,
+            unsafe { LAPIC_BASE }
         );
         // Decode the error code
         crate::idt::dump_gp_error(err, idtr_base);
@@ -856,14 +895,16 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
         let rflags_val = unsafe { *frame.add(frame_rip_index(true) + 2) };
         crate::sprintln!(
             "Aegis: [GP] interrupted: CS={:#x} RFLAGS={:#x}",
-            cs_val, rflags_val
+            cs_val,
+            rflags_val
         );
         // The error code tells us which vector caused the #GP.
         // For error code 0x13B: EXT=1 IDT=1 index=0x27=39
         let idx = (err >> 3) & 0x1FFF;
         crate::sprintln!(
             "Aegis: [GP] #GP is about IDT vector {} (0x{:X}), NOT vector 13",
-            idx, idx
+            idx,
+            idx
         );
         // Dump the ACTUAL referenced gate as raw bytes + decoded
         crate::sprintln!("Aegis: [GP] gate[{}] RAW dump:", idx);
@@ -880,7 +921,8 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
         }
         crate::sprintln!(
             "Aegis: [GP] PIC masks: master=0b{:08b} slave=0b{:08b} (0=unmasked)",
-            master_pic_mask, slave_pic_mask
+            master_pic_mask,
+            slave_pic_mask
         );
         // Decode which IRQs are unmasked
         crate::sprintln!(
@@ -889,18 +931,50 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
             if master_pic_mask & 2 == 0 { "1" } else { "-" },
             if master_pic_mask & 4 == 0 { "2" } else { "-" },
             if master_pic_mask & 8 == 0 { "3" } else { "-" },
-            if master_pic_mask & 0x10 == 0 { "4" } else { "-" },
-            if master_pic_mask & 0x20 == 0 { "5" } else { "-" },
-            if master_pic_mask & 0x40 == 0 { "6" } else { "-" },
-            if master_pic_mask & 0x80 == 0 { "7" } else { "-" },
+            if master_pic_mask & 0x10 == 0 {
+                "4"
+            } else {
+                "-"
+            },
+            if master_pic_mask & 0x20 == 0 {
+                "5"
+            } else {
+                "-"
+            },
+            if master_pic_mask & 0x40 == 0 {
+                "6"
+            } else {
+                "-"
+            },
+            if master_pic_mask & 0x80 == 0 {
+                "7"
+            } else {
+                "-"
+            },
             if slave_pic_mask & 1 == 0 { "8" } else { "-" },
             if slave_pic_mask & 2 == 0 { "9" } else { "-" },
             if slave_pic_mask & 4 == 0 { "10" } else { "-" },
             if slave_pic_mask & 8 == 0 { "11" } else { "-" },
-            if slave_pic_mask & 0x10 == 0 { "12" } else { "-" },
-            if slave_pic_mask & 0x20 == 0 { "13" } else { "-" },
-            if slave_pic_mask & 0x40 == 0 { "14" } else { "-" },
-            if slave_pic_mask & 0x80 == 0 { "15" } else { "-" },
+            if slave_pic_mask & 0x10 == 0 {
+                "12"
+            } else {
+                "-"
+            },
+            if slave_pic_mask & 0x20 == 0 {
+                "13"
+            } else {
+                "-"
+            },
+            if slave_pic_mask & 0x40 == 0 {
+                "14"
+            } else {
+                "-"
+            },
+            if slave_pic_mask & 0x80 == 0 {
+                "15"
+            } else {
+                "-"
+            },
         );
         // Dump gate 39 specifically (vector 0x27) — raw bytes + decoded
         crate::sprintln!("Aegis: [GP] gate[39] (0x27) RAW dump — THE FAULTING VECTOR:");
@@ -921,7 +995,9 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
             };
             crate::sprintln!(
                 "Aegis: [GP] LAPIC SVR={:#010x} (vec={} en={})",
-                svr, svr & 0xFF, (svr >> 8) & 1
+                svr,
+                svr & 0xFF,
+                (svr >> 8) & 1
             );
             crate::sprintln!(
                 "Aegis: [GP] LAPIC LVT: timer={:#x} thermal={:#x} pmc={:#x} lint0={:#x} lint1={:#x} err={:#x}",
@@ -940,7 +1016,9 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
                 let max_entries = ((ver >> 16) & 0xFF) + 1;
                 crate::sprintln!(
                     "Aegis: [GP] I/O APIC base={:#x} ver={:#x} entries={}",
-                    IOAPIC_BASE, ver, max_entries
+                    IOAPIC_BASE,
+                    ver,
+                    max_entries
                 );
                 for i in 0..max_entries {
                     let low = ioapic_read(0x10 + 2 * i);
@@ -950,7 +1028,12 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
                     if vec != 0 || masked == 0 {
                         crate::sprintln!(
                             "Aegis: [GP] IOAPIC[{}] vec={} mask={} dest={:#x} low={:#x} high={:#x}",
-                            i, vec, masked, (high >> 24) & 0xFF, low, high
+                            i,
+                            vec,
+                            masked,
+                            (high >> 24) & 0xFF,
+                            low,
+                            high
                         );
                     }
                 }
@@ -1344,7 +1427,16 @@ pub unsafe fn set_xhci_phase(p: u8) {
     );
     // Paint the phase NUMBER as huge white digits below the block so the
     // exact phase is readable even if the colour is ambiguous on the panel.
-    fb_hex(8, (DIAG_H as usize).saturating_sub(190), p as u64, 2, 4, 0xFF, 0xFF, 0xFF);
+    fb_hex(
+        8,
+        (DIAG_H as usize).saturating_sub(190),
+        p as u64,
+        2,
+        4,
+        0xFF,
+        0xFF,
+        0xFF,
+    );
 }
 
 /// Phase -> colour, shared by `diag_phase_block` (bottom strip) and the
@@ -1733,7 +1825,9 @@ pub fn xhci_db_rd() -> u32 {
 /// on-screen diagnostic show whether port power/reset ran under a Running
 /// controller (required; a Halted controller can't reset ports -> CC=05).
 pub fn set_xhci_hch_enum(running: u8) {
-    unsafe { XHCI_HCH_ENUM = running; }
+    unsafe {
+        XHCI_HCH_ENUM = running;
+    }
 }
 pub fn xhci_hch_enum() -> u8 {
     unsafe { XHCI_HCH_ENUM }
@@ -1778,7 +1872,16 @@ pub fn xhci_dcb_rd() -> u32 {
 /// test both the spec-correct offsets (0x14/0x20/0x28) and the original-code
 /// offsets (0x18/0x30/0x38) to locate where the firmware's CRCR (0x200 from
 /// EVPTR), DCBAAP, and CONFIG actually live.
-pub fn set_xhci_op_raw(op0: u32, op2: u32, op14: u32, op18: u32, op20: u32, op28: u32, op30: u32, op38: u32) {
+pub fn set_xhci_op_raw(
+    op0: u32,
+    op2: u32,
+    op14: u32,
+    op18: u32,
+    op20: u32,
+    op28: u32,
+    op30: u32,
+    op38: u32,
+) {
     unsafe {
         XHCI_OP0 = op0;
         XHCI_OP2 = op2;
@@ -1790,14 +1893,30 @@ pub fn set_xhci_op_raw(op0: u32, op2: u32, op14: u32, op18: u32, op20: u32, op28
         XHCI_OP38 = op38;
     }
 }
-pub fn xhci_op0() -> u32 { unsafe { XHCI_OP0 } }
-pub fn xhci_op2() -> u32 { unsafe { XHCI_OP2 } }
-pub fn xhci_op5() -> u32 { unsafe { XHCI_OP5 } }
-pub fn xhci_op8() -> u32 { unsafe { XHCI_OP8 } }
-pub fn xhci_op10() -> u32 { unsafe { XHCI_OP10 } }
-pub fn xhci_op18() -> u32 { unsafe { XHCI_OP18 } }
-pub fn xhci_op30() -> u32 { unsafe { XHCI_OP30 } }
-pub fn xhci_op38() -> u32 { unsafe { XHCI_OP38 } }
+pub fn xhci_op0() -> u32 {
+    unsafe { XHCI_OP0 }
+}
+pub fn xhci_op2() -> u32 {
+    unsafe { XHCI_OP2 }
+}
+pub fn xhci_op5() -> u32 {
+    unsafe { XHCI_OP5 }
+}
+pub fn xhci_op8() -> u32 {
+    unsafe { XHCI_OP8 }
+}
+pub fn xhci_op10() -> u32 {
+    unsafe { XHCI_OP10 }
+}
+pub fn xhci_op18() -> u32 {
+    unsafe { XHCI_OP18 }
+}
+pub fn xhci_op30() -> u32 {
+    unsafe { XHCI_OP30 }
+}
+pub fn xhci_op38() -> u32 {
+    unsafe { XHCI_OP38 }
+}
 
 /// Snapshot the LAPIC's health for the on-screen boot diagnostic: whether we
 /// are in x2APIC (MSR) mode, whether the LAPIC is software-enabled (SVR bit 8),

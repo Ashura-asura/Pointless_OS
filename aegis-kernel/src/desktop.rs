@@ -1565,12 +1565,7 @@ impl Desktop {
         let _ = write!(
             w5,
             "CRW={:08X}{:08X} CR={:08X}{:08X} IMM={:08X} NA={}",
-            crcr_whi,
-            crcr_wlo,
-            crcr_hi,
-            crcr_lo,
-            crcr_imm,
-            na
+            crcr_whi, crcr_wlo, crcr_hi, crcr_lo, crcr_imm, na
         );
         for (i, &b) in w5.buf[..w5.len].iter().enumerate() {
             if i < SW {

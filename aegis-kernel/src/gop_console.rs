@@ -166,65 +166,65 @@ fn blit() {
     let start = unsafe { BUF[2] as i16 };
     let start = ((start as isize + 1).max(0)) as usize;
     let fb = base as *mut u8;
-unsafe {
-            // Clear the new rows to black (they may hold garbage).
-            for r in start..=upto {
-                for px in 0..cols.min(COLS) * 8 {
-                    let py = r * 16;
-                    let off = (py * stride as usize + px) * bpp_bytes;
-                    for k in 0..bpp_bytes.min(4) {
-                        core::ptr::write_volatile(fb.add(off + k), 0);
-                    }
+    unsafe {
+        // Clear the new rows to black (they may hold garbage).
+        for r in start..=upto {
+            for px in 0..cols.min(COLS) * 8 {
+                let py = r * 16;
+                let off = (py * stride as usize + px) * bpp_bytes;
+                for k in 0..bpp_bytes.min(4) {
+                    core::ptr::write_volatile(fb.add(off + k), 0);
                 }
             }
-            // Draw the new rows' glyphs.
-            for r in start..=upto {
-                for c in 0..cols.min(COLS) {
-                    let ch = BUF[STATE_HDR + r * COLS + c] as usize;
-                    let glyph = crate::font::FONT8X16_BASIC[ch & 0xFF];
-                    for (gy, bits) in glyph.iter().enumerate() {
-                        for gx in 0..8 {
-                            let on = (bits >> (7 - gx)) & 1 == 1;
-                            let px = c * 8 + gx;
-                            let py = r * 16 + gy;
-                            let off = (py * stride as usize + px) * bpp_bytes;
-                            let rgb = if on { 0xFFu8 } else { 0x00u8 };
-                            for k in 0..bpp_bytes.min(4) {
-                                core::ptr::write_volatile(fb.add(off + k), rgb);
-                            }
-                        }
-                    }
-                }
-            }
-            BUF[2] = upto as u16; // drawn_upto
-            // DIAG: draw a 4-pixel-tall bright-green bar across the full width
-            // at the very bottom of the screen (y = height-4).  This is OUTSIDE
-            // the console text area (40 rows × 16 px = 640 px, screen = 768)
-            // so blit()'s row-clearing never touches it.  If it appears on the
-            // photo, blit() is being called AND the framebuffer writes land.
-            // If it does NOT appear, blit() is never entered or the FB address
-            // is wrong.  We paint it every blit() call so even a single call
-            // leaves evidence.
-            {
-                let w = width as usize;
-                let h = _height as usize;
-                if h > 8 && w > 0 {
-                    let bar_y0 = h - 4;
-                    for dy in 0u32..4 {
-                        for dx in 0..w {
-                            let off = ((bar_y0 + dy as usize) * stride as usize + dx) * bpp_bytes;
-                            // BGRA: green = byte 1
-                            for k in 0..bpp_bytes.min(4) {
-                                core::ptr::write_volatile(
-                                    fb.add(off + k),
-                                    if k == 1 { 0xFF } else { 0x00 },
-                                );
-                            }
+        }
+        // Draw the new rows' glyphs.
+        for r in start..=upto {
+            for c in 0..cols.min(COLS) {
+                let ch = BUF[STATE_HDR + r * COLS + c] as usize;
+                let glyph = crate::font::FONT8X16_BASIC[ch & 0xFF];
+                for (gy, bits) in glyph.iter().enumerate() {
+                    for gx in 0..8 {
+                        let on = (bits >> (7 - gx)) & 1 == 1;
+                        let px = c * 8 + gx;
+                        let py = r * 16 + gy;
+                        let off = (py * stride as usize + px) * bpp_bytes;
+                        let rgb = if on { 0xFFu8 } else { 0x00u8 };
+                        for k in 0..bpp_bytes.min(4) {
+                            core::ptr::write_volatile(fb.add(off + k), rgb);
                         }
                     }
                 }
             }
         }
+        BUF[2] = upto as u16; // drawn_upto
+                              // DIAG: draw a 4-pixel-tall bright-green bar across the full width
+                              // at the very bottom of the screen (y = height-4).  This is OUTSIDE
+                              // the console text area (40 rows × 16 px = 640 px, screen = 768)
+                              // so blit()'s row-clearing never touches it.  If it appears on the
+                              // photo, blit() is being called AND the framebuffer writes land.
+                              // If it does NOT appear, blit() is never entered or the FB address
+                              // is wrong.  We paint it every blit() call so even a single call
+                              // leaves evidence.
+        {
+            let w = width as usize;
+            let h = _height as usize;
+            if h > 8 && w > 0 {
+                let bar_y0 = h - 4;
+                for dy in 0u32..4 {
+                    for dx in 0..w {
+                        let off = ((bar_y0 + dy as usize) * stride as usize + dx) * bpp_bytes;
+                        // BGRA: green = byte 1
+                        for k in 0..bpp_bytes.min(4) {
+                            core::ptr::write_volatile(
+                                fb.add(off + k),
+                                if k == 1 { 0xFF } else { 0x00 },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -322,10 +322,7 @@ unsafe fn wrmsr(msr: u32, val: u64) {
 unsafe fn ensure_wb_mtrr(phys: u64) {
     let def = rdmsr(0x2FF);
     let def_type = (def & 0xFF) as u8;
-    crate::sprintln!(
-        "Aegis: [vmx] MTRR: def_type={} phys={:#x}",
-        def_type, phys
-    );
+    crate::sprintln!("Aegis: [vmx] MTRR: def_type={} phys={:#x}", def_type, phys);
     if def_type == 6 {
         return; // default is already WB
     }
@@ -381,7 +378,10 @@ unsafe fn vmxon(phys_addr: u64) -> bool {
     // serializing write to guarantee the write is committed before vmxon.
     let cr4 = read_cr4();
     if cr4 & (1 << 13) == 0 {
-        crate::sprintln!("Aegis: [vmx] vmxon pre-flight: CR4.VMXE was CLEAR, re-asserting (cr4={:#x})", cr4);
+        crate::sprintln!(
+            "Aegis: [vmx] vmxon pre-flight: CR4.VMXE was CLEAR, re-asserting (cr4={:#x})",
+            cr4
+        );
         write_cr4(cr4 | (1 << 13));
     }
     // Dump diagnostics: IA32_FEATURE_CONTROL, CR0, CR4, VMXON region contents.
@@ -413,9 +413,7 @@ unsafe fn vmxon(phys_addr: u64) -> bool {
         options(nostack)
     );
     if cf != 0 {
-        crate::sprintln!(
-            "Aegis: [vmx] vmxon FAILED: CF=1 (VMfailInvalid)"
-        );
+        crate::sprintln!("Aegis: [vmx] vmxon FAILED: CF=1 (VMfailInvalid)");
         false
     } else {
         true
@@ -459,7 +457,8 @@ unsafe fn resstamp_vmcs_header(vmcs_phys: u64) {
     let check = core::ptr::read_volatile(vmcs_phys as *const u32);
     crate::sprintln!(
         "Aegis: [vmx]   resstamp: wrote rev={:#x} hdr={:#x} {}",
-        revision, check,
+        revision,
+        check,
         if check == revision { "ok" } else { "MISMATCH" }
     );
 }
@@ -509,8 +508,14 @@ unsafe fn vmwrite(field: u64, value: u64) -> bool {
     if cf != 0 || zf != 0 {
         crate::sprintln!(
             "Aegis: [vmx] vmwrite FAILED: field={:#x} CF={} ZF={} ({})",
-            field, cf, zf,
-            if cf != 0 { "VMfailInvalid" } else { "VMfailValid" }
+            field,
+            cf,
+            zf,
+            if cf != 0 {
+                "VMfailInvalid"
+            } else {
+                "VMfailValid"
+            }
         );
         false
     } else {
@@ -619,7 +624,8 @@ pub unsafe fn enable_vmx_operation() -> Result<(), &'static str> {
     if cr0 != cr0_new {
         crate::sprintln!(
             "Aegis: [vmx] enable_vmx: CR0 fixed bits: {:#x} -> {:#x}",
-            cr0, cr0_new
+            cr0,
+            cr0_new
         );
         // MOV CR0 requires bit 5 (NE) to already be set if CD is being
         // changed — set NE first with a separate MOV, then the full value.
@@ -634,7 +640,8 @@ pub unsafe fn enable_vmx_operation() -> Result<(), &'static str> {
     if cr4 != cr4_new {
         crate::sprintln!(
             "Aegis: [vmx] enable_vmx: CR4 fixed bits: {:#x} -> {:#x}",
-            cr4, cr4_new
+            cr4,
+            cr4_new
         );
     }
     // Set CR4.VMXE (bit 13) on top of the fixed-bit result.
@@ -795,7 +802,10 @@ unsafe fn alloc_vmx_region() -> Result<u64, &'static str> {
     let check = core::ptr::read_volatile(phys as *const u32);
     crate::sprintln!(
         "Aegis: [vmx] alloc_vmx: phys={:#x} revision={:#x} check={:#x} match={}",
-        phys, revision, check, revision == check
+        phys,
+        revision,
+        check,
+        revision == check
     );
     // Ensure this physical page is Write-Back via MTRR (Bay Trail UC default
     // causes vmxon to #GP).
@@ -1141,7 +1151,10 @@ unsafe fn calibrate_host_tsc_hz() -> u64 {
             if hz >= 100_000_000 {
                 crate::sprintln!(
                     "Aegis: [vmx] TSC calibrated via CPUID.15h: {} Hz (freq={} numer={} denom={})",
-                    hz, freq, numer, denom
+                    hz,
+                    freq,
+                    numer,
+                    denom
                 );
                 return hz;
             }
@@ -1162,7 +1175,8 @@ unsafe fn calibrate_host_tsc_hz() -> u64 {
             let hz = mhz * 1_000_000;
             crate::sprintln!(
                 "Aegis: [vmx] TSC calibrated via CPUID.16h: {} MHz -> {} Hz",
-                mhz, hz
+                mhz,
+                hz
             );
             return hz;
         }
@@ -1269,9 +1283,7 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
         "Aegis: [vmx] run-loop: header after alloc: {:#x}",
         read_vmcs_header(vmcs_region)
     );
-    crate::sprintln!(
-        "Aegis: [vmx] run-loop: NO-VMCLEAR — vmptrld directly on fresh VMCS"
-    );
+    crate::sprintln!("Aegis: [vmx] run-loop: NO-VMCLEAR — vmptrld directly on fresh VMCS");
     if !vmptrld(vmcs_region) {
         return Err("VMPTRLD failed — VMCS not made current");
     }
@@ -1479,7 +1491,9 @@ pub unsafe fn run_loop_demo() -> Result<(), &'static str> {
         let cs = crate::idt::idt_checksum(base, limit);
         crate::sprintln!(
             "Aegis: [vmx] POST-RETURN IDT: base={:#x} limit={} checksum={:#018x}",
-            base, limit, cs
+            base,
+            limit,
+            cs
         );
         crate::idt::dump_gate(base, 13);
         // Raw descriptors for byte-level comparison
@@ -1579,9 +1593,7 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
         "Aegis: [vmx] guest-boot: header after alloc: {:#x}",
         read_vmcs_header(vmcs_region)
     );
-    crate::sprintln!(
-        "Aegis: [vmx] guest-boot: NO-VMCLEAR — vmptrld directly on fresh VMCS"
-    );
+    crate::sprintln!("Aegis: [vmx] guest-boot: NO-VMCLEAR — vmptrld directly on fresh VMCS");
     if !vmptrld(vmcs_region) {
         return Err("VMPTRLD failed — VMCS not made current");
     }
@@ -1622,6 +1634,93 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
     .map_err(|_| "guest image load failed (layout/EPT error — see vm.rs GuestBoot)")?;
     let boot = vm.boot_state().ok_or("guest not loaded")?;
     setup_host_state()?;
+
+    // ── Dump first 16 bytes at the32-bit entry point ──
+    {
+        if let Some(hpa) = vm.ept.translate(crate::vm::CODE32_GPA) {
+            let src = hpa as *const u8;
+            let mut hex = [0u8; 48];
+            for i in 0..16u32 {
+                let b = core::ptr::read_volatile(src.add(i as usize));
+                let hi = b >> 4;
+                let lo = b & 0x0F;
+                hex[(i * 3) as usize] = if hi < 10 { b'0' + hi } else { b'A' + hi - 10 };
+                hex[(i * 3 + 1) as usize] = if lo < 10 { b'0' + lo } else { b'A' + lo - 10 };
+                hex[(i * 3 + 2) as usize] = b' ';
+            }
+            crate::sprintln!(
+                "Aegis: [vmx] guest boot: first 16 bytes at {:#x} (hpa={:#x}): {:?}",
+                crate::vm::CODE32_GPA,
+                hpa,
+                core::str::from_utf8(&hex).unwrap_or("?")
+            );
+        } else {
+            crate::sprintln!(
+                "Aegis: [vmx] guest boot: WARNING — cannot translate GPA {:#x} to host PA",
+                crate::vm::CODE32_GPA
+            );
+        }
+    }
+
+    // ── Write a minimal IDT into guest memory ──
+    // The guest IDTR points to GPA 0 (the low-memory page). Write
+    // exception gate entries for vectors 0–31, each pointing to a
+    // tiny handler at GPA 0x200 that just does `iret`. Without this,
+    // injected exceptions (#GP/#PF) can't be delivered — the CPU
+    // reads an all-zero IDT entry, cascades to #NP/#DF, triple-faults.
+    const IDT_BASE: u64 = 0x0;
+    const IDT_HANDLER: u64 = 0x200; // `iret` gadget
+    {
+        let mut idt = [0u8; 256]; // 32 vectors × 8 bytes
+        for v in 0..32u64 {
+            let off = IDT_HANDLER as u32;
+            let entry: [u8; 8] = [
+                (off & 0xFF) as u8,
+                ((off >> 8) & 0xFF) as u8,
+                0x08, // selector = kernel code
+                0,    // reserved
+                0x8E, // present, DPL=0, 32-bit interrupt gate
+                0x00,
+                ((off >> 16) & 0xFF) as u8,
+                ((off >> 24) & 0xFF) as u8,
+            ];
+            let base = (v * 8) as usize;
+            idt[base..base + 8].copy_from_slice(&entry);
+        }
+        // Translate GPA→HPA and write directly (avoids GuestMem visibility issue)
+        let mut write_at = |gpa: u64, data: &[u8]| -> bool {
+            match vm.ept.translate(gpa) {
+                Some(hpa) => {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(data.as_ptr(), hpa as *mut u8, data.len());
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        if !write_at(IDT_BASE, &idt) {
+            crate::sprintln!(
+                "Aegis: [vmx] guest boot: WARNING — IDT write to GPA {:#x} failed",
+                IDT_BASE
+            );
+        }
+        if !write_at(IDT_HANDLER, &[0xCF]) {
+            // iret
+            crate::sprintln!(
+                "Aegis: [vmx] guest boot: WARNING — iret gadget write to GPA {:#x} failed",
+                IDT_HANDLER
+            );
+        }
+        // Update the VMCS IDTR (vmwrite touches VMCS, not vm.ept)
+        vmwrite(field::GUEST_IDTR_BASE, IDT_BASE);
+        vmwrite(field::GUEST_IDTR_LIMIT, (32 * 8 - 1) as u64);
+        crate::sprintln!(
+            "Aegis: [vmx] guest boot: minimal IDT at GPA {:#x} (32 vectors → iret at {:#x})",
+            IDT_BASE,
+            IDT_HANDLER
+        );
+    }
 
     crate::sprintln!(
         "Aegis: [vmx] guest boot: bzImage {} bytes, initramfs {} bytes, cmdline \"{}\"",
@@ -1698,7 +1797,9 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
         let cs = crate::idt::idt_checksum(base, limit);
         crate::sprintln!(
             "Aegis: [vmx] GUEST BOOT POST-RETURN IDT: base={:#x} limit={} checksum={:#018x}",
-            base, limit, cs
+            base,
+            limit,
+            cs
         );
         crate::idt::dump_gate(base, 13);
         // Raw descriptors for byte-level comparison
@@ -1770,12 +1871,8 @@ unsafe fn setup_host_state() -> Result<(), &'static str> {
     // byte 7 (base[31:24]), and bytes 8-11 (base[63:32]).
     {
         let tr_idx = ((tr & 0xFFF8) >> 3) as u64;
-        let desc_lo = core::ptr::read_volatile(
-            (gdtr_base + tr_idx * 8) as *const u64,
-        );
-        let desc_hi = core::ptr::read_volatile(
-            (gdtr_base + tr_idx * 8 + 8) as *const u64,
-        );
+        let desc_lo = core::ptr::read_volatile((gdtr_base + tr_idx * 8) as *const u64);
+        let desc_hi = core::ptr::read_volatile((gdtr_base + tr_idx * 8 + 8) as *const u64);
         let base_lo = (desc_lo >> 16) & 0xFFFF;
         let base_mid = (desc_lo >> 32) & 0xFF;
         let base_hi = (desc_lo >> 56) & 0xFF;
@@ -1803,7 +1900,11 @@ unsafe fn setup_host_state() -> Result<(), &'static str> {
     Ok(())
 }
 
-unsafe fn setup_guest_state(guest_code_phys: u64, gdt_phys: u64, tss_phys: u64) -> Result<(), &'static str> {
+unsafe fn setup_guest_state(
+    guest_code_phys: u64,
+    gdt_phys: u64,
+    tss_phys: u64,
+) -> Result<(), &'static str> {
     // Protected-mode guest with flat 32-bit segments. Real mode can't reach
     // code pages allocated above 1MB (selector is only 16 bits, so
     // selector*16 can't exceed 1MB). With PE=1, PG=0, and flat segments
@@ -2258,8 +2359,12 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
     );
     // ── Live CPU segment registers (right now, before VMLAUNCH) ──
     {
-        let mut cs: u16; let mut ss: u16; let mut ds: u16;
-        let mut es: u16; let mut fs: u16; let mut gs: u16;
+        let mut cs: u16;
+        let mut ss: u16;
+        let mut ds: u16;
+        let mut es: u16;
+        let mut fs: u16;
+        let mut gs: u16;
         let mut tr: u16;
         unsafe {
             core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack));
@@ -2281,7 +2386,8 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
         for sel in [0x08u16, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38] {
             let idx = (sel >> 3) as usize;
             let desc_lo = core::ptr::read_volatile((gdtr_base + (idx * 8) as u64) as *const u64);
-            let desc_hi = core::ptr::read_volatile((gdtr_base + (idx * 8 + 8) as u64) as *const u64);
+            let desc_hi =
+                core::ptr::read_volatile((gdtr_base + (idx * 8 + 8) as u64) as *const u64);
             let base = ((desc_lo >> 16) & 0xFFFF)
                 | (((desc_lo >> 32) & 0xFF) << 16)
                 | (((desc_lo >> 56) & 0xFF) << 24);
@@ -2304,7 +2410,7 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
     {
         let gpa_rip = boot.eip;
         let mut hex32 = [0u8; 96]; // 32 bytes × 3 hex chars
-        // Read through EPT translation (what the guest actually sees)
+                                   // Read through EPT translation (what the guest actually sees)
         let hpa = vm.ept.translate(gpa_rip);
         if let Some(hpa) = hpa {
             let src = hpa as *const u8;
@@ -2351,7 +2457,9 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
         let cs = crate::idt::idt_checksum(base, limit);
         crate::sprintln!(
             "Aegis: [vmx] PRE-LAUNCH IDT: base={:#x} limit={} checksum={:#018x}",
-            base, limit, cs
+            base,
+            limit,
+            cs
         );
         // Dump the specific gate that would be vector 13 (#GP) for cross-check
         crate::idt::dump_gate(base, 13);
@@ -2404,7 +2512,9 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
             let err = vmread(field::VM_INSTRUCTION_ERROR);
             crate::sprintln!(
                 "Aegis: [vmx] vmentry FAILED: CF={} ZF={} VM_INSTRUCTION_ERROR={}",
-                cf, zf, err
+                cf,
+                zf,
+                err
             );
             if cf != 0 && zf == 0 {
                 return Err("vmentry failed: VMfailInvalid (VMCS not valid or not current)");
@@ -2453,8 +2563,17 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
 
                 if int_info & (1 << 31) != 0 && (vector == 14 || vector == 13) {
                     inject_count += 1;
+                    if inject_count <= 5 || inject_count % 100 == 0 {
+                        let err_q = vmread(field::EXIT_QUALIFICATION);
+                        crate::sprintln!(
+                            "Aegis: [vmx] inject vec={} rip={:#x} err_qual={:#x} int_info={:#x} (count={})",
+                            vector, rip, err_q, int_info, inject_count
+                        );
+                    }
                     if inject_count > 2000 {
-                        return Err("exception injection loop detected (>50 #PF/#GP at same point)");
+                        return Err(
+                            "exception injection loop detected (>50 #PF/#GP at same point)",
+                        );
                     }
                     let error_code =
                         (vmread(field::VM_EXIT_INTERRUPTION_ERROR_CODE) & 0xFFFF) as u32;
@@ -2467,7 +2586,7 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
                     }
                     let entry_info: u32 = (1u32 << 31)      // valid
                         | (3u32 << 8)                        // type = hardware exception
-                        | (vector as u32 & 0xFF);            // vector
+                        | (vector as u32 & 0xFF); // vector
                     vmwrite(field::VM_ENTRY_INTR_INFO, entry_info as u64);
                     vmwrite(field::VM_ENTRY_EXCEPTION_ERROR_CODE, error_code as u64);
                     vmwrite(field::VM_ENTRY_INSTRUCTION_LEN, inst_len as u64);
@@ -2490,7 +2609,9 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
                 if mystery_count <= 10 {
                     crate::sprintln!(
                         "Aegis: [vmx] mystery exit reason=0 rip={:#x} int_info={:#x} (count={})",
-                        rip, int_info, mystery_count
+                        rip,
+                        int_info,
+                        mystery_count
                     );
                 }
                 if mystery_count > 10 {
@@ -2607,9 +2728,7 @@ pub unsafe fn bringup_demo() -> Result<(), &'static str> {
         "Aegis: [vmx] header after alloc (fresh, zeroed): {:#x}",
         read_vmcs_header(vmcs_region)
     );
-    crate::sprintln!(
-        "Aegis: [vmx] --- NO-VMCLEAR TEST: skipping vmclear, vmptrld only ---"
-    );
+    crate::sprintln!("Aegis: [vmx] --- NO-VMCLEAR TEST: skipping vmclear, vmptrld only ---");
     if !vmptrld(vmcs_region) {
         return Err("VMPTRLD failed — VMCS not made current");
     }
@@ -2732,7 +2851,10 @@ pub unsafe fn bringup_demo() -> Result<(), &'static str> {
     .map_err(|_| "EPT map failed for guest TSS page")?;
     crate::sprintln!(
         "Aegis: [vmx] bringup EPT: identity-mapped code={:#x} gdt={:#x} tss={:#x} ({} tables)",
-        guest_code, gdt_phys, tss_phys, ept.table_pages()
+        guest_code,
+        gdt_phys,
+        tss_phys,
+        ept.table_pages()
     );
 
     setup_controls(true, ept.root())?;
@@ -2749,7 +2871,9 @@ pub unsafe fn bringup_demo() -> Result<(), &'static str> {
         let cs = crate::idt::idt_checksum(base, limit);
         crate::sprintln!(
             "Aegis: [vmx] BRINGUP PRE-LAUNCH IDT: base={:#x} limit={} checksum={:#018x}",
-            base, limit, cs
+            base,
+            limit,
+            cs
         );
         crate::idt::dump_gate(base, 13);
         // Raw descriptors for byte-level comparison
@@ -2809,12 +2933,12 @@ pub unsafe fn bringup_demo() -> Result<(), &'static str> {
         let vmcs_hdr = read_vmcs_header(vmcs_region);
         crate::sprintln!(
             "Aegis: [vmx] 4/4 VMLAUNCH FAILED — CF={} ZF={} vmcs_header={:#x}",
-            cf, zf, vmcs_hdr
+            cf,
+            zf,
+            vmcs_hdr
         );
         if cf != 0 && zf == 0 {
-            crate::sprintln!(
-                "Aegis: [vmx]   class: VMfailInvalid — VMCS not valid or not current"
-            );
+            crate::sprintln!("Aegis: [vmx]   class: VMfailInvalid — VMCS not valid or not current");
         } else if cf == 0 && zf != 0 {
             let inst_err = vmread(field::VM_INSTRUCTION_ERROR);
             crate::sprintln!(
@@ -2822,9 +2946,7 @@ pub unsafe fn bringup_demo() -> Result<(), &'static str> {
                 inst_err
             );
         } else {
-            crate::sprintln!(
-                "Aegis: [vmx]   class: unexpected CF={} ZF={}", cf, zf
-            );
+            crate::sprintln!("Aegis: [vmx]   class: unexpected CF={} ZF={}", cf, zf);
         }
         return Err("vmlaunch failed — see VMX trace above");
     }
@@ -2865,7 +2987,9 @@ pub unsafe fn bringup_demo() -> Result<(), &'static str> {
         let cs = crate::idt::idt_checksum(base, limit);
         crate::sprintln!(
             "Aegis: [vmx] BRINGUP POST-RETURN IDT: base={:#x} limit={} checksum={:#018x}",
-            base, limit, cs
+            base,
+            limit,
+            cs
         );
         crate::idt::dump_gate(base, 13);
         // Raw descriptors for byte-level comparison
@@ -2972,7 +3096,7 @@ mod tests {
         // value = 0 (neither NE set, bit 0 set) -> result = 0x20 & !0x1 = 0x20.
         let val = 0u64;
         let fixed0 = 0x20u64; // bit 5 must be 1
-        let fixed1 = !0u64;   // all bits allowed
+        let fixed1 = !0u64; // all bits allowed
         let result = (val | fixed0) & fixed1;
         assert_eq!(result, 0x20);
         // value = 0x21 (NE + bit 0) with fixed1 clearing bit 0 -> 0x20.

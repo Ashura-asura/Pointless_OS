@@ -41,12 +41,12 @@ pub extern "sysv64" fn _start(handoff_addr: u64) -> ! {
     // K0: very first instruction in the kernel — prove the loader jumped
     // to the correct address and the CPU is executing kernel code.
     paint(handoff_addr, 0, 2, [0x00, 0xFF, 0xFF]); // K0: _start reached
-    // Enter on a freshly-established kernel stack: jump (never return) so
-    // boot_kernel's prologue and all its %rsp-relative slots live below the
-    // stack top, instead of spilling into BSS statics placed just above it.
-    // `handoff_addr` is the loader-controlled page (image_end) where the
-    // boot-info handoff was written — it must stay valid in %rdi through the
-    // stack switch, which it does (RDI is not clobbered by the asm).
+                                                   // Enter on a freshly-established kernel stack: jump (never return) so
+                                                   // boot_kernel's prologue and all its %rsp-relative slots live below the
+                                                   // stack top, instead of spilling into BSS statics placed just above it.
+                                                   // `handoff_addr` is the loader-controlled page (image_end) where the
+                                                   // boot-info handoff was written — it must stay valid in %rdi through the
+                                                   // stack switch, which it does (RDI is not clobbered by the asm).
     unsafe { aegis_kernel::cpu::switch_to_kernel_stack_and_jump(boot_kernel, handoff_addr) }
 }
 
@@ -124,8 +124,8 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     unsafe { aegis_kernel::boot_info::set_boot_handoff(handoff_addr) };
     // K2: boot_handoff stashed, Rust globals accessible — early init done.
     paint(handoff_addr, 0, 4, [0x00, 0xFF, 0x00]); // K2: handoff stashed
-    // Register the diagnostic framebuffer EARLY (before frame::init_global)
-    // so the markers inside the allocator init can paint via `diag_fill`.
+                                                   // Register the diagnostic framebuffer EARLY (before frame::init_global)
+                                                   // so the markers inside the allocator init can paint via `diag_fill`.
     if let Some(h) = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) } {
         unsafe {
             aegis_kernel::cpu::init_diag_fb(h.framebuffer_base, h.stride_px, h.width, h.height);
@@ -139,10 +139,10 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     // exactly where the kernel freezes. Each paint() is a small 40x40 block.
     aegis_kernel::serial::SerialWriter::init();
     paint(handoff_addr, 0, 9, [0x00, 0xFF, 0x00]); // M2: after serial init
-                                                    // Blank the VGA text buffer only: entering text mode (which disables
-                                                    // the firmware's Bochs-VBE/GOP display mode) is deferred until after
-                                                    // the display backend is chosen below — a pixel backend must not kill
-                                                    // the GOP framebuffer the firmware set up.
+                                                   // Blank the VGA text buffer only: entering text mode (which disables
+                                                   // the firmware's Bochs-VBE/GOP display mode) is deferred until after
+                                                   // the display backend is chosen below — a pixel backend must not kill
+                                                   // the GOP framebuffer the firmware set up.
     aegis_kernel::vga::vga_init();
     paint(handoff_addr, 0, 10, [0x00, 0x00, 0xFF]); // M3: after vga_init
 
@@ -175,9 +175,9 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
     paint(handoff_addr, 0, 13, [0x80, 0xFF, 0x00]); // M6: before boot_info::locate_at
     let boot_info = unsafe { aegis_kernel::boot_info::locate_at(handoff_addr) };
     paint(handoff_addr, 0, 14, [0x00, 0x80, 0x80]); // M7: after boot_info::locate_at
-    // Extract the runtime fleet config (FLEET.CFG on the boot volume) and
-    // point the interface at the configured IP before NetIf::init. Absent =>
-    // compile-time defaults apply.
+                                                    // Extract the runtime fleet config (FLEET.CFG on the boot volume) and
+                                                    // point the interface at the configured IP before NetIf::init. Absent =>
+                                                    // compile-time defaults apply.
     paint(handoff_addr, 0, 15, [0x00, 0xFF, 0x00]); // M8: before fleet_at
     let fleet_cfg = unsafe { aegis_kernel::boot_info::fleet_at(handoff_addr) };
     paint(handoff_addr, 0, 16, [0xFF, 0x80, 0x80]); // M9: after fleet_at
@@ -226,11 +226,11 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             }
             paint(handoff_addr, 0, 18, [0xFF, 0xFF, 0x00]); // M11: after frame::init_global (was pure black — invisible; changed to yellow)
             paint(handoff_addr, 0, 19, [0xFF, 0x80, 0x00]); // M12: before alloc_contiguous_global (idle stack)
-            // Dedicated idle stack: its saved scheduler frame must point at
-            // private, never-clobbered memory. If idle shared KERNEL_STACK,
-            // other tasks' timer/syscall entries would overwrite that region
-            // and restoring idle would pop garbage (QEMU/TCG tolerated it;
-            // VMware faulted). Allocate it like the task stacks.
+                                                            // Dedicated idle stack: its saved scheduler frame must point at
+                                                            // private, never-clobbered memory. If idle shared KERNEL_STACK,
+                                                            // other tasks' timer/syscall entries would overwrite that region
+                                                            // and restoring idle would pop garbage (QEMU/TCG tolerated it;
+                                                            // VMware faulted). Allocate it like the task stacks.
             let idle_stack = unsafe {
                 aegis_kernel::frame::alloc_contiguous_global(
                     aegis_kernel::tasks::TASK_STACK_SIZE / 4096,
@@ -316,12 +316,16 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         let cs = aegis_kernel::idt::idt_checksum(base, limit);
         sprintln!(
             "Aegis: IDT integrity: IDT_FRAME={:#x} IDTR base={:#x} limit={} checksum={:#018x}",
-            idt_phys, base, limit, cs
+            idt_phys,
+            base,
+            limit,
+            cs
         );
         if base != idt_phys {
             sprintln!(
                 "Aegis: IDT WARNING: IDTR base != IDT_FRAME! IDTR={:#x} FRAME={:#x}",
-                base, idt_phys
+                base,
+                idt_phys
             );
         }
         aegis_kernel::idt::dump_all_gates(base);
@@ -386,13 +390,14 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         aegis_kernel::page_tables::switch_to(aegis_kernel::page_tables::kernel_pml4_phys());
     }
     paint(handoff_addr, 0, 29, [0xFF, 0x00, 0xFF]); // magenta: after CR3 switch
-    // The kernel page tables map GB2 (0x80000000-0xBFFFFFFF) as 2 MB WB pages.
-    // The GOP framebuffer at 0x90000000 on the TP201S lives there and MUST be
-    // uncacheable for writes to land on the display panel. Without this, the
-    // CPU caches framebuffer stores and the screen goes black after CR3 switch
-    // (the loader's UEFI WC mapping is replaced by our plain WB entries).
+                                                    // The kernel page tables map GB2 (0x80000000-0xBFFFFFFF) as 2 MB WB pages.
+                                                    // The GOP framebuffer at 0x90000000 on the TP201S lives there and MUST be
+                                                    // uncacheable for writes to land on the display panel. Without this, the
+                                                    // CPU caches framebuffer stores and the screen goes black after CR3 switch
+                                                    // (the loader's UEFI WC mapping is replaced by our plain WB entries).
     paint(handoff_addr, 0, 30, [0x00, 0xFF, 0xFF]); // cyan: before gop_at post-CR3
-    let post_cr3_fb = unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) }.map(|h| h.framebuffer_base);
+    let post_cr3_fb =
+        unsafe { aegis_kernel::boot_info::gop_at(handoff_addr) }.map(|h| h.framebuffer_base);
     paint(handoff_addr, 0, 31, [0xFF, 0xFF, 0x00]); // yellow: gop_at returned
     if let Some(fb) = post_cr3_fb {
         paint(handoff_addr, 0, 32, [0xFF, 0x00, 0x00]); // red: about to mark_mmio_uncacheable
@@ -400,10 +405,7 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             aegis_kernel::page_tables::mark_mmio_uncacheable(fb);
         }
         paint(handoff_addr, 0, 33, [0x00, 0xFF, 0x00]); // green: mark_mmio done
-        sprintln!(
-            "Aegis: GOP framebuffer at {:#x} marked uncacheable",
-            fb
-        );
+        sprintln!("Aegis: GOP framebuffer at {:#x} marked uncacheable", fb);
     }
     paint(handoff_addr, 0, 11, [0xFF, 0x00, 0x80]); // pink: CR3 switched
     sprintln!("Aegis: CR3 switched to kernel page tables (identity with 4 KB LAPIC mapping)");
@@ -2620,11 +2622,15 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
         if aegis_kernel::vmx::vmx_supported() && aegis_kernel::vmx::guest_image_valid() {
             // ── Pre-VMX interrupt state dump ──
             let rflags_val: u64;
-            unsafe { core::arch::asm!("pushfq; pop {0}", out(reg) rflags_val, options(nostack, preserves_flags)); }
+            unsafe {
+                core::arch::asm!("pushfq; pop {0}", out(reg) rflags_val, options(nostack, preserves_flags));
+            }
             let if_set = (rflags_val >> 9) & 1;
             sprintln!(
                 "Aegis: [vmx] PRE-VMX RFLAGS={:#x} IF={} interrupts {}",
-                rflags_val, if_set, if if_set != 0 { "ENABLED" } else { "DISABLED" }
+                rflags_val,
+                if_set,
+                if if_set != 0 { "ENABLED" } else { "DISABLED" }
             );
             // Read PIC masks
             let master_mask: u8;
@@ -2635,12 +2641,15 @@ extern "sysv64" fn boot_kernel(handoff_addr: u64) -> ! {
             }
             sprintln!(
                 "Aegis: [vmx] PRE-VMX PIC masks: master=0b{:08b} slave=0b{:08b}",
-                master_mask, slave_mask
+                master_mask,
+                slave_mask
             );
             // Ensure interrupts are disabled during VMX demos (diagnostic)
             if if_set != 0 {
                 sprintln!("Aegis: [vmx] WARNING: interrupts were ON — issuing CLI for safety");
-                unsafe { core::arch::asm!("cli", options(nomem, preserves_flags)); }
+                unsafe {
+                    core::arch::asm!("cli", options(nomem, preserves_flags));
+                }
             }
             sprintln!("Aegis: [vmx] VT-x present — running bring-up demo");
             unsafe {

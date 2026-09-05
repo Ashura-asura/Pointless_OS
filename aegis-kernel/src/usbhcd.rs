@@ -684,7 +684,11 @@ impl XhciController {
         }
 
         // Program the Command Ring pointer (while Halted).
-        reg_write64(self.base, caplen + CRCR, ((cmd_hi as u64) << 32) | (cmd_base as u64));
+        reg_write64(
+            self.base,
+            caplen + CRCR,
+            ((cmd_hi as u64) << 32) | (cmd_base as u64),
+        );
         reg_write(self.base, caplen + CRCR + 4, cmd_hi);
         reg_write(self.base, caplen + CRCR, cmd_base);
         // DIAGNOSTIC: read CRCR back IMMEDIATELY (no delay) to see if the write
@@ -767,7 +771,9 @@ impl XhciController {
         // Bay Trail MMIO bus wedges if we read ERSTSZ/ERDP/IMAN after
         // programming ERSTBA.  A plain fence is enough here.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        unsafe { core::arch::x86_64::_mm_mfence(); }
+        unsafe {
+            core::arch::x86_64::_mm_mfence();
+        }
         // Write ERDP as two 32-bit writes.
         let erdp_lo = (self.buf.ev_ring as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 };
         let erdp_hi = (self.buf.ev_ring >> 32) as u32;
@@ -1146,7 +1152,11 @@ impl XhciController {
                 self.ev_ccs = !self.ev_ccs;
             }
             let next = self.buf.ev_ring + (self.ev_idx as u64) * 16;
-            reg_write(rts, ERDP, (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 });
+            reg_write(
+                rts,
+                ERDP,
+                (next as u32) | 0x8 | if self.ev_ccs { 1 } else { 0 },
+            );
             reg_write(rts, ERDP + 4, (next >> 32) as u32);
         }
         // Mark the ring as not-ready so the next cmd() re-arms it fresh
@@ -1283,19 +1293,19 @@ impl XhciController {
                 crate::cpu::set_xhci_hub(true);
             }
         }
-            let max_pkt0 = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(7)) };
-            // EXPERIMENT: quiesce the event ring (disable interrupter, drain
-            // and acknowledge all pending events, disarm so the next command
-            // re-arms it fresh) before the next operation after the control
-            // transfer.  This isolates whether the Cherry-Trail MMIO wedge is
-            // caused by the live event ring at the transition.
-            unsafe { crate::cpu::set_xhci_phase(11) }; // lime: quiescing event ring
-            self.quiesce_event_ring();
-            unsafe { crate::cpu::set_xhci_phase(12) }; // teal: quiesced, before BSR re-address
-            if !self.address_device(slot, max_pkt0, 0, true, speed) {
-                return false;
-            }
-            unsafe { crate::cpu::set_xhci_phase(9) }; // purple: BSR re-address returned
+        let max_pkt0 = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(7)) };
+        // EXPERIMENT: quiesce the event ring (disable interrupter, drain
+        // and acknowledge all pending events, disarm so the next command
+        // re-arms it fresh) before the next operation after the control
+        // transfer.  This isolates whether the Cherry-Trail MMIO wedge is
+        // caused by the live event ring at the transition.
+        unsafe { crate::cpu::set_xhci_phase(11) }; // lime: quiescing event ring
+        self.quiesce_event_ring();
+        unsafe { crate::cpu::set_xhci_phase(12) }; // teal: quiesced, before BSR re-address
+        if !self.address_device(slot, max_pkt0, 0, true, speed) {
+            return false;
+        }
+        unsafe { crate::cpu::set_xhci_phase(9) }; // purple: BSR re-address returned
         unsafe { crate::cpu::set_xhci_phase(7) };
         true
     }
@@ -1581,7 +1591,10 @@ impl XhciController {
             unsafe { crate::cpu::set_xhci_phase(13) };
             crate::sprintln!("Aegis: xHCI: enumerate_hid E5: enable_slot port{}", p);
             let Some(slot) = self.enable_slot() else {
-                crate::sprintln!("Aegis: xHCI: enumerate_hid E5: enable_slot FAILED port{}", p);
+                crate::sprintln!(
+                    "Aegis: xHCI: enumerate_hid E5: enable_slot FAILED port{}",
+                    p
+                );
                 continue;
             };
             crate::sprintln!("Aegis: xHCI: enumerate_hid E5b: slot={}", slot);
@@ -1606,12 +1619,12 @@ impl XhciController {
                 continue;
             }
             crate::sprintln!("Aegis: xHCI: enumerate_hid E9: GET_DESCRIPTOR(8) OK");
-unsafe { crate::cpu::set_xhci_phase(6) };
-        // DIAG fingerprint: immediately paint the center block RED so we can
-        // tell whether the quiesce build is actually running. If you see a
-        // RED center block, the new build is active. If still cyan, the
-        // device is booting a stale binary.
-        unsafe { crate::cpu::set_xhci_phase(1) };
+            unsafe { crate::cpu::set_xhci_phase(6) };
+            // DIAG fingerprint: immediately paint the center block RED so we can
+            // tell whether the quiesce build is actually running. If you see a
+            // RED center block, the new build is active. If still cyan, the
+            // device is booting a stale binary.
+            unsafe { crate::cpu::set_xhci_phase(1) };
             let cls = unsafe { core::ptr::read_volatile((self.buf.desc as *const u8).add(4)) };
             unsafe {
                 crate::cpu::set_xhci_dev(true);

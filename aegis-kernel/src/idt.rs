@@ -284,9 +284,7 @@ pub unsafe fn read_gate(base: u64, vector: usize) -> (u16, u64, u8) {
     let offset_mid = u16::from_le_bytes([b6, b7]);
     let offset_high = u32::from_le_bytes([b8, b9, b10, b11]);
 
-    let offset = (offset_low as u64)
-        | ((offset_mid as u64) << 16)
-        | ((offset_high as u64) << 32);
+    let offset = (offset_low as u64) | ((offset_mid as u64) << 16) | ((offset_high as u64) << 32);
     (selector, offset, type_attr)
 }
 
@@ -313,7 +311,12 @@ pub fn dump_all_gates(base: u64) {
             let gate_type = attr & 0x0F;
             crate::sprintln!(
                 "Aegis: [idt] gate[{:3}] sel={:#06X} off={:#018X} type={} DPL={} P={}",
-                v, sel, off, gate_type, dpl, present
+                v,
+                sel,
+                off,
+                gate_type,
+                dpl,
+                present
             );
         }
     }
@@ -327,7 +330,12 @@ pub fn dump_gate(base: u64, vector: usize) {
     let gate_type = attr & 0x0F;
     crate::sprintln!(
         "Aegis: [idt] gate[{:3}] sel={:#06X} off={:#018X} type={} DPL={} P={}",
-        vector, sel, off, gate_type, dpl, present
+        vector,
+        sel,
+        off,
+        gate_type,
+        dpl,
+        present
     );
 }
 
@@ -359,7 +367,12 @@ pub fn dump_raw_gates(base: u64, start: usize, end: usize) {
         let gate_type = type_attr & 0x0F;
         crate::sprintln!(
             "Aegis: [idt] DECODE gate[{:2}]: sel={:#06X} off={:#018X} type={} DPL={} P={}",
-            v, sel, offset, gate_type, dpl, present
+            v,
+            sel,
+            offset,
+            gate_type,
+            dpl,
+            present
         );
     }
 }
@@ -399,7 +412,10 @@ pub fn dump_gp_error(err: u64, idtr_base: u64) {
     let index = (err >> 3) & 0x1FFF;
     crate::sprintln!(
         "Aegis: [idt] #GP decode: EXT={} IDT={} index={:#x} (raw err={:#x})",
-        ext, idt, index, err
+        ext,
+        idt,
+        index,
+        err
     );
     if idt == 1 {
         crate::sprintln!(
