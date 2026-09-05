@@ -143,12 +143,21 @@ mod field {
     // 32-bit read-only (VM-exit info)
     pub const VM_INSTRUCTION_ERROR: u64 = 0x4400;
     pub const VM_EXIT_REASON: u64 = 0x4402;
+    /// VM-exit interruption information (SDM Vol. 3C §24.9.2, Table 24-13):
+    /// bits 7:0 = vector, bits 10:8 = type (0=ext,2=NMI,3=hw-exc,6=sw-int),
+    /// bit 31 = valid. Whenever `VM_EXIT_REASON` == 0 (exception or NMI),
+    /// the SDM *guarantees* bit 31 here is set — so a "reason=0, this field
+    /// reads 0" observation always means the wrong field is being read,
+    /// never a hardware quirk. This is the correct source for the
+    /// exception vector on exit reason 0.
+    pub const VM_EXIT_INTERRUPTION_INFO: u64 = 0x4404;
+    /// Error code for the event named by `VM_EXIT_INTERRUPTION_INFO`, valid
+    /// whenever that field's vector delivers one (#PF, #GP, #DF, ...).
+    /// NOT the same as `EXIT_QUALIFICATION`, which for a #PF exit instead
+    /// holds the faulting linear address (identical to CR2) — a common
+    /// mix-up since both are populated together on page faults.
+    pub const VM_EXIT_INTERRUPTION_ERROR_CODE: u64 = 0x4406;
     pub const VM_EXIT_INSTRUCTION_LEN: u64 = 0x440C;
-    /// VM-Exit IDT-Vectoring Information (SDM §27.2.1, Table 24-7):
-    /// bits 7:0 = vector, bits 12:8 = type (0=ext,2=NMI,3=hw-exc,6=sw-int),
-    /// bit 31 = valid. This is the CORRECT source for the exception vector on
-    /// exit reason 0 — EXIT_QUALIFICATION does NOT contain the vector.
-    pub const VM_EXIT_INTERRUPTION_INFO: u64 = 0x440E;
     pub const EXIT_QUALIFICATION: u64 = 0x6400;
     // 32-bit guest-state
     pub const GUEST_ES_LIMIT: u64 = 0x4800;
@@ -2441,7 +2450,8 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
                     if inject_count > 50 {
                         return Err("exception injection loop detected (>50 #PF/#GP at same point)");
                     }
-                    let error_code = (vmread(field::EXIT_QUALIFICATION) & 0xFFFF) as u32;
+                    let error_code =
+                        (vmread(field::VM_EXIT_INTERRUPTION_ERROR_CODE) & 0xFFFF) as u32;
                     let inst_len = vmread(field::VM_EXIT_INSTRUCTION_LEN) as u32;
                     let entry_info: u32 = (1u32 << 31)      // valid
                         | (3u32 << 8)                        // type = hardware exception
@@ -2455,9 +2465,15 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
                     continue;
                 }
 
-                // Exit reason 0 with int_info bit 31 clear: Braswell quirk —
-                // the processor exited but cannot report the cause.  Count
-                // these and abort rather than spinning forever.
+                // Exit reason 0 with the (now-correctly-read) interruption-
+                // info field's valid bit clear should be unreachable per
+                // spec — SDM guarantees it's set whenever exit reason is 0.
+                // Kept as a safety net rather than a panic in case some
+                // other exit-reason==0 path exists that this code doesn't
+                // yet classify, but this should no longer fire in practice
+                // now that VM_EXIT_INTERRUPTION_INFO reads the correct
+                // field (0x4404) instead of VM-exit instruction information
+                // (0x440E), which is what it read here previously.
                 mystery_count += 1;
                 if mystery_count <= 10 {
                     crate::sprintln!(
@@ -3152,6 +3168,12 @@ mod tests {
         assert_eq!(field::HOST_RIP >> 8, 0x6C);
         assert_eq!(field::EXIT_QUALIFICATION >> 8, 0x64);
         assert_eq!(field::VM_ENTRY_INTR_INFO >> 8, 0x40);
+        // Exact-value checks: VM_EXIT_INTERRUPTION_INFO was previously
+        // 0x440E (IDT-vectoring info) instead of 0x4404 (interruption info),
+        // causing every exception exit to read 0x0 and appear as a "mystery
+        // exit". Both share the 0x44 type byte so prefix checks pass.
+        assert_eq!(field::VM_EXIT_INTERRUPTION_INFO, 0x4404);
+        assert_eq!(field::VM_EXIT_INTERRUPTION_ERROR_CODE, 0x4406);
     }
 
     #[cfg(feature = "vmx-demo")]
