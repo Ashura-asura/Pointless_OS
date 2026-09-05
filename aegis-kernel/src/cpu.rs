@@ -372,7 +372,11 @@ pub unsafe fn init_ioapic_legacy() {
     // them with arbitrary vectors (including 0x27=39). Only the entries we
     // explicitly route (keyboard, mouse) should be unmasked.
     let ver = ioapic_read(0x01);
-    let max_entries = ((ver >> 16) & 0xFF) + 1; // bits 23:16 = max redirection index
+    // bits 23:16 = max redirection entry index; add 1 for count.
+    // Sanity-cap at 32: no Bay Trail / consumer IOAPIC has more than 24,
+    // and a bogus IOAPICVER read (wrong base, MMIO aliasing) could return
+    // garbage that sends the loop into undefined register space → #GP.
+    let max_entries = (((ver >> 16) & 0xFF) + 1).min(32);
     let keyboard_gsi = gsi_for(1) as u32;
     let mouse_gsi = gsi_for(12) as u32;
     crate::sprintln!(
@@ -1013,7 +1017,8 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
         unsafe {
             if IOAPIC_BASE != 0 {
                 let ver = ioapic_read(0x01);
-                let max_entries = ((ver >> 16) & 0xFF) + 1;
+                // Sanity-cap: Bay Trail has ≤24 entries; bogus reads could return garbage.
+                let max_entries = (((ver >> 16) & 0xFF) + 1).min(32);
                 crate::sprintln!(
                     "Aegis: [GP] I/O APIC base={:#x} ver={:#x} entries={}",
                     IOAPIC_BASE,
