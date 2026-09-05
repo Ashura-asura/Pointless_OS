@@ -437,6 +437,19 @@ pub unsafe fn ioapic_eoi() {
 
 static mut KERNEL_GDT: crate::gdt::Gdt = crate::gdt::Gdt::new();
 
+/// Dedicated 16 KiB stack for IST1 (exception handlers for vectors 13/14).
+/// The CPU switches to this stack before calling the handler, preventing
+/// nested stack overflow when the handler prints heavy diagnostics.
+const FAULT_STACK_SIZE: usize = 16384;
+#[repr(align(16))]
+struct FaultStack([u8; FAULT_STACK_SIZE]);
+static mut FAULT_STACK: FaultStack = FaultStack([0u8; FAULT_STACK_SIZE]);
+
+/// Top of the IST1 fault stack (stacks grow downward).
+pub fn fault_stack_top() -> u64 {
+    unsafe { FAULT_STACK.0.as_ptr().add(FAULT_STACK_SIZE) as u64 }
+}
+
 /// Load the kernel GDT (and TSS).
 ///
 /// # Safety
@@ -450,6 +463,9 @@ pub unsafe fn init_gdt() {
     // top until the first preemptive switch installs the scheduled task's
     // own CPL0 stack.
     gdt.tss_mut().rsp0 = stack_top();
+    // IST1: dedicated stack for #GP/#PF exception handlers so their
+    // diagnostic output doesn't overflow the interrupted task's stack.
+    gdt.tss_mut().ist1 = fault_stack_top();
 }
 
 /// Point TSS.RSP0 at the CPL0 stack of the task about to run. Called by the
@@ -1013,7 +1029,8 @@ pub(crate) extern "sysv64" fn exception_trap_rust(vector: u64, has_err: u64, fra
                 lvt0 & 0xFF, lvt1 & 0xFF, lvt_err & 0xFF
             );
         }
-        // Dump I/O APIC redirection entries to find who's delivering vector 39
+        // Dump I/O APIC redirection entries — only entries with vec!=0
+        // to avoid flooding the output with empty entries.
         unsafe {
             if IOAPIC_BASE != 0 {
                 let ver = ioapic_read(0x01);

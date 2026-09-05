@@ -71,6 +71,15 @@ impl Idt {
         self.entries[vector] = idt_entry(handler_addr, selector, 0, type_attr);
     }
 
+    /// Set a handler with IST (Interrupt Stack Table) index.
+    /// IST 1-7 cause the CPU to switch to a dedicated stack from the TSS
+    /// before calling the handler, avoiding stack overflow in deep
+    /// diagnostic/panic paths.
+    pub fn set_handler_with_ist(&mut self, vector: usize, handler_addr: u64, selector: u16, dpl: u8, ist: u8) {
+        let type_attr = 0x80 | ((dpl & 3) << 5) | 0x0E;
+        self.entries[vector] = idt_entry(handler_addr, selector, ist, type_attr);
+    }
+
     /// Set a DPL-0 interrupt-gate handler for a hardware IRQ (type attr 0x8E:
     /// interrupts are cleared while the handler runs by the CPU).
     pub fn set_irq_handler(&mut self, vector: usize, handler_addr: u64) {
@@ -243,13 +252,14 @@ pub fn install_exception_handlers(idt: &mut Idt) {
         0,
     );
     idt.set_handler(12, handler_stack_fault as *const () as u64, selector, 0);
-    idt.set_handler(
+    idt.set_handler_with_ist(
         13,
         handler_general_protection as *const () as u64,
         selector,
         0,
+        1, // IST1: dedicated fault stack
     );
-    idt.set_handler(14, handler_page_fault as *const () as u64, selector, 0);
+    idt.set_handler_with_ist(14, handler_page_fault as *const () as u64, selector, 0, 1); // IST1
     idt.set_handler(15, handler_x87_fpu as *const () as u64, selector, 0);
     idt.set_handler(16, handler_alignment_check as *const () as u64, selector, 0);
     idt.set_handler(17, handler_machine_check as *const () as u64, selector, 0);
