@@ -2355,6 +2355,8 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
 
     let mut entered = false;
     let mut exits = 0u64;
+    let mut inject_count = 0u32;
+    let mut mystery_count = 0u32;
     // Virtual-clock bookkeeping: the last host TSC sample and the
     // sub-millisecond accumulator (µs), so fractional per-exit deltas are
     // not lost to integer rounding.
@@ -2370,6 +2372,10 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
             if entered { "vmresume" } else { "vmx_do_launch" },
             entered as u32,
         );
+        // Clear any stale VM-entry interruption info from a previous
+        // injection attempt — if left set, the CPU will try to deliver
+        // the old event on the next VM-entry, causing an immediate exit.
+        vmwrite(field::VM_ENTRY_INTR_INFO, 0);
         let fail = if entered {
             vmx_do_resume()
         } else {
@@ -2431,10 +2437,8 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
                 }
 
                 if int_info & (1 << 31) != 0 && (vector == 14 || vector == 13) {
-                    static INJECT_COUNT: core::sync::atomic::AtomicU32 =
-                        core::sync::atomic::AtomicU32::new(0);
-                    let count = INJECT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    if count > 50 {
+                    inject_count += 1;
+                    if inject_count > 50 {
                         return Err("exception injection loop detected (>50 #PF/#GP at same point)");
                     }
                     let error_code = (vmread(field::EXIT_QUALIFICATION) & 0xFFFF) as u32;
@@ -2454,16 +2458,14 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
                 // Exit reason 0 with int_info bit 31 clear: Braswell quirk —
                 // the processor exited but cannot report the cause.  Count
                 // these and abort rather than spinning forever.
-                static MYSTERY_EXIT_COUNT: core::sync::atomic::AtomicU32 =
-                    core::sync::atomic::AtomicU32::new(0);
-                let mc = MYSTERY_EXIT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if mc < 10 {
+                mystery_count += 1;
+                if mystery_count <= 10 {
                     crate::sprintln!(
                         "Aegis: [vmx] mystery exit reason=0 rip={:#x} int_info={:#x} (count={})",
-                        rip, int_info, mc
+                        rip, int_info, mystery_count
                     );
                 }
-                if mc >= 10 {
+                if mystery_count > 10 {
                     return Err("too many mystery VM-exits (reason=0, int_info=0) — guest triple-faults on entry?");
                 }
                 if !exit_hook(vm)? {
