@@ -1662,17 +1662,22 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
         }
     }
 
-    // ── Write a minimal IDT into guest memory ──
+    // ── Write a 256-entry IDT into guest memory ──
     // The guest IDTR points to GPA 0 (the low-memory page). Write
-    // exception gate entries for vectors 0–31, each pointing to a
-    // tiny handler at GPA 0x200 that just does `iret`. Without this,
-    // injected exceptions (#GP/#PF) can't be delivered — the CPU
-    // reads an all-zero IDT entry, cascades to #NP/#DF, triple-faults.
+    // exception gate entries for ALL 256 vectors, each pointing to a
+    // tiny handler at GPA 0x200 that just does `iret`.
+    //
+    // IMPORTANT: vmx_run_guest → setup_guest_state_from_boot overrides
+    // GUEST_IDTR_LIMIT to 0xFFFF (64KB). If we only write 32 entries,
+    // any interrupt with vector ≥ 32 reads garbage from GPA 0x100+,
+    // causing #GP(0) on VM-entry — this is the root cause of the
+    // #GP(0) at RIP=0x100000 on Braswell (xHCI MSI = vector 39).
+    // All 256 vectors must be covered to survive the 0xFFFF override.
     const IDT_BASE: u64 = 0x0;
     const IDT_HANDLER: u64 = 0x200; // `iret` gadget
     {
-        let mut idt = [0u8; 256]; // 32 vectors × 8 bytes
-        for v in 0..32u64 {
+        let mut idt = [0u8; 2048]; // 256 vectors × 8 bytes
+        for v in 0..256u64 {
             let off = IDT_HANDLER as u32;
             let entry: [u8; 8] = [
                 (off & 0xFF) as u8,
@@ -1714,9 +1719,9 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
         }
         // Update the VMCS IDTR (vmwrite touches VMCS, not vm.ept)
         vmwrite(field::GUEST_IDTR_BASE, IDT_BASE);
-        vmwrite(field::GUEST_IDTR_LIMIT, (32 * 8 - 1) as u64);
+        vmwrite(field::GUEST_IDTR_LIMIT, (256 * 8 - 1) as u64);
         crate::sprintln!(
-            "Aegis: [vmx] guest boot: minimal IDT at GPA {:#x} (32 vectors → iret at {:#x})",
+            "Aegis: [vmx] guest boot: 256-entry IDT at GPA {:#x} (all vectors → iret at {:#x})",
             IDT_BASE,
             IDT_HANDLER
         );
