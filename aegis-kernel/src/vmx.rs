@@ -1541,7 +1541,7 @@ const GUEST_INITRAMFS: &[u8] = include_bytes!("../../guest/out/initramfs.cpio.gz
 /// its own shell instead of trying to boot an invalid 4-byte "guest".
 #[cfg(feature = "vmx-demo")]
 pub fn guest_image_valid() -> bool {
-    GUEST_BZIMAGE.len() > (1 << 20)
+    GUEST_BZIMAGE.len() > (1 << 20) && GUEST_INITRAMFS.len() > (1 << 17)
 }
 
 /// Guest RAM for the real-kernel demo: must cover the kernel's `init_size`
@@ -1624,7 +1624,7 @@ pub unsafe fn guest_boot_demo() -> Result<(), &'static str> {
     // `noapic`: the guest has no ACPI tables, so Linux must not touch the
     // LAPIC/I/O-APIC MMIO (unmapped in the EPT — a violation would stop
     // the run). The legacy PIC + PIT + 16550 are the whole device set.
-    const CMDLINE: &str = "console=ttyS0,115200n8 noapic";
+    const CMDLINE: &str = "console=ttyS0,115200n8 noapic nolapic";
     vm.load_linux(
         &mut crate::ept::KernelAlloc,
         GUEST_BZIMAGE,
