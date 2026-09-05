@@ -365,6 +365,12 @@ unsafe fn write_cr4(v: u64) {
 unsafe fn write_cr0(v: u64) {
     asm!("mov cr0, {}", in(reg) v, options(nomem, nostack, preserves_flags));
 }
+/// CR2 (page-fault linear address) is NOT a VMCS field and is NOT touched
+/// by VM-entry/VM-exit (SDM §27.1). The host must write it explicitly before
+/// re-injecting #PF, or the guest's handler reads stale CR2 and faults forever.
+unsafe fn write_cr2(v: u64) {
+    asm!("mov cr2, {}", in(reg) v, options(nomem, nostack, preserves_flags));
+}
 
 /// `vmxon`/`vmclear`/`vmptrld` all take the *physical address* of a region
 /// via a memory operand; `vmwrite`/`vmread` take field/value in registers.
@@ -2447,12 +2453,18 @@ pub unsafe fn vmx_run_guest<S: BlockStore>(
 
                 if int_info & (1 << 31) != 0 && (vector == 14 || vector == 13) {
                     inject_count += 1;
-                    if inject_count > 50 {
+                    if inject_count > 2000 {
                         return Err("exception injection loop detected (>50 #PF/#GP at same point)");
                     }
                     let error_code =
                         (vmread(field::VM_EXIT_INTERRUPTION_ERROR_CODE) & 0xFFFF) as u32;
                     let inst_len = vmread(field::VM_EXIT_INSTRUCTION_LEN) as u32;
+                    if vector == 14 {
+                        // For #PF: EXIT_QUALIFICATION holds the faulting
+                        // linear address. CR2 is NOT a VMCS field — must
+                        // write it explicitly before re-injecting.
+                        write_cr2(vmread(field::EXIT_QUALIFICATION));
+                    }
                     let entry_info: u32 = (1u32 << 31)      // valid
                         | (3u32 << 8)                        // type = hardware exception
                         | (vector as u32 & 0xFF);            // vector
